@@ -1,0 +1,47 @@
+{
+  "schema_version": "lifter_recovery_manifest_v2",
+  "intrinsic_bindings": [
+    {
+      "path": "pcall",
+      "evidence": {
+        "kind": "frontend_proof",
+        "locator": "fixture:intrinsic-invocation:stable-pcall"
+      }
+    },
+    {
+      "path": "xpcall",
+      "evidence": {
+        "kind": "frontend_proof",
+        "locator": "fixture:intrinsic-invocation:stable-xpcall"
+      }
+    },
+    {
+      "path": "coroutine.create",
+      "evidence": {
+        "kind": "frontend_proof",
+        "locator": "fixture:intrinsic-invocation:stable-coroutine-create"
+      }
+    },
+    {
+      "path": "coroutine.resume",
+      "evidence": {
+        "kind": "frontend_proof",
+        "locator": "fixture:intrinsic-invocation:stable-coroutine-resume"
+      }
+    },
+    {
+      "path": "coroutine.yield",
+      "evidence": {
+        "kind": "frontend_proof",
+        "locator": "fixture:intrinsic-invocation:stable-coroutine-yield"
+      }
+    },
+    {
+      "path": "error",
+      "evidence": {
+        "kind": "frontend_proof",
+        "locator": "fixture:intrinsic-invocation:stable-error"
+      }
+    }
+  ]
+}
