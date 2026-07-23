@@ -1,0 +1,213 @@
+{
+  "schema_version": "lifter_recovery_manifest_v7",
+  "target_recovery": {
+    "source_sha256": "049375cab7584bb95931ea74b8133cf90f001436724c739caec356d7fb4f9eb5",
+    "call_site_count": 37,
+    "unresolved_call_count": 19,
+    "lowered_unresolved_call_count": 19,
+    "unresolved_target_selectors": [
+      { "kind": "local_name", "value": "unresolvedSnapshot" },
+      { "kind": "local_name", "value": "unresolvedMutable" },
+      { "kind": "local_name", "value": "unresolvedJoined" },
+      { "kind": "local_name", "value": "unresolvedPrecommit" },
+      { "kind": "local_name", "value": "unresolvedForHeader" },
+      { "kind": "local_name", "value": "unresolvedGuard" },
+      { "kind": "local_name", "value": "unresolvedLoopFixed" },
+      { "kind": "local_name", "value": "unresolvedBreakFixed" },
+      { "kind": "local_name", "value": "unresolvedContinueFixed" },
+      { "kind": "local_name", "value": "unresolvedImmediate" },
+      { "kind": "local_name", "value": "unresolvedInnerFuture" },
+      { "kind": "local_name", "value": "unresolvedNestedWrite" },
+      { "kind": "local_name", "value": "unresolvedReadChain" },
+      { "kind": "local_name", "value": "unresolvedLocalInvoke" },
+      { "kind": "local_name", "value": "unresolvedLocalFunction" },
+      { "kind": "local_name", "value": "unresolvedAssignedInvoke" },
+      { "kind": "local_name", "value": "unresolvedAliasedInvoke" },
+      { "kind": "local_name", "value": "unresolvedCapturedInvoke" }
+    ],
+    "target_resolutions": [
+      {
+        "call_location": "72,36 - 72,61",
+        "origin": {
+          "table_get": {
+            "table": { "local_value": "2,7 - 2,16" },
+            "key": "dispatch"
+          }
+        },
+        "evidence": {
+          "kind": "dynamic_fixture",
+          "locator": "fixture:temporal-snapshot-definition",
+          "digest": "049375cab7584bb95931ea74b8133cf90f001436724c739caec356d7fb4f9eb5"
+        }
+      },
+      {
+        "call_location": "73,34 - 73,58",
+        "origin": { "local_place": "18,7 - 18,24" },
+        "evidence": {
+          "kind": "dynamic_fixture",
+          "locator": "fixture:temporal-single-write",
+          "digest": "049375cab7584bb95931ea74b8133cf90f001436724c739caec356d7fb4f9eb5"
+        }
+      },
+      {
+        "call_location": "74,32 - 74,55",
+        "origin": { "local_value": "22,7 - 22,19" },
+        "evidence": {
+          "kind": "dynamic_fixture",
+          "locator": "fixture:temporal-branch-definition-set",
+          "digest": "049375cab7584bb95931ea74b8133cf90f001436724c739caec356d7fb4f9eb5"
+        }
+      },
+      {
+        "call_location": "40,6 - 40,32",
+        "origin": { "local_value": "32,7 - 32,22" },
+        "evidence": {
+          "kind": "dynamic_fixture",
+          "locator": "fixture:temporal-assignment-precommit",
+          "digest": "049375cab7584bb95931ea74b8133cf90f001436724c739caec356d7fb4f9eb5"
+        }
+      },
+      {
+        "call_location": "46,13 - 46,39",
+        "origin": { "local_value": "41,7 - 41,22" },
+        "evidence": {
+          "kind": "dynamic_fixture",
+          "locator": "fixture:temporal-for-header",
+          "digest": "049375cab7584bb95931ea74b8133cf90f001436724c739caec356d7fb4f9eb5"
+        }
+      },
+      {
+        "call_location": "60,4 - 60,26",
+        "origin": { "local_value": "52,7 - 52,18" },
+        "evidence": {
+          "kind": "dynamic_fixture",
+          "locator": "fixture:temporal-structured-guard",
+          "digest": "049375cab7584bb95931ea74b8133cf90f001436724c739caec356d7fb4f9eb5"
+        }
+      },
+      {
+        "call_location": "85,29 - 85,55",
+        "origin": { "local_value": "76,7 - 76,17" },
+        "evidence": {
+          "kind": "dynamic_fixture",
+          "locator": "fixture:temporal-loop-condition-phase",
+          "digest": "049375cab7584bb95931ea74b8133cf90f001436724c739caec356d7fb4f9eb5"
+        }
+      },
+      {
+        "call_location": "89,28 - 89,54",
+        "origin": { "local_value": "76,7 - 76,17" },
+        "evidence": {
+          "kind": "dynamic_fixture",
+          "locator": "fixture:temporal-loop-fixed-point",
+          "digest": "049375cab7584bb95931ea74b8133cf90f001436724c739caec356d7fb4f9eb5"
+        }
+      },
+      {
+        "call_location": "100,30 - 100,57",
+        "origin": { "local_value": "90,7 - 90,21" },
+        "evidence": {
+          "kind": "dynamic_fixture",
+          "locator": "fixture:temporal-break-exit",
+          "digest": "049375cab7584bb95931ea74b8133cf90f001436724c739caec356d7fb4f9eb5"
+        }
+      },
+      {
+        "call_location": "112,36 - 112,66",
+        "origin": { "local_value": "90,7 - 90,21" },
+        "evidence": {
+          "kind": "dynamic_fixture",
+          "locator": "fixture:temporal-continue-backedge",
+          "digest": "049375cab7584bb95931ea74b8133cf90f001436724c739caec356d7fb4f9eb5"
+        }
+      },
+      {
+        "call_location": "118,9 - 118,35",
+        "origin": { "local_value": "113,7 - 113,22" },
+        "evidence": {
+          "kind": "dynamic_fixture",
+          "locator": "fixture:temporal-immediate-invocation",
+          "digest": "049375cab7584bb95931ea74b8133cf90f001436724c739caec356d7fb4f9eb5"
+        }
+      },
+      {
+        "call_location": "128,22 - 128,50",
+        "origin": { "local_value": "123,7 - 123,24" },
+        "evidence": {
+          "kind": "dynamic_fixture",
+          "locator": "fixture:temporal-invocation-local-future-write",
+          "digest": "049375cab7584bb95931ea74b8133cf90f001436724c739caec356d7fb4f9eb5"
+        }
+      },
+      {
+        "call_location": "139,22 - 139,50",
+        "origin": { "local_value": "134,7 - 134,24" },
+        "evidence": {
+          "kind": "dynamic_fixture",
+          "locator": "fixture:temporal-nested-direct-invocation-write",
+          "digest": "049375cab7584bb95931ea74b8133cf90f001436724c739caec356d7fb4f9eb5"
+        }
+      },
+      {
+        "call_location": "155,10 - 155,36",
+        "origin": { "local_value": "149,7 - 149,22" },
+        "evidence": {
+          "kind": "dynamic_fixture",
+          "locator": "fixture:temporal-nested-direct-invocation-read",
+          "digest": "049375cab7584bb95931ea74b8133cf90f001436724c739caec356d7fb4f9eb5"
+        }
+      },
+      {
+        "call_location": "168,10 - 168,38",
+        "origin": { "local_value": "162,7 - 162,24" },
+        "evidence": {
+          "kind": "dynamic_fixture",
+          "locator": "fixture:temporal-single-use-local-invocation",
+          "digest": "049375cab7584bb95931ea74b8133cf90f001436724c739caec356d7fb4f9eb5"
+        }
+      },
+      {
+        "call_location": "182,10 - 182,40",
+        "origin": { "local_value": "176,7 - 176,26" },
+        "evidence": {
+          "kind": "dynamic_fixture",
+          "locator": "fixture:temporal-single-use-local-function",
+          "digest": "049375cab7584bb95931ea74b8133cf90f001436724c739caec356d7fb4f9eb5"
+        }
+      },
+      {
+        "call_location": "197,10 - 197,41",
+        "origin": { "local_value": "190,7 - 190,27" },
+        "evidence": {
+          "kind": "dynamic_fixture",
+          "locator": "fixture:temporal-single-reaching-assignment-invocation",
+          "digest": "049375cab7584bb95931ea74b8133cf90f001436724c739caec356d7fb4f9eb5"
+        }
+      },
+      {
+        "call_location": "212,10 - 212,40",
+        "origin": { "local_value": "205,7 - 205,24" },
+        "evidence": {
+          "kind": "dynamic_fixture",
+          "locator": "fixture:temporal-bounded-local-callee-alias",
+          "digest": "049375cab7584bb95931ea74b8133cf90f001436724c739caec356d7fb4f9eb5"
+        }
+      },
+      {
+        "call_location": "227,10 - 227,41",
+        "origin": { "local_value": "221,7 - 221,27" },
+        "evidence": {
+          "kind": "dynamic_fixture",
+          "locator": "fixture:temporal-exact-synchronous-capture-chain",
+          "digest": "049375cab7584bb95931ea74b8133cf90f001436724c739caec356d7fb4f9eb5"
+        }
+      }
+    ],
+    "detail": "local target identity requires an authenticated temporal definition",
+    "evidence": {
+      "kind": "structural_derivation",
+      "locator": "fixture:temporal-target-frontier",
+      "digest": "049375cab7584bb95931ea74b8133cf90f001436724c739caec356d7fb4f9eb5"
+    }
+  }
+}
