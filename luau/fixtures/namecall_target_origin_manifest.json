@@ -1,0 +1,73 @@
+{
+  "schema_version": "lifter_recovery_manifest_v9",
+  "program_obligations": [],
+  "intrinsic_bindings": [],
+  "target_recovery": {
+    "source_sha256": "e31f90a50dd696e58d73b49926673ae11c6f9ea698169ab78895c60da952c51f",
+    "call_site_count": 14,
+    "unresolved_call_count": 3,
+    "lowered_unresolved_call_count": 3,
+    "unresolved_target_selectors": [
+      {
+        "kind": "local_name_prefix",
+        "value": "unresolved"
+      }
+    ],
+    "target_resolutions": [
+      {
+        "call_location": "36,31 - 36,72",
+        "origin": {
+          "namecall": {
+            "receiver": {
+              "local_value": "23,6 - 23,23"
+            },
+            "method": "dispatch"
+          }
+        },
+        "evidence": {
+          "kind": "dynamic_fixture",
+          "locator": "fixture:namecall-origin:value-receiver",
+          "digest": "e31f90a50dd696e58d73b49926673ae11c6f9ea698169ab78895c60da952c51f"
+        }
+      },
+      {
+        "call_location": "37,31 - 37,72",
+        "origin": {
+          "namecall": {
+            "receiver": {
+              "local_place": "26,6 - 26,21"
+            },
+            "method": "dispatch"
+          }
+        },
+        "evidence": {
+          "kind": "dynamic_fixture",
+          "locator": "fixture:namecall-origin:place-receiver",
+          "digest": "e31f90a50dd696e58d73b49926673ae11c6f9ea698169ab78895c60da952c51f"
+        }
+      },
+      {
+        "call_location": "38,43 - 38,90",
+        "origin": {
+          "namecall": {
+            "receiver": {
+              "environment": "semantic_lifter_origin_method_receiver"
+            },
+            "method": "dispatch"
+          }
+        },
+        "evidence": {
+          "kind": "dynamic_fixture",
+          "locator": "fixture:namecall-origin:environment-receiver",
+          "digest": "e31f90a50dd696e58d73b49926673ae11c6f9ea698169ab78895c60da952c51f"
+        }
+      }
+    ],
+    "detail": "selected method calls require authenticated receiver origins",
+    "evidence": {
+      "kind": "structural_derivation",
+      "locator": "fixture:namecall-origin-frontier",
+      "digest": "e31f90a50dd696e58d73b49926673ae11c6f9ea698169ab78895c60da952c51f"
+    }
+  }
+}

@@ -1,0 +1,94 @@
+{
+  "schema_version": "lifter_recovery_manifest_v14",
+  "program_obligations": [],
+  "intrinsic_bindings": [],
+  "proof_bundle": {
+    "signature": "c56519bf99f5f1c72e73e8b48ef74348ad7c9b559fbfc0a8ff0cd33a67757db3c0f6901367277de877873c66c442edecf3860b25052ad257d0c052afecb96800",
+    "evidence": {
+      "kind": "frontend_proof",
+      "locator": "fixture:target-resolution-proof-bundle",
+      "digest": "ec8f93e3c99fa99ee015086d85ac8e2bb916dbcacb46a605e125a45cd9dc5047"
+    }
+  },
+  "target_recovery": {
+    "source_sha256": "0012fb7b4f4f2c648de34828c872212b54678e24a610a0c8ff5c20043b8af435",
+    "call_site_count": 3,
+    "unresolved_call_count": 3,
+    "lowered_unresolved_call_count": 3,
+    "unresolved_target_selectors": [
+      {
+        "kind": "local_name",
+        "value": "recoveredPcall"
+      },
+      {
+        "kind": "global_name",
+        "value": "pcall"
+      }
+    ],
+    "target_resolutions": [
+      {
+        "call_location": "6,33 - 6,62",
+        "origin": {
+          "intrinsic": "pcall"
+        },
+        "evidence": {
+          "kind": "dynamic_fixture",
+          "locator": "fixture:target-resolution:local",
+          "digest": "0012fb7b4f4f2c648de34828c872212b54678e24a610a0c8ff5c20043b8af435"
+        },
+        "proof": {
+          "entry_id": "sha256:98ecd33df3b20a6466f066f054e325ccae9342dd618140de03ff883e131da2b8",
+          "evidence": {
+            "kind": "frontend_proof",
+            "locator": "fixture:target-resolution-proof:local",
+            "digest": "470bf78b4835253a425198bc92d796e1e11b149b3849e04a1bf9d6bd4e207bcf"
+          }
+        }
+      },
+      {
+        "call_location": "7,37 - 7,72",
+        "origin": {
+          "intrinsic": "pcall"
+        },
+        "evidence": {
+          "kind": "dynamic_fixture",
+          "locator": "fixture:target-resolution:grouped",
+          "digest": "0012fb7b4f4f2c648de34828c872212b54678e24a610a0c8ff5c20043b8af435"
+        },
+        "proof": {
+          "entry_id": "sha256:98ecd33df3b20a6466f066f054e325ccae9342dd618140de03ff883e131da2b8",
+          "evidence": {
+            "kind": "frontend_proof",
+            "locator": "fixture:target-resolution-proof:grouped",
+            "digest": "81cb4d74ac9285341edf02ae3884b306a4cc8370b8c0b6ab84abd7a7125aa3a2"
+          }
+        }
+      },
+      {
+        "call_location": "8,35 - 8,59",
+        "origin": {
+          "intrinsic": "pcall"
+        },
+        "evidence": {
+          "kind": "dynamic_fixture",
+          "locator": "fixture:target-resolution:global",
+          "digest": "0012fb7b4f4f2c648de34828c872212b54678e24a610a0c8ff5c20043b8af435"
+        },
+        "proof": {
+          "entry_id": "sha256:98ecd33df3b20a6466f066f054e325ccae9342dd618140de03ff883e131da2b8",
+          "evidence": {
+            "kind": "frontend_proof",
+            "locator": "fixture:target-resolution-proof:global",
+            "digest": "23491a8cdb096ba2171143cc7b04e70d4dbb2f93703f81e88cf28fb3018a94c3"
+          }
+        }
+      }
+    ],
+    "detail": "selected call targets require authenticated intrinsic identity",
+    "evidence": {
+      "kind": "structural_derivation",
+      "locator": "fixture:target-resolution-frontier",
+      "digest": "0012fb7b4f4f2c648de34828c872212b54678e24a610a0c8ff5c20043b8af435"
+    }
+  }
+}
