@@ -1,0 +1,572 @@
+{
+  "schema_version": "lifter_recovery_manifest_v16",
+  "target_recovery": {
+    "source_sha256": "f2c2b0c42cbb99c539599854de851cb8f6b2f3ba5015a53b9945ad6116f68272",
+    "call_site_count": 471,
+    "unresolved_call_count": 109,
+    "lowered_unresolved_call_count": 99,
+    "unresolved_target_selectors": [
+      { "kind": "local_name_prefix", "value": "unresolved_" }
+    ],
+    "target_resolutions": [
+      {
+        "call_location": "3087,25 - 3087,45",
+        "origin": {
+          "access_path": {
+            "root": {
+              "local_value": "2,6 - 2,9"
+            },
+            "keys": [
+              "os",
+              "clock"
+            ]
+          }
+        },
+        "evidence": {
+          "kind": "structural_derivation",
+          "locator": "recovery-frontier:call-target-resolution:3087:env-os-clock",
+          "digest": "f2c2b0c42cbb99c539599854de851cb8f6b2f3ba5015a53b9945ad6116f68272"
+        }
+      },
+      {
+        "call_location": "2772,2 - 2774,6",
+        "origin": {
+          "local_place": "2571,8 - 2571,22"
+        },
+        "evidence": {
+          "kind": "structural_derivation",
+          "locator": "recovery-frontier:call-target-resolution:2772:pcall-local-place",
+          "digest": "f2c2b0c42cbb99c539599854de851cb8f6b2f3ba5015a53b9945ad6116f68272"
+        }
+      },
+      {
+        "call_location": "2775,2 - 2777,6",
+        "origin": {
+          "local_place": "2571,8 - 2571,22"
+        },
+        "evidence": {
+          "kind": "structural_derivation",
+          "locator": "recovery-frontier:call-target-resolution:2775:pcall-local-place",
+          "digest": "f2c2b0c42cbb99c539599854de851cb8f6b2f3ba5015a53b9945ad6116f68272"
+        }
+      },
+      {
+        "call_location": "2726,23 - 2726,59",
+        "origin": {
+          "local_place": "2572,8 - 2572,25"
+        },
+        "evidence": {
+          "kind": "structural_derivation",
+          "locator": "recovery-frontier:call-target-resolution:2726:tostring-local-place",
+          "digest": "f2c2b0c42cbb99c539599854de851cb8f6b2f3ba5015a53b9945ad6116f68272"
+        }
+      },
+      {
+        "call_location": "2784,23 - 2784,57",
+        "origin": {
+          "local_place": "2573,48 - 2573,59"
+        },
+        "evidence": {
+          "kind": "structural_derivation",
+          "locator": "recovery-frontier:call-target-resolution:2784:random-local-place",
+          "digest": "f2c2b0c42cbb99c539599854de851cb8f6b2f3ba5015a53b9945ad6116f68272"
+        }
+      },
+      {
+        "call_location": "2788,23 - 2788,82",
+        "origin": {
+          "local_place": "2573,61 - 2573,71"
+        },
+        "evidence": {
+          "kind": "structural_derivation",
+          "locator": "recovery-frontier:call-target-resolution:2788:floor-local-place",
+          "digest": "f2c2b0c42cbb99c539599854de851cb8f6b2f3ba5015a53b9945ad6116f68272"
+        }
+      },
+      {
+        "call_location": "2796,23 - 2796,61",
+        "origin": {
+          "local_place": "2573,61 - 2573,71"
+        },
+        "evidence": {
+          "kind": "structural_derivation",
+          "locator": "recovery-frontier:call-target-resolution:2796:floor-local-place",
+          "digest": "f2c2b0c42cbb99c539599854de851cb8f6b2f3ba5015a53b9945ad6116f68272"
+        }
+      },
+      {
+        "call_location": "7,9 - 7,67",
+        "origin": {
+          "table_get": {
+            "table": {
+              "environment": "u_vm_stack"
+            },
+            "key": {
+              "environment": "u_vm_top"
+            }
+          }
+        },
+        "evidence": {
+          "kind": "structural_derivation",
+          "locator": "recovery-frontier:call-target-resolution:7:stack-top-snapshot",
+          "digest": "f2c2b0c42cbb99c539599854de851cb8f6b2f3ba5015a53b9945ad6116f68272"
+        }
+      },
+      {
+        "call_location": "1759,9 - 1759,59",
+        "origin": {
+          "table_get": {
+            "table": {
+              "environment": "u_vm_state"
+            },
+            "key": {
+              "environment": "u_wrap_bop"
+            }
+          }
+        },
+        "evidence": {
+          "kind": "structural_derivation",
+          "locator": "recovery-frontier:call-target-resolution:1759:state-bop-snapshot",
+          "digest": "f2c2b0c42cbb99c539599854de851cb8f6b2f3ba5015a53b9945ad6116f68272"
+        }
+      },
+      {
+        "call_location": "1765,9 - 1767,3",
+        "origin": {
+          "table_get": {
+            "table": {
+              "environment": "u_vm_state"
+            },
+            "key": {
+              "environment": "u_wrap_bpf"
+            }
+          }
+        },
+        "evidence": {
+          "kind": "structural_derivation",
+          "locator": "recovery-frontier:call-target-resolution:1765:state-bpf-snapshot",
+          "digest": "f2c2b0c42cbb99c539599854de851cb8f6b2f3ba5015a53b9945ad6116f68272"
+        }
+      },
+      {
+        "call_location": "1773,9 - 1775,3",
+        "origin": {
+          "table_get": {
+            "table": {
+              "environment": "u_vm_state"
+            },
+            "key": {
+              "environment": "u_wrap_bpf"
+            }
+          }
+        },
+        "evidence": {
+          "kind": "structural_derivation",
+          "locator": "recovery-frontier:call-target-resolution:1773:state-bpf-snapshot",
+          "digest": "f2c2b0c42cbb99c539599854de851cb8f6b2f3ba5015a53b9945ad6116f68272"
+        }
+      },
+      {
+        "call_location": "1259,4 - 1259,73",
+        "origin": {
+          "table_get": {
+            "table": {
+              "local_place": "1248,18 - 1248,32"
+            },
+            "key": {
+              "local_value": "1248,34 - 1248,78"
+            }
+          }
+        },
+        "evidence": {
+          "kind": "structural_derivation",
+          "locator": "recovery-frontier:call-target-resolution:1259:direct-index",
+          "digest": "f2c2b0c42cbb99c539599854de851cb8f6b2f3ba5015a53b9945ad6116f68272"
+        }
+      },
+      {
+        "call_location": "1305,28 - 1305,96",
+        "origin": {
+          "table_get": {
+            "table": {
+              "local_place": "1281,8 - 1281,28"
+            },
+            "key": {
+              "local_value": "1282,8 - 1282,45"
+            }
+          }
+        },
+        "evidence": {
+          "kind": "structural_derivation",
+          "locator": "recovery-frontier:call-target-resolution:1305:direct-index",
+          "digest": "f2c2b0c42cbb99c539599854de851cb8f6b2f3ba5015a53b9945ad6116f68272"
+        }
+      },
+      {
+        "call_location": "1319,4 - 1323,5",
+        "origin": {
+          "table_get": {
+            "table": {
+              "local_place": "1282,47 - 1282,73"
+            },
+            "key": {
+              "local_value": "1283,4 - 1283,47"
+            }
+          }
+        },
+        "evidence": {
+          "kind": "structural_derivation",
+          "locator": "recovery-frontier:call-target-resolution:1319:direct-index",
+          "digest": "f2c2b0c42cbb99c539599854de851cb8f6b2f3ba5015a53b9945ad6116f68272"
+        }
+      },
+      {
+        "call_location": "1622,4 - 1626,10",
+        "origin": {
+          "table_get": {
+            "table": {
+              "local_place": "1474,8 - 1474,55"
+            },
+            "key": {
+              "local_place": "1496,8 - 1496,52"
+            }
+          }
+        },
+        "evidence": {
+          "kind": "structural_derivation",
+          "locator": "recovery-frontier:call-target-resolution:1622:direct-index",
+          "digest": "f2c2b0c42cbb99c539599854de851cb8f6b2f3ba5015a53b9945ad6116f68272"
+        }
+      },
+      {
+        "call_location": "1509,49 - 1511,3",
+        "origin": {
+          "access_path": {
+            "root": {
+              "local_value": "2,6 - 2,9"
+            },
+            "keys": [
+              "game"
+            ]
+          }
+        },
+        "evidence": {
+          "kind": "structural_derivation",
+          "locator": "recovery-frontier:call-target-resolution:1509:env-game",
+          "digest": "f2c2b0c42cbb99c539599854de851cb8f6b2f3ba5015a53b9945ad6116f68272"
+        }
+      },
+      {
+        "call_location": "1515,52 - 1517,3",
+        "origin": {
+          "access_path": {
+            "root": {
+              "local_value": "2,6 - 2,9"
+            },
+            "keys": [
+              "game"
+            ]
+          }
+        },
+        "evidence": {
+          "kind": "structural_derivation",
+          "locator": "recovery-frontier:call-target-resolution:1515:env-game",
+          "digest": "f2c2b0c42cbb99c539599854de851cb8f6b2f3ba5015a53b9945ad6116f68272"
+        }
+      },
+      {
+        "call_location": "1520,52 - 1522,3",
+        "origin": {
+          "access_path": {
+            "root": {
+              "local_value": "2,6 - 2,9"
+            },
+            "keys": [
+              "game"
+            ]
+          }
+        },
+        "evidence": {
+          "kind": "structural_derivation",
+          "locator": "recovery-frontier:call-target-resolution:1520:env-game",
+          "digest": "f2c2b0c42cbb99c539599854de851cb8f6b2f3ba5015a53b9945ad6116f68272"
+        }
+      },
+      {
+        "call_location": "1537,4 - 1539,3",
+        "origin": {
+          "access_path": {
+            "root": {
+              "local_value": "2,6 - 2,9"
+            },
+            "keys": [
+              "game"
+            ]
+          }
+        },
+        "evidence": {
+          "kind": "structural_derivation",
+          "locator": "recovery-frontier:call-target-resolution:1537:env-game",
+          "digest": "f2c2b0c42cbb99c539599854de851cb8f6b2f3ba5015a53b9945ad6116f68272"
+        }
+      },
+      {
+        "call_location": "2854,23 - 2854,81",
+        "origin": {
+          "access_path": {
+            "root": {
+              "local_value": "2,6 - 2,9"
+            },
+            "keys": [
+              "game"
+            ]
+          }
+        },
+        "evidence": {
+          "kind": "structural_derivation",
+          "locator": "recovery-frontier:call-target-resolution:2854:env-game",
+          "digest": "f2c2b0c42cbb99c539599854de851cb8f6b2f3ba5015a53b9945ad6116f68272"
+        }
+      },
+      {
+        "call_location": "2857,23 - 2857,72",
+        "origin": {
+          "access_path": {
+            "root": {
+              "local_value": "2,6 - 2,9"
+            },
+            "keys": [
+              "game"
+            ]
+          }
+        },
+        "evidence": {
+          "kind": "structural_derivation",
+          "locator": "recovery-frontier:call-target-resolution:2857:env-game",
+          "digest": "f2c2b0c42cbb99c539599854de851cb8f6b2f3ba5015a53b9945ad6116f68272"
+        }
+      },
+      {
+        "call_location": "1384,4 - 1384,59",
+        "origin": {
+          "access_path": {
+            "root": {
+              "environment": "u_vm_proto"
+            },
+            "keys": [
+              {
+                "literal": {
+                  "number": 126
+                }
+              },
+              {
+                "literal": {
+                  "number": 28601
+                }
+              }
+            ]
+          }
+        },
+        "evidence": {
+          "kind": "structural_derivation",
+          "locator": "recovery-frontier:call-target-resolution:1384:vm-proto-literal-path",
+          "digest": "f2c2b0c42cbb99c539599854de851cb8f6b2f3ba5015a53b9945ad6116f68272"
+        }
+      },
+      {
+        "call_location": "1603,4 - 1605,5",
+        "origin": {
+          "access_path": {
+            "root": {
+              "environment": "u_vm_proto"
+            },
+            "keys": [
+              {
+                "literal": {
+                  "number": 126
+                }
+              },
+              {
+                "literal": {
+                  "number": 28600
+                }
+              }
+            ]
+          }
+        },
+        "evidence": {
+          "kind": "structural_derivation",
+          "locator": "recovery-frontier:call-target-resolution:1603:vm-proto-literal-path",
+          "digest": "f2c2b0c42cbb99c539599854de851cb8f6b2f3ba5015a53b9945ad6116f68272"
+        }
+      },
+      {
+        "call_location": "1604,6 - 1604,63",
+        "origin": {
+          "namecall": {
+            "receiver": {
+              "local_place": "1473,24 - 1473,68"
+            },
+            "method": "GetPlayers"
+          }
+        },
+        "evidence": {
+          "kind": "structural_derivation",
+          "locator": "recovery-frontier:call-target-resolution:1604:get-players-namecall",
+          "digest": "f2c2b0c42cbb99c539599854de851cb8f6b2f3ba5015a53b9945ad6116f68272"
+        }
+      },
+      {
+        "call_location": "1609,4 - 1609,71",
+        "origin": {
+          "local_place": "1473,24 - 1473,68"
+        },
+        "evidence": {
+          "kind": "structural_derivation",
+          "locator": "recovery-frontier:call-target-resolution:1609:players-service-place",
+          "digest": "f2c2b0c42cbb99c539599854de851cb8f6b2f3ba5015a53b9945ad6116f68272"
+        }
+      },
+      {
+        "call_location": "1614,4 - 1614,89",
+        "origin": {
+          "access_path": {
+            "root": {
+              "local_place": "1473,24 - 1473,68"
+            },
+            "keys": [
+              "PlayerAdded"
+            ]
+          }
+        },
+        "evidence": {
+          "kind": "structural_derivation",
+          "locator": "recovery-frontier:call-target-resolution:1614:player-added-signal",
+          "digest": "f2c2b0c42cbb99c539599854de851cb8f6b2f3ba5015a53b9945ad6116f68272"
+        }
+      },
+      {
+        "call_location": "1618,4 - 1618,92",
+        "origin": {
+          "access_path": {
+            "root": {
+              "local_place": "1473,24 - 1473,68"
+            },
+            "keys": [
+              "PlayerRemoving"
+            ]
+          }
+        },
+        "evidence": {
+          "kind": "structural_derivation",
+          "locator": "recovery-frontier:call-target-resolution:1618:player-removing-signal",
+          "digest": "f2c2b0c42cbb99c539599854de851cb8f6b2f3ba5015a53b9945ad6116f68272"
+        }
+      },
+      {
+        "call_location": "2766,23 - 2766,61",
+        "origin": {
+          "closure_value": "2756,23 - 2763,5"
+        },
+        "evidence": {
+          "kind": "structural_derivation",
+          "locator": "recovery-frontier:call-target-resolution:2766:closure-allocation",
+          "digest": "f2c2b0c42cbb99c539599854de851cb8f6b2f3ba5015a53b9945ad6116f68272"
+        }
+      },
+      {
+        "call_location": "2820,23 - 2828,6",
+        "origin": {
+          "closure_value": "2809,23 - 2817,5"
+        },
+        "evidence": {
+          "kind": "structural_derivation",
+          "locator": "recovery-frontier:call-target-resolution:2820:closure-allocation",
+          "digest": "f2c2b0c42cbb99c539599854de851cb8f6b2f3ba5015a53b9945ad6116f68272"
+        }
+      },
+      {
+        "call_location": "3059,28 - 3059,66",
+        "origin": {
+          "closure_value": "3042,25 - 3044,7"
+        },
+        "evidence": {
+          "kind": "structural_derivation",
+          "locator": "recovery-frontier:call-target-resolution:3059:closure-allocation",
+          "digest": "f2c2b0c42cbb99c539599854de851cb8f6b2f3ba5015a53b9945ad6116f68272"
+        }
+      },
+      {
+        "call_location": "3061,25 - 3084,8",
+        "origin": {
+          "closure_value": "3050,25 - 3058,7"
+        },
+        "evidence": {
+          "kind": "structural_derivation",
+          "locator": "recovery-frontier:call-target-resolution:3061:closure-allocation",
+          "digest": "f2c2b0c42cbb99c539599854de851cb8f6b2f3ba5015a53b9945ad6116f68272"
+        }
+      },
+      {
+        "call_location": "587,11 - 587,82",
+        "origin": {
+          "table_get": {
+            "table": {
+              "environment": "u_vm_stack"
+            },
+            "key": {
+              "source_expression": "586,73 - 586,85"
+            }
+          }
+        },
+        "evidence": {
+          "kind": "structural_derivation",
+          "locator": "recovery-frontier:call-target-resolution:587:computed-table-key",
+          "digest": "f2c2b0c42cbb99c539599854de851cb8f6b2f3ba5015a53b9945ad6116f68272"
+        }
+      },
+      {
+        "call_location": "1121,11 - 1121,71",
+        "origin": {
+          "table_get": {
+            "table": {
+              "environment": "u_vm_stack"
+            },
+            "key": {
+              "source_expression": "1120,62 - 1120,74"
+            }
+          }
+        },
+        "evidence": {
+          "kind": "structural_derivation",
+          "locator": "recovery-frontier:call-target-resolution:1121:computed-table-key",
+          "digest": "f2c2b0c42cbb99c539599854de851cb8f6b2f3ba5015a53b9945ad6116f68272"
+        }
+      },
+      {
+        "call_location": "1655,9 - 1655,96",
+        "origin": {
+          "table_get": {
+            "table": {
+              "environment": "u_vm_stack"
+            },
+            "key": {
+              "source_expression": "1654,61 - 1654,73"
+            }
+          }
+        },
+        "evidence": {
+          "kind": "structural_derivation",
+          "locator": "recovery-frontier:call-target-resolution:1655:computed-table-key",
+          "digest": "f2c2b0c42cbb99c539599854de851cb8f6b2f3ba5015a53b9945ad6116f68272"
+        }
+      }
+    ],
+    "detail": "call target identity is unresolved in the authenticated recovery frontier",
+    "evidence": {
+      "kind": "structural_derivation",
+      "locator": "recovery-frontier:call-target-selector:v1",
+      "digest": "f2c2b0c42cbb99c539599854de851cb8f6b2f3ba5015a53b9945ad6116f68272"
+    }
+  }
+}

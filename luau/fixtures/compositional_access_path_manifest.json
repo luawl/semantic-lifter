@@ -1,0 +1,185 @@
+{
+  "schema_version": "lifter_recovery_manifest_v12",
+  "program_obligations": [],
+  "intrinsic_bindings": [],
+  "target_recovery": {
+    "source_sha256": "f9dc611f55c7980adeb13b36792dabe3d7e7a2674ff2ae57c2e33252290a8424",
+    "call_site_count": 22,
+    "unresolved_call_count": 7,
+    "lowered_unresolved_call_count": 7,
+    "unresolved_target_selectors": [
+      {
+        "kind": "local_name_prefix",
+        "value": "unresolved"
+      }
+    ],
+    "target_resolutions": [
+      {
+        "call_location": "102,31 - 102,53",
+        "origin": {
+          "access_path": {
+            "root": {
+              "local_value": "1,6 - 1,19"
+            },
+            "keys": [
+              "layer",
+              {
+                "local_value": "0,6 - 0,18"
+              }
+            ]
+          }
+        },
+        "evidence": {
+          "kind": "dynamic_fixture",
+          "locator": "fixture:compositional-path:value",
+          "digest": "f9dc611f55c7980adeb13b36792dabe3d7e7a2674ff2ae57c2e33252290a8424"
+        }
+      },
+      {
+        "call_location": "103,31 - 103,53",
+        "origin": {
+          "access_path": {
+            "root": {
+              "local_place": "11,6 - 11,17"
+            },
+            "keys": [
+              "layer",
+              {
+                "local_place": "10,6 - 10,16"
+              }
+            ]
+          }
+        },
+        "evidence": {
+          "kind": "dynamic_fixture",
+          "locator": "fixture:compositional-path:place",
+          "digest": "f9dc611f55c7980adeb13b36792dabe3d7e7a2674ff2ae57c2e33252290a8424"
+        }
+      },
+      {
+        "call_location": "104,43 - 104,71",
+        "origin": {
+          "access_path": {
+            "root": {
+              "environment": "semantic_lifter_origin_path_root"
+            },
+            "keys": [
+              "layer",
+              {
+                "environment": "semantic_lifter_origin_path_key"
+              }
+            ]
+          }
+        },
+        "evidence": {
+          "kind": "dynamic_fixture",
+          "locator": "fixture:compositional-path:environment",
+          "digest": "f9dc611f55c7980adeb13b36792dabe3d7e7a2674ff2ae57c2e33252290a8424"
+		}
+	  },
+	  {
+		"call_location": "105,35 - 105,59",
+		"origin": {
+		  "access_path": {
+			"root": {
+			  "local_value": "39,6 - 39,17"
+			},
+			"keys": [
+			  {
+				"literal": {
+				  "number": 7
+				}
+			  },
+			  {
+				"literal": {
+				  "boolean": false
+				}
+			  }
+			]
+		  }
+		},
+		"evidence": {
+		  "kind": "dynamic_fixture",
+		  "locator": "fixture:compositional-path:literal",
+		  "digest": "f9dc611f55c7980adeb13b36792dabe3d7e7a2674ff2ae57c2e33252290a8424"
+		}
+	  },
+	  {
+		"call_location": "106,37 - 106,81",
+        "origin": {
+          "namecall": {
+            "receiver": {
+              "access_path": {
+                "root": {
+				  "local_value": "65,6 - 65,18"
+                },
+                "keys": [
+                  "layer",
+                  {
+					"local_value": "64,6 - 64,17"
+                  }
+                ]
+              }
+            },
+            "method": "dispatch"
+          }
+        },
+        "evidence": {
+          "kind": "dynamic_fixture",
+          "locator": "fixture:compositional-path:namecall",
+          "digest": "f9dc611f55c7980adeb13b36792dabe3d7e7a2674ff2ae57c2e33252290a8424"
+        }
+      },
+      {
+        "call_location": "109,33 - 109,91",
+        "origin": {
+          "table_get": {
+            "table": {
+              "local_value": "69,6 - 69,26"
+            },
+            "key": {
+              "local_value": "68,6 - 68,25"
+            }
+          }
+        },
+        "evidence": {
+          "kind": "dynamic_fixture",
+          "locator": "fixture:compositional-path:direct-call",
+          "digest": "f9dc611f55c7980adeb13b36792dabe3d7e7a2674ff2ae57c2e33252290a8424"
+        }
+      },
+      {
+        "call_location": "112,49 - 112,138",
+        "origin": {
+          "namecall": {
+            "receiver": {
+              "access_path": {
+                "root": {
+                  "local_value": "93,6 - 93,34"
+                },
+                "keys": [
+                  "layer",
+                  {
+                    "local_value": "92,6 - 92,33"
+                  }
+                ]
+              }
+            },
+            "method": "dispatch"
+          }
+        },
+        "evidence": {
+          "kind": "dynamic_fixture",
+          "locator": "fixture:compositional-path:direct-namecall",
+          "digest": "f9dc611f55c7980adeb13b36792dabe3d7e7a2674ff2ae57c2e33252290a8424"
+        }
+      }
+    ],
+    "detail": "selected call targets require authenticated compositional paths, literal keys, and direct source access",
+    "evidence": {
+      "kind": "structural_derivation",
+      "locator": "fixture:compositional-path-frontier",
+      "digest": "f9dc611f55c7980adeb13b36792dabe3d7e7a2674ff2ae57c2e33252290a8424"
+    }
+  }
+}

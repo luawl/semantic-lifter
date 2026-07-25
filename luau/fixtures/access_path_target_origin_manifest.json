@@ -1,0 +1,73 @@
+{
+  "schema_version": "lifter_recovery_manifest_v7",
+  "program_obligations": [],
+  "intrinsic_bindings": [],
+  "target_recovery": {
+    "source_sha256": "6de4f191e2cc6162b547f52c7f0ea717bc5b8048c9b1148c3d224af5221aebfd",
+    "call_site_count": 3,
+    "unresolved_call_count": 3,
+    "lowered_unresolved_call_count": 3,
+    "unresolved_target_selectors": [
+      {
+        "kind": "local_name_prefix",
+        "value": "unresolved"
+      }
+    ],
+    "target_resolutions": [
+      {
+        "call_location": "28,31 - 28,53",
+        "origin": {
+          "table_get": {
+            "table": {
+              "local_value": "0,6 - 0,24"
+            },
+            "key": "dispatch"
+          }
+        },
+        "evidence": {
+          "kind": "dynamic_fixture",
+          "locator": "fixture:access-path-origin:value-table",
+          "digest": "6de4f191e2cc6162b547f52c7f0ea717bc5b8048c9b1148c3d224af5221aebfd"
+        }
+      },
+      {
+        "call_location": "29,31 - 29,53",
+        "origin": {
+          "table_get": {
+            "table": {
+              "local_place": "7,6 - 7,22"
+            },
+            "key": "dispatch"
+          }
+        },
+        "evidence": {
+          "kind": "dynamic_fixture",
+          "locator": "fixture:access-path-origin:place-table",
+          "digest": "6de4f191e2cc6162b547f52c7f0ea717bc5b8048c9b1148c3d224af5221aebfd"
+        }
+      },
+      {
+        "call_location": "30,43 - 30,71",
+        "origin": {
+          "table_get": {
+            "table": {
+              "environment": "semantic_lifter_origin_namespace"
+            },
+            "key": "dispatch"
+          }
+        },
+        "evidence": {
+          "kind": "dynamic_fixture",
+          "locator": "fixture:access-path-origin:environment-table",
+          "digest": "6de4f191e2cc6162b547f52c7f0ea717bc5b8048c9b1148c3d224af5221aebfd"
+        }
+      }
+    ],
+    "detail": "selected call targets require authenticated table access origins",
+    "evidence": {
+      "kind": "structural_derivation",
+      "locator": "fixture:access-path-origin-frontier",
+      "digest": "6de4f191e2cc6162b547f52c7f0ea717bc5b8048c9b1148c3d224af5221aebfd"
+    }
+  }
+}

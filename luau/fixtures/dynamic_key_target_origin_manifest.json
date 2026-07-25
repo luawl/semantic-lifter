@@ -1,0 +1,97 @@
+{
+  "schema_version": "lifter_recovery_manifest_v16",
+  "program_obligations": [],
+  "intrinsic_bindings": [],
+  "target_recovery": {
+    "source_sha256": "305d8441ae4cd4a5bb3e66c00f45539c7b926ee986fd3f28a47fb183644ae0f6",
+    "call_site_count": 4,
+    "unresolved_call_count": 4,
+    "lowered_unresolved_call_count": 4,
+    "unresolved_target_selectors": [
+      {
+        "kind": "local_name_prefix",
+        "value": "unresolved"
+      }
+    ],
+    "target_resolutions": [
+      {
+        "call_location": "40,31 - 40,53",
+        "origin": {
+          "table_get": {
+            "table": {
+              "local_value": "1,6 - 1,24"
+            },
+            "key": {
+              "local_value": "0,6 - 0,18"
+            }
+          }
+        },
+        "evidence": {
+          "kind": "dynamic_fixture",
+          "locator": "fixture:dynamic-key-origin:value-table-key",
+          "digest": "305d8441ae4cd4a5bb3e66c00f45539c7b926ee986fd3f28a47fb183644ae0f6"
+        }
+      },
+      {
+        "call_location": "41,31 - 41,53",
+        "origin": {
+          "table_get": {
+            "table": {
+              "local_place": "9,6 - 9,22"
+            },
+            "key": {
+              "local_place": "8,6 - 8,16"
+            }
+          }
+        },
+        "evidence": {
+          "kind": "dynamic_fixture",
+          "locator": "fixture:dynamic-key-origin:place-table-key",
+          "digest": "305d8441ae4cd4a5bb3e66c00f45539c7b926ee986fd3f28a47fb183644ae0f6"
+        }
+      },
+      {
+        "call_location": "42,43 - 42,71",
+        "origin": {
+          "table_get": {
+            "table": {
+              "environment": "semantic_lifter_origin_dynamic_namespace"
+            },
+            "key": {
+              "environment": "semantic_lifter_origin_dynamic_key"
+            }
+          }
+        },
+        "evidence": {
+          "kind": "dynamic_fixture",
+          "locator": "fixture:dynamic-key-origin:environment-table-key",
+          "digest": "305d8441ae4cd4a5bb3e66c00f45539c7b926ee986fd3f28a47fb183644ae0f6"
+        }
+      },
+      {
+        "call_location": "43,41 - 43,68",
+        "origin": {
+          "table_get": {
+            "table": {
+              "local_value": "32,6 - 32,23"
+            },
+            "key": {
+              "source_expression": "37,47 - 37,64"
+            }
+          }
+        },
+        "evidence": {
+          "kind": "dynamic_fixture",
+          "locator": "fixture:dynamic-key-origin:source-expression-key",
+          "digest": "305d8441ae4cd4a5bb3e66c00f45539c7b926ee986fd3f28a47fb183644ae0f6"
+        }
+      }
+    ],
+    "detail": "selected call targets require authenticated dynamic-key table access origins",
+    "evidence": {
+      "kind": "structural_derivation",
+      "locator": "fixture:dynamic-key-origin-frontier",
+      "digest": "305d8441ae4cd4a5bb3e66c00f45539c7b926ee986fd3f28a47fb183644ae0f6"
+    }
+  }
+}
