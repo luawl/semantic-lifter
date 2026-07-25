@@ -1,0 +1,14 @@
+{
+  "schema_version": "lifter_target_proof_bundle_v1",
+  "entries": [
+    {
+      "id": "sha256:98ecd33df3b20a6466f066f054e325ccae9342dd618140de03ff883e131da2b8",
+      "content": "trusted binding analysis establishes intrinsic pcall identity",
+      "bindings": [
+        "470bf78b4835253a425198bc92d796e1e11b149b3849e04a1bf9d6bd4e207bcf",
+        "23491a8cdb096ba2171143cc7b04e70d4dbb2f93703f81e88cf28fb3018a94c3",
+        "81cb4d74ac9285341edf02ae3884b306a4cc8370b8c0b6ab84abd7a7125aa3a2"
+      ]
+    }
+  ]
+}
