@@ -1,0 +1,57 @@
+{
+  "schema_version": "lifter_recovery_manifest_v17",
+  "intrinsic_bindings": [],
+  "target_recovery": {
+    "source_sha256": "3b264917df7b4e7ec6847f3e1dc71920897b2eb5c03c319bca6939fe428b0012",
+    "call_site_count": 3,
+    "unresolved_call_count": 1,
+    "lowered_unresolved_call_count": 1,
+    "unresolved_target_selectors": [
+      {
+        "kind": "local_name",
+        "value": "unresolvedResultTarget"
+      }
+    ],
+    "target_resolutions": [
+      {
+        "call_location": "19,20 - 19,57",
+        "origin": {
+          "intrinsic": "pcall"
+        },
+        "evidence": {
+          "kind": "dynamic_fixture",
+          "locator": "fixture:opaque-result-resolution-source",
+          "digest": "3b264917df7b4e7ec6847f3e1dc71920897b2eb5c03c319bca6939fe428b0012"
+        }
+      }
+    ],
+    "result_contracts": [
+      {
+        "producer_call_location": "11,5 - 11,22",
+        "result_ordinal": 2,
+        "origin": {
+          "intrinsic": "pcall"
+        },
+        "evidence": {
+          "kind": "dynamic_fixture",
+          "locator": "fixture:opaque-result-contract-source",
+          "digest": "3b264917df7b4e7ec6847f3e1dc71920897b2eb5c03c319bca6939fe428b0012"
+        },
+        "proof": {
+          "content": "provider target result two is pcall under fixture oracle",
+          "evidence": {
+            "kind": "frontend_proof",
+            "locator": "fixture:opaque-result-contract-proof",
+            "digest": "ab9f3a5718c337df26a1ec581c7ac02535e3e7f840ca21979e27111dbae28377"
+          }
+        }
+      }
+    ],
+    "detail": "selected target requires an authenticated opaque producer result",
+    "evidence": {
+      "kind": "structural_derivation",
+      "locator": "fixture:opaque-result-frontier",
+      "digest": "3b264917df7b4e7ec6847f3e1dc71920897b2eb5c03c319bca6939fe428b0012"
+    }
+  }
+}

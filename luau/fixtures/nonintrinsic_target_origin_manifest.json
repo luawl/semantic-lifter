@@ -1,0 +1,91 @@
+{
+  "schema_version": "lifter_recovery_manifest_v15",
+  "program_obligations": [],
+  "intrinsic_bindings": [],
+  "target_recovery": {
+    "source_sha256": "8fe447aa445a143b0e672add23b9b85fcc91e21bd453895d587dc6dccf3daea0",
+    "call_site_count": 9,
+    "unresolved_call_count": 6,
+    "lowered_unresolved_call_count": 6,
+    "unresolved_target_selectors": [
+      {
+        "kind": "local_name_prefix",
+        "value": "unresolved"
+      }
+    ],
+    "target_resolutions": [
+      {
+        "call_location": "52,31 - 52,53",
+        "origin": {
+          "local_value": "0,6 - 0,21"
+        },
+        "evidence": {
+          "kind": "dynamic_fixture",
+          "locator": "fixture:nonintrinsic-origin:value",
+          "digest": "8fe447aa445a143b0e672add23b9b85fcc91e21bd453895d587dc6dccf3daea0"
+        }
+      },
+      {
+        "call_location": "53,31 - 53,53",
+        "origin": {
+          "local_place": "5,15 - 5,28"
+        },
+        "evidence": {
+          "kind": "dynamic_fixture",
+          "locator": "fixture:nonintrinsic-origin:place",
+          "digest": "8fe447aa445a143b0e672add23b9b85fcc91e21bd453895d587dc6dccf3daea0"
+        }
+      },
+      {
+        "call_location": "54,43 - 54,71",
+        "origin": {
+          "environment": "semantic_lifter_origin_environment"
+        },
+        "evidence": {
+          "kind": "dynamic_fixture",
+          "locator": "fixture:nonintrinsic-origin:environment",
+          "digest": "8fe447aa445a143b0e672add23b9b85fcc91e21bd453895d587dc6dccf3daea0"
+        }
+      },
+      {
+        "call_location": "55,47 - 55,77",
+        "origin": {
+          "closure_value": "20,1 - 22,4"
+        },
+        "evidence": {
+          "kind": "dynamic_fixture",
+          "locator": "fixture:nonintrinsic-origin:local-function",
+          "digest": "8fe447aa445a143b0e672add23b9b85fcc91e21bd453895d587dc6dccf3daea0"
+        }
+      },
+      {
+        "call_location": "56,43 - 56,71",
+        "origin": {
+          "closure_value": "29,9 - 31,5"
+        },
+        "evidence": {
+          "kind": "dynamic_fixture",
+          "locator": "fixture:nonintrinsic-origin:conditional-not-nil",
+          "digest": "8fe447aa445a143b0e672add23b9b85fcc91e21bd453895d587dc6dccf3daea0"
+        }
+      },
+      {
+        "call_location": "57,63 - 57,101",
+        "origin": {
+          "closure_value": "45,7 - 47,5"
+        },
+        "evidence": {
+          "kind": "dynamic_fixture",
+          "locator": "fixture:nonintrinsic-origin:conditional-expression-not-zero",
+          "digest": "8fe447aa445a143b0e672add23b9b85fcc91e21bd453895d587dc6dccf3daea0"
+        }
+      }
+    ],
+    "detail": "selected call targets require authenticated value origins",
+    "evidence": {
+      "kind": "structural_derivation",
+      "locator": "fixture:nonintrinsic-origin-frontier",
+      "digest": "8fe447aa445a143b0e672add23b9b85fcc91e21bd453895d587dc6dccf3daea0"
+    }
+  }
+}
