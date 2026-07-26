@@ -744,3 +744,905 @@ test "Z3 consumes an admitted partial source value definition" {
     defer result.deinit(std.testing.allocator);
     try std.testing.expectEqual(ir.SolverResolution.proved, result.resolution);
 }
+
+test "Z3 lowers guarded explicit division modes" {
+    const boolean: ir.SolverSort = .{ .kind = .boolean };
+    const integer: ir.SolverSort = .{ .kind = .integer };
+    const real: ir.SolverSort = .{ .kind = .real };
+    const unsigned_bv8: ir.SolverSort = .{ .kind = .bit_vector, .bit_width = 8 };
+    const signed_bv8: ir.SolverSort = .{ .kind = .bit_vector, .bit_width = 8, .signed = true };
+    var terms = [_]ir.SolverTerm{
+        .{ .id = ir.SolverTermId.fromIndex(0), .sort = integer, .operation = .{ .integer_literal = "-5" } },
+        .{ .id = ir.SolverTermId.fromIndex(1), .sort = integer, .operation = .{ .integer_literal = "2" } },
+        .{ .id = ir.SolverTermId.fromIndex(2), .sort = boolean, .operation = .{ .is_nonzero = ir.SolverTermId.fromIndex(1) } },
+        .{ .id = ir.SolverTermId.fromIndex(3), .sort = integer, .operation = .{ .division = .{
+            .mode = .integer_euclidean,
+            .left = ir.SolverTermId.fromIndex(0),
+            .right = ir.SolverTermId.fromIndex(1),
+            .defined_by = ir.SolverTermId.fromIndex(2),
+        } } },
+        .{ .id = ir.SolverTermId.fromIndex(4), .sort = integer, .operation = .{ .integer_literal = "-3" } },
+        .{ .id = ir.SolverTermId.fromIndex(5), .sort = boolean, .operation = .{ .binary = .{
+            .operator = .equal,
+            .left = ir.SolverTermId.fromIndex(3),
+            .right = ir.SolverTermId.fromIndex(4),
+        } } },
+        .{ .id = ir.SolverTermId.fromIndex(6), .sort = real, .operation = .{ .real_literal = .{ .numerator = "3", .denominator = "2" } } },
+        .{ .id = ir.SolverTermId.fromIndex(7), .sort = real, .operation = .{ .real_literal = .{ .numerator = "3", .denominator = "4" } } },
+        .{ .id = ir.SolverTermId.fromIndex(8), .sort = boolean, .operation = .{ .is_nonzero = ir.SolverTermId.fromIndex(7) } },
+        .{ .id = ir.SolverTermId.fromIndex(9), .sort = real, .operation = .{ .division = .{
+            .mode = .real,
+            .left = ir.SolverTermId.fromIndex(6),
+            .right = ir.SolverTermId.fromIndex(7),
+            .defined_by = ir.SolverTermId.fromIndex(8),
+        } } },
+        .{ .id = ir.SolverTermId.fromIndex(10), .sort = real, .operation = .{ .real_literal = .{ .numerator = "2", .denominator = "1" } } },
+        .{ .id = ir.SolverTermId.fromIndex(11), .sort = boolean, .operation = .{ .binary = .{
+            .operator = .equal,
+            .left = ir.SolverTermId.fromIndex(9),
+            .right = ir.SolverTermId.fromIndex(10),
+        } } },
+        .{ .id = ir.SolverTermId.fromIndex(12), .sort = unsigned_bv8, .operation = .{ .bit_vector_literal = .{ .value = "255", .bit_width = 8 } } },
+        .{ .id = ir.SolverTermId.fromIndex(13), .sort = unsigned_bv8, .operation = .{ .bit_vector_literal = .{ .value = "2", .bit_width = 8 } } },
+        .{ .id = ir.SolverTermId.fromIndex(14), .sort = boolean, .operation = .{ .is_nonzero = ir.SolverTermId.fromIndex(13) } },
+        .{ .id = ir.SolverTermId.fromIndex(15), .sort = unsigned_bv8, .operation = .{ .division = .{
+            .mode = .bit_vector_unsigned,
+            .left = ir.SolverTermId.fromIndex(12),
+            .right = ir.SolverTermId.fromIndex(13),
+            .defined_by = ir.SolverTermId.fromIndex(14),
+        } } },
+        .{ .id = ir.SolverTermId.fromIndex(16), .sort = unsigned_bv8, .operation = .{ .bit_vector_literal = .{ .value = "127", .bit_width = 8 } } },
+        .{ .id = ir.SolverTermId.fromIndex(17), .sort = boolean, .operation = .{ .binary = .{
+            .operator = .equal,
+            .left = ir.SolverTermId.fromIndex(15),
+            .right = ir.SolverTermId.fromIndex(16),
+        } } },
+        .{ .id = ir.SolverTermId.fromIndex(18), .sort = signed_bv8, .operation = .{ .bit_vector_literal = .{ .value = "251", .bit_width = 8 } } },
+        .{ .id = ir.SolverTermId.fromIndex(19), .sort = signed_bv8, .operation = .{ .bit_vector_literal = .{ .value = "2", .bit_width = 8 } } },
+        .{ .id = ir.SolverTermId.fromIndex(20), .sort = boolean, .operation = .{ .is_nonzero = ir.SolverTermId.fromIndex(19) } },
+        .{ .id = ir.SolverTermId.fromIndex(21), .sort = signed_bv8, .operation = .{ .division = .{
+            .mode = .bit_vector_signed,
+            .left = ir.SolverTermId.fromIndex(18),
+            .right = ir.SolverTermId.fromIndex(19),
+            .defined_by = ir.SolverTermId.fromIndex(20),
+        } } },
+        .{ .id = ir.SolverTermId.fromIndex(22), .sort = signed_bv8, .operation = .{ .bit_vector_literal = .{ .value = "254", .bit_width = 8 } } },
+        .{ .id = ir.SolverTermId.fromIndex(23), .sort = boolean, .operation = .{ .binary = .{
+            .operator = .equal,
+            .left = ir.SolverTermId.fromIndex(21),
+            .right = ir.SolverTermId.fromIndex(22),
+        } } },
+        .{ .id = ir.SolverTermId.fromIndex(24), .sort = boolean, .operation = .{ .binary = .{
+            .operator = .logical_and,
+            .left = ir.SolverTermId.fromIndex(5),
+            .right = ir.SolverTermId.fromIndex(11),
+        } } },
+        .{ .id = ir.SolverTermId.fromIndex(25), .sort = boolean, .operation = .{ .binary = .{
+            .operator = .logical_and,
+            .left = ir.SolverTermId.fromIndex(17),
+            .right = ir.SolverTermId.fromIndex(23),
+        } } },
+        .{ .id = ir.SolverTermId.fromIndex(26), .sort = boolean, .operation = .{ .binary = .{
+            .operator = .logical_and,
+            .left = ir.SolverTermId.fromIndex(24),
+            .right = ir.SolverTermId.fromIndex(25),
+        } } },
+        .{ .id = ir.SolverTermId.fromIndex(27), .sort = integer, .operation = .{ .remainder = .{
+            .mode = .integer_euclidean,
+            .left = ir.SolverTermId.fromIndex(0),
+            .right = ir.SolverTermId.fromIndex(1),
+            .defined_by = ir.SolverTermId.fromIndex(2),
+        } } },
+        .{ .id = ir.SolverTermId.fromIndex(28), .sort = integer, .operation = .{ .integer_literal = "1" } },
+        .{ .id = ir.SolverTermId.fromIndex(29), .sort = boolean, .operation = .{ .binary = .{
+            .operator = .equal,
+            .left = ir.SolverTermId.fromIndex(27),
+            .right = ir.SolverTermId.fromIndex(28),
+        } } },
+        .{ .id = ir.SolverTermId.fromIndex(30), .sort = integer, .operation = .{ .integer_literal = "5" } },
+        .{ .id = ir.SolverTermId.fromIndex(31), .sort = integer, .operation = .{ .integer_literal = "-2" } },
+        .{ .id = ir.SolverTermId.fromIndex(32), .sort = boolean, .operation = .{ .is_nonzero = ir.SolverTermId.fromIndex(31) } },
+        .{ .id = ir.SolverTermId.fromIndex(33), .sort = integer, .operation = .{ .remainder = .{
+            .mode = .integer_floor,
+            .left = ir.SolverTermId.fromIndex(30),
+            .right = ir.SolverTermId.fromIndex(31),
+            .defined_by = ir.SolverTermId.fromIndex(32),
+        } } },
+        .{ .id = ir.SolverTermId.fromIndex(34), .sort = integer, .operation = .{ .integer_literal = "-1" } },
+        .{ .id = ir.SolverTermId.fromIndex(35), .sort = boolean, .operation = .{ .binary = .{
+            .operator = .equal,
+            .left = ir.SolverTermId.fromIndex(33),
+            .right = ir.SolverTermId.fromIndex(34),
+        } } },
+        .{ .id = ir.SolverTermId.fromIndex(36), .sort = unsigned_bv8, .operation = .{ .remainder = .{
+            .mode = .bit_vector_unsigned,
+            .left = ir.SolverTermId.fromIndex(12),
+            .right = ir.SolverTermId.fromIndex(13),
+            .defined_by = ir.SolverTermId.fromIndex(14),
+        } } },
+        .{ .id = ir.SolverTermId.fromIndex(37), .sort = unsigned_bv8, .operation = .{ .bit_vector_literal = .{ .value = "1", .bit_width = 8 } } },
+        .{ .id = ir.SolverTermId.fromIndex(38), .sort = boolean, .operation = .{ .binary = .{
+            .operator = .equal,
+            .left = ir.SolverTermId.fromIndex(36),
+            .right = ir.SolverTermId.fromIndex(37),
+        } } },
+        .{ .id = ir.SolverTermId.fromIndex(39), .sort = signed_bv8, .operation = .{ .remainder = .{
+            .mode = .bit_vector_signed_dividend,
+            .left = ir.SolverTermId.fromIndex(18),
+            .right = ir.SolverTermId.fromIndex(19),
+            .defined_by = ir.SolverTermId.fromIndex(20),
+        } } },
+        .{ .id = ir.SolverTermId.fromIndex(40), .sort = signed_bv8, .operation = .{ .bit_vector_literal = .{ .value = "255", .bit_width = 8 } } },
+        .{ .id = ir.SolverTermId.fromIndex(41), .sort = boolean, .operation = .{ .binary = .{
+            .operator = .equal,
+            .left = ir.SolverTermId.fromIndex(39),
+            .right = ir.SolverTermId.fromIndex(40),
+        } } },
+        .{ .id = ir.SolverTermId.fromIndex(42), .sort = signed_bv8, .operation = .{ .remainder = .{
+            .mode = .bit_vector_signed_divisor,
+            .left = ir.SolverTermId.fromIndex(18),
+            .right = ir.SolverTermId.fromIndex(19),
+            .defined_by = ir.SolverTermId.fromIndex(20),
+        } } },
+        .{ .id = ir.SolverTermId.fromIndex(43), .sort = signed_bv8, .operation = .{ .bit_vector_literal = .{ .value = "1", .bit_width = 8 } } },
+        .{ .id = ir.SolverTermId.fromIndex(44), .sort = boolean, .operation = .{ .binary = .{
+            .operator = .equal,
+            .left = ir.SolverTermId.fromIndex(42),
+            .right = ir.SolverTermId.fromIndex(43),
+        } } },
+        .{ .id = ir.SolverTermId.fromIndex(45), .sort = boolean, .operation = .{ .binary = .{
+            .operator = .logical_and,
+            .left = ir.SolverTermId.fromIndex(29),
+            .right = ir.SolverTermId.fromIndex(35),
+        } } },
+        .{ .id = ir.SolverTermId.fromIndex(46), .sort = boolean, .operation = .{ .binary = .{
+            .operator = .logical_and,
+            .left = ir.SolverTermId.fromIndex(38),
+            .right = ir.SolverTermId.fromIndex(41),
+        } } },
+        .{ .id = ir.SolverTermId.fromIndex(47), .sort = boolean, .operation = .{ .binary = .{
+            .operator = .logical_and,
+            .left = ir.SolverTermId.fromIndex(46),
+            .right = ir.SolverTermId.fromIndex(44),
+        } } },
+        .{ .id = ir.SolverTermId.fromIndex(48), .sort = boolean, .operation = .{ .binary = .{
+            .operator = .logical_and,
+            .left = ir.SolverTermId.fromIndex(45),
+            .right = ir.SolverTermId.fromIndex(47),
+        } } },
+        .{ .id = ir.SolverTermId.fromIndex(49), .sort = boolean, .operation = .{ .binary = .{
+            .operator = .logical_and,
+            .left = ir.SolverTermId.fromIndex(26),
+            .right = ir.SolverTermId.fromIndex(48),
+        } } },
+        .{ .id = ir.SolverTermId.fromIndex(50), .sort = integer, .operation = .{ .division = .{
+            .mode = .integer_floor,
+            .left = ir.SolverTermId.fromIndex(30),
+            .right = ir.SolverTermId.fromIndex(31),
+            .defined_by = ir.SolverTermId.fromIndex(32),
+        } } },
+        .{ .id = ir.SolverTermId.fromIndex(51), .sort = integer, .operation = .{ .integer_literal = "-3" } },
+        .{ .id = ir.SolverTermId.fromIndex(52), .sort = boolean, .operation = .{ .binary = .{
+            .operator = .equal,
+            .left = ir.SolverTermId.fromIndex(50),
+            .right = ir.SolverTermId.fromIndex(51),
+        } } },
+        .{ .id = ir.SolverTermId.fromIndex(53), .sort = boolean, .operation = .{ .binary = .{
+            .operator = .logical_and,
+            .left = ir.SolverTermId.fromIndex(49),
+            .right = ir.SolverTermId.fromIndex(52),
+        } } },
+    };
+    const constraints = [_]ir.Constraint{
+        .{ .id = ir.ConstraintId.fromIndex(0), .predicate = ir.SolverTermId.fromIndex(2) },
+        .{ .id = ir.ConstraintId.fromIndex(1), .predicate = ir.SolverTermId.fromIndex(8) },
+        .{ .id = ir.ConstraintId.fromIndex(2), .predicate = ir.SolverTermId.fromIndex(14) },
+        .{ .id = ir.ConstraintId.fromIndex(3), .predicate = ir.SolverTermId.fromIndex(20) },
+        .{ .id = ir.ConstraintId.fromIndex(4), .predicate = ir.SolverTermId.fromIndex(32) },
+    };
+    const program: ir.Program = .{
+        .program_id = "z3-guarded-division",
+        .entry_function = ir.FunctionId.fromIndex(0),
+        .functions = &.{},
+        .blocks = &.{},
+        .instructions = &.{},
+        .values = &.{},
+        .solver_terms = &terms,
+        .constraints = &constraints,
+    };
+    var query: ir.SolverQuery = .{
+        .id = ir.QueryId.fromIndex(0),
+        .kind = .prove_true,
+        .assumptions = &.{
+            ir.ConstraintId.fromIndex(0),
+            ir.ConstraintId.fromIndex(1),
+            ir.ConstraintId.fromIndex(2),
+            ir.ConstraintId.fromIndex(3),
+            ir.ConstraintId.fromIndex(4),
+        },
+        .goal = ir.SolverTermId.fromIndex(53),
+    };
+
+    query.assumptions = &.{ ir.ConstraintId.fromIndex(0), ir.ConstraintId.fromIndex(2), ir.ConstraintId.fromIndex(3), ir.ConstraintId.fromIndex(4) };
+    var inferred_guard = try defaultBackend().solve(std.testing.allocator, &program, query);
+    defer inferred_guard.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ir.SolverResolution.proved, inferred_guard.resolution);
+
+    terms[8].operation = .{ .semantic_atom = .{ .instruction_effects = ir.InstructionId.fromIndex(0) } };
+    try std.testing.expectError(error.MissingSolverPrecondition, defaultBackend().solve(std.testing.allocator, &program, query));
+    terms[8].operation = .{ .is_nonzero = ir.SolverTermId.fromIndex(7) };
+    query.assumptions = &.{
+        ir.ConstraintId.fromIndex(0),
+        ir.ConstraintId.fromIndex(1),
+        ir.ConstraintId.fromIndex(2),
+        ir.ConstraintId.fromIndex(3),
+        ir.ConstraintId.fromIndex(4),
+    };
+    try std.testing.expectEqual(ir.SolverResolution.unknown, lifter.solver.solve(&program, query));
+    var result = try defaultBackend().solve(std.testing.allocator, &program, query);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ir.SolverResolution.proved, result.resolution);
+}
+
+test "Z3 matches internal integer division semantics in every sign quadrant" {
+    const cases = [_]struct {
+        left: []const u8,
+        right: []const u8,
+        euclidean_quotient: []const u8,
+        euclidean_remainder: []const u8,
+        floor_quotient: []const u8,
+        floor_remainder: []const u8,
+    }{
+        .{ .left = "7", .right = "3", .euclidean_quotient = "2", .euclidean_remainder = "1", .floor_quotient = "2", .floor_remainder = "1" },
+        .{ .left = "-7", .right = "3", .euclidean_quotient = "-3", .euclidean_remainder = "2", .floor_quotient = "-3", .floor_remainder = "2" },
+        .{ .left = "7", .right = "-3", .euclidean_quotient = "-2", .euclidean_remainder = "1", .floor_quotient = "-3", .floor_remainder = "-2" },
+        .{ .left = "-7", .right = "-3", .euclidean_quotient = "3", .euclidean_remainder = "2", .floor_quotient = "2", .floor_remainder = "-1" },
+    };
+    const integer: ir.SolverSort = .{ .kind = .integer };
+    const boolean: ir.SolverSort = .{ .kind = .boolean };
+
+    for (cases) |values| {
+        const terms = [_]ir.SolverTerm{
+            .{ .id = ir.SolverTermId.fromIndex(0), .sort = integer, .operation = .{ .integer_literal = values.left } },
+            .{ .id = ir.SolverTermId.fromIndex(1), .sort = integer, .operation = .{ .integer_literal = values.right } },
+            .{ .id = ir.SolverTermId.fromIndex(2), .sort = boolean, .operation = .{ .is_nonzero = ir.SolverTermId.fromIndex(1) } },
+            .{ .id = ir.SolverTermId.fromIndex(3), .sort = integer, .operation = .{ .division = .{
+                .mode = .integer_euclidean,
+                .left = ir.SolverTermId.fromIndex(0),
+                .right = ir.SolverTermId.fromIndex(1),
+                .defined_by = ir.SolverTermId.fromIndex(2),
+            } } },
+            .{ .id = ir.SolverTermId.fromIndex(4), .sort = integer, .operation = .{ .integer_literal = values.euclidean_quotient } },
+            .{ .id = ir.SolverTermId.fromIndex(5), .sort = boolean, .operation = .{ .binary = .{
+                .operator = .equal,
+                .left = ir.SolverTermId.fromIndex(3),
+                .right = ir.SolverTermId.fromIndex(4),
+            } } },
+            .{ .id = ir.SolverTermId.fromIndex(6), .sort = integer, .operation = .{ .remainder = .{
+                .mode = .integer_euclidean,
+                .left = ir.SolverTermId.fromIndex(0),
+                .right = ir.SolverTermId.fromIndex(1),
+                .defined_by = ir.SolverTermId.fromIndex(2),
+            } } },
+            .{ .id = ir.SolverTermId.fromIndex(7), .sort = integer, .operation = .{ .integer_literal = values.euclidean_remainder } },
+            .{ .id = ir.SolverTermId.fromIndex(8), .sort = boolean, .operation = .{ .binary = .{
+                .operator = .equal,
+                .left = ir.SolverTermId.fromIndex(6),
+                .right = ir.SolverTermId.fromIndex(7),
+            } } },
+            .{ .id = ir.SolverTermId.fromIndex(9), .sort = integer, .operation = .{ .division = .{
+                .mode = .integer_floor,
+                .left = ir.SolverTermId.fromIndex(0),
+                .right = ir.SolverTermId.fromIndex(1),
+                .defined_by = ir.SolverTermId.fromIndex(2),
+            } } },
+            .{ .id = ir.SolverTermId.fromIndex(10), .sort = integer, .operation = .{ .integer_literal = values.floor_quotient } },
+            .{ .id = ir.SolverTermId.fromIndex(11), .sort = boolean, .operation = .{ .binary = .{
+                .operator = .equal,
+                .left = ir.SolverTermId.fromIndex(9),
+                .right = ir.SolverTermId.fromIndex(10),
+            } } },
+            .{ .id = ir.SolverTermId.fromIndex(12), .sort = integer, .operation = .{ .remainder = .{
+                .mode = .integer_floor,
+                .left = ir.SolverTermId.fromIndex(0),
+                .right = ir.SolverTermId.fromIndex(1),
+                .defined_by = ir.SolverTermId.fromIndex(2),
+            } } },
+            .{ .id = ir.SolverTermId.fromIndex(13), .sort = integer, .operation = .{ .integer_literal = values.floor_remainder } },
+            .{ .id = ir.SolverTermId.fromIndex(14), .sort = boolean, .operation = .{ .binary = .{
+                .operator = .equal,
+                .left = ir.SolverTermId.fromIndex(12),
+                .right = ir.SolverTermId.fromIndex(13),
+            } } },
+            .{ .id = ir.SolverTermId.fromIndex(15), .sort = boolean, .operation = .{ .binary = .{
+                .operator = .logical_and,
+                .left = ir.SolverTermId.fromIndex(5),
+                .right = ir.SolverTermId.fromIndex(8),
+            } } },
+            .{ .id = ir.SolverTermId.fromIndex(16), .sort = boolean, .operation = .{ .binary = .{
+                .operator = .logical_and,
+                .left = ir.SolverTermId.fromIndex(11),
+                .right = ir.SolverTermId.fromIndex(14),
+            } } },
+            .{ .id = ir.SolverTermId.fromIndex(17), .sort = boolean, .operation = .{ .binary = .{
+                .operator = .logical_and,
+                .left = ir.SolverTermId.fromIndex(15),
+                .right = ir.SolverTermId.fromIndex(16),
+            } } },
+        };
+        const constraints = [_]ir.Constraint{.{
+            .id = ir.ConstraintId.fromIndex(0),
+            .predicate = ir.SolverTermId.fromIndex(2),
+        }};
+        const program: ir.Program = .{
+            .program_id = "integer-division-sign-quadrants",
+            .entry_function = ir.FunctionId.fromIndex(0),
+            .functions = &.{},
+            .blocks = &.{},
+            .instructions = &.{},
+            .values = &.{},
+            .solver_terms = &terms,
+            .constraints = &constraints,
+        };
+        const query: ir.SolverQuery = .{
+            .id = ir.QueryId.fromIndex(0),
+            .kind = .prove_true,
+            .assumptions = &.{ir.ConstraintId.fromIndex(0)},
+            .goal = ir.SolverTermId.fromIndex(17),
+        };
+
+        try std.testing.expectEqual(ir.SolverResolution.proved, lifter.solver.solve(&program, query));
+        var result = try defaultBackend().solve(std.testing.allocator, &program, query);
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(ir.SolverResolution.proved, result.resolution);
+    }
+}
+
+const BitVectorDivisionKind = enum {
+    unsigned_division,
+    signed_division,
+    unsigned_remainder,
+    signed_dividend_remainder,
+    signed_divisor_remainder,
+};
+
+const BitVectorDivisionCase = struct {
+    kind: BitVectorDivisionKind,
+    left: []const u8,
+    right: []const u8,
+    expected: []const u8,
+};
+
+fn bitVectorDivisionOperation(case: BitVectorDivisionCase) ir.SolverTermOperation {
+    const left = ir.SolverTermId.fromIndex(0);
+    const right = ir.SolverTermId.fromIndex(1);
+    const defined_by = ir.SolverTermId.fromIndex(2);
+    return switch (case.kind) {
+        .unsigned_division => .{ .division = .{
+            .mode = .bit_vector_unsigned,
+            .left = left,
+            .right = right,
+            .defined_by = defined_by,
+        } },
+        .signed_division => .{ .division = .{
+            .mode = .bit_vector_signed,
+            .left = left,
+            .right = right,
+            .defined_by = defined_by,
+        } },
+        .unsigned_remainder => .{ .remainder = .{
+            .mode = .bit_vector_unsigned,
+            .left = left,
+            .right = right,
+            .defined_by = defined_by,
+        } },
+        .signed_dividend_remainder => .{ .remainder = .{
+            .mode = .bit_vector_signed_dividend,
+            .left = left,
+            .right = right,
+            .defined_by = defined_by,
+        } },
+        .signed_divisor_remainder => .{ .remainder = .{
+            .mode = .bit_vector_signed_divisor,
+            .left = left,
+            .right = right,
+            .defined_by = defined_by,
+        } },
+    };
+}
+
+test "Z3 and internal facts agree across bounded bit-vector division semantics" {
+    const boolean: ir.SolverSort = .{ .kind = .boolean };
+    const unsigned_bv8: ir.SolverSort = .{ .kind = .bit_vector, .bit_width = 8 };
+    const signed_bv8: ir.SolverSort = .{ .kind = .bit_vector, .bit_width = 8, .signed = true };
+    const cases = [_]BitVectorDivisionCase{
+        .{ .kind = .unsigned_division, .left = "255", .right = "2", .expected = "127" },
+        .{ .kind = .unsigned_remainder, .left = "255", .right = "2", .expected = "1" },
+        .{ .kind = .signed_division, .left = "5", .right = "2", .expected = "2" },
+        .{ .kind = .signed_division, .left = "251", .right = "2", .expected = "254" },
+        .{ .kind = .signed_division, .left = "5", .right = "254", .expected = "254" },
+        .{ .kind = .signed_division, .left = "251", .right = "254", .expected = "2" },
+        .{ .kind = .signed_division, .left = "128", .right = "255", .expected = "128" },
+        .{ .kind = .signed_dividend_remainder, .left = "5", .right = "2", .expected = "1" },
+        .{ .kind = .signed_dividend_remainder, .left = "251", .right = "2", .expected = "255" },
+        .{ .kind = .signed_dividend_remainder, .left = "5", .right = "254", .expected = "1" },
+        .{ .kind = .signed_dividend_remainder, .left = "251", .right = "254", .expected = "255" },
+        .{ .kind = .signed_dividend_remainder, .left = "128", .right = "255", .expected = "0" },
+        .{ .kind = .signed_divisor_remainder, .left = "5", .right = "2", .expected = "1" },
+        .{ .kind = .signed_divisor_remainder, .left = "251", .right = "2", .expected = "1" },
+        .{ .kind = .signed_divisor_remainder, .left = "5", .right = "254", .expected = "255" },
+        .{ .kind = .signed_divisor_remainder, .left = "251", .right = "254", .expected = "255" },
+        .{ .kind = .signed_divisor_remainder, .left = "128", .right = "255", .expected = "0" },
+    };
+
+    for (cases) |case| {
+        const sort = switch (case.kind) {
+            .unsigned_division, .unsigned_remainder => unsigned_bv8,
+            .signed_division, .signed_dividend_remainder, .signed_divisor_remainder => signed_bv8,
+        };
+        const terms = [_]ir.SolverTerm{
+            literalTerm(0, sort, case.left),
+            literalTerm(1, sort, case.right),
+            .{ .id = ir.SolverTermId.fromIndex(2), .sort = boolean, .operation = .{ .is_nonzero = ir.SolverTermId.fromIndex(1) } },
+            .{ .id = ir.SolverTermId.fromIndex(3), .sort = sort, .operation = bitVectorDivisionOperation(case) },
+            literalTerm(4, sort, case.expected),
+            .{ .id = ir.SolverTermId.fromIndex(5), .sort = boolean, .operation = .{ .binary = .{
+                .operator = .equal,
+                .left = ir.SolverTermId.fromIndex(3),
+                .right = ir.SolverTermId.fromIndex(4),
+            } } },
+        };
+        const constraints = [_]ir.Constraint{.{
+            .id = ir.ConstraintId.fromIndex(0),
+            .predicate = ir.SolverTermId.fromIndex(2),
+        }};
+        const program: ir.Program = .{
+            .program_id = "bounded-bit-vector-division-differential",
+            .entry_function = ir.FunctionId.fromIndex(0),
+            .functions = &.{},
+            .blocks = &.{},
+            .instructions = &.{},
+            .values = &.{},
+            .solver_terms = &terms,
+            .constraints = &constraints,
+        };
+        const query: ir.SolverQuery = .{
+            .id = ir.QueryId.fromIndex(0),
+            .kind = .prove_true,
+            .assumptions = &.{ir.ConstraintId.fromIndex(0)},
+            .goal = ir.SolverTermId.fromIndex(5),
+        };
+
+        const internal = lifter.solver.solve(&program, query);
+        try std.testing.expectEqual(ir.SolverResolution.proved, internal);
+        var result = try defaultBackend().solve(std.testing.allocator, &program, query);
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(internal, result.resolution);
+    }
+}
+
+test "Z3 proves a symbolic implication under explicit assumptions" {
+    const value_id = ir.ValueId.fromIndex(0);
+    const values = [_]ir.Value{.{ .id = value_id, .function = ir.FunctionId.fromIndex(0), .type = .integer, .origin = .{ .parameter = 0 } }};
+    const terms = [_]ir.SolverTerm{
+        .{ .id = ir.SolverTermId.fromIndex(0), .sort = .{ .kind = .integer }, .operation = .{ .value = value_id } },
+        .{ .id = ir.SolverTermId.fromIndex(1), .sort = .{ .kind = .integer }, .operation = .{ .integer_literal = "0" } },
+        .{ .id = ir.SolverTermId.fromIndex(2), .sort = .{ .kind = .boolean }, .operation = .{ .binary = .{ .operator = .greater, .left = ir.SolverTermId.fromIndex(0), .right = ir.SolverTermId.fromIndex(1) } } },
+        .{ .id = ir.SolverTermId.fromIndex(3), .sort = .{ .kind = .integer }, .operation = .{ .integer_literal = "1" } },
+        .{ .id = ir.SolverTermId.fromIndex(4), .sort = .{ .kind = .integer }, .operation = .{ .binary = .{ .operator = .add, .left = ir.SolverTermId.fromIndex(0), .right = ir.SolverTermId.fromIndex(3) } } },
+        .{ .id = ir.SolverTermId.fromIndex(5), .sort = .{ .kind = .boolean }, .operation = .{ .binary = .{ .operator = .greater, .left = ir.SolverTermId.fromIndex(4), .right = ir.SolverTermId.fromIndex(1) } } },
+        .{ .id = ir.SolverTermId.fromIndex(6), .sort = .{ .kind = .boolean }, .operation = .{ .boolean_literal = true } },
+    };
+    const constraints = [_]ir.Constraint{
+        .{ .id = ir.ConstraintId.fromIndex(0), .predicate = ir.SolverTermId.fromIndex(2) },
+        .{ .id = ir.ConstraintId.fromIndex(1), .predicate = ir.SolverTermId.fromIndex(6) },
+    };
+    const program: ir.Program = .{ .program_id = "z3-symbolic-implication", .entry_function = ir.FunctionId.fromIndex(0), .functions = &.{}, .blocks = &.{}, .instructions = &.{}, .values = &values, .solver_terms = &terms, .constraints = &constraints };
+    const query: ir.SolverQuery = .{ .id = ir.QueryId.fromIndex(0), .kind = .prove_true, .assumptions = &.{ ir.ConstraintId.fromIndex(0), ir.ConstraintId.fromIndex(1) }, .goal = ir.SolverTermId.fromIndex(5) };
+    var result = try defaultBackend().solve(std.testing.allocator, &program, query);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ir.SolverResolution.proved, result.resolution);
+    try std.testing.expectEqualSlices(ir.ConstraintId, &.{ir.ConstraintId.fromIndex(0)}, result.unsat_core.items);
+}
+
+test "Z3 returns typed integer and rational models" {
+    {
+        const value_id = ir.ValueId.fromIndex(0);
+        const values = [_]ir.Value{.{ .id = value_id, .function = ir.FunctionId.fromIndex(0), .type = .integer, .origin = .{ .parameter = 0 } }};
+        const terms = [_]ir.SolverTerm{
+            .{ .id = ir.SolverTermId.fromIndex(0), .sort = .{ .kind = .integer }, .operation = .{ .value = value_id } },
+            .{ .id = ir.SolverTermId.fromIndex(1), .sort = .{ .kind = .integer }, .operation = .{ .integer_literal = "7" } },
+            .{ .id = ir.SolverTermId.fromIndex(2), .sort = .{ .kind = .boolean }, .operation = .{ .binary = .{ .operator = .equal, .left = ir.SolverTermId.fromIndex(0), .right = ir.SolverTermId.fromIndex(1) } } },
+        };
+        const program: ir.Program = .{ .program_id = "z3-typed-model", .entry_function = ir.FunctionId.fromIndex(0), .functions = &.{}, .blocks = &.{}, .instructions = &.{}, .values = &values, .solver_terms = &terms };
+        const query: ir.SolverQuery = .{ .id = ir.QueryId.fromIndex(0), .kind = .find_model, .goal = ir.SolverTermId.fromIndex(2) };
+        var result = try defaultBackend().solve(std.testing.allocator, &program, query);
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(ir.SolverResolution.proved, result.resolution);
+        try std.testing.expectEqual(@as(usize, 1), result.model.items.len);
+        try std.testing.expectEqualStrings("7", result.model.items[0].value.integer);
+        try std.testing.expectEqual(
+            lifter.solver_model.Replay.satisfied,
+            try lifter.solver_model.replayAlloc(std.testing.allocator, &program, query, result.model.items),
+        );
+    }
+    {
+        const value_id = ir.ValueId.fromIndex(0);
+        const values = [_]ir.Value{.{ .id = value_id, .function = ir.FunctionId.fromIndex(0), .type = .number, .origin = .{ .parameter = 0 } }};
+        const terms = [_]ir.SolverTerm{
+            .{ .id = ir.SolverTermId.fromIndex(0), .sort = .{ .kind = .real }, .operation = .{ .value = value_id } },
+            .{ .id = ir.SolverTermId.fromIndex(1), .sort = .{ .kind = .real }, .operation = .{ .real_literal = .{ .numerator = "3", .denominator = "2" } } },
+            .{ .id = ir.SolverTermId.fromIndex(2), .sort = .{ .kind = .boolean }, .operation = .{ .binary = .{ .operator = .equal, .left = ir.SolverTermId.fromIndex(0), .right = ir.SolverTermId.fromIndex(1) } } },
+        };
+        const program: ir.Program = .{ .program_id = "z3-rational-model", .entry_function = ir.FunctionId.fromIndex(0), .functions = &.{}, .blocks = &.{}, .instructions = &.{}, .values = &values, .solver_terms = &terms };
+        const query: ir.SolverQuery = .{ .id = ir.QueryId.fromIndex(0), .kind = .find_model, .goal = ir.SolverTermId.fromIndex(2) };
+        var result = try defaultBackend().solve(std.testing.allocator, &program, query);
+        defer result.deinit(std.testing.allocator);
+        const rational = result.model.items[0].value.real;
+        try std.testing.expectEqualStrings("3", rational.numerator);
+        try std.testing.expectEqualStrings("2", rational.denominator);
+        try std.testing.expectEqual(
+            lifter.solver_model.Replay.satisfied,
+            try lifter.solver_model.replayAlloc(std.testing.allocator, &program, query, result.model.items),
+        );
+    }
+}
+
+test "Z3 proves bit-vector and arbitrary precision identities" {
+    {
+        const value_id = ir.ValueId.fromIndex(0);
+        const values = [_]ir.Value{.{ .id = value_id, .function = ir.FunctionId.fromIndex(0), .type = .dynamic, .origin = .{ .parameter = 0 } }};
+        const bv8: ir.SolverSort = .{ .kind = .bit_vector, .bit_width = 8 };
+        const terms = [_]ir.SolverTerm{
+            .{ .id = ir.SolverTermId.fromIndex(0), .sort = bv8, .operation = .{ .value = value_id } },
+            .{ .id = ir.SolverTermId.fromIndex(1), .sort = bv8, .operation = .{ .bit_vector_literal = .{ .value = "0", .bit_width = 8 } } },
+            .{ .id = ir.SolverTermId.fromIndex(2), .sort = bv8, .operation = .{ .binary = .{ .operator = .bit_and, .left = ir.SolverTermId.fromIndex(0), .right = ir.SolverTermId.fromIndex(1) } } },
+            .{ .id = ir.SolverTermId.fromIndex(3), .sort = .{ .kind = .boolean }, .operation = .{ .binary = .{ .operator = .equal, .left = ir.SolverTermId.fromIndex(2), .right = ir.SolverTermId.fromIndex(1) } } },
+        };
+        const program: ir.Program = .{ .program_id = "z3-bit-vector-mask", .entry_function = ir.FunctionId.fromIndex(0), .functions = &.{}, .blocks = &.{}, .instructions = &.{}, .values = &values, .solver_terms = &terms };
+        const query: ir.SolverQuery = .{ .id = ir.QueryId.fromIndex(0), .kind = .prove_true, .goal = ir.SolverTermId.fromIndex(3) };
+        var result = try defaultBackend().solve(std.testing.allocator, &program, query);
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(ir.SolverResolution.proved, result.resolution);
+    }
+    {
+        const bv128: ir.SolverSort = .{ .kind = .bit_vector, .bit_width = 128 };
+        const terms = [_]ir.SolverTerm{
+            .{ .id = ir.SolverTermId.fromIndex(0), .sort = bv128, .operation = .{ .bit_vector_literal = .{
+                .value = "340282366920938463463374607431768211455",
+                .bit_width = 128,
+            } } },
+            .{ .id = ir.SolverTermId.fromIndex(1), .sort = bv128, .operation = .{ .bit_vector_literal = .{
+                .value = "1",
+                .bit_width = 128,
+            } } },
+            .{ .id = ir.SolverTermId.fromIndex(2), .sort = bv128, .operation = .{ .binary = .{
+                .operator = .add,
+                .left = ir.SolverTermId.fromIndex(0),
+                .right = ir.SolverTermId.fromIndex(1),
+            } } },
+            .{ .id = ir.SolverTermId.fromIndex(3), .sort = bv128, .operation = .{ .bit_vector_literal = .{
+                .value = "0",
+                .bit_width = 128,
+            } } },
+            .{ .id = ir.SolverTermId.fromIndex(4), .sort = .{ .kind = .boolean }, .operation = .{ .binary = .{
+                .operator = .equal,
+                .left = ir.SolverTermId.fromIndex(2),
+                .right = ir.SolverTermId.fromIndex(3),
+            } } },
+        };
+        const program: ir.Program = .{ .program_id = "z3-wide-bit-vector-wrap", .entry_function = ir.FunctionId.fromIndex(0), .functions = &.{}, .blocks = &.{}, .instructions = &.{}, .values = &.{}, .solver_terms = &terms };
+        const query: ir.SolverQuery = .{ .id = ir.QueryId.fromIndex(0), .kind = .prove_true, .goal = ir.SolverTermId.fromIndex(4) };
+        try std.testing.expectEqual(ir.SolverResolution.unknown, lifter.solver.solve(&program, query));
+        var result = try defaultBackend().solve(std.testing.allocator, &program, query);
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(ir.SolverResolution.proved, result.resolution);
+    }
+    {
+        const terms = [_]ir.SolverTerm{
+            .{ .id = ir.SolverTermId.fromIndex(0), .sort = .{ .kind = .integer }, .operation = .{ .integer_literal = "9223372036854775808" } },
+            .{ .id = ir.SolverTermId.fromIndex(1), .sort = .{ .kind = .integer }, .operation = .{ .integer_literal = "9223372036854775808" } },
+            .{ .id = ir.SolverTermId.fromIndex(2), .sort = .{ .kind = .boolean }, .operation = .{ .binary = .{ .operator = .equal, .left = ir.SolverTermId.fromIndex(0), .right = ir.SolverTermId.fromIndex(1) } } },
+        };
+        const program: ir.Program = .{ .program_id = "z3-arbitrary-precision-integer", .entry_function = ir.FunctionId.fromIndex(0), .functions = &.{}, .blocks = &.{}, .instructions = &.{}, .values = &.{}, .solver_terms = &terms };
+        const query: ir.SolverQuery = .{ .id = ir.QueryId.fromIndex(0), .kind = .prove_true, .goal = ir.SolverTermId.fromIndex(2) };
+        try std.testing.expect(lifter.solver.evaluate(&program, ir.SolverTermId.fromIndex(0)) == .unknown);
+        try std.testing.expectEqual(ir.SolverResolution.proved, lifter.solver.solve(&program, query));
+        var result = try defaultBackend().solve(std.testing.allocator, &program, query);
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(ir.SolverResolution.proved, result.resolution);
+    }
+}
+
+test "Z3 returns wide bit-vector models without host-width truncation" {
+    const value_id = ir.ValueId.fromIndex(0);
+    const values = [_]ir.Value{.{
+        .id = value_id,
+        .function = ir.FunctionId.fromIndex(0),
+        .type = .dynamic,
+        .origin = .{ .parameter = 0 },
+    }};
+    const bv128: ir.SolverSort = .{ .kind = .bit_vector, .bit_width = 128 };
+    const terms = [_]ir.SolverTerm{
+        .{ .id = ir.SolverTermId.fromIndex(0), .sort = bv128, .operation = .{ .value = value_id } },
+        .{ .id = ir.SolverTermId.fromIndex(1), .sort = bv128, .operation = .{ .bit_vector_literal = .{
+            .value = "340282366920938463463374607431768211455",
+            .bit_width = 128,
+        } } },
+        .{ .id = ir.SolverTermId.fromIndex(2), .sort = .{ .kind = .boolean }, .operation = .{ .binary = .{
+            .operator = .equal,
+            .left = ir.SolverTermId.fromIndex(0),
+            .right = ir.SolverTermId.fromIndex(1),
+        } } },
+    };
+    const program: ir.Program = .{
+        .program_id = "z3-wide-bit-vector-model",
+        .entry_function = ir.FunctionId.fromIndex(0),
+        .functions = &.{},
+        .blocks = &.{},
+        .instructions = &.{},
+        .values = &values,
+        .solver_terms = &terms,
+    };
+    const query: ir.SolverQuery = .{
+        .id = ir.QueryId.fromIndex(0),
+        .kind = .find_model,
+        .goal = ir.SolverTermId.fromIndex(2),
+    };
+    var result = try defaultBackend().solve(std.testing.allocator, &program, query);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ir.SolverResolution.proved, result.resolution);
+    try std.testing.expectEqual(@as(usize, 1), result.model.items.len);
+    const model = result.model.items[0].value.bit_vector;
+    try std.testing.expectEqual(@as(u16, 128), model.bit_width);
+    try std.testing.expectEqualStrings("340282366920938463463374607431768211455", model.value);
+}
+
+test "Z3 receives exact wide constants from normalized IR value definitions" {
+    const fixture = lifter.fixtures.arithmetic_module;
+    var values = fixture.values;
+    values[fixture.v_factor.index()].type = .{ .kind = .integer, .bit_width = 128, .signed = false };
+    var instructions = fixture.instructions;
+    instructions[fixture.i_factor.index()].operation = .{ .constant = .{
+        .integer = "340282366920938463463374607431768211455",
+    } };
+    const bv128: ir.SolverSort = .{ .kind = .bit_vector, .bit_width = 128 };
+    const terms = [_]ir.SolverTerm{
+        .{ .id = ir.SolverTermId.fromIndex(0), .sort = bv128, .operation = .{ .value = fixture.v_factor } },
+        .{ .id = ir.SolverTermId.fromIndex(1), .sort = bv128, .operation = .{ .bit_vector_literal = .{
+            .value = "340282366920938463463374607431768211455",
+            .bit_width = 128,
+        } } },
+        .{ .id = ir.SolverTermId.fromIndex(2), .sort = .{ .kind = .boolean }, .operation = .{ .binary = .{
+            .operator = .equal,
+            .left = ir.SolverTermId.fromIndex(0),
+            .right = ir.SolverTermId.fromIndex(1),
+        } } },
+    };
+    var program = fixture.program;
+    program.values = &values;
+    program.instructions = &instructions;
+    program.solver_terms = &terms;
+    const query: ir.SolverQuery = .{ .id = ir.QueryId.fromIndex(0), .kind = .prove_true, .goal = ir.SolverTermId.fromIndex(2) };
+
+    try std.testing.expectEqual(ir.SolverResolution.unknown, lifter.solver.solve(&program, query));
+    var result = try defaultBackend().solve(std.testing.allocator, &program, query);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ir.SolverResolution.proved, result.resolution);
+}
+
+test "Z3 semantic atoms require matching explicit assumptions" {
+    const fixture = lifter.fixtures.arithmetic_module;
+    const terms = [_]ir.SolverTerm{
+        .{ .id = ir.SolverTermId.fromIndex(0), .sort = .{ .kind = .boolean }, .operation = .{ .semantic_atom = .{ .instruction_effects = fixture.i_sum } } },
+        .{ .id = ir.SolverTermId.fromIndex(1), .sort = .{ .kind = .boolean }, .operation = .{ .semantic_atom = .{ .primitive_operator_domain = fixture.i_sum } } },
+        .{ .id = ir.SolverTermId.fromIndex(2), .sort = .{ .kind = .boolean }, .operation = .{ .semantic_atom = .{ .instruction_effects = fixture.i_result } } },
+    };
+    const constraints = [_]ir.Constraint{.{ .id = ir.ConstraintId.fromIndex(0), .predicate = ir.SolverTermId.fromIndex(0) }};
+    var program = fixture.program;
+    program.solver_terms = &terms;
+    program.constraints = &constraints;
+    const assumed_exact: ir.SolverQuery = .{ .id = ir.QueryId.fromIndex(0), .kind = .prove_true, .assumptions = &.{ir.ConstraintId.fromIndex(0)}, .goal = ir.SolverTermId.fromIndex(0) };
+    const unassumed: ir.SolverQuery = .{ .id = ir.QueryId.fromIndex(1), .kind = .prove_true, .goal = ir.SolverTermId.fromIndex(0) };
+    const wrong_property: ir.SolverQuery = .{ .id = ir.QueryId.fromIndex(2), .kind = .prove_true, .assumptions = &.{ir.ConstraintId.fromIndex(0)}, .goal = ir.SolverTermId.fromIndex(1) };
+    const wrong_instruction: ir.SolverQuery = .{ .id = ir.QueryId.fromIndex(3), .kind = .prove_true, .assumptions = &.{ir.ConstraintId.fromIndex(0)}, .goal = ir.SolverTermId.fromIndex(2) };
+    var exact_result = try defaultBackend().solve(std.testing.allocator, &program, assumed_exact);
+    defer exact_result.deinit(std.testing.allocator);
+    var unassumed_result = try defaultBackend().solve(std.testing.allocator, &program, unassumed);
+    defer unassumed_result.deinit(std.testing.allocator);
+    var property_result = try defaultBackend().solve(std.testing.allocator, &program, wrong_property);
+    defer property_result.deinit(std.testing.allocator);
+    var instruction_result = try defaultBackend().solve(std.testing.allocator, &program, wrong_instruction);
+    defer instruction_result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ir.SolverResolution.proved, exact_result.resolution);
+    try std.testing.expectEqual(ir.SolverResolution.disproved, unassumed_result.resolution);
+    try std.testing.expectEqual(ir.SolverResolution.disproved, property_result.resolution);
+    try std.testing.expectEqual(ir.SolverResolution.disproved, instruction_result.resolution);
+    try std.testing.expectEqualSlices(ir.ConstraintId, &.{ir.ConstraintId.fromIndex(0)}, exact_result.unsat_core.items);
+    try std.testing.expectEqual(@as(usize, 1), unassumed_result.model.items.len);
+    try std.testing.expectEqual(ir.SolverTermId.fromIndex(0), unassumed_result.model.items[0].term);
+    try std.testing.expect(!unassumed_result.model.items[0].value.boolean);
+}
+
+test "Z3 orchestration admits and emits a typed semantic claim" {
+    const fixture = lifter.fixtures.arithmetic_module;
+    var values = fixture.values;
+    values[fixture.v_left.index()].type = .dynamic;
+    var instructions = fixture.instructions;
+    instructions[fixture.i_sum.index()].operation.binary.mode = .primitive;
+    const instruction_claims = [_]ir.ClaimId{ir.ClaimId.fromIndex(0)};
+    instructions[fixture.i_sum.index()].claims = &instruction_claims;
+    const terms = [_]ir.SolverTerm{.{
+        .id = ir.SolverTermId.fromIndex(0),
+        .sort = .{ .kind = .boolean },
+        .operation = .{ .semantic_atom = .{ .primitive_operator_domain = fixture.i_sum } },
+    }};
+    const constraints = [_]ir.Constraint{.{
+        .id = ir.ConstraintId.fromIndex(0),
+        .predicate = ir.SolverTermId.fromIndex(0),
+        .evidence = &.{fixture.proof},
+    }};
+    const queries = [_]ir.SolverQuery{.{
+        .id = ir.QueryId.fromIndex(0),
+        .kind = .prove_true,
+        .assumptions = &.{ir.ConstraintId.fromIndex(0)},
+        .goal = ir.SolverTermId.fromIndex(0),
+    }};
+    const claims = [_]ir.Claim{.{
+        .id = ir.ClaimId.fromIndex(0),
+        .subject = .{ .instruction = fixture.i_sum },
+        .predicate = ir.SolverTermId.fromIndex(0),
+        .purpose = .{ .primitive_operator_domain = .pure },
+        .status = .unproven,
+        .required_for_emission = true,
+        .evidence = &.{fixture.proof},
+        .query = ir.QueryId.fromIndex(0),
+    }};
+    const obligations = [_]ir.Obligation{.{
+        .id = ir.ObligationId.fromIndex(0),
+        .kind = .primitive_domain,
+        .subject = .{ .instruction = fixture.i_sum },
+        .status = .open,
+        .blocks_profile = .readable_luau,
+        .detail = "Z3 must discharge the linked primitive-domain obligation",
+        .requirement = ir.ObligationRequirement.fromQuery(queries[0]),
+        .query = ir.QueryId.fromIndex(0),
+    }};
+    var program = fixture.program;
+    program.values = &values;
+    program.instructions = &instructions;
+    program.solver_terms = &terms;
+    program.constraints = &constraints;
+    program.queries = &queries;
+    program.claims = &claims;
+    program.obligations = &obligations;
+
+    var resolved = try lifter.proof_orchestrator.resolveAlloc(std.testing.allocator, &program, defaultBackend());
+    defer resolved.deinit();
+    try std.testing.expectEqual(ir.ClaimStatus.proved, resolved.program.claims[0].status);
+    try std.testing.expectEqual(ir.ObligationStatus.discharged, resolved.program.obligations[0].status);
+    try std.testing.expectEqual(resolved.program.claims[0].certificate, resolved.program.obligations[0].certificate);
+    try std.testing.expectEqual(@as(usize, 1), resolved.program.unsat_cores.len);
+    try std.testing.expectEqualSlices(ir.ConstraintId, &.{ir.ConstraintId.fromIndex(0)}, resolved.program.unsat_cores[0].constraints);
+    var report = try lifter.validate.validate(std.testing.allocator, &resolved.program, .readable_luau);
+    defer report.deinit();
+    try std.testing.expect(report.isClean());
+
+    const tampered_cores = try std.testing.allocator.dupe(ir.UnsatCore, resolved.program.unsat_cores);
+    defer std.testing.allocator.free(tampered_cores);
+    tampered_cores[0].constraints = &.{};
+    const tampered_certificates = try std.testing.allocator.dupe(ir.SolverCertificate, resolved.program.certificates);
+    defer std.testing.allocator.free(tampered_certificates);
+    var tampered = resolved.program;
+    tampered.unsat_cores = tampered_cores;
+    tampered.certificates = tampered_certificates;
+    const tampered_digest = try lifter.proof_digest.computeAlloc(
+        std.testing.allocator,
+        &tampered,
+        tampered.queries[tampered_certificates[0].query.index()],
+        tampered_certificates[0].engine,
+        tampered_certificates[0].resolution,
+        tampered_certificates[0].evidence,
+        &.{},
+        &.{},
+    );
+    defer std.testing.allocator.free(tampered_digest);
+    tampered_certificates[0].certificate_digest = tampered_digest;
+    var tampered_report = try lifter.validate.validate(std.testing.allocator, &tampered, .readable_luau);
+    defer tampered_report.deinit();
+    try std.testing.expect(tampered_report.isClean());
+    try std.testing.expectError(
+        error.ContradictoryUnsatCore,
+        lifter.proof_orchestrator.resolveAlloc(std.testing.allocator, &tampered, defaultBackend()),
+    );
+
+    var outcome = try lifter.pipeline.runAlloc(
+        std.testing.allocator,
+        &program,
+        defaultBackend(),
+        .{ .profile = .readable_luau, .emit_luau = .standard_luau },
+    );
+    defer outcome.deinit();
+    try std.testing.expect(outcome.isAdmitted());
+    try std.testing.expect(std.mem.indexOf(u8, outcome.luau_source.?, "return (left + right) * 2") != null);
+}
+
+test "Z3 receives exact IR constants through normalized value terms" {
+    const fixture = lifter.fixtures.arithmetic_module;
+    var instructions = fixture.instructions;
+    instructions[fixture.i_sum.index()].operation = .{ .constant = .{ .integer = "4" } };
+    const terms = [_]ir.SolverTerm{
+        .{ .id = ir.SolverTermId.fromIndex(0), .sort = .{ .kind = .integer }, .operation = .{ .value = fixture.v_result } },
+        .{ .id = ir.SolverTermId.fromIndex(1), .sort = .{ .kind = .integer }, .operation = .{ .integer_literal = "8" } },
+        .{ .id = ir.SolverTermId.fromIndex(2), .sort = .{ .kind = .boolean }, .operation = .{ .binary = .{
+            .operator = .equal,
+            .left = ir.SolverTermId.fromIndex(0),
+            .right = ir.SolverTermId.fromIndex(1),
+        } } },
+    };
+    const query: ir.SolverQuery = .{
+        .id = ir.QueryId.fromIndex(0),
+        .kind = .prove_true,
+        .goal = ir.SolverTermId.fromIndex(2),
+    };
+    var program = fixture.program;
+    program.instructions = &instructions;
+    program.solver_terms = &terms;
+
+    var result = try defaultBackend().solve(std.testing.allocator, &program, query);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ir.SolverResolution.proved, result.resolution);
+}
+
+test "Z3 pipeline plans both directions from scoped branch facts" {
+    const fixture = lifter.fixtures.absolute_value_module;
+    const terms = [_]ir.SolverTerm{.{
+        .id = ir.SolverTermId.fromIndex(0),
+        .sort = .{ .kind = .boolean },
+        .operation = .{ .value = fixture.v_is_negative },
+    }};
+    const constraints = [_]ir.Constraint{.{
+        .id = ir.ConstraintId.fromIndex(0),
+        .predicate = ir.SolverTermId.fromIndex(0),
+        .evidence = &.{fixture.proof},
+        .scope = .{ .block = fixture.b_entry },
+    }};
+    var program = fixture.program;
+    program.solver_terms = &terms;
+    program.constraints = &constraints;
+
+    var outcome = try lifter.pipeline.runAlloc(
+        std.testing.allocator,
+        &program,
+        defaultBackend(),
+        .{ .profile = .readable_luau, .emit_luau = .standard_luau },
+    );
+    defer outcome.deinit();
+    try std.testing.expect(outcome.isAdmitted());
+    try std.testing.expectEqual(ir.ClaimStatus.proved, outcome.program().?.claims[0].status);
+    try std.testing.expectEqual(ir.ClaimStatus.disproved, outcome.program().?.claims[1].status);
+    try std.testing.expectEqual(@as(usize, 2), outcome.program().?.certificates.len);
+    try std.testing.expectEqual(@as(usize, 1), outcome.program().?.unsat_cores.len);
+    try std.testing.expectEqual(@as(usize, 1), outcome.program().?.solver_models.len);
+    try std.testing.expectEqual(fixture.b_negative, outcome.program().?.blocks[fixture.b_entry.index()].terminator.jump.target);
+    try std.testing.expect(std.mem.indexOf(u8, outcome.luau_source.?, "if ") == null);
+}
+
+test "Z3 proves relational edge facts through exact-pure IR definitions" {
+    const fixture = lifter.fixtures.relational_dispatch_module;
+    var outcome = try lifter.pipeline.runAlloc(
+        std.testing.allocator,
+        &fixture.program,
+        defaultBackend(),
+        .{ .profile = .readable_luau, .emit_luau = .standard_luau },
+    );
+    defer outcome.deinit();
+
+    try std.testing.expect(outcome.isAdmitted());
+    try std.testing.expectEqual(@as(usize, 4), outcome.program().?.queries.len);
+    try std.testing.expectEqual(@as(usize, 4), outcome.program().?.certificates.len);
+    try std.testing.expectEqual(fixture.b_true, outcome.program().?.blocks[fixture.b_left.index()].terminator.jump.target);
+    try std.testing.expectEqual(fixture.b_false, outcome.program().?.blocks[fixture.b_right.index()].terminator.jump.target);
+    try std.testing.expect(std.mem.indexOf(u8, outcome.luau_source.?, "state_matches") == null);
+    try std.testing.expect(std.mem.indexOf(u8, outcome.luau_source.?, "if selector then") != null);
+}
