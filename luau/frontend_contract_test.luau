@@ -327,6 +327,10 @@ local function intrinsicNil(): any
 	return intrinsicNode({ type = "AstExprConstantNil" })
 end
 
+local function intrinsicBool(value: boolean): any
+	return intrinsicNode({ type = "AstExprConstantBool", value = value })
+end
+
 local function intrinsicLocal(name: string): any
 	return intrinsicNode({ type = "AstLocal", name = name })
 end
@@ -821,4 +825,788 @@ assert(
 		and capturedAliasThrow.level == 1
 		and immutableAliasProgram.values[capturedAliasThrow.value + 1].type.kind == "thread",
 	"captured consumer/producer aliases lost exact open-tail termination"
+)
+
+local mutableErrorAlias = intrinsicLocal("mutable_fail")
+local mutableAliasFallback = AstFrontend.tryLift(intrinsicDocument({
+	intrinsicNode({ type = "AstStatLocal", vars = { mutableErrorAlias }, values = { intrinsicGlobal("error") } }),
+	intrinsicNode({
+		type = "AstStatAssign",
+		vars = { intrinsicLocalExpression(mutableErrorAlias) },
+		values = { intrinsicGlobal("replacement") },
+	}),
+	intrinsicNode({
+		type = "AstStatExpr",
+		expr = intrinsicCall(intrinsicLocalExpression(mutableErrorAlias), { intrinsicString("ordinary"), intrinsicNumber(0) }),
+	}),
+}), {
+	program_id = "frontend-mutable-intrinsic-alias",
+	source_name = "frontend-mutable-intrinsic-alias",
+	intrinsic_bindings = { errorBinding },
+})
+assert(mutableAliasFallback.program ~= nil, "mutable intrinsic alias fallback was rejected")
+local mutableAliasProgram = mutableAliasFallback.program :: any
+local mutableCalls = 0
+local mutableThrows = 0
+for _, instruction in mutableAliasProgram.instructions do
+	mutableCalls += if instruction.operation.call ~= nil then 1 else 0
+end
+for _, block in mutableAliasProgram.blocks do
+	mutableThrows += if block.terminator.throw_error ~= nil then 1 else 0
+end
+assert(mutableCalls == 1 and mutableThrows == 0, "mutable intrinsic alias retained stale authenticated identity")
+
+local function liftJoinedAlias(name: string, expression: any, bindings: { any }): any
+	local aliasLocal = intrinsicLocal(name)
+	return AstFrontend.tryLift(intrinsicDocument({
+		intrinsicNode({ type = "AstStatLocal", vars = { aliasLocal }, values = { expression } }),
+		intrinsicNode({
+			type = "AstStatExpr",
+			expr = intrinsicCall(intrinsicLocalExpression(aliasLocal), {
+				intrinsicGlobal("target"),
+				intrinsicGlobal("handler"),
+			}),
+		}),
+	}), {
+		program_id = `frontend-{name}`,
+		source_name = `frontend-{name}`,
+		intrinsic_bindings = bindings,
+	})
+end
+
+local function joinedAliasKinds(result: any): { [string]: number }
+	assert(result.program ~= nil, "joined intrinsic alias was rejected")
+	local kinds = { protected_call = 0, call = 0, throw_error = 0 }
+	for _, instruction in (result.program :: any).instructions do
+		kinds.protected_call += if instruction.operation.protected_call ~= nil then 1 else 0
+		kinds.call += if instruction.operation.call ~= nil then 1 else 0
+	end
+	for _, block in (result.program :: any).blocks do
+		kinds.throw_error += if block.terminator.throw_error ~= nil then 1 else 0
+	end
+	return kinds
+end
+
+local matchedIfJoin = joinedAliasKinds(liftJoinedAlias("matched-if-intrinsic-join", intrinsicNode({
+	type = "AstExprIfElse",
+	condition = intrinsicGlobal("condition"),
+	trueExpr = intrinsicGlobal("pcall"),
+	falseExpr = intrinsicGlobal("pcall"),
+}), { intrinsicBindings[1] }))
+assert(matchedIfJoin.protected_call == 1 and matchedIfJoin.call == 0, "matching if-expression identities did not survive their join")
+
+local matchedShortJoin = joinedAliasKinds(liftJoinedAlias("matched-short-intrinsic-join", intrinsicNode({
+	type = "AstExprBinary",
+	op = "And",
+	left = intrinsicGlobal("pcall"),
+	right = intrinsicGlobal("pcall"),
+}), { intrinsicBindings[1] }))
+assert(matchedShortJoin.protected_call == 1 and matchedShortJoin.call == 0, "matching short-circuit identities did not survive their join")
+
+local survivingIfJoin = joinedAliasKinds(liftJoinedAlias("surviving-intrinsic-join", intrinsicNode({
+	type = "AstExprIfElse",
+	condition = intrinsicGlobal("condition"),
+	trueExpr = intrinsicCall(intrinsicGlobal("error"), { intrinsicString("stop"), intrinsicNumber(0) }),
+	falseExpr = intrinsicGlobal("pcall"),
+}), { intrinsicBindings[1], errorBinding }))
+assert(
+	survivingIfJoin.protected_call == 1 and survivingIfJoin.call == 0 and survivingIfJoin.throw_error == 1,
+	"sole surviving identity did not cross a partially terminating join"
+)
+
+local mismatchedIfJoin = joinedAliasKinds(liftJoinedAlias("mismatched-intrinsic-join", intrinsicNode({
+	type = "AstExprIfElse",
+	condition = intrinsicGlobal("condition"),
+	trueExpr = intrinsicGlobal("pcall"),
+	falseExpr = intrinsicGlobal("xpcall"),
+}), { intrinsicBindings[1], intrinsicBindings[2] }))
+assert(mismatchedIfJoin.protected_call == 0 and mismatchedIfJoin.call == 1, "mismatched identities produced a false joined intrinsic")
+
+local function joinedExpressionType(name: string, expression: any, bindings: { any }?): any
+	local result = AstFrontend.tryLift(intrinsicDocument({
+		intrinsicNode({ type = "AstStatReturn", list = { expression } }),
+	}), {
+		program_id = `frontend-{name}`,
+		source_name = `frontend-{name}`,
+		intrinsic_bindings = bindings or {},
+	})
+	assert(result.program ~= nil, `joined expression {name} was rejected`)
+	local program = result.program :: any
+	for _, block in program.blocks do
+		if (block.name_hint == "if_value_join" or block.name_hint == "logical_join") and #block.parameters == 1 then
+			return program.values[block.parameters[1] + 1].type
+		end
+	end
+	error(`joined expression {name} has no result parameter`)
+end
+
+local wideIntegerType = joinedExpressionType("matching-wide-integer-join", intrinsicNode({
+	type = "AstExprIfElse",
+	condition = intrinsicGlobal("condition"),
+	trueExpr = intrinsicNode({ type = "AstExprConstantInteger", value = "1" }),
+	falseExpr = intrinsicNode({ type = "AstExprConstantInteger", value = "2" }),
+}), nil)
+assert(
+	wideIntegerType.kind == "integer" and wideIntegerType.bit_width == 65535 and wideIntegerType.signed == false,
+	"matching exact integer domains collapsed at an if-expression join"
+)
+
+local mismatchedIntegerType = joinedExpressionType("mismatched-integer-width-join", intrinsicNode({
+	type = "AstExprIfElse",
+	condition = intrinsicGlobal("condition"),
+	trueExpr = intrinsicNode({ type = "AstExprConstantInteger", value = "1" }),
+	falseExpr = intrinsicNumber(2),
+}), nil)
+assert(mismatchedIntegerType.kind == "dynamic", "same-kind integer width mismatch produced a false joined domain")
+
+local survivingStringType = joinedExpressionType("surviving-string-join", intrinsicNode({
+	type = "AstExprIfElse",
+	condition = intrinsicGlobal("condition"),
+	trueExpr = intrinsicCall(intrinsicGlobal("error"), { intrinsicString("stop"), intrinsicNumber(0) }),
+	falseExpr = intrinsicString("survived"),
+}), { errorBinding })
+assert(survivingStringType.kind == "string", "sole surviving if-expression type was lost")
+
+local matchingAndType = joinedExpressionType("matching-and-type-join", intrinsicNode({
+	type = "AstExprBinary",
+	op = "And",
+	left = intrinsicString("left"),
+	right = intrinsicString("right"),
+}), nil)
+assert(matchingAndType.kind == "string", "matching and-expression types collapsed at their join")
+
+local matchingOrType = joinedExpressionType("matching-or-type-join", intrinsicNode({
+	type = "AstExprBinary",
+	op = "Or",
+	left = intrinsicBool(false),
+	right = intrinsicBool(true),
+}), nil)
+assert(matchingOrType.kind == "boolean", "matching or-expression types collapsed at their join")
+
+local survivingShortType = joinedExpressionType("surviving-short-type-join", intrinsicNode({
+	type = "AstExprBinary",
+	op = "And",
+	left = intrinsicBool(false),
+	right = intrinsicCall(intrinsicGlobal("error"), { intrinsicString("stop"), intrinsicNumber(0) }),
+}), { errorBinding })
+assert(survivingShortType.kind == "boolean", "sole surviving short-circuit type was lost")
+
+local mismatchedShortType = joinedExpressionType("mismatched-short-type-join", intrinsicNode({
+	type = "AstExprBinary",
+	op = "Or",
+	left = intrinsicString("left"),
+	right = intrinsicBool(true),
+}), nil)
+assert(mismatchedShortType.kind == "dynamic", "mismatched short-circuit types produced a false joined domain")
+
+local function returnedOperatorSemantics(name: string, expression: any): (any, any, any)
+	local result = AstFrontend.tryLift(intrinsicDocument({
+		intrinsicNode({ type = "AstStatReturn", list = { expression } }),
+	}), {
+		program_id = `frontend-{name}`,
+		source_name = `frontend-{name}`,
+	})
+	assert(result.program ~= nil and #result.diagnostics == 0, `operator expression {name} was rejected`)
+	local program = result.program :: any
+	local returnedValue
+	for _, block in program.blocks do
+		if block.terminator.return_values ~= nil then
+			assert(#block.terminator.return_values == 1, `operator expression {name} changed result arity`)
+			returnedValue = block.terminator.return_values[1]
+		end
+	end
+	assert(returnedValue ~= nil, `operator expression {name} has no scalar return`)
+	local value = program.values[returnedValue + 1]
+	local origin = value.origin.instruction_result
+	assert(origin ~= nil, `operator expression {name} result is not instruction-owned`)
+	local instruction = program.instructions[origin.instruction + 1]
+	return value.type, instruction.effects, instruction.operation
+end
+
+local function hasExactPureEffects(effects: any): boolean
+	return effects.precision == "exact"
+		and not effects.reads_memory
+		and not effects.writes_memory
+		and not effects.may_throw
+		and not effects.may_yield
+		and not effects.invokes_unknown_code
+end
+
+local function hasDynamicOperatorEffects(effects: any): boolean
+	return effects.precision == "conservative"
+		and effects.reads_memory
+		and effects.writes_memory
+		and effects.may_throw
+		and effects.may_yield
+		and effects.invokes_unknown_code
+end
+
+local primitiveBinaryRows = {
+	{ name = "add", source = "Add", lowered = "add", left = intrinsicNumber(0.5), right = intrinsicNumber(2), result = "number" },
+	{ name = "subtract", source = "Sub", lowered = "subtract", left = intrinsicNumber(5), right = intrinsicNumber(2), result = "number" },
+	{ name = "multiply", source = "Mul", lowered = "multiply", left = intrinsicNumber(3), right = intrinsicNumber(4), result = "number" },
+	{ name = "divide", source = "Div", lowered = "divide", left = intrinsicNumber(5), right = intrinsicNumber(2), result = "number" },
+	{ name = "floor-divide", source = "FloorDiv", lowered = "floor_divide", left = intrinsicNumber(5), right = intrinsicNumber(2), result = "number" },
+	{ name = "modulo", source = "Mod", lowered = "modulo", left = intrinsicNumber(5), right = intrinsicNumber(2), result = "number" },
+	{ name = "power", source = "Pow", lowered = "power", left = intrinsicNumber(2), right = intrinsicNumber(3), result = "number" },
+	{ name = "concat", source = "Concat", lowered = "concat", left = intrinsicString("value="), right = intrinsicNumber(2), result = "string" },
+	{ name = "equal", source = "CompareEq", lowered = "equal", left = intrinsicString("a"), right = intrinsicString("b"), result = "boolean" },
+	{ name = "not-equal", source = "CompareNe", lowered = "not_equal", left = intrinsicString("a"), right = intrinsicString("b"), result = "boolean" },
+	{ name = "less", source = "CompareLt", lowered = "less", left = intrinsicString("a"), right = intrinsicString("b"), result = "boolean" },
+	{ name = "less-equal", source = "CompareLe", lowered = "less_equal", left = intrinsicString("a"), right = intrinsicString("b"), result = "boolean" },
+	{ name = "greater", source = "CompareGt", lowered = "greater", left = intrinsicString("a"), right = intrinsicString("b"), result = "boolean" },
+	{ name = "greater-equal", source = "CompareGe", lowered = "greater_equal", left = intrinsicString("a"), right = intrinsicString("b"), result = "boolean" },
+	{ name = "numeric-less", source = "CompareLt", lowered = "less", left = intrinsicNumber(0.5), right = intrinsicNumber(2), result = "boolean" },
+}
+for _, row in primitiveBinaryRows do
+	local resultType, effects, operation = returnedOperatorSemantics(`primitive-{row.name}`, intrinsicNode({
+		type = "AstExprBinary",
+		op = row.source,
+		left = row.left,
+		right = row.right,
+	}))
+	assert(resultType.kind == row.result, `primitive {row.name} lost its result domain`)
+	assert(hasExactPureEffects(effects), `primitive {row.name} retained dynamic effects`)
+	assert(operation.binary ~= nil and operation.binary.operator == row.lowered, `primitive {row.name} changed operator mapping`)
+end
+
+local primitiveUnaryRows = {
+	{ name = "not", source = "Not", lowered = "logical_not", operand = intrinsicGlobal("dynamic_value"), result = "boolean" },
+	{ name = "minus", source = "Minus", lowered = "negate", operand = intrinsicNumber(0.5), result = "number" },
+	{ name = "length", source = "Len", lowered = "length", operand = intrinsicString("value"), result = "integer" },
+}
+for _, row in primitiveUnaryRows do
+	local resultType, effects, operation = returnedOperatorSemantics(`primitive-{row.name}`, intrinsicNode({
+		type = "AstExprUnary",
+		op = row.source,
+		expr = row.operand,
+	}))
+	assert(resultType.kind == row.result, `primitive {row.name} lost its result domain`)
+	assert(hasExactPureEffects(effects), `primitive {row.name} retained dynamic effects`)
+	assert(operation.unary ~= nil and operation.unary.operator == row.lowered, `primitive {row.name} changed operator mapping`)
+end
+
+local unresolvedOperatorRows = {
+	{
+		name = "dynamic-add",
+		expression = intrinsicNode({ type = "AstExprBinary", op = "Add", left = intrinsicGlobal("dynamic_left"), right = intrinsicNumber(1) }),
+		result = "dynamic",
+	},
+	{
+		name = "table-concat",
+		expression = intrinsicNode({ type = "AstExprBinary", op = "Concat", left = intrinsicNode({ type = "AstExprTable", items = {} }), right = intrinsicString("value") }),
+		result = "dynamic",
+	},
+	{
+		name = "mixed-less",
+		expression = intrinsicNode({ type = "AstExprBinary", op = "CompareLt", left = intrinsicString("value"), right = intrinsicNumber(1) }),
+		result = "boolean",
+	},
+	{
+		name = "table-equality",
+		expression = intrinsicNode({ type = "AstExprBinary", op = "CompareEq", left = intrinsicNode({ type = "AstExprTable", items = {} }), right = intrinsicNode({ type = "AstExprTable", items = {} }) }),
+		result = "boolean",
+	},
+	{
+		name = "string-minus",
+		expression = intrinsicNode({ type = "AstExprUnary", op = "Minus", expr = intrinsicString("value") }),
+		result = "dynamic",
+	},
+	{
+		name = "table-length",
+		expression = intrinsicNode({ type = "AstExprUnary", op = "Len", expr = intrinsicNode({ type = "AstExprTable", items = {} }) }),
+		result = "dynamic",
+	},
+}
+for _, row in unresolvedOperatorRows do
+	local resultType, effects = returnedOperatorSemantics(`unresolved-{row.name}`, row.expression)
+	assert(resultType.kind == row.result, `unresolved {row.name} made a false result claim`)
+	assert(hasDynamicOperatorEffects(effects), `unresolved {row.name} understated dynamic dispatch`)
+end
+
+local uniformPlaceLocal = intrinsicLocal("uniform_place")
+local uniformPlace = AstFrontend.tryLift(intrinsicDocument({
+	intrinsicNode({ type = "AstStatLocal", vars = { uniformPlaceLocal }, values = { intrinsicNumber(1) } }),
+	intrinsicNode({
+		type = "AstStatAssign",
+		vars = { intrinsicLocalExpression(uniformPlaceLocal) },
+		values = { intrinsicNumber(2) },
+	}),
+	intrinsicNode({
+		type = "AstStatReturn",
+		list = {
+			intrinsicNode({
+				type = "AstExprBinary",
+				op = "Add",
+				left = intrinsicLocalExpression(uniformPlaceLocal),
+				right = intrinsicNumber(0.5),
+			}),
+		},
+	}),
+}), { program_id = "frontend-uniform-place-domain", source_name = "frontend-uniform-place-domain" })
+assert(uniformPlace.program ~= nil and #uniformPlace.diagnostics == 0, "uniform local place was rejected")
+local uniformPlaceProgram = uniformPlace.program :: any
+local uniformRead
+local uniformAdd
+for _, instruction in uniformPlaceProgram.instructions do
+	if instruction.operation.place_read ~= nil then
+		uniformRead = instruction
+	elseif instruction.operation.binary ~= nil and instruction.operation.binary.operator == "add" then
+		uniformAdd = instruction
+	end
+end
+assert(uniformPlaceProgram.places[1].type.kind == "integer", "uniform local place lost its concrete domain")
+assert(
+	uniformRead ~= nil and uniformPlaceProgram.values[uniformRead.results[1] + 1].type.kind == "integer",
+	"uniform local place read lost its concrete domain"
+)
+assert(
+	uniformAdd ~= nil
+		and uniformPlaceProgram.values[uniformAdd.results[1] + 1].type.kind == "number"
+		and hasExactPureEffects(uniformAdd.effects),
+	"refined local place did not update its downstream operator domain"
+)
+
+local mixedPlaceLocal = intrinsicLocal("mixed_place")
+local mixedPlace = AstFrontend.tryLift(intrinsicDocument({
+	intrinsicNode({ type = "AstStatLocal", vars = { mixedPlaceLocal }, values = { intrinsicNumber(1) } }),
+	intrinsicNode({
+		type = "AstStatAssign",
+		vars = { intrinsicLocalExpression(mixedPlaceLocal) },
+		values = { intrinsicString("changed") },
+	}),
+	intrinsicNode({
+		type = "AstStatReturn",
+		list = {
+			intrinsicNode({
+				type = "AstExprBinary",
+				op = "Add",
+				left = intrinsicLocalExpression(mixedPlaceLocal),
+				right = intrinsicNumber(1),
+			}),
+		},
+	}),
+}), { program_id = "frontend-mixed-place-domain", source_name = "frontend-mixed-place-domain" })
+assert(mixedPlace.program ~= nil and #mixedPlace.diagnostics == 0, "mixed local place was rejected")
+local mixedPlaceProgram = mixedPlace.program :: any
+local mixedAdd
+for _, instruction in mixedPlaceProgram.instructions do
+	if instruction.operation.binary ~= nil and instruction.operation.binary.operator == "add" then
+		mixedAdd = instruction
+	end
+end
+assert(mixedPlaceProgram.places[1].type.kind == "dynamic", "mixed local place gained a false concrete domain")
+assert(
+	mixedAdd ~= nil
+		and mixedPlaceProgram.values[mixedAdd.results[1] + 1].type.kind == "dynamic"
+		and hasDynamicOperatorEffects(mixedAdd.effects),
+	"mixed local place understated downstream dynamic dispatch"
+)
+
+assert(require("./source_domain_fixed_point_test"), "source domain fixed-point tests failed")
+
+local truthyPlaceLocal = intrinsicLocal("truthy_place")
+local truthyPlace = AstFrontend.tryLift(intrinsicDocument({
+	intrinsicNode({ type = "AstStatLocal", vars = { truthyPlaceLocal }, values = { intrinsicNumber(1) } }),
+	intrinsicNode({
+		type = "AstStatAssign",
+		vars = { intrinsicLocalExpression(truthyPlaceLocal) },
+		values = { intrinsicNumber(2) },
+	}),
+	intrinsicNode({
+		type = "AstStatIf",
+		condition = intrinsicLocalExpression(truthyPlaceLocal),
+		thenbody = intrinsicNode({
+			type = "AstStatBlock",
+			body = { intrinsicNode({ type = "AstStatReturn", list = { intrinsicBool(true) } }) },
+		}),
+	}),
+	intrinsicNode({ type = "AstStatReturn", list = { intrinsicBool(false) } }),
+}), { program_id = "frontend-truthy-place-domain", source_name = "frontend-truthy-place-domain" })
+assert(truthyPlace.program ~= nil and #truthyPlace.diagnostics == 0, "truthiness-used local place was rejected")
+local truthyPlaceProgram = truthyPlace.program :: any
+local truthyCondition
+for _, block in truthyPlaceProgram.blocks do
+	if block.terminator.branch ~= nil then
+		truthyCondition = block.terminator.branch.condition
+	end
+end
+assert(
+	truthyPlaceProgram.places[1].type.kind == "integer"
+		and truthyCondition ~= nil
+		and truthyPlaceProgram.values[truthyCondition + 1].type.kind == "integer",
+	"closed non-Boolean place did not preserve its branch truthiness domain"
+)
+
+local function repeatError(message: string): any
+	return intrinsicCall(intrinsicGlobal("error"), { intrinsicString(message), intrinsicNumber(0) })
+end
+
+local function countEnvironmentGets(program: any, name: string): number
+	local count = 0
+	for _, instruction in program.instructions do
+		count += if instruction.operation.environment_get ~= nil and instruction.operation.environment_get.name == name then 1 else 0
+	end
+	return count
+end
+
+local function countTerminators(program: any, kind: string): number
+	local count = 0
+	for _, block in program.blocks do
+		count += if block.terminator[kind] ~= nil then 1 else 0
+	end
+	return count
+end
+
+local noBreakRepeat = AstFrontend.tryLift(intrinsicDocument({
+	intrinsicNode({
+		type = "AstStatRepeat",
+		body = intrinsicNode({ type = "AstStatBlock", body = {} }),
+		condition = repeatError("repeat-no-break"),
+	}),
+	intrinsicNode({ type = "AstStatExpr", expr = intrinsicCall(intrinsicGlobal("after"), {}) }),
+}), {
+	program_id = "frontend-terminating-repeat-no-break",
+	source_name = "frontend-terminating-repeat-no-break",
+	intrinsic_bindings = { errorBinding },
+})
+assert(noBreakRepeat.program ~= nil, "terminating repeat without break was rejected")
+local noBreakProgram = noBreakRepeat.program :: any
+assert(
+	countTerminators(noBreakProgram, "throw_error") == 1
+		and countTerminators(noBreakProgram, "unreachable_block") == 1
+		and countEnvironmentGets(noBreakProgram, "after") == 0,
+	"no-break repeat retained a synthetic continuation"
+)
+
+local breakOnlyRepeat = AstFrontend.tryLift(intrinsicDocument({
+	intrinsicNode({
+		type = "AstStatRepeat",
+		body = intrinsicNode({ type = "AstStatBlock", body = { intrinsicNode({ type = "AstStatBreak" }) } }),
+		condition = repeatError("dead-break-latch"),
+	}),
+	intrinsicNode({ type = "AstStatExpr", expr = intrinsicCall(intrinsicGlobal("after"), {}) }),
+}), {
+	program_id = "frontend-repeat-break-only",
+	source_name = "frontend-repeat-break-only",
+	intrinsic_bindings = { errorBinding },
+})
+assert(breakOnlyRepeat.program ~= nil, "break-only repeat was rejected")
+local breakOnlyProgram = breakOnlyRepeat.program :: any
+assert(
+	countTerminators(breakOnlyProgram, "throw_error") == 0
+		and countTerminators(breakOnlyProgram, "unreachable_block") == 1
+		and countEnvironmentGets(breakOnlyProgram, "after") == 1,
+	"break-only repeat lowered its unreachable latch or lost its exit"
+)
+
+local terminatingBodyRepeat = AstFrontend.tryLift(intrinsicDocument({
+	intrinsicNode({
+		type = "AstStatRepeat",
+		body = intrinsicNode({
+			type = "AstStatBlock",
+			body = {
+				intrinsicNode({ type = "AstStatExpr", expr = repeatError("repeat-body") }),
+				intrinsicNode({ type = "AstStatContinue" }),
+			},
+		}),
+		condition = repeatError("dead-body-latch"),
+	}),
+	intrinsicNode({ type = "AstStatExpr", expr = intrinsicCall(intrinsicGlobal("after"), {}) }),
+}), {
+	program_id = "frontend-repeat-terminating-body",
+	source_name = "frontend-repeat-terminating-body",
+	intrinsic_bindings = { errorBinding },
+})
+assert(terminatingBodyRepeat.program ~= nil, "terminating repeat body was rejected")
+local terminatingBodyProgram = terminatingBodyRepeat.program :: any
+assert(
+	countTerminators(terminatingBodyProgram, "throw_error") == 1
+		and countTerminators(terminatingBodyProgram, "unreachable_block") == 2
+		and countEnvironmentGets(terminatingBodyProgram, "after") == 0,
+	"terminating repeat body retained a dead-tail continue, latch, or continuation"
+)
+
+local conditionalContinueRepeat = AstFrontend.tryLift(intrinsicDocument({
+	intrinsicNode({
+		type = "AstStatRepeat",
+		body = intrinsicNode({
+			type = "AstStatBlock",
+			body = {
+				intrinsicNode({
+					type = "AstStatIf",
+					condition = intrinsicGlobal("again"),
+					thenbody = intrinsicNode({ type = "AstStatBlock", body = { intrinsicNode({ type = "AstStatContinue" }) } }),
+				}),
+				intrinsicNode({ type = "AstStatExpr", expr = repeatError("repeat-non-continue") }),
+			},
+		}),
+		condition = intrinsicGlobal("done"),
+	}),
+	intrinsicNode({ type = "AstStatExpr", expr = intrinsicCall(intrinsicGlobal("after"), {}) }),
+}), {
+	program_id = "frontend-repeat-conditional-continue",
+	source_name = "frontend-repeat-conditional-continue",
+	intrinsic_bindings = { errorBinding },
+})
+assert(conditionalContinueRepeat.program ~= nil, "conditional repeat continue was rejected")
+local conditionalContinueProgram = conditionalContinueRepeat.program :: any
+assert(
+	countTerminators(conditionalContinueProgram, "throw_error") == 1
+		and countEnvironmentGets(conditionalContinueProgram, "done") == 1
+		and countEnvironmentGets(conditionalContinueProgram, "after") == 1,
+	"actual continue edge did not preserve the repeat latch and exit"
+)
+
+local nestedContinueRepeat = AstFrontend.tryLift(intrinsicDocument({
+	intrinsicNode({
+		type = "AstStatRepeat",
+		body = intrinsicNode({
+			type = "AstStatBlock",
+			body = {
+				intrinsicNode({
+					type = "AstStatRepeat",
+					body = intrinsicNode({ type = "AstStatBlock", body = { intrinsicNode({ type = "AstStatContinue" }) } }),
+					condition = intrinsicBool(true),
+				}),
+				intrinsicNode({ type = "AstStatExpr", expr = repeatError("nested-continue-body") }),
+			},
+		}),
+		condition = repeatError("dead-outer-latch"),
+	}),
+	intrinsicNode({ type = "AstStatExpr", expr = intrinsicCall(intrinsicGlobal("after"), {}) }),
+}), {
+	program_id = "frontend-repeat-nested-continue",
+	source_name = "frontend-repeat-nested-continue",
+	intrinsic_bindings = { errorBinding },
+})
+assert(nestedContinueRepeat.program ~= nil, "nested repeat continue was rejected")
+local nestedContinueProgram = nestedContinueRepeat.program :: any
+assert(
+	countTerminators(nestedContinueProgram, "throw_error") == 1
+		and countTerminators(nestedContinueProgram, "unreachable_block") == 2
+		and countEnvironmentGets(nestedContinueProgram, "after") == 0,
+	"nested-loop continue incorrectly preserved the outer repeat latch or exit"
+)
+
+local conditionalBreakRepeat = AstFrontend.tryLift(intrinsicDocument({
+	intrinsicNode({
+		type = "AstStatRepeat",
+		body = intrinsicNode({
+			type = "AstStatBlock",
+			body = {
+				intrinsicNode({
+					type = "AstStatIf",
+					condition = intrinsicGlobal("leave"),
+					thenbody = intrinsicNode({ type = "AstStatBlock", body = { intrinsicNode({ type = "AstStatBreak" }) } }),
+				}),
+			},
+		}),
+		condition = repeatError("repeat-with-break"),
+	}),
+	intrinsicNode({ type = "AstStatExpr", expr = intrinsicCall(intrinsicGlobal("after"), {}) }),
+}), {
+	program_id = "frontend-terminating-repeat-with-break",
+	source_name = "frontend-terminating-repeat-with-break",
+	intrinsic_bindings = { errorBinding },
+})
+assert(conditionalBreakRepeat.program ~= nil, "terminating repeat with break was rejected")
+local conditionalBreakProgram = conditionalBreakRepeat.program :: any
+assert(countEnvironmentGets(conditionalBreakProgram, "after") == 1, "actual break edge did not preserve the repeat exit")
+
+local nestedBreakRepeat = AstFrontend.tryLift(intrinsicDocument({
+	intrinsicNode({
+		type = "AstStatRepeat",
+		body = intrinsicNode({
+			type = "AstStatBlock",
+			body = {
+				intrinsicNode({
+					type = "AstStatRepeat",
+					body = intrinsicNode({ type = "AstStatBlock", body = { intrinsicNode({ type = "AstStatBreak" }) } }),
+					condition = intrinsicBool(true),
+				}),
+			},
+		}),
+		condition = repeatError("outer-repeat"),
+	}),
+	intrinsicNode({ type = "AstStatExpr", expr = intrinsicCall(intrinsicGlobal("after"), {}) }),
+}), {
+	program_id = "frontend-nested-break-repeat",
+	source_name = "frontend-nested-break-repeat",
+	intrinsic_bindings = { errorBinding },
+})
+assert(nestedBreakRepeat.program ~= nil, "nested repeat break case was rejected")
+local nestedBreakProgram = nestedBreakRepeat.program :: any
+assert(countEnvironmentGets(nestedBreakProgram, "after") == 0, "nested-loop break incorrectly preserved the outer repeat exit")
+
+local nestedArgumentError = AstFrontend.tryLift(intrinsicDocument({
+	intrinsicNode({
+		type = "AstStatReturn",
+		list = {
+			intrinsicCall(intrinsicGlobal("sink"), {
+				intrinsicCall(intrinsicGlobal("before"), {}),
+				intrinsicCall(intrinsicGlobal("error"), { intrinsicString("argument"), intrinsicNumber(0) }),
+				intrinsicCall(intrinsicGlobal("after"), {}),
+			}),
+		},
+	}),
+}), {
+	program_id = "frontend-nested-argument-error",
+	source_name = "frontend-nested-argument-error",
+	intrinsic_bindings = { errorBinding },
+})
+assert(nestedArgumentError.program ~= nil, "nested argument error was rejected")
+local nestedArgumentProgram = nestedArgumentError.program :: any
+local nestedLookups = {}
+local nestedCalls = 0
+for _, instruction in nestedArgumentProgram.instructions do
+	local lookup = instruction.operation.environment_get
+	if lookup ~= nil then
+		nestedLookups[lookup.name] = (nestedLookups[lookup.name] or 0) + 1
+	elseif instruction.operation.call ~= nil then
+		nestedCalls += 1
+	end
+end
+assert(nestedArgumentProgram.blocks[1].terminator.throw_error ~= nil, "nested argument error did not terminate its owner")
+assert(nestedLookups.sink == 1 and nestedLookups.before == 1, "call callee or earlier argument was not evaluated")
+assert(nestedLookups.after == nil and nestedLookups.error == nil, "nested argument error evaluated a later argument or mutable builtin")
+assert(nestedCalls == 1, "nested argument error emitted the unreachable outer call")
+
+local nestedTerminator = AstFrontend.tryLift(intrinsicDocument({
+	intrinsicNode({
+		type = "AstStatReturn",
+		list = {
+			intrinsicCall(intrinsicGlobal("error"), {
+				intrinsicCall(intrinsicGlobal("error"), { intrinsicString("inner"), intrinsicNumber(0) }),
+				intrinsicNumber(0),
+			}),
+		},
+	}),
+}), {
+	program_id = "frontend-nested-terminator",
+	source_name = "frontend-nested-terminator",
+	intrinsic_bindings = { errorBinding },
+})
+assert(nestedTerminator.program ~= nil, "nested terminating error was rejected")
+local nestedTerminatorProgram = nestedTerminator.program :: any
+assert(#nestedTerminatorProgram.instructions == 2, "outer error evaluated after its message terminated")
+assert(nestedTerminatorProgram.blocks[1].terminator.throw_error ~= nil, "nested error did not finalize exactly one throw")
+
+local shortCircuitError = AstFrontend.tryLift(intrinsicDocument({
+	intrinsicNode({
+		type = "AstStatReturn",
+		list = {
+			intrinsicNode({
+				type = "AstExprBinary",
+				op = "And",
+				left = intrinsicGlobal("condition"),
+				right = intrinsicCall(intrinsicGlobal("error"), { intrinsicString("right"), intrinsicNumber(0) }),
+			}),
+		},
+	}),
+}), {
+	program_id = "frontend-short-circuit-error",
+	source_name = "frontend-short-circuit-error",
+	intrinsic_bindings = { errorBinding },
+})
+assert(shortCircuitError.program ~= nil, "short-circuit error branch was rejected")
+local shortCircuitProgram = shortCircuitError.program :: any
+local shortThrows = 0
+local shortReturns = 0
+for _, block in shortCircuitProgram.blocks do
+	shortThrows += if block.terminator.throw_error ~= nil then 1 else 0
+	shortReturns += if block.terminator.return_values ~= nil then 1 else 0
+end
+assert(#shortCircuitProgram.blocks == 4 and shortThrows == 1 and shortReturns == 1, "short-circuit termination lost its surviving join")
+
+local bothBranchError = AstFrontend.tryLift(intrinsicDocument({
+	intrinsicNode({
+		type = "AstStatReturn",
+		list = {
+			intrinsicNode({
+				type = "AstExprIfElse",
+				condition = intrinsicGlobal("condition"),
+				trueExpr = intrinsicCall(intrinsicGlobal("error"), { intrinsicString("true"), intrinsicNumber(0) }),
+				falseExpr = intrinsicCall(intrinsicGlobal("error"), { intrinsicString("false"), intrinsicNumber(0) }),
+			}),
+		},
+	}),
+}), {
+	program_id = "frontend-both-branch-error",
+	source_name = "frontend-both-branch-error",
+	intrinsic_bindings = { errorBinding },
+})
+assert(bothBranchError.program ~= nil, "fully terminating if expression was rejected")
+local bothBranchProgram = bothBranchError.program :: any
+local branchThrows = 0
+local deadJoins = 0
+for _, block in bothBranchProgram.blocks do
+	branchThrows += if block.terminator.throw_error ~= nil then 1 else 0
+	deadJoins += if block.terminator.unreachable_block ~= nil then 1 else 0
+	assert(block.terminator.return_values == nil, "fully terminating if expression retained an unreachable return")
+end
+assert(#bothBranchProgram.blocks == 4 and branchThrows == 2 and deadJoins == 1, "fully terminating if expression did not seal its reserved join")
+
+local openCreate = AstFrontend.tryLift(intrinsicDocument({
+	intrinsicNode({
+		type = "AstStatReturn",
+		list = {
+			intrinsicCall(intrinsicMember("coroutine", "create"), { intrinsicGlobal("target") }),
+		},
+	}),
+}), {
+	program_id = "frontend-open-create",
+	source_name = "frontend-open-create",
+	intrinsic_bindings = { intrinsicBindings[3] },
+})
+assert(openCreate.program ~= nil, "open-result coroutine.create was rejected")
+local openCreateKinds = { call = 0, coroutine_create = 0, pack_values = 0, coroutine_lookup = 0 }
+local openCreatePack
+for _, instruction in (openCreate.program :: any).instructions do
+	if instruction.operation.call ~= nil then
+		openCreateKinds.call += 1
+	elseif instruction.operation.coroutine_create ~= nil then
+		openCreateKinds.coroutine_create += 1
+	elseif instruction.operation.pack_values ~= nil then
+		openCreateKinds.pack_values += 1
+		openCreatePack = instruction.pack_result
+	elseif instruction.operation.environment_get ~= nil and instruction.operation.environment_get.name == "coroutine" then
+		openCreateKinds.coroutine_lookup += 1
+	end
+end
+assert(
+	openCreateKinds.call == 0
+		and openCreateKinds.coroutine_create == 1
+		and openCreateKinds.pack_values == 1
+		and openCreateKinds.coroutine_lookup == 0,
+	"open coroutine.create did not use native creation and closed pack construction"
+)
+assert(openCreatePack ~= nil, "open coroutine.create did not produce a pack")
+local openPack = (openCreate.program :: any).value_packs[openCreatePack + 1]
+assert(openPack.shape.tail == "closed" and #openPack.shape.prefix == 1, "open coroutine.create pack did not stay one fixed result")
+assert(openPack.shape.prefix[1].kind == "thread", "open coroutine.create pack lost its thread domain")
+
+local duplicateIntrinsicOptions = AstFrontend.tryLift(intrinsicDocument({}), {
+	program_id = "frontend-duplicate-intrinsic-options",
+	source_name = "frontend-duplicate-intrinsic-options",
+	intrinsic_bindings = { intrinsicBindings[1], intrinsicBindings[1] },
+})
+assert(
+	duplicateIntrinsicOptions.program == nil and duplicateIntrinsicOptions.diagnostics[1].code == "invalid_options",
+	"direct frontend options accepted duplicate intrinsic authority"
+)
+
+local malformedIntrinsicOptions = AstFrontend.tryLift(intrinsicDocument({}), {
+	program_id = "frontend-malformed-intrinsic-options",
+	source_name = "frontend-malformed-intrinsic-options",
+	intrinsic_bindings = {
+		{
+			path = "pcall",
+			evidence = { kind = "frontend_proof", locator = "" },
+		},
+	},
+})
+assert(
+	malformedIntrinsicOptions.program == nil and malformedIntrinsicOptions.diagnostics[1].code == "invalid_options",
+	"direct frontend options accepted malformed intrinsic evidence"
 )
