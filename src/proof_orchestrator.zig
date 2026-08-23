@@ -766,3 +766,712 @@ test "detached framework proofs refresh after edge topology changes" {
     try std.testing.expect(!std.mem.eql(u8, initial, refreshed));
     try std.testing.expectEqualStrings(expected, refreshed);
 }
+
+test "proof forwarding renormalizes irreducible entries before serialization" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const child_function_id = ir.FunctionId.fromIndex(1);
+    const entry_id = ir.BlockId.fromIndex(0);
+    const primary_id = ir.BlockId.fromIndex(1);
+    const secondary_id = ir.BlockId.fromIndex(2);
+    const exit_id = ir.BlockId.fromIndex(3);
+    const child_block_id = ir.BlockId.fromIndex(4);
+    const entry_zero_id = ir.InstructionId.fromIndex(0);
+    const primary_zero_id = ir.InstructionId.fromIndex(1);
+    const condition_id = ir.InstructionId.fromIndex(2);
+    const secondary_one_id = ir.InstructionId.fromIndex(3);
+    const closure_id = ir.InstructionId.fromIndex(4);
+    const selector = ir.ValueId.fromIndex(0);
+    const entry_zero = ir.ValueId.fromIndex(1);
+    const primary_value = ir.ValueId.fromIndex(2);
+    const secondary_value = ir.ValueId.fromIndex(3);
+    const exit_value = ir.ValueId.fromIndex(4);
+    const primary_zero = ir.ValueId.fromIndex(5);
+    const condition = ir.ValueId.fromIndex(6);
+    const secondary_one = ir.ValueId.fromIndex(7);
+    const closure_value = ir.ValueId.fromIndex(8);
+    const child_captured_value = ir.ValueId.fromIndex(9);
+    const child_capture = ir.CaptureId.fromIndex(0);
+    const evidence_id = ir.EvidenceId.fromIndex(0);
+    const values = [_]ir.Value{
+        .{ .id = selector, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{
+            .id = entry_zero,
+            .function = function_id,
+            .type = .integer,
+            .origin = .{ .instruction_result = .{ .instruction = entry_zero_id, .index = 0 } },
+        },
+        .{
+            .id = primary_value,
+            .function = function_id,
+            .type = .integer,
+            .origin = .{ .block_parameter = .{ .block = primary_id, .index = 0 } },
+        },
+        .{
+            .id = secondary_value,
+            .function = function_id,
+            .type = .integer,
+            .origin = .{ .block_parameter = .{ .block = secondary_id, .index = 0 } },
+        },
+        .{
+            .id = exit_value,
+            .function = function_id,
+            .type = .integer,
+            .origin = .{ .block_parameter = .{ .block = exit_id, .index = 0 } },
+        },
+        .{
+            .id = primary_zero,
+            .function = function_id,
+            .type = .integer,
+            .origin = .{ .instruction_result = .{ .instruction = primary_zero_id, .index = 0 } },
+        },
+        .{
+            .id = condition,
+            .function = function_id,
+            .type = .boolean,
+            .origin = .{ .instruction_result = .{ .instruction = condition_id, .index = 0 } },
+        },
+        .{
+            .id = secondary_one,
+            .function = function_id,
+            .type = .integer,
+            .origin = .{ .instruction_result = .{ .instruction = secondary_one_id, .index = 0 } },
+        },
+        .{
+            .id = closure_value,
+            .function = function_id,
+            .type = .function,
+            .origin = .{ .instruction_result = .{ .instruction = closure_id, .index = 0 } },
+        },
+        .{
+            .id = child_captured_value,
+            .function = child_function_id,
+            .type = .integer,
+            .origin = .{ .capture = child_capture },
+        },
+    };
+    const captures = [_]ir.Capture{.{
+        .id = child_capture,
+        .function = child_function_id,
+        .kind = .{ .immutable_value = child_captured_value },
+        .evidence = &.{evidence_id},
+    }};
+    const instructions = [_]ir.Instruction{
+        .{
+            .id = entry_zero_id,
+            .block = entry_id,
+            .operation = .{ .constant = .{ .integer = "0" } },
+            .results = &.{entry_zero},
+            .effects = .pure,
+            .evidence = &.{evidence_id},
+        },
+        .{
+            .id = primary_zero_id,
+            .block = primary_id,
+            .operation = .{ .constant = .{ .integer = "0" } },
+            .results = &.{primary_zero},
+            .effects = .pure,
+            .evidence = &.{evidence_id},
+        },
+        .{
+            .id = condition_id,
+            .block = primary_id,
+            .operation = .{ .binary = .{
+                .operator = .equal,
+                .left = primary_value,
+                .right = primary_zero,
+            } },
+            .results = &.{condition},
+            .effects = .pure,
+            .evidence = &.{evidence_id},
+        },
+        .{
+            .id = secondary_one_id,
+            .block = secondary_id,
+            .operation = .{ .constant = .{ .integer = "1" } },
+            .results = &.{secondary_one},
+            .effects = .pure,
+            .evidence = &.{evidence_id},
+        },
+        .{
+            .id = closure_id,
+            .block = secondary_id,
+            .operation = .{ .make_closure = .{
+                .function = child_function_id,
+                .bindings = &.{.{ .value = secondary_value }},
+            } },
+            .results = &.{closure_value},
+            .effects = .pure,
+            .evidence = &.{evidence_id},
+        },
+    };
+    const blocks = [_]ir.Block{
+        .{
+            .id = entry_id,
+            .function = function_id,
+            .instructions = &.{entry_zero_id},
+            .terminator = .{ .branch = .{
+                .condition = selector,
+                .then_edge = .{ .target = secondary_id, .arguments = &.{entry_zero} },
+                .else_edge = .{ .target = primary_id, .arguments = &.{entry_zero} },
+            } },
+            .evidence = &.{evidence_id},
+        },
+        .{
+            .id = primary_id,
+            .function = function_id,
+            .parameters = &.{primary_value},
+            .instructions = &.{ primary_zero_id, condition_id },
+            .terminator = .{ .branch = .{
+                .condition = condition,
+                .then_edge = .{ .target = secondary_id, .arguments = &.{primary_value} },
+                .else_edge = .{ .target = exit_id, .arguments = &.{primary_value} },
+            } },
+            .evidence = &.{evidence_id},
+        },
+        .{
+            .id = secondary_id,
+            .function = function_id,
+            .parameters = &.{secondary_value},
+            .instructions = &.{ secondary_one_id, closure_id },
+            .terminator = .{ .jump = .{ .target = primary_id, .arguments = &.{secondary_one} } },
+            .evidence = &.{evidence_id},
+        },
+        .{
+            .id = exit_id,
+            .function = function_id,
+            .parameters = &.{exit_value},
+            .terminator = .{ .return_values = &.{exit_value} },
+            .evidence = &.{evidence_id},
+        },
+        .{
+            .id = child_block_id,
+            .function = child_function_id,
+            .terminator = .{ .return_values = &.{child_captured_value} },
+            .evidence = &.{evidence_id},
+        },
+    };
+    const functions = [_]ir.Function{
+        .{
+            .id = function_id,
+            .parameters = &.{selector},
+            .blocks = &.{ entry_id, primary_id, secondary_id, exit_id },
+            .entry_block = entry_id,
+            .evidence = &.{evidence_id},
+        },
+        .{
+            .id = child_function_id,
+            .lexical_parent = function_id,
+            .captures = &.{child_capture},
+            .blocks = &.{child_block_id},
+            .entry_block = child_block_id,
+            .evidence = &.{evidence_id},
+        },
+    };
+    const evidence = [_]ir.Evidence{.{
+        .id = evidence_id,
+        .kind = .structural_derivation,
+        .locator = "fixture:post-proof-irreducible-fixpoint",
+    }};
+    const terms = [_]ir.SolverTerm{
+        .{ .id = ir.SolverTermId.fromIndex(0), .sort = .{ .kind = .dynamic_value }, .operation = .{ .value = closure_value } },
+        .{ .id = ir.SolverTermId.fromIndex(1), .sort = .{ .kind = .boolean }, .operation = .{ .binary = .{
+            .operator = .equal,
+            .left = ir.SolverTermId.fromIndex(0),
+            .right = ir.SolverTermId.fromIndex(0),
+        } } },
+    };
+    const queries = [_]ir.SolverQuery{.{
+        .id = ir.QueryId.fromIndex(0),
+        .kind = .prove_true,
+        .goal = ir.SolverTermId.fromIndex(1),
+    }};
+    const claims = [_]ir.Claim{.{
+        .id = ir.ClaimId.fromIndex(0),
+        .subject = .{ .program = {} },
+        .predicate = ir.SolverTermId.fromIndex(1),
+        .status = .unproven,
+        .required_for_emission = true,
+        .evidence = &.{evidence_id},
+        .query = ir.QueryId.fromIndex(0),
+    }};
+    const program: ir.Program = .{
+        .program_id = "post-proof-irreducible-fixpoint",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+        .captures = &captures,
+        .evidence = &evidence,
+        .solver_terms = &terms,
+        .queries = &queries,
+        .claims = &claims,
+    };
+
+    var resolved = try resolveAlloc(std.testing.allocator, &program, solver_backend.internalFacts());
+    defer resolved.deinit();
+    try std.testing.expectEqual(@as(usize, 7), resolved.program.blocks.len);
+    try std.testing.expectEqual(@as(usize, 3), resolved.program.edge_rewrites.len);
+    try std.testing.expectEqual(ir.EdgeRewriteRule.node_split, resolved.program.edge_rewrites[0].rule);
+    try std.testing.expectEqual(ir.EdgeRewriteRule.proved_branch, resolved.program.edge_rewrites[1].rule);
+    try std.testing.expectEqual(ir.EdgeRewriteRule.node_split, resolved.program.edge_rewrites[2].rule);
+    try std.testing.expect(resolved.program.certificates.len != 0);
+    var combined_certificates: usize = 0;
+    for (resolved.program.certificates) |certificate| {
+        try std.testing.expect(proof_digest.isFrameworkDigest(certificate.certificate_digest.?));
+        if (std.mem.startsWith(u8, certificate.certificate_digest.?, proof_digest.combined_runtime_prefix)) {
+            combined_certificates += 1;
+        }
+    }
+    try std.testing.expect(combined_certificates != 0);
+
+    var report = try @import("validate.zig").validate(std.testing.allocator, &resolved.program, .core);
+    defer report.deinit();
+    try std.testing.expect(report.isClean());
+    var graph = try @import("cfg.zig").Analysis.init(std.testing.allocator, &resolved.program, resolved.program.functions[0]);
+    defer graph.deinit();
+    var regions = try @import("irreducible_region.zig").analyze(std.testing.allocator, &graph);
+    defer regions.deinit();
+    try std.testing.expectEqual(@as(usize, 0), regions.regions.len);
+
+    var reresolved = try resolveAlloc(std.testing.allocator, &resolved.program, solver_backend.internalFacts());
+    defer reresolved.deinit();
+    const codec = @import("codec.zig");
+    const first_encoded = try codec.encodeAlloc(std.testing.allocator, &resolved.program);
+    defer std.testing.allocator.free(first_encoded);
+    const second_encoded = try codec.encodeAlloc(std.testing.allocator, &reresolved.program);
+    defer std.testing.allocator.free(second_encoded);
+    try std.testing.expectEqualStrings(first_encoded, second_encoded);
+
+    var parsed = try codec.parse(std.testing.allocator, first_encoded);
+    defer parsed.deinit();
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        parsed.value.certificates[0].certificate_digest.?,
+        proof_digest.combined_runtime_prefix,
+    ));
+
+    const stale_certificates = try std.testing.allocator.dupe(ir.SolverCertificate, parsed.value.certificates);
+    defer std.testing.allocator.free(stale_certificates);
+    stale_certificates[0].certificate_digest = proof_digest.lexical_binding_prefix ++ "0000000000000000000000000000000000000000000000000000000000000000";
+    var stale_program = parsed.value;
+    stale_program.certificates = stale_certificates;
+    var stale_report = try @import("validate.zig").validate(std.testing.allocator, &stale_program, .core);
+    defer stale_report.deinit();
+    try std.testing.expect(stale_report.contains(.certificate_digest_mismatch));
+
+    var transport_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer transport_arena.deinit();
+    const transport_allocator = transport_arena.allocator();
+    const imported_certificates = try transport_allocator.dupe(ir.SolverCertificate, parsed.value.certificates);
+    imported_certificates[0].engine = .imported;
+    var imported_program = parsed.value;
+    imported_program.certificates = imported_certificates;
+    var imported_model: []const ir.SolverModelBinding = &.{};
+    if (imported_certificates[0].model) |model_id| {
+        imported_model = imported_program.solver_models[model_id.index()].bindings;
+    }
+    var imported_core: []const ir.ConstraintId = &.{};
+    if (imported_certificates[0].unsat_core) |core_id| {
+        imported_core = imported_program.unsat_cores[core_id.index()].constraints;
+    }
+    const imported_digest = try proof_digest.computeAlloc(
+        transport_allocator,
+        &imported_program,
+        imported_program.queries[imported_certificates[0].query.index()],
+        .imported,
+        imported_certificates[0].resolution,
+        imported_certificates[0].evidence,
+        imported_model,
+        imported_core,
+    );
+    imported_certificates[0].certificate_digest = imported_digest;
+    const imported_instructions = try transport_allocator.dupe(ir.Instruction, imported_program.instructions);
+    imported_instructions[closure_id.index()].operation.make_closure.bindings = &.{.{ .value = entry_zero }};
+    imported_program.instructions = imported_instructions;
+    try refreshDependencyDigests(transport_allocator, &imported_program, imported_certificates);
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        imported_digest,
+        imported_certificates[0].certificate_digest.?,
+    ));
+}
+
+test "internal proof orchestration resolves required claims deterministically" {
+    const fixtures = @import("fixtures.zig");
+    const fixture = fixtures.arithmetic_module;
+    const terms = [_]ir.SolverTerm{.{
+        .id = ir.SolverTermId.fromIndex(0),
+        .sort = .{ .kind = .boolean },
+        .operation = .{ .boolean_literal = true },
+    }};
+    const queries = [_]ir.SolverQuery{.{
+        .id = ir.QueryId.fromIndex(0),
+        .kind = .prove_true,
+        .goal = ir.SolverTermId.fromIndex(0),
+    }};
+    const claims = [_]ir.Claim{
+        .{
+            .id = ir.ClaimId.fromIndex(0),
+            .subject = .{ .program = {} },
+            .predicate = ir.SolverTermId.fromIndex(0),
+            .status = .unproven,
+            .required_for_emission = true,
+            .evidence = &.{fixture.proof},
+            .query = ir.QueryId.fromIndex(0),
+        },
+        .{
+            .id = ir.ClaimId.fromIndex(1),
+            .subject = .{ .function = fixture.f_add },
+            .predicate = ir.SolverTermId.fromIndex(0),
+            .status = .unproven,
+            .required_for_emission = true,
+            .evidence = &.{fixture.proof},
+            .query = ir.QueryId.fromIndex(0),
+        },
+    };
+    const obligations = [_]ir.Obligation{.{
+        .id = ir.ObligationId.fromIndex(0),
+        .kind = .numeric_domain,
+        .subject = .{ .program = {} },
+        .status = .open,
+        .blocks_profile = .readable_luau,
+        .detail = "shared query must discharge this obligation",
+        .requirement = ir.ObligationRequirement.fromQuery(queries[0]),
+        .query = ir.QueryId.fromIndex(0),
+    }};
+    var program = fixture.program;
+    program.solver_terms = &terms;
+    program.queries = &queries;
+    program.claims = &claims;
+    program.obligations = &obligations;
+
+    var resolved = try resolveAlloc(std.testing.allocator, &program, solver_backend.internalFacts());
+    defer resolved.deinit();
+    try std.testing.expectEqual(ir.ClaimStatus.proved, resolved.program.claims[0].status);
+    try std.testing.expectEqual(ir.ClaimStatus.proved, resolved.program.claims[1].status);
+    try std.testing.expectEqual(ir.ObligationStatus.discharged, resolved.program.obligations[0].status);
+    try std.testing.expectEqual(resolved.program.claims[0].certificate, resolved.program.claims[1].certificate);
+    try std.testing.expectEqual(resolved.program.claims[0].certificate, resolved.program.obligations[0].certificate);
+    try std.testing.expectEqual(@as(usize, 1), resolved.program.certificates.len);
+    try std.testing.expectEqual(@as(usize, 1), resolved.program.unsat_cores.len);
+    try std.testing.expect(proof_digest.isFrameworkDigest(resolved.program.certificates[0].certificate_digest.?));
+
+    var resolved_again = try resolveAlloc(std.testing.allocator, &program, solver_backend.internalFacts());
+    defer resolved_again.deinit();
+    try std.testing.expectEqualStrings(
+        resolved.program.certificates[0].certificate_digest.?,
+        resolved_again.program.certificates[0].certificate_digest.?,
+    );
+
+    var valid_report = try @import("validate.zig").validate(std.testing.allocator, &resolved.program, .readable_luau);
+    defer valid_report.deinit();
+    try std.testing.expect(valid_report.isClean());
+
+    var tampered = resolved.program;
+    tampered.program_id = "different-program-identity";
+    var tampered_report = try @import("validate.zig").validate(std.testing.allocator, &tampered, .core);
+    defer tampered_report.deinit();
+    try std.testing.expect(tampered_report.contains(.certificate_digest_mismatch));
+
+    var changed_evidence = fixture.evidence;
+    changed_evidence[fixture.proof.index()].locator = "fixture:changed-provenance";
+    tampered = resolved.program;
+    tampered.evidence = &changed_evidence;
+    var provenance_report = try @import("validate.zig").validate(std.testing.allocator, &tampered, .core);
+    defer provenance_report.deinit();
+    try std.testing.expect(provenance_report.contains(.certificate_digest_mismatch));
+}
+
+test "external binding certificates survive persisted replay and reject remapping" {
+    const fixture = @import("fixtures.zig").arithmetic_module;
+    const capture_first = ir.CaptureId.fromIndex(0);
+    const capture_second = ir.CaptureId.fromIndex(1);
+    const captured_first = ir.ValueId.fromIndex(fixture.values.len);
+    const captured_second = ir.ValueId.fromIndex(fixture.values.len + 1);
+    const binding_first = ir.ExternalBindingId.fromIndex(0);
+    const binding_second = ir.ExternalBindingId.fromIndex(1);
+    const values = fixture.values ++ [_]ir.Value{
+        .{ .id = captured_first, .function = fixture.f_entry, .type = .integer, .origin = .{ .capture = capture_first } },
+        .{ .id = captured_second, .function = fixture.f_entry, .type = .integer, .origin = .{ .capture = capture_second } },
+    };
+    const captures = [_]ir.Capture{
+        .{ .id = capture_first, .function = fixture.f_entry, .kind = .{ .immutable_value = captured_first }, .evidence = &.{fixture.proof} },
+        .{ .id = capture_second, .function = fixture.f_entry, .kind = .{ .immutable_value = captured_second }, .evidence = &.{fixture.proof} },
+    };
+    const capture_ids = [_]ir.CaptureId{ capture_first, capture_second };
+    var functions = fixture.functions;
+    functions[fixture.f_entry.index()].captures = &capture_ids;
+    const external_bindings = [_]ir.ExternalBinding{
+        .{ .id = binding_first, .kind = .immutable_value, .type = .integer, .evidence = &.{fixture.proof} },
+        .{ .id = binding_second, .kind = .immutable_value, .type = .integer, .evidence = &.{fixture.proof} },
+    };
+    const entry_bindings = [_]ir.ExternalBindingId{ binding_first, binding_second };
+    const terms = [_]ir.SolverTerm{.{
+        .id = ir.SolverTermId.fromIndex(0),
+        .sort = .{ .kind = .boolean },
+        .operation = .{ .boolean_literal = true },
+    }};
+    const queries = [_]ir.SolverQuery{.{
+        .id = ir.QueryId.fromIndex(0),
+        .kind = .prove_true,
+        .goal = ir.SolverTermId.fromIndex(0),
+    }};
+    const claims = [_]ir.Claim{.{
+        .id = ir.ClaimId.fromIndex(0),
+        .subject = .{ .program = {} },
+        .predicate = ir.SolverTermId.fromIndex(0),
+        .status = .unproven,
+        .required_for_emission = true,
+        .evidence = &.{fixture.proof},
+        .query = ir.QueryId.fromIndex(0),
+    }};
+    var program = fixture.program;
+    program.entry_bindings = &entry_bindings;
+    program.external_bindings = &external_bindings;
+    program.functions = &functions;
+    program.values = &values;
+    program.captures = &captures;
+    program.solver_terms = &terms;
+    program.queries = &queries;
+    program.claims = &claims;
+
+    var resolved = try resolveAlloc(std.testing.allocator, &program, solver_backend.internalFacts());
+    defer resolved.deinit();
+    try std.testing.expectEqual(@as(usize, 1), resolved.program.certificates.len);
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        resolved.program.certificates[0].certificate_digest.?,
+        proof_digest.lexical_binding_prefix,
+    ));
+
+    const codec = @import("codec.zig");
+    const encoded = try codec.encodeAlloc(std.testing.allocator, &resolved.program);
+    defer std.testing.allocator.free(encoded);
+    var parsed = try codec.parse(std.testing.allocator, encoded);
+    defer parsed.deinit();
+
+    var replay_report = try @import("validate.zig").validate(std.testing.allocator, &parsed.value, .core);
+    defer replay_report.deinit();
+    try std.testing.expect(replay_report.isClean());
+
+    const stale_certificates = try std.testing.allocator.dupe(ir.SolverCertificate, parsed.value.certificates);
+    defer std.testing.allocator.free(stale_certificates);
+    stale_certificates[0].certificate_digest = proof_digest.external_binding_prefix ++ "0000000000000000000000000000000000000000000000000000000000000000";
+    var stale_program = parsed.value;
+    stale_program.certificates = stale_certificates;
+    var stale_report = try @import("validate.zig").validate(std.testing.allocator, &stale_program, .core);
+    defer stale_report.deinit();
+    try std.testing.expect(stale_report.contains(.certificate_digest_mismatch));
+
+    var replayed = try resolveAlloc(std.testing.allocator, &parsed.value, solver_backend.internalFacts());
+    defer replayed.deinit();
+    const replayed_encoded = try codec.encodeAlloc(std.testing.allocator, &replayed.program);
+    defer std.testing.allocator.free(replayed_encoded);
+    try std.testing.expectEqualStrings(encoded, replayed_encoded);
+
+    const swapped_entry_bindings = [_]ir.ExternalBindingId{ binding_second, binding_first };
+    var tampered = parsed.value;
+    tampered.entry_bindings = &swapped_entry_bindings;
+    var tampered_report = try @import("validate.zig").validate(std.testing.allocator, &tampered, .core);
+    defer tampered_report.deinit();
+    try std.testing.expect(tampered_report.contains(.certificate_digest_mismatch));
+
+    const imported_certificates = try std.testing.allocator.dupe(ir.SolverCertificate, parsed.value.certificates);
+    defer std.testing.allocator.free(imported_certificates);
+    defer for (imported_certificates[1..], 1..) |certificate, index| {
+        const refreshed = certificate.certificate_digest orelse continue;
+        const unchanged = if (parsed.value.certificates[index].certificate_digest) |original|
+            refreshed.ptr == original.ptr
+        else
+            false;
+        if (!unchanged) std.testing.allocator.free(@constCast(refreshed));
+    };
+    imported_certificates[0].engine = .imported;
+    var model: []const ir.SolverModelBinding = &.{};
+    if (imported_certificates[0].model) |model_id| model = parsed.value.solver_models[model_id.index()].bindings;
+    var unsat_core: []const ir.ConstraintId = &.{};
+    if (imported_certificates[0].unsat_core) |core_id| unsat_core = parsed.value.unsat_cores[core_id.index()].constraints;
+    var imported_program = parsed.value;
+    imported_program.certificates = imported_certificates;
+    const imported_digest = try proof_digest.computeAlloc(
+        std.testing.allocator,
+        &imported_program,
+        parsed.value.queries[imported_certificates[0].query.index()],
+        .imported,
+        imported_certificates[0].resolution,
+        imported_certificates[0].evidence,
+        model,
+        unsat_core,
+    );
+    defer std.testing.allocator.free(imported_digest);
+    imported_certificates[0].certificate_digest = imported_digest;
+    imported_program.entry_bindings = &swapped_entry_bindings;
+    try refreshDependencyDigests(std.testing.allocator, &imported_program, imported_certificates);
+    const transported_digest = imported_certificates[0].certificate_digest.?;
+    defer std.testing.allocator.free(transported_digest);
+    try std.testing.expect(!std.mem.eql(u8, imported_digest, transported_digest));
+
+    imported_certificates[0].certificate_digest = "fixture:opaque-imported-proof";
+    try refreshDependencyDigests(std.testing.allocator, &imported_program, imported_certificates);
+    try std.testing.expectEqualStrings("fixture:opaque-imported-proof", imported_certificates[0].certificate_digest.?);
+}
+
+test "lexical capture certificates survive replay and reject source remapping" {
+    const fixture = @import("fixtures.zig").immutable_closure_module;
+    const alternate = ir.ValueId.fromIndex(fixture.values.len);
+    const values = fixture.values ++ [_]ir.Value{.{
+        .id = alternate,
+        .function = fixture.f_factory,
+        .type = .integer,
+        .origin = .{ .parameter = 1 },
+    }};
+    var functions = fixture.functions;
+    functions[fixture.f_factory.index()].parameters = &.{ fixture.v_base, alternate };
+    var instructions = fixture.instructions;
+    instructions[fixture.i_add.index()].claims = &.{ir.ClaimId.fromIndex(2)};
+    const terms = [_]ir.SolverTerm{
+        .{ .id = ir.SolverTermId.fromIndex(0), .sort = .{ .kind = .integer }, .operation = .{ .value = fixture.v_captured_base } },
+        .{ .id = ir.SolverTermId.fromIndex(1), .sort = .{ .kind = .boolean }, .operation = .{ .binary = .{
+            .operator = .equal,
+            .left = ir.SolverTermId.fromIndex(0),
+            .right = ir.SolverTermId.fromIndex(0),
+        } } },
+        .{ .id = ir.SolverTermId.fromIndex(2), .sort = .{ .kind = .boolean }, .operation = .{ .boolean_literal = true } },
+        .{ .id = ir.SolverTermId.fromIndex(3), .sort = .{ .kind = .boolean }, .operation = .{ .semantic_atom = .{
+            .primitive_operator_domain = fixture.i_add,
+        } } },
+    };
+    const constraints = [_]ir.Constraint{.{
+        .id = ir.ConstraintId.fromIndex(0),
+        .predicate = ir.SolverTermId.fromIndex(3),
+        .evidence = &.{fixture.proof},
+    }};
+    const queries = [_]ir.SolverQuery{
+        .{ .id = ir.QueryId.fromIndex(0), .kind = .prove_true, .goal = ir.SolverTermId.fromIndex(1) },
+        .{ .id = ir.QueryId.fromIndex(1), .kind = .prove_true, .goal = ir.SolverTermId.fromIndex(2) },
+        .{
+            .id = ir.QueryId.fromIndex(2),
+            .kind = .prove_true,
+            .assumptions = &.{ir.ConstraintId.fromIndex(0)},
+            .goal = ir.SolverTermId.fromIndex(3),
+        },
+    };
+    const claims = [_]ir.Claim{
+        .{
+            .id = ir.ClaimId.fromIndex(0),
+            .subject = .{ .function = fixture.f_adder },
+            .predicate = ir.SolverTermId.fromIndex(1),
+            .status = .unproven,
+            .required_for_emission = true,
+            .evidence = &.{fixture.proof},
+            .query = ir.QueryId.fromIndex(0),
+        },
+        .{
+            .id = ir.ClaimId.fromIndex(1),
+            .subject = .{ .program = {} },
+            .predicate = ir.SolverTermId.fromIndex(2),
+            .status = .unproven,
+            .required_for_emission = true,
+            .evidence = &.{fixture.proof},
+            .query = ir.QueryId.fromIndex(1),
+        },
+        .{
+            .id = ir.ClaimId.fromIndex(2),
+            .subject = .{ .instruction = fixture.i_add },
+            .predicate = ir.SolverTermId.fromIndex(3),
+            .purpose = .{ .primitive_operator_domain = .pure },
+            .status = .unproven,
+            .required_for_emission = true,
+            .evidence = &.{fixture.proof},
+            .query = ir.QueryId.fromIndex(2),
+        },
+    };
+    var program = fixture.program;
+    program.functions = &functions;
+    program.instructions = &instructions;
+    program.values = &values;
+    program.solver_terms = &terms;
+    program.constraints = &constraints;
+    program.queries = &queries;
+    program.claims = &claims;
+
+    var resolved = try resolveAlloc(std.testing.allocator, &program, solver_backend.internalFacts());
+    defer resolved.deinit();
+    try std.testing.expectEqual(@as(usize, 3), resolved.program.certificates.len);
+    try std.testing.expectEqual(@as(usize, 1), resolved.solve_report.diagnostics.items.len);
+    const replay_diagnostic = resolved.solve_report.diagnostics.items[0];
+    try std.testing.expectEqual(diagnostics.Code.solver_unknown, replay_diagnostic.code);
+    try std.testing.expectEqual(@as(?u32, 2), replay_diagnostic.entity_index);
+    try std.testing.expectEqual(
+        diagnostics.SolverUnknownPhase.unsat_core_replay,
+        replay_diagnostic.detail.solver_unknown.phase,
+    );
+    try std.testing.expectEqual(
+        solver_backend.UnknownReason.bounded_internal_incompleteness,
+        replay_diagnostic.detail.solver_unknown.reason,
+    );
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        resolved.program.certificates[0].certificate_digest.?,
+        proof_digest.lexical_binding_prefix,
+    ));
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        resolved.program.certificates[1].certificate_digest.?,
+        proof_digest.prefix,
+    ));
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        resolved.program.certificates[2].certificate_digest.?,
+        proof_digest.lexical_binding_prefix,
+    ));
+
+    const codec = @import("codec.zig");
+    const encoded = try codec.encodeAlloc(std.testing.allocator, &resolved.program);
+    defer std.testing.allocator.free(encoded);
+    var parsed = try codec.parse(std.testing.allocator, encoded);
+    defer parsed.deinit();
+    var replay_report = try @import("validate.zig").validate(std.testing.allocator, &parsed.value, .core);
+    defer replay_report.deinit();
+    try std.testing.expect(replay_report.isClean());
+
+    const stale_certificates = try std.testing.allocator.dupe(ir.SolverCertificate, parsed.value.certificates);
+    defer std.testing.allocator.free(stale_certificates);
+    stale_certificates[1].certificate_digest = proof_digest.lexical_binding_prefix ++ "0000000000000000000000000000000000000000000000000000000000000000";
+    var stale = parsed.value;
+    stale.certificates = stale_certificates;
+    var stale_report = try @import("validate.zig").validate(std.testing.allocator, &stale, .core);
+    defer stale_report.deinit();
+    try std.testing.expect(stale_report.contains(.certificate_digest_mismatch));
+
+    const tampered_values = try std.testing.allocator.dupe(ir.Value, parsed.value.values);
+    defer std.testing.allocator.free(tampered_values);
+    tampered_values[fixture.v_captured_base.index()].type = .dynamic;
+    var stale_semantic = parsed.value;
+    stale_semantic.values = tampered_values;
+    var stale_semantic_report = try @import("validate.zig").validate(std.testing.allocator, &stale_semantic, .core);
+    defer stale_semantic_report.deinit();
+    var rejected_semantic_certificate = false;
+    for (stale_semantic_report.diagnostics.items) |diagnostic| {
+        if (diagnostic.code == .certificate_digest_mismatch and diagnostic.entity_index == 2) {
+            rejected_semantic_certificate = true;
+        }
+    }
+    try std.testing.expect(rejected_semantic_certificate);
+
+    var replayed = try resolveAlloc(std.testing.allocator, &parsed.value, solver_backend.internalFacts());
+    defer replayed.deinit();
+    const replayed_encoded = try codec.encodeAlloc(std.testing.allocator, &replayed.program);
+    defer std.testing.allocator.free(replayed_encoded);
+    try std.testing.expectEqualStrings(encoded, replayed_encoded);
+
+    const tampered_instructions = try std.testing.allocator.dupe(ir.Instruction, parsed.value.instructions);
+    defer std.testing.allocator.free(tampered_instructions);
+    tampered_instructions[fixture.i_make_adder.index()].operation.make_closure.bindings = &.{.{ .value = alternate }};
+    var tampered = parsed.value;
+    tampered.instructions = tampered_instructions;
+    var tampered_report = try @import("validate.zig").validate(std.testing.allocator, &tampered, .core);
+    defer tampered_report.deinit();
+    try std.testing.expect(tampered_report.contains(.certificate_digest_mismatch));
+}
