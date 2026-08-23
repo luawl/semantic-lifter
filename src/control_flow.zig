@@ -663,6 +663,171 @@ test "proof rewriting preserves node split source and clone witnesses" {
     try std.testing.expectEqual(std.meta.Tag(ir.Terminator).branch, std.meta.activeTag(program.blocks[clone.index()].terminator));
 }
 
+test "authenticated branch decisions may close a split witness block" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry_id = ir.BlockId.fromIndex(0);
+    const witness_id = ir.BlockId.fromIndex(1);
+    const clone_id = ir.BlockId.fromIndex(2);
+    const exit_id = ir.BlockId.fromIndex(3);
+    const condition_id = ir.ValueId.fromIndex(0);
+    const evidence_id = ir.EvidenceId.fromIndex(0);
+    const query_id = ir.QueryId.fromIndex(0);
+    const certificate_id = ir.CertificateId.fromIndex(0);
+    const branch: ir.Branch = .{
+        .condition = condition_id,
+        .then_edge = .{ .target = exit_id },
+        .else_edge = .{ .target = clone_id },
+    };
+    const blocks = [_]ir.Block{
+        .{ .id = entry_id, .function = function_id, .terminator = .{ .jump = .{ .target = witness_id } } },
+        .{ .id = witness_id, .function = function_id, .terminator = .{ .branch = branch } },
+        .{ .id = clone_id, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = exit_id, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const function: ir.Function = .{
+        .id = function_id,
+        .parameters = &.{condition_id},
+        .blocks = &.{ entry_id, witness_id, clone_id, exit_id },
+        .entry_block = entry_id,
+    };
+    const values = [_]ir.Value{.{
+        .id = condition_id,
+        .function = function_id,
+        .type = .boolean,
+        .origin = .{ .parameter = 0 },
+    }};
+    const evidence = [_]ir.Evidence{.{
+        .id = evidence_id,
+        .kind = .frontend_proof,
+        .locator = "fixture:authenticated-branch-witness",
+    }};
+    const terms = [_]ir.SolverTerm{.{
+        .id = ir.SolverTermId.fromIndex(0),
+        .sort = .{ .kind = .boolean },
+        .operation = .{ .value = condition_id },
+    }};
+    const queries = [_]ir.SolverQuery{.{
+        .id = query_id,
+        .kind = .prove_true,
+        .goal = ir.SolverTermId.fromIndex(0),
+    }};
+    const certificates = [_]ir.SolverCertificate{.{
+        .id = certificate_id,
+        .query = query_id,
+        .engine = .internal_facts,
+        .resolution = .proved,
+        .evidence = &.{evidence_id},
+        .certificate_digest = proof_digest.control_branch_prefix ++ "fixture",
+    }};
+    const obligations = [_]ir.Obligation{.{
+        .id = ir.ObligationId.fromIndex(0),
+        .kind = .control_structure,
+        .subject = .{ .control_branch = .{ .block = witness_id, .branch = branch } },
+        .status = .discharged,
+        .blocks_profile = .readable_luau,
+        .detail = "authenticated branch witness",
+        .evidence = &.{evidence_id},
+        .requirement = ir.ObligationRequirement.fromQuery(queries[0]),
+        .query = query_id,
+        .certificate = certificate_id,
+    }};
+    const rewrites = [_]ir.CfgEdgeRewrite{.{
+        .id = ir.EdgeRewriteId.fromIndex(0),
+        .source = entry_id,
+        .kind = .jump,
+        .from = .{ .target = witness_id },
+        .to = .{ .target = clone_id },
+        .rule = .node_split,
+        .node_split_group = ir.NodeSplitGroupId.fromIndex(0),
+    }};
+    var program: ir.Program = .{
+        .program_id = "authenticated-branch-witness",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+        .evidence = &evidence,
+        .solver_terms = &terms,
+        .queries = &queries,
+        .certificates = &certificates,
+        .edge_rewrites = &rewrites,
+        .obligations = &obligations,
+    };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const result = try applyProvedBranches(arena.allocator(), &program);
+    try std.testing.expectEqual(@as(usize, 1), result.rewritten_blocks);
+    try std.testing.expectEqual(exit_id, program.blocks[witness_id.index()].terminator.jump.target);
+    try std.testing.expectEqual(@as(usize, 1), program.edge_rewrites.len);
+    try std.testing.expectEqual(ir.EdgeRewriteRule.node_split, program.edge_rewrites[0].rule);
+}
+
+test "proved values do not rewrite unreachable branches" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry_id = ir.BlockId.fromIndex(0);
+    const dead_branch_id = ir.BlockId.fromIndex(1);
+    const dead_then_id = ir.BlockId.fromIndex(2);
+    const dead_else_id = ir.BlockId.fromIndex(3);
+    const condition_id = ir.ValueId.fromIndex(0);
+    const blocks = [_]ir.Block{
+        .{ .id = entry_id, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = dead_branch_id, .function = function_id, .terminator = .{ .branch = .{
+            .condition = condition_id,
+            .then_edge = .{ .target = dead_then_id },
+            .else_edge = .{ .target = dead_else_id },
+        } } },
+        .{ .id = dead_then_id, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = dead_else_id, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const function: ir.Function = .{
+        .id = function_id,
+        .parameters = &.{condition_id},
+        .entry_block = entry_id,
+        .blocks = &.{ entry_id, dead_branch_id, dead_then_id, dead_else_id },
+    };
+    const values = [_]ir.Value{.{
+        .id = condition_id,
+        .function = function_id,
+        .type = .boolean,
+        .origin = .{ .parameter = 0 },
+    }};
+    const terms = [_]ir.SolverTerm{.{
+        .id = ir.SolverTermId.fromIndex(0),
+        .sort = .{ .kind = .boolean },
+        .operation = .{ .value = condition_id },
+    }};
+    const queries = [_]ir.SolverQuery{.{
+        .id = ir.QueryId.fromIndex(0),
+        .kind = .prove_true,
+        .goal = ir.SolverTermId.fromIndex(0),
+    }};
+    const certificates = [_]ir.SolverCertificate{.{
+        .id = ir.CertificateId.fromIndex(0),
+        .query = ir.QueryId.fromIndex(0),
+        .engine = .internal_facts,
+        .resolution = .proved,
+    }};
+    var program: ir.Program = .{
+        .program_id = "unreachable-proved-branch",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+        .solver_terms = &terms,
+        .queries = &queries,
+        .certificates = &certificates,
+    };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const result = try applyProvedBranches(arena.allocator(), &program);
+    try std.testing.expectEqual(@as(usize, 0), result.rewritten_blocks);
+    try std.testing.expectEqual(std.meta.Tag(ir.Terminator).branch, std.meta.activeTag(program.blocks[dead_branch_id.index()].terminator));
+}
+
 fn dispatcherInstructionsAreDroppable(
     allocator: std.mem.Allocator,
     program: *const ir.Program,
@@ -921,4 +1086,781 @@ fn evidenceCovers(available: []const ir.EvidenceId, required: []const ir.Evidenc
         } else return false;
     }
     return true;
+}
+
+test "proved Boolean value queries cannot select a global CFG edge without a control witness" {
+    const fixture = @import("fixtures.zig").absolute_value_module;
+    var instructions = fixture.instructions;
+    instructions[fixture.i_is_negative.index()].operation = .{ .constant = .{ .boolean = true } };
+    const terms = [_]ir.SolverTerm{
+        .{
+            .id = ir.SolverTermId.fromIndex(0),
+            .sort = .{ .kind = .boolean },
+            .operation = .{ .boolean_literal = true },
+        },
+        .{
+            .id = ir.SolverTermId.fromIndex(1),
+            .sort = .{ .kind = .boolean },
+            .operation = .{ .value_definition = .{
+                .value = fixture.v_is_negative,
+                .expression = ir.SolverTermId.fromIndex(0),
+            } },
+        },
+    };
+    const queries = [_]ir.SolverQuery{.{
+        .id = ir.QueryId.fromIndex(0),
+        .kind = .prove_true,
+        .goal = ir.SolverTermId.fromIndex(1),
+    }};
+    const certificates = [_]ir.SolverCertificate{.{
+        .id = ir.CertificateId.fromIndex(0),
+        .query = ir.QueryId.fromIndex(0),
+        .engine = .internal_facts,
+        .resolution = .proved,
+    }};
+    var program = fixture.program;
+    program.instructions = &instructions;
+    program.solver_terms = &terms;
+    program.queries = &queries;
+    program.certificates = &certificates;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const result = try applyProvedBranches(arena.allocator(), &program);
+    try std.testing.expectEqual(@as(usize, 0), result.rewritten_blocks);
+    try std.testing.expect(program.blocks[fixture.b_entry.index()].terminator == .branch);
+}
+
+test "proved dynamic truthiness queries cannot select global CFG edges without control witnesses" {
+    const fixture = @import("fixtures.zig").dynamic_truthiness_module;
+    const terms = [_]ir.SolverTerm{
+        .{ .id = ir.SolverTermId.fromIndex(0), .sort = .{ .kind = .dynamic_value }, .operation = .{ .value = fixture.v_truthy_condition } },
+        .{ .id = ir.SolverTermId.fromIndex(1), .sort = .{ .kind = .boolean }, .operation = .{ .dynamic_truthiness = ir.SolverTermId.fromIndex(0) } },
+        .{ .id = ir.SolverTermId.fromIndex(2), .sort = .{ .kind = .dynamic_value }, .operation = .{ .value = fixture.v_falsy_condition } },
+        .{ .id = ir.SolverTermId.fromIndex(3), .sort = .{ .kind = .boolean }, .operation = .{ .dynamic_truthiness = ir.SolverTermId.fromIndex(2) } },
+        .{ .id = ir.SolverTermId.fromIndex(4), .sort = .{ .kind = .boolean }, .operation = .{ .logical_not = ir.SolverTermId.fromIndex(3) } },
+    };
+    const queries = [_]ir.SolverQuery{
+        .{ .id = ir.QueryId.fromIndex(0), .kind = .prove_true, .goal = ir.SolverTermId.fromIndex(1) },
+        .{ .id = ir.QueryId.fromIndex(1), .kind = .prove_true, .goal = ir.SolverTermId.fromIndex(4) },
+    };
+    const certificates = [_]ir.SolverCertificate{
+        .{ .id = ir.CertificateId.fromIndex(0), .query = ir.QueryId.fromIndex(0), .engine = .internal_facts, .resolution = .proved },
+        .{ .id = ir.CertificateId.fromIndex(1), .query = ir.QueryId.fromIndex(1), .engine = .internal_facts, .resolution = .proved },
+    };
+    var program = fixture.program;
+    program.solver_terms = &terms;
+    program.queries = &queries;
+    program.certificates = &certificates;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const result = try applyProvedBranches(arena.allocator(), &program);
+    try std.testing.expectEqual(@as(usize, 0), result.rewritten_blocks);
+    try std.testing.expect(program.blocks[fixture.b_truthy_entry.index()].terminator == .branch);
+    try std.testing.expect(program.blocks[fixture.b_falsy_entry.index()].terminator == .branch);
+}
+
+test "scalar obligations preserve branch identity across shared proof work" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const first_id = ir.BlockId.fromIndex(0);
+    const bypass_id = ir.BlockId.fromIndex(1);
+    const second_id = ir.BlockId.fromIndex(2);
+    const then_id = ir.BlockId.fromIndex(3);
+    const else_id = ir.BlockId.fromIndex(4);
+    const effect_id = ir.InstructionId.fromIndex(0);
+    const first_condition = ir.ValueId.fromIndex(0);
+    const second_condition = ir.ValueId.fromIndex(1);
+    const first_evidence = ir.EvidenceId.fromIndex(0);
+    const second_evidence = ir.EvidenceId.fromIndex(1);
+    const query_id = ir.QueryId.fromIndex(0);
+    const certificate_id = ir.CertificateId.fromIndex(0);
+    const evidence = [_]ir.Evidence{
+        .{ .id = first_evidence, .kind = .dynamic_fixture, .locator = "fixture:scalar-first-branch" },
+        .{ .id = second_evidence, .kind = .dynamic_fixture, .locator = "fixture:scalar-second-branch" },
+    };
+    const values = [_]ir.Value{
+        .{
+            .id = first_condition,
+            .function = function_id,
+            .type = .string,
+            .origin = .{ .instruction_result = .{ .instruction = effect_id, .index = 0 } },
+        },
+        .{ .id = second_condition, .function = function_id, .type = .integer, .origin = .{ .parameter = 0 } },
+    };
+    const instructions = [_]ir.Instruction{.{
+        .id = effect_id,
+        .block = first_id,
+        .operation = .{ .environment_get = .{ .target = .{ .ambient = {} }, .name = "effectful_condition" } },
+        .results = &.{first_condition},
+        .effects = .semantic_environment_read,
+        .evidence = &.{first_evidence},
+    }};
+    const first_branch: ir.Branch = .{
+        .condition = first_condition,
+        .then_edge = .{ .target = second_id },
+        .else_edge = .{ .target = bypass_id },
+    };
+    const second_branch: ir.Branch = .{
+        .condition = second_condition,
+        .then_edge = .{ .target = then_id },
+        .else_edge = .{ .target = else_id },
+    };
+    const blocks = [_]ir.Block{
+        .{
+            .id = first_id,
+            .function = function_id,
+            .instructions = &.{effect_id},
+            .terminator = .{ .branch = first_branch },
+            .evidence = &.{first_evidence},
+        },
+        .{ .id = bypass_id, .function = function_id, .terminator = .{ .jump = .{ .target = second_id } } },
+        .{
+            .id = second_id,
+            .function = function_id,
+            .terminator = .{ .branch = second_branch },
+            .evidence = &.{second_evidence},
+        },
+        .{ .id = then_id, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = else_id, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .parameters = &.{second_condition},
+        .blocks = &.{ first_id, bypass_id, second_id, then_id, else_id },
+        .entry_block = first_id,
+        .evidence = &.{second_evidence},
+    }};
+    const terms = [_]ir.SolverTerm{.{
+        .id = ir.SolverTermId.fromIndex(0),
+        .sort = .{ .kind = .boolean },
+        .operation = .{ .boolean_literal = true },
+    }};
+    const queries = [_]ir.SolverQuery{.{ .id = query_id, .kind = .prove_true, .goal = ir.SolverTermId.fromIndex(0) }};
+    const certificates = [_]ir.SolverCertificate{.{
+        .id = certificate_id,
+        .query = query_id,
+        .engine = .internal_facts,
+        .resolution = .proved,
+        .evidence = &.{ first_evidence, second_evidence },
+        .certificate_digest = proof_digest.control_branch_prefix ++ "fixture",
+    }};
+    const obligations = [_]ir.Obligation{
+        .{
+            .id = ir.ObligationId.fromIndex(0),
+            .kind = .control_structure,
+            .subject = .{ .control_branch = .{ .block = first_id, .branch = first_branch } },
+            .status = .discharged,
+            .blocks_profile = .readable_luau,
+            .detail = "first scalar branch",
+            .evidence = &.{first_evidence},
+            .requirement = ir.ObligationRequirement.fromQuery(queries[0]),
+            .query = query_id,
+            .certificate = certificate_id,
+        },
+        .{
+            .id = ir.ObligationId.fromIndex(1),
+            .kind = .control_structure,
+            .subject = .{ .control_branch = .{ .block = second_id, .branch = second_branch } },
+            .status = .discharged,
+            .blocks_profile = .readable_luau,
+            .detail = "second scalar branch",
+            .evidence = &.{second_evidence},
+            .requirement = ir.ObligationRequirement.fromQuery(queries[0]),
+            .query = query_id,
+            .certificate = certificate_id,
+        },
+    };
+    const base: ir.Program = .{
+        .program_id = "shared-scalar-truthiness-proof",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+        .evidence = &evidence,
+        .solver_terms = &terms,
+        .queries = &queries,
+        .certificates = &certificates,
+        .obligations = &obligations,
+    };
+
+    {
+        var program = base;
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const result = try applyProvedBranches(arena.allocator(), &program);
+        try std.testing.expectEqual(@as(usize, 2), result.rewritten_blocks);
+        try std.testing.expectEqual(second_id, program.blocks[first_id.index()].terminator.jump.target);
+        try std.testing.expectEqual(then_id, program.blocks[second_id.index()].terminator.jump.target);
+        try std.testing.expectEqualSlices(ir.InstructionId, &.{effect_id}, program.blocks[first_id.index()].instructions);
+    }
+    {
+        var insufficient_certificates = certificates;
+        insufficient_certificates[0].evidence = &.{first_evidence};
+        var program = base;
+        program.certificates = &insufficient_certificates;
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const result = try applyProvedBranches(arena.allocator(), &program);
+        try std.testing.expectEqual(@as(usize, 1), result.rewritten_blocks);
+        try std.testing.expect(program.blocks[second_id.index()].terminator == .branch);
+    }
+    {
+        const constraints = [_]ir.Constraint{
+            .{
+                .id = ir.ConstraintId.fromIndex(0),
+                .predicate = ir.SolverTermId.fromIndex(0),
+                .evidence = &.{first_evidence},
+                .scope = .{ .edge = .{ .source = first_id, .kind = .branch_then, .target = second_id } },
+            },
+            .{
+                .id = ir.ConstraintId.fromIndex(1),
+                .predicate = ir.SolverTermId.fromIndex(0),
+                .evidence = &.{first_evidence},
+                .scope = .{ .edge = .{ .source = first_id, .kind = .branch_else, .target = bypass_id } },
+            },
+        };
+        var program = base;
+        program.constraints = &constraints;
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const result = try applyProvedBranches(arena.allocator(), &program);
+        try std.testing.expectEqual(@as(usize, 2), result.rewritten_blocks);
+        try std.testing.expectEqual(second_id, program.blocks[first_id.index()].terminator.jump.target);
+        try std.testing.expectEqual(second_id, edge_path.constraintEffectiveTarget(&program, constraints[0]).?);
+        try std.testing.expectEqual(bypass_id, edge_path.constraintEffectiveTarget(&program, constraints[1]).?);
+
+        var unwitnessed = program;
+        unwitnessed.obligations = &.{};
+        try std.testing.expect(edge_path.constraintEffectiveTarget(&unwitnessed, constraints[0]) == null);
+        try std.testing.expect(edge_path.constraintEffectiveTarget(&unwitnessed, constraints[1]) == null);
+    }
+    {
+        var mismatched_terms = terms;
+        mismatched_terms[0].operation.boolean_literal = false;
+        var program = base;
+        program.solver_terms = &mismatched_terms;
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const result = try applyProvedBranches(arena.allocator(), &program);
+        try std.testing.expectEqual(@as(usize, 0), result.rewritten_blocks);
+    }
+}
+
+test "proved edge fact bypasses a parameterized instruction-free dispatcher" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry_id = ir.BlockId.fromIndex(0);
+    const dispatch_id = ir.BlockId.fromIndex(1);
+    const true_id = ir.BlockId.fromIndex(2);
+    const false_id = ir.BlockId.fromIndex(3);
+    const input_id = ir.ValueId.fromIndex(0);
+    const condition_id = ir.ValueId.fromIndex(1);
+    const true_parameter = ir.ValueId.fromIndex(2);
+    const false_parameter = ir.ValueId.fromIndex(3);
+    const evidence_id = ir.EvidenceId.fromIndex(0);
+    const blocks = [_]ir.Block{
+        .{ .id = entry_id, .function = function_id, .terminator = .{ .jump = .{ .target = dispatch_id, .arguments = &.{input_id} } } },
+        .{ .id = dispatch_id, .function = function_id, .parameters = &.{condition_id}, .terminator = .{ .branch = .{
+            .condition = condition_id,
+            .then_edge = .{ .target = true_id, .arguments = &.{condition_id} },
+            .else_edge = .{ .target = false_id, .arguments = &.{condition_id} },
+        } } },
+        .{ .id = true_id, .function = function_id, .parameters = &.{true_parameter}, .terminator = .{ .return_values = &.{true_parameter} } },
+        .{ .id = false_id, .function = function_id, .parameters = &.{false_parameter}, .terminator = .{ .return_values = &.{false_parameter} } },
+    };
+    const values = [_]ir.Value{
+        .{ .id = input_id, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = condition_id, .function = function_id, .type = .boolean, .origin = .{ .block_parameter = .{ .block = dispatch_id, .index = 0 } } },
+        .{ .id = true_parameter, .function = function_id, .type = .boolean, .origin = .{ .block_parameter = .{ .block = true_id, .index = 0 } } },
+        .{ .id = false_parameter, .function = function_id, .type = .boolean, .origin = .{ .block_parameter = .{ .block = false_id, .index = 0 } } },
+    };
+    const terms = [_]ir.SolverTerm{.{
+        .id = ir.SolverTermId.fromIndex(0),
+        .sort = .{ .kind = .boolean },
+        .operation = .{ .value = condition_id },
+    }};
+    const constraints = [_]ir.Constraint{.{
+        .id = ir.ConstraintId.fromIndex(0),
+        .predicate = ir.SolverTermId.fromIndex(0),
+        .evidence = &.{evidence_id},
+        .scope = .{ .edge = .{ .source = entry_id, .kind = .jump, .target = dispatch_id } },
+    }};
+    const queries = [_]ir.SolverQuery{.{
+        .id = ir.QueryId.fromIndex(0),
+        .kind = .prove_true,
+        .assumptions = &.{ir.ConstraintId.fromIndex(0)},
+        .goal = ir.SolverTermId.fromIndex(0),
+    }};
+    const certificates = [_]ir.SolverCertificate{.{
+        .id = ir.CertificateId.fromIndex(0),
+        .query = ir.QueryId.fromIndex(0),
+        .engine = .internal_facts,
+        .resolution = .proved,
+    }};
+    const base_program: ir.Program = .{
+        .program_id = "edge-dispatch-bypass",
+        .entry_function = function_id,
+        .functions = &.{.{
+            .id = function_id,
+            .parameters = &.{input_id},
+            .entry_block = entry_id,
+            .blocks = &.{ entry_id, dispatch_id, true_id, false_id },
+        }},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+        .evidence = &.{.{ .id = evidence_id, .kind = .dynamic_fixture, .locator = "fixture:edge-dispatch-bypass" }},
+        .solver_terms = &terms,
+        .constraints = &constraints,
+        .queries = &queries,
+        .certificates = &certificates,
+    };
+
+    var program = base_program;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const result = try applyProvedBranches(arena.allocator(), &program);
+    try std.testing.expectEqual(@as(usize, 0), result.rewritten_blocks);
+    try std.testing.expectEqual(@as(usize, 1), result.specialized_edges);
+    try std.testing.expectEqual(true_id, program.blocks[entry_id.index()].terminator.jump.target);
+    try std.testing.expectEqualSlices(ir.ValueId, &.{input_id}, program.blocks[entry_id.index()].terminator.jump.arguments);
+
+    var escaping_blocks = blocks;
+    escaping_blocks[true_id.index()].terminator = .{ .return_values = &.{condition_id} };
+    var escaping = base_program;
+    escaping.blocks = &escaping_blocks;
+    const escaping_result = try applyProvedBranches(arena.allocator(), &escaping);
+    try std.testing.expectEqual(@as(usize, 0), escaping_result.specialized_edges);
+    try std.testing.expectEqual(dispatch_id, escaping.blocks[entry_id.index()].terminator.jump.target);
+}
+
+test "opposite proved facts in one edge context suppress specialization" {
+    const fixture = @import("fixtures.zig").relational_dispatch_module;
+    const t_condition = ir.SolverTermId.fromIndex(fixture.solver_terms.len);
+    const t_not_condition = ir.SolverTermId.fromIndex(fixture.solver_terms.len + 1);
+    const terms = fixture.solver_terms ++ [_]ir.SolverTerm{
+        .{ .id = t_condition, .sort = .{ .kind = .boolean }, .operation = .{ .value = fixture.v_condition } },
+        .{ .id = t_not_condition, .sort = .{ .kind = .boolean }, .operation = .{ .logical_not = t_condition } },
+    };
+    const queries = [_]ir.SolverQuery{
+        .{
+            .id = ir.QueryId.fromIndex(0),
+            .kind = .prove_true,
+            .assumptions = &.{fixture.c_left},
+            .goal = t_condition,
+        },
+        .{
+            .id = ir.QueryId.fromIndex(1),
+            .kind = .prove_true,
+            .assumptions = &.{fixture.c_left},
+            .goal = t_not_condition,
+        },
+    };
+    const certificates = [_]ir.SolverCertificate{
+        .{ .id = ir.CertificateId.fromIndex(0), .query = ir.QueryId.fromIndex(0), .engine = .internal_facts, .resolution = .proved },
+        .{ .id = ir.CertificateId.fromIndex(1), .query = ir.QueryId.fromIndex(1), .engine = .internal_facts, .resolution = .proved },
+    };
+    var program = fixture.program;
+    program.solver_terms = &terms;
+    program.queries = &queries;
+    program.certificates = &certificates;
+    const original_edge = program.blocks[fixture.b_left.index()].terminator.jump;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    for (0..2) |_| {
+        const result = try applyProvedBranches(arena.allocator(), &program);
+        try std.testing.expect(result.conflicting_certificate == null);
+        try std.testing.expectEqual(@as(usize, 0), result.specialized_edges);
+        try std.testing.expect(edge_path.sameEdge(original_edge, program.blocks[fixture.b_left.index()].terminator.jump));
+        try std.testing.expectEqual(@as(usize, 0), program.edge_rewrites.len);
+    }
+}
+
+test "proved relational edge fact drops only a local exact-pure dispatcher expression" {
+    const fixture = @import("fixtures.zig").relational_dispatch_module;
+    const t_condition = ir.SolverTermId.fromIndex(fixture.solver_terms.len);
+    const t_not_condition = ir.SolverTermId.fromIndex(fixture.solver_terms.len + 1);
+    const terms = fixture.solver_terms ++ [_]ir.SolverTerm{
+        .{ .id = t_condition, .sort = .{ .kind = .boolean }, .operation = .{ .value = fixture.v_condition } },
+        .{ .id = t_not_condition, .sort = .{ .kind = .boolean }, .operation = .{ .logical_not = t_condition } },
+    };
+    const queries = [_]ir.SolverQuery{
+        .{
+            .id = ir.QueryId.fromIndex(0),
+            .kind = .prove_true,
+            .assumptions = &.{fixture.c_left},
+            .goal = t_condition,
+        },
+        .{
+            .id = ir.QueryId.fromIndex(1),
+            .kind = .prove_true,
+            .assumptions = &.{fixture.c_right},
+            .goal = t_not_condition,
+        },
+    };
+    const certificates = [_]ir.SolverCertificate{
+        .{
+            .id = ir.CertificateId.fromIndex(0),
+            .query = ir.QueryId.fromIndex(0),
+            .engine = .internal_facts,
+            .resolution = .proved,
+        },
+        .{
+            .id = ir.CertificateId.fromIndex(1),
+            .query = ir.QueryId.fromIndex(1),
+            .engine = .internal_facts,
+            .resolution = .proved,
+        },
+    };
+    var base_program = fixture.program;
+    base_program.solver_terms = &terms;
+    base_program.queries = &queries;
+    base_program.certificates = &certificates;
+
+    {
+        var program = base_program;
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const result = try applyProvedBranches(arena.allocator(), &program);
+        try std.testing.expectEqual(@as(usize, 2), result.specialized_edges);
+        try std.testing.expectEqual(fixture.b_true, program.blocks[fixture.b_left.index()].terminator.jump.target);
+        try std.testing.expectEqual(fixture.b_false, program.blocks[fixture.b_right.index()].terminator.jump.target);
+    }
+    {
+        var escaping_blocks = fixture.blocks;
+        escaping_blocks[fixture.b_true.index()].terminator = .{ .return_values = &.{fixture.v_condition} };
+        var program = base_program;
+        program.blocks = &escaping_blocks;
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const result = try applyProvedBranches(arena.allocator(), &program);
+        try std.testing.expectEqual(@as(usize, 0), result.specialized_edges);
+        try std.testing.expectEqual(fixture.b_dispatch, program.blocks[fixture.b_left.index()].terminator.jump.target);
+        try std.testing.expectEqual(fixture.b_dispatch, program.blocks[fixture.b_right.index()].terminator.jump.target);
+    }
+    {
+        var throwing_instructions = fixture.instructions;
+        throwing_instructions[fixture.i_condition.index()].effects = .{ .precision = .exact, .may_throw = true };
+        var program = base_program;
+        program.instructions = &throwing_instructions;
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const result = try applyProvedBranches(arena.allocator(), &program);
+        try std.testing.expectEqual(@as(usize, 0), result.specialized_edges);
+        try std.testing.expectEqual(fixture.b_dispatch, program.blocks[fixture.b_left.index()].terminator.jump.target);
+        try std.testing.expectEqual(fixture.b_dispatch, program.blocks[fixture.b_right.index()].terminator.jump.target);
+    }
+}
+
+test "iteration forwarding retains an empty acyclic body arm" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry_id = ir.BlockId.fromIndex(0);
+    const header_id = ir.BlockId.fromIndex(1);
+    const body_id = ir.BlockId.fromIndex(2);
+    const exit_id = ir.BlockId.fromIndex(3);
+    const transition_id = ir.InstructionId.fromIndex(0);
+    const input_control = ir.ValueId.fromIndex(0);
+    const input_limit = ir.ValueId.fromIndex(1);
+    const input_step = ir.ValueId.fromIndex(2);
+    const input_initial = ir.ValueId.fromIndex(3);
+    const header_control = ir.ValueId.fromIndex(4);
+    const header_limit = ir.ValueId.fromIndex(5);
+    const header_step = ir.ValueId.fromIndex(6);
+    const header_initial = ir.ValueId.fromIndex(7);
+    const has_value = ir.ValueId.fromIndex(8);
+    const normalized_limit = ir.ValueId.fromIndex(9);
+    const normalized_step = ir.ValueId.fromIndex(10);
+    const index = ir.ValueId.fromIndex(11);
+    const body_index = ir.ValueId.fromIndex(12);
+    const evidence_id = ir.EvidenceId.fromIndex(0);
+    const blocks = [_]ir.Block{
+        .{ .id = entry_id, .function = function_id, .terminator = .{ .jump = .{
+            .target = header_id,
+            .arguments = &.{ input_control, input_limit, input_step, input_initial },
+        } } },
+        .{
+            .id = header_id,
+            .function = function_id,
+            .parameters = &.{ header_control, header_limit, header_step, header_initial },
+            .instructions = &.{transition_id},
+            .terminator = .{ .branch = .{
+                .condition = has_value,
+                .then_edge = .{ .target = body_id, .arguments = &.{index} },
+                .else_edge = .{ .target = exit_id },
+            } },
+        },
+        .{
+            .id = body_id,
+            .function = function_id,
+            .parameters = &.{body_index},
+            .terminator = .{ .jump = .{ .target = exit_id } },
+        },
+        .{ .id = exit_id, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const values = [_]ir.Value{
+        .{ .id = input_control, .function = function_id, .type = .number, .origin = .{ .parameter = 0 } },
+        .{ .id = input_limit, .function = function_id, .type = .number, .origin = .{ .parameter = 1 } },
+        .{ .id = input_step, .function = function_id, .type = .number, .origin = .{ .parameter = 2 } },
+        .{ .id = input_initial, .function = function_id, .type = .boolean, .origin = .{ .parameter = 3 } },
+        .{ .id = header_control, .function = function_id, .type = .number, .origin = .{ .block_parameter = .{ .block = header_id, .index = 0 } } },
+        .{ .id = header_limit, .function = function_id, .type = .number, .origin = .{ .block_parameter = .{ .block = header_id, .index = 1 } } },
+        .{ .id = header_step, .function = function_id, .type = .number, .origin = .{ .block_parameter = .{ .block = header_id, .index = 2 } } },
+        .{ .id = header_initial, .function = function_id, .type = .boolean, .origin = .{ .block_parameter = .{ .block = header_id, .index = 3 } } },
+        .{ .id = has_value, .function = function_id, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = transition_id, .index = 0 } } },
+        .{ .id = normalized_limit, .function = function_id, .type = .number, .origin = .{ .instruction_result = .{ .instruction = transition_id, .index = 1 } } },
+        .{ .id = normalized_step, .function = function_id, .type = .number, .origin = .{ .instruction_result = .{ .instruction = transition_id, .index = 2 } } },
+        .{ .id = index, .function = function_id, .type = .number, .origin = .{ .instruction_result = .{ .instruction = transition_id, .index = 3 } } },
+        .{ .id = body_index, .function = function_id, .type = .number, .origin = .{ .block_parameter = .{ .block = body_id, .index = 0 } } },
+    };
+    const instructions = [_]ir.Instruction{.{
+        .id = transition_id,
+        .block = header_id,
+        .operation = .{ .numeric_for_next = .{
+            .control = header_control,
+            .limit = header_limit,
+            .step = header_step,
+            .initial = header_initial,
+        } },
+        .results = &.{ has_value, normalized_limit, normalized_step, index },
+        .effects = .numeric_for_next,
+        .evidence = &.{evidence_id},
+    }};
+    const evidence = [_]ir.Evidence{.{
+        .id = evidence_id,
+        .kind = .frontend_proof,
+        .locator = "fixture:iteration-empty-body-arm",
+    }};
+    const terms = [_]ir.SolverTerm{.{
+        .id = ir.SolverTermId.fromIndex(0),
+        .sort = .{ .kind = .boolean },
+        .operation = .{ .value = has_value },
+    }};
+    const constraints = [_]ir.Constraint{.{
+        .id = ir.ConstraintId.fromIndex(0),
+        .predicate = ir.SolverTermId.fromIndex(0),
+        .evidence = &.{evidence_id},
+        .scope = .{ .edge = .{ .source = header_id, .kind = .branch_then, .target = body_id } },
+    }};
+    var program: ir.Program = .{
+        .program_id = "iteration-empty-body-arm",
+        .entry_function = function_id,
+        .functions = &.{.{
+            .id = function_id,
+            .parameters = &.{ input_control, input_limit, input_step, input_initial },
+            .blocks = &.{ entry_id, header_id, body_id, exit_id },
+            .entry_block = entry_id,
+        }},
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+        .evidence = &evidence,
+        .solver_terms = &terms,
+        .constraints = &constraints,
+    };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const result = try applyProvedBranches(arena.allocator(), &program);
+    try std.testing.expectEqual(@as(usize, 0), result.specialized_edges);
+    try std.testing.expectEqual(body_id, program.blocks[header_id.index()].terminator.branch.then_edge.target);
+    try std.testing.expectEqual(@as(usize, 0), program.edge_rewrites.len);
+}
+
+test "forwarding jumps persist replayable copy-chain parameter substitution" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry_id = ir.BlockId.fromIndex(0);
+    const forwarding_id = ir.BlockId.fromIndex(1);
+    const exit_id = ir.BlockId.fromIndex(2);
+    const input_left = ir.ValueId.fromIndex(0);
+    const input_right = ir.ValueId.fromIndex(1);
+    const forwarded_left = ir.ValueId.fromIndex(2);
+    const forwarded_right = ir.ValueId.fromIndex(3);
+    const output_left = ir.ValueId.fromIndex(4);
+    const output_right = ir.ValueId.fromIndex(5);
+    const output_duplicate = ir.ValueId.fromIndex(6);
+    const blocks = [_]ir.Block{
+        .{ .id = entry_id, .function = function_id, .terminator = .{ .jump = .{
+            .target = forwarding_id,
+            .arguments = &.{ input_left, input_right },
+        } } },
+        .{
+            .id = forwarding_id,
+            .function = function_id,
+            .parameters = &.{ forwarded_left, forwarded_right },
+            .terminator = .{ .jump = .{
+                .target = exit_id,
+                .arguments = &.{ forwarded_right, forwarded_left, forwarded_right },
+            } },
+        },
+        .{
+            .id = exit_id,
+            .function = function_id,
+            .parameters = &.{ output_left, output_right, output_duplicate },
+            .terminator = .{ .return_values = &.{ output_left, output_right, output_duplicate } },
+        },
+    };
+    const values = [_]ir.Value{
+        .{ .id = input_left, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = input_right, .function = function_id, .type = .boolean, .origin = .{ .parameter = 1 } },
+        .{ .id = forwarded_left, .function = function_id, .type = .boolean, .origin = .{ .block_parameter = .{ .block = forwarding_id, .index = 0 } } },
+        .{ .id = forwarded_right, .function = function_id, .type = .boolean, .origin = .{ .block_parameter = .{ .block = forwarding_id, .index = 1 } } },
+        .{ .id = output_left, .function = function_id, .type = .boolean, .origin = .{ .block_parameter = .{ .block = exit_id, .index = 0 } } },
+        .{ .id = output_right, .function = function_id, .type = .boolean, .origin = .{ .block_parameter = .{ .block = exit_id, .index = 1 } } },
+        .{ .id = output_duplicate, .function = function_id, .type = .boolean, .origin = .{ .block_parameter = .{ .block = exit_id, .index = 2 } } },
+    };
+    const evidence_id = ir.EvidenceId.fromIndex(0);
+    const evidence = [_]ir.Evidence{.{
+        .id = evidence_id,
+        .kind = .frontend_proof,
+        .locator = "fixture:forwarding-jump-substitution",
+    }};
+    const terms = [_]ir.SolverTerm{.{
+        .id = ir.SolverTermId.fromIndex(0),
+        .sort = .{ .kind = .boolean },
+        .operation = .{ .value = input_left },
+    }};
+    const constraints = [_]ir.Constraint{.{
+        .id = ir.ConstraintId.fromIndex(0),
+        .predicate = ir.SolverTermId.fromIndex(0),
+        .evidence = &.{evidence_id},
+        .scope = .{ .edge = .{ .source = entry_id, .kind = .jump, .target = forwarding_id } },
+    }};
+    var program: ir.Program = .{
+        .program_id = "forwarding-jump-substitution",
+        .entry_function = function_id,
+        .functions = &.{.{
+            .id = function_id,
+            .parameters = &.{ input_left, input_right },
+            .blocks = &.{ entry_id, forwarding_id, exit_id },
+            .entry_block = entry_id,
+        }},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+        .evidence = &evidence,
+        .solver_terms = &terms,
+        .constraints = &constraints,
+    };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const result = try applyProvedBranches(arena.allocator(), &program);
+    try std.testing.expectEqual(@as(usize, 1), result.specialized_edges);
+    try std.testing.expectEqual(exit_id, program.blocks[entry_id.index()].terminator.jump.target);
+    try std.testing.expectEqualSlices(ir.ValueId, &.{ input_right, input_left, input_right }, program.blocks[entry_id.index()].terminator.jump.arguments);
+    try std.testing.expectEqual(@as(usize, 1), program.edge_rewrites.len);
+    try std.testing.expectEqual(ir.EdgeRewriteRule.forwarding_jump, program.edge_rewrites[0].rule);
+    try std.testing.expect(program.edge_rewrites[0].certificate == null);
+
+    var report = try @import("validate.zig").validate(std.testing.allocator, &program, .core);
+    defer report.deinit();
+    try std.testing.expect(report.isClean());
+
+    const copied_right = ir.ValueId.fromIndex(values.len);
+    const recopied_right = ir.ValueId.fromIndex(values.len + 1);
+    const copied_values = values ++ [_]ir.Value{
+        .{
+            .id = copied_right,
+            .function = function_id,
+            .type = .boolean,
+            .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(0), .index = 0 } },
+        },
+        .{
+            .id = recopied_right,
+            .function = function_id,
+            .type = .boolean,
+            .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(1), .index = 0 } },
+        },
+    };
+    const copy_instructions = [_]ir.Instruction{
+        .{
+            .id = ir.InstructionId.fromIndex(0),
+            .block = forwarding_id,
+            .operation = .{ .copy = forwarded_right },
+            .results = &.{copied_right},
+            .effects = .pure,
+            .evidence = &.{evidence_id},
+        },
+        .{
+            .id = ir.InstructionId.fromIndex(1),
+            .block = forwarding_id,
+            .operation = .{ .copy = copied_right },
+            .results = &.{recopied_right},
+            .effects = .pure,
+            .evidence = &.{evidence_id},
+        },
+    };
+    var copy_blocks = blocks;
+    copy_blocks[forwarding_id.index()].instructions = &.{ ir.InstructionId.fromIndex(0), ir.InstructionId.fromIndex(1) };
+    copy_blocks[forwarding_id.index()].terminator.jump.arguments = &.{ recopied_right, forwarded_left, recopied_right };
+    var copy_program = program;
+    copy_program.blocks = &copy_blocks;
+    copy_program.instructions = &copy_instructions;
+    copy_program.values = &copied_values;
+    copy_program.edge_rewrites = &.{};
+    const copy_result = try applyProvedBranches(arena.allocator(), &copy_program);
+    try std.testing.expectEqual(@as(usize, 1), copy_result.specialized_edges);
+    try std.testing.expectEqualSlices(ir.ValueId, &.{ input_right, input_left, input_right }, copy_program.blocks[entry_id.index()].terminator.jump.arguments);
+    var copy_report = try @import("validate.zig").validate(std.testing.allocator, &copy_program, .core);
+    defer copy_report.deinit();
+    try std.testing.expect(copy_report.isClean());
+
+    var escaping_parameter_blocks = blocks;
+    escaping_parameter_blocks[exit_id.index()].terminator = .{ .return_values = &.{forwarded_left} };
+    var escaping_parameter_program = program;
+    escaping_parameter_program.blocks = &escaping_parameter_blocks;
+    escaping_parameter_program.edge_rewrites = &.{};
+    const escaping_parameter_result = try applyProvedBranches(arena.allocator(), &escaping_parameter_program);
+    try std.testing.expectEqual(@as(usize, 0), escaping_parameter_result.specialized_edges);
+    try std.testing.expectEqual(forwarding_id, escaping_parameter_program.blocks[entry_id.index()].terminator.jump.target);
+
+    var escaping_result_blocks = copy_blocks;
+    escaping_result_blocks[exit_id.index()].terminator = .{ .return_values = &.{copied_right} };
+    var escaping_result_program = copy_program;
+    escaping_result_program.blocks = &escaping_result_blocks;
+    escaping_result_program.edge_rewrites = &.{};
+    const escaping_result = try applyProvedBranches(arena.allocator(), &escaping_result_program);
+    try std.testing.expectEqual(@as(usize, 0), escaping_result.specialized_edges);
+    try std.testing.expectEqual(forwarding_id, escaping_result_program.blocks[entry_id.index()].terminator.jump.target);
+
+    var throwing_instructions = copy_instructions;
+    throwing_instructions[0].effects = .{ .precision = .exact, .may_throw = true };
+    var throwing_program = program;
+    throwing_program.blocks = &copy_blocks;
+    throwing_program.instructions = &throwing_instructions;
+    throwing_program.values = &copied_values;
+    throwing_program.edge_rewrites = &.{};
+    const throwing_result = try applyProvedBranches(arena.allocator(), &throwing_program);
+    try std.testing.expectEqual(@as(usize, 0), throwing_result.specialized_edges);
+    try std.testing.expectEqual(forwarding_id, throwing_program.blocks[entry_id.index()].terminator.jump.target);
+
+    var constant_instructions = copy_instructions;
+    constant_instructions[0].operation = .{ .constant = .{ .boolean = true } };
+    var constant_program = program;
+    constant_program.blocks = &copy_blocks;
+    constant_program.instructions = &constant_instructions;
+    constant_program.values = &copied_values;
+    constant_program.edge_rewrites = &.{};
+    const constant_result = try applyProvedBranches(arena.allocator(), &constant_program);
+    try std.testing.expectEqual(@as(usize, 0), constant_result.specialized_edges);
+    try std.testing.expectEqual(forwarding_id, constant_program.blocks[entry_id.index()].terminator.jump.target);
+
+    var tampered_rewrites = [_]ir.CfgEdgeRewrite{program.edge_rewrites[0]};
+    tampered_rewrites[0].to.arguments = &.{ input_left, input_right, input_left };
+    var tampered = program;
+    tampered.edge_rewrites = &tampered_rewrites;
+    var tampered_report = try @import("validate.zig").validate(std.testing.allocator, &tampered, .core);
+    defer tampered_report.deinit();
+    try std.testing.expect(tampered_report.contains(.invalid_edge_rewrite));
+
+    var instruction_blocks = blocks;
+    instruction_blocks[forwarding_id.index()].instructions = &.{ir.InstructionId.fromIndex(0)};
+    var retained = program;
+    retained.blocks = &instruction_blocks;
+    retained.edge_rewrites = &.{};
+    const retained_result = try applyProvedBranches(arena.allocator(), &retained);
+    try std.testing.expectEqual(@as(usize, 0), retained_result.specialized_edges);
+    try std.testing.expectEqual(forwarding_id, retained.blocks[entry_id.index()].terminator.jump.target);
 }
