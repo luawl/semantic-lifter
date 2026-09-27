@@ -1442,3 +1442,278 @@ test "diamond reachability and dominance use function-local block identity" {
         analysis.blockIndex(fixtures.absolute_value_module.b_entry).?
     ]);
 }
+
+test "reachability can exclude a required barrier" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const definition = ir.BlockId.fromIndex(1);
+    const header = ir.BlockId.fromIndex(2);
+    const barrier = ir.BlockId.fromIndex(3);
+    const terminal = ir.BlockId.fromIndex(4);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .jump = .{ .target = definition } } },
+        .{ .id = definition, .function = function_id, .terminator = .{ .jump = .{ .target = header } } },
+        .{ .id = header, .function = function_id, .terminator = .{ .branch = .{
+            .condition = ir.ValueId.fromIndex(0),
+            .then_edge = .{ .target = barrier },
+            .else_edge = .{ .target = terminal },
+        } } },
+        .{ .id = barrier, .function = function_id, .terminator = .{ .jump = .{ .target = definition } } },
+        .{ .id = terminal, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const function: ir.Function = .{
+        .id = function_id,
+        .entry_block = entry,
+        .blocks = &.{ entry, definition, header, barrier, terminal },
+    };
+    const program: ir.Program = .{
+        .program_id = "cfg-reachability-barrier",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &.{},
+    };
+
+    var analysis = try Analysis.init(std.testing.allocator, &program, function);
+    defer analysis.deinit();
+    try std.testing.expect(try analysis.canReach(header, definition));
+    try std.testing.expect(!try analysis.canReachAvoiding(header, definition, barrier));
+    try std.testing.expectEqual(@as(usize, 1), analysis.reachability_cache.blocked_reachability_rows.count());
+    try std.testing.expect(try analysis.canReachAvoiding(header, definition, terminal));
+    try std.testing.expectEqual(@as(usize, 2), analysis.reachability_cache.blocked_reachability_rows.count());
+    try std.testing.expect(!try analysis.canReachAvoiding(header, definition, barrier));
+    try std.testing.expect(try analysis.canReachAvoiding(header, definition, terminal));
+    try std.testing.expectEqual(@as(usize, 2), analysis.reachability_cache.blocked_reachability_rows.count());
+    try std.testing.expect(!try analysis.canReachAvoiding(header, definition, header));
+    try std.testing.expect(!try analysis.canReachAvoiding(header, definition, definition));
+}
+
+test "cached unrestricted reachability rows are released" {
+    const fixtures = @import("fixtures.zig");
+    const program = &fixtures.absolute_value_module.program;
+    const function = fixtures.absolute_value_module.functions[1];
+    var analysis = try Analysis.init(std.testing.allocator, program, function);
+    defer analysis.deinit();
+
+    // Populate every cached unrestricted row, including repeated lookups of
+    // the same row, before the analysis owns and releases its cache.
+    for (function.blocks) |start| {
+        for (function.blocks) |target| {
+            _ = try analysis.canReach(start, target);
+            _ = try analysis.canReach(start, target);
+        }
+    }
+}
+
+test "convergence permits terminal-only paths that bypass the join" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const direct = ir.BlockId.fromIndex(1);
+    const nested_entry = ir.BlockId.fromIndex(2);
+    const nested = ir.BlockId.fromIndex(3);
+    const join = ir.BlockId.fromIndex(4);
+    const terminal = ir.BlockId.fromIndex(5);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = ir.ValueId.fromIndex(0),
+            .then_edge = .{ .target = direct },
+            .else_edge = .{ .target = nested_entry },
+        } } },
+        .{ .id = direct, .function = function_id, .terminator = .{ .jump = .{ .target = join } } },
+        .{ .id = nested_entry, .function = function_id, .terminator = .{ .jump = .{ .target = nested } } },
+        .{ .id = nested, .function = function_id, .terminator = .{ .branch = .{
+            .condition = ir.ValueId.fromIndex(1),
+            .then_edge = .{ .target = join },
+            .else_edge = .{ .target = terminal },
+        } } },
+        .{ .id = join, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = terminal, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const function: ir.Function = .{
+        .id = function_id,
+        .entry_block = entry,
+        .blocks = &.{ terminal, nested, entry, join, direct, nested_entry },
+    };
+    const program: ir.Program = .{
+        .program_id = "cfg-terminal-partial-convergence",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &.{},
+    };
+
+    var analysis = try Analysis.init(std.testing.allocator, &program, function);
+    defer analysis.deinit();
+    try std.testing.expectEqual(join, (try analysis.immediateConvergence(std.testing.allocator, entry, null)).?);
+    try std.testing.expectEqual(join, (try analysis.immediateConvergenceBetween(
+        std.testing.allocator,
+        direct,
+        nested_entry,
+        null,
+    )).?);
+    try std.testing.expectEqual(join, (try analysis.immediatePostDominatorWithin(std.testing.allocator, nested, join, null)).?);
+
+    const allowed = [_]bool{ false, true, true, true, true, true };
+    try std.testing.expectEqual(join, (try analysis.immediateConvergence(std.testing.allocator, entry, &allowed)).?);
+    try std.testing.expectEqual(join, (try analysis.immediatePostDominatorWithin(std.testing.allocator, nested, join, &allowed)).?);
+}
+
+test "bounded postdomination rejects a nonterminating path that bypasses the stop" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const stop = ir.BlockId.fromIndex(1);
+    const cycle = ir.BlockId.fromIndex(2);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = ir.ValueId.fromIndex(0),
+            .then_edge = .{ .target = stop },
+            .else_edge = .{ .target = cycle },
+        } } },
+        .{ .id = stop, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = cycle, .function = function_id, .terminator = .{ .jump = .{ .target = cycle } } },
+    };
+    const function: ir.Function = .{
+        .id = function_id,
+        .entry_block = entry,
+        .blocks = &.{ cycle, entry, stop },
+    };
+    const program: ir.Program = .{
+        .program_id = "cfg-nonterminating-partial-convergence",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &.{},
+    };
+
+    var analysis = try Analysis.init(std.testing.allocator, &program, function);
+    defer analysis.deinit();
+    try std.testing.expect((try analysis.immediatePostDominatorWithin(std.testing.allocator, entry, stop, null)) == null);
+    const allowed = [_]bool{ false, true, true };
+    try std.testing.expect((try analysis.immediatePostDominatorWithin(std.testing.allocator, entry, stop, &allowed)) == null);
+    try std.testing.expectEqual(stop, (try analysis.immediateStructuralPostDominatorWithin(
+        std.testing.allocator,
+        entry,
+        stop,
+        null,
+    )).?);
+    try std.testing.expect((try analysis.immediateStructuralPostDominatorWithin(
+        std.testing.allocator,
+        entry,
+        stop,
+        &allowed,
+    )) == null);
+}
+
+test "structural convergence distinguishes infinite-only and mixed bypasses" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const first = ir.BlockId.fromIndex(1);
+    const second = ir.BlockId.fromIndex(2);
+    const join = ir.BlockId.fromIndex(3);
+    const mixed = ir.BlockId.fromIndex(4);
+    const terminal = ir.BlockId.fromIndex(5);
+    const other_terminal = ir.BlockId.fromIndex(6);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = ir.ValueId.fromIndex(0),
+            .then_edge = .{ .target = first },
+            .else_edge = .{ .target = second },
+        } } },
+        .{ .id = first, .function = function_id, .terminator = .{ .jump = .{ .target = join } } },
+        .{ .id = second, .function = function_id, .terminator = .{ .branch = .{
+            .condition = ir.ValueId.fromIndex(1),
+            .then_edge = .{ .target = join },
+            .else_edge = .{ .target = mixed },
+        } } },
+        .{ .id = join, .function = function_id, .terminator = .{ .jump = .{ .target = terminal } } },
+        .{ .id = mixed, .function = function_id, .terminator = .{ .jump = .{ .target = mixed } } },
+        .{ .id = terminal, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = other_terminal, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const function: ir.Function = .{
+        .id = function_id,
+        .entry_block = entry,
+        .blocks = &.{ entry, first, second, join, mixed, terminal, other_terminal },
+    };
+
+    var infinite_only = blocks;
+    var infinite_program: ir.Program = .{
+        .program_id = "cfg-structural-infinite-only-bypass",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &infinite_only,
+        .instructions = &.{},
+        .values = &.{},
+    };
+    var infinite_analysis = try Analysis.init(std.testing.allocator, &infinite_program, function);
+    defer infinite_analysis.deinit();
+    try std.testing.expectEqual(join, (try infinite_analysis.immediateStructuralConvergenceBetween(
+        std.testing.allocator,
+        first,
+        second,
+        null,
+    )).?);
+
+    var mixed_bypass = blocks;
+    mixed_bypass[mixed.index()].terminator = .{ .branch = .{
+        .condition = ir.ValueId.fromIndex(2),
+        .then_edge = .{ .target = other_terminal },
+        .else_edge = .{ .target = mixed },
+    } };
+    var mixed_program = infinite_program;
+    mixed_program.program_id = "cfg-structural-mixed-bypass";
+    mixed_program.blocks = &mixed_bypass;
+    var mixed_analysis = try Analysis.init(std.testing.allocator, &mixed_program, function);
+    defer mixed_analysis.deinit();
+    try std.testing.expect((try mixed_analysis.immediateStructuralConvergenceBetween(
+        std.testing.allocator,
+        first,
+        second,
+        null,
+    )) == null);
+}
+
+test "duplicate function block membership is rejected" {
+    const fixtures = @import("fixtures.zig");
+    const duplicate_blocks = [_]ir.BlockId{
+        fixtures.absolute_value_module.b_entry,
+        fixtures.absolute_value_module.b_entry,
+    };
+    var function = fixtures.absolute_value_module.functions[1];
+    function.blocks = &duplicate_blocks;
+    try std.testing.expectError(error.InvalidCfg, Analysis.init(std.testing.allocator, &fixtures.absolute_value_module.program, function));
+}
+
+test "public adjacency excludes unreachable control" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry_id = ir.BlockId.fromIndex(0);
+    const dead_id = ir.BlockId.fromIndex(1);
+    const blocks = [_]ir.Block{
+        .{ .id = entry_id, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = dead_id, .function = function_id, .terminator = .{ .jump = .{ .target = entry_id } } },
+    };
+    const function: ir.Function = .{
+        .id = function_id,
+        .entry_block = entry_id,
+        .blocks = &.{ entry_id, dead_id },
+    };
+    const program: ir.Program = .{
+        .program_id = "cfg-live-adjacency",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &.{},
+    };
+
+    var analysis = try Analysis.init(std.testing.allocator, &program, function);
+    defer analysis.deinit();
+    try std.testing.expect(!analysis.isReachable(dead_id));
+    try std.testing.expectEqual(@as(usize, 0), analysis.predecessorCount(entry_id));
+    try std.testing.expect(analysis.predecessorAt(entry_id, 0) == null);
+    try std.testing.expectEqual(@as(usize, 0), analysis.successorCount(dead_id));
+    try std.testing.expect(analysis.successorAt(dead_id, 0) == null);
+}
