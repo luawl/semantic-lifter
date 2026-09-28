@@ -5557,6 +5557,371 @@ test "incoming-source definitions are not remapped through a downstream clone" {
     try std.testing.expectEqualSlices(ir.ValueId, &.{source_value}, mappings.clone_values);
 }
 
+test "nested clone context keeps distinct continuation edge arguments" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const producer = ir.BlockId.fromIndex(1);
+    const sibling = ir.BlockId.fromIndex(2);
+    const selected = ir.BlockId.fromIndex(3);
+    const nested = ir.BlockId.fromIndex(4);
+    const continuation = ir.BlockId.fromIndex(5);
+    const exit = ir.BlockId.fromIndex(6);
+    const selector = ir.ValueId.fromIndex(0);
+    const seed = ir.ValueId.fromIndex(1);
+    const producer_value = ir.ValueId.fromIndex(2);
+    const sibling_value = ir.ValueId.fromIndex(3);
+    const selected_value = ir.ValueId.fromIndex(4);
+    const nested_value = ir.ValueId.fromIndex(5);
+    const continuation_value = ir.ValueId.fromIndex(6);
+    const exit_value = ir.ValueId.fromIndex(7);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = selector,
+            .then_edge = .{ .target = producer, .arguments = &.{seed} },
+            .else_edge = .{ .target = sibling, .arguments = &.{seed} },
+        } } },
+        .{ .id = producer, .function = function_id, .parameters = &.{producer_value}, .terminator = .{ .jump = .{
+            .target = selected,
+            .arguments = &.{producer_value},
+        } } },
+        .{ .id = sibling, .function = function_id, .parameters = &.{sibling_value}, .terminator = .{ .jump = .{
+            .target = nested,
+            .arguments = &.{sibling_value},
+        } } },
+        .{ .id = selected, .function = function_id, .parameters = &.{selected_value}, .terminator = .{ .jump = .{
+            .target = nested,
+            .arguments = &.{selected_value},
+        } } },
+        .{ .id = nested, .function = function_id, .parameters = &.{nested_value}, .terminator = .{ .jump = .{
+            .target = continuation,
+            .arguments = &.{nested_value},
+        } } },
+        .{ .id = continuation, .function = function_id, .parameters = &.{continuation_value}, .terminator = .{ .jump = .{
+            .target = exit,
+            .arguments = &.{producer_value},
+        } } },
+        .{ .id = exit, .function = function_id, .parameters = &.{exit_value}, .terminator = .{ .return_values = &.{exit_value} } },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .parameters = &.{ selector, seed },
+        .blocks = &.{ entry, producer, sibling, selected, nested, continuation, exit },
+        .entry_block = entry,
+    }};
+    const values = [_]ir.Value{
+        .{ .id = selector, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = seed, .function = function_id, .type = .integer, .origin = .{ .parameter = 1 } },
+        .{ .id = producer_value, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = producer, .index = 0 } } },
+        .{ .id = sibling_value, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = sibling, .index = 0 } } },
+        .{ .id = selected_value, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = selected, .index = 0 } } },
+        .{ .id = nested_value, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = nested, .index = 0 } } },
+        .{ .id = continuation_value, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = continuation, .index = 0 } } },
+        .{ .id = exit_value, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = exit, .index = 0 } } },
+    };
+    const rewrites = [_]ir.CfgEdgeRewrite{
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(0),
+            .source = entry,
+            .kind = .branch_else,
+            .from = .{ .target = producer, .arguments = &.{seed} },
+            .to = .{ .target = sibling, .arguments = &.{seed} },
+            .rule = .node_split,
+            .node_split_group = ir.NodeSplitGroupId.fromIndex(0),
+        },
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(1),
+            .source = entry,
+            .kind = .branch_then,
+            .from = .{ .target = producer, .arguments = &.{seed} },
+            .to = .{ .target = selected, .arguments = &.{seed} },
+            .rule = .node_split,
+            .node_split_group = ir.NodeSplitGroupId.fromIndex(1),
+        },
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(2),
+            .source = selected,
+            .kind = .jump,
+            .from = .{ .target = selected, .arguments = &.{selected_value} },
+            .to = .{ .target = nested, .arguments = &.{selected_value} },
+            .rule = .node_split,
+            .node_split_group = ir.NodeSplitGroupId.fromIndex(2),
+        },
+    };
+    const program: ir.Program = .{
+        .program_id = "nested-clone-continuation-edge-context",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+        .edge_rewrites = &rewrites,
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, functions[0]);
+    defer analysis.deinit();
+    const incoming = [_]ir.CfgEdgeRef{.{
+        .source = nested,
+        .kind = .jump,
+        .target = continuation,
+    }};
+
+    try std.testing.expect(!try cloneContextMatchesIncoming(&program, &analysis, sibling, &incoming));
+    try std.testing.expect(try cloneContextMatchesIncoming(&program, &analysis, selected, &incoming));
+
+    const context = try findIncomingCloneLineageValueMappingAlloc(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        producer,
+        producer_value,
+        &incoming,
+        null,
+        null,
+    );
+    try std.testing.expect(!context.ambiguous);
+    try std.testing.expectEqual(nested_value, context.value.?);
+
+    var mappings = (try collectExternalCloneMappingsAlloc(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        &.{continuation},
+        &incoming,
+    )).?;
+    defer mappings.deinit();
+    try std.testing.expectEqualSlices(ir.ValueId, &.{producer_value}, mappings.values);
+    try std.testing.expectEqualSlices(ir.ValueId, &.{nested_value}, mappings.clone_values);
+}
+
+test "composed clone mapping rejects unstable incoming lineage" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const producer = ir.BlockId.fromIndex(1);
+    const clone_one = ir.BlockId.fromIndex(2);
+    const clone_two = ir.BlockId.fromIndex(3);
+    const continuation = ir.BlockId.fromIndex(4);
+    const selector = ir.ValueId.fromIndex(0);
+    const seed = ir.ValueId.fromIndex(1);
+    const alternate = ir.ValueId.fromIndex(2);
+    const source_value = ir.ValueId.fromIndex(3);
+    const clone_one_value = ir.ValueId.fromIndex(4);
+    const clone_two_value = ir.ValueId.fromIndex(5);
+    const continuation_value = ir.ValueId.fromIndex(6);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = selector,
+            .then_edge = .{ .target = producer, .arguments = &.{seed} },
+            .else_edge = .{ .target = clone_one, .arguments = &.{seed} },
+        } } },
+        .{ .id = producer, .function = function_id, .parameters = &.{source_value}, .terminator = .{ .jump = .{
+            .target = continuation,
+            .arguments = &.{source_value},
+        } } },
+        .{ .id = clone_one, .function = function_id, .parameters = &.{clone_one_value}, .terminator = .{ .jump = .{
+            .target = clone_two,
+            .arguments = &.{clone_one_value},
+        } } },
+        .{ .id = clone_two, .function = function_id, .parameters = &.{clone_two_value}, .terminator = .{ .jump = .{
+            .target = continuation,
+            .arguments = &.{clone_two_value},
+        } } },
+        .{ .id = continuation, .function = function_id, .parameters = &.{continuation_value}, .terminator = .{ .return_values = &.{continuation_value} } },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .parameters = &.{ selector, seed, alternate },
+        .blocks = &.{ entry, producer, clone_one, clone_two, continuation },
+        .entry_block = entry,
+    }};
+    const values = [_]ir.Value{
+        .{ .id = selector, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = seed, .function = function_id, .type = .integer, .origin = .{ .parameter = 1 } },
+        .{ .id = alternate, .function = function_id, .type = .integer, .origin = .{ .parameter = 2 } },
+        .{ .id = source_value, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = producer, .index = 0 } } },
+        .{ .id = clone_one_value, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = clone_one, .index = 0 } } },
+        .{ .id = clone_two_value, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = clone_two, .index = 0 } } },
+        .{ .id = continuation_value, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = continuation, .index = 0 } } },
+    };
+    const rewrites = [_]ir.CfgEdgeRewrite{
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(0),
+            .source = entry,
+            .kind = .branch_then,
+            .from = .{ .target = producer, .arguments = &.{seed} },
+            .to = .{ .target = clone_one, .arguments = &.{seed} },
+            .rule = .node_split,
+            .node_split_group = ir.NodeSplitGroupId.fromIndex(0),
+        },
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(1),
+            .source = clone_one,
+            .kind = .jump,
+            .from = .{ .target = clone_one, .arguments = &.{clone_one_value} },
+            .to = .{ .target = clone_two, .arguments = &.{alternate} },
+            .rule = .node_split,
+            .node_split_group = ir.NodeSplitGroupId.fromIndex(1),
+        },
+    };
+    const program: ir.Program = .{
+        .program_id = "unstable-composed-clone-context",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+        .edge_rewrites = &rewrites,
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, functions[0]);
+    defer analysis.deinit();
+    var lineage_index = try CloneLineageIndex.init(std.testing.allocator, &program);
+    defer lineage_index.deinit();
+    var replay_index = try node_split.ReplayIndex.init(std.testing.allocator, &program);
+    defer replay_index.deinit();
+    const incoming = [_]ir.CfgEdgeRef{.{
+        .source = clone_two,
+        .kind = .jump,
+        .target = continuation,
+    }};
+    const mapping = try findIncomingCloneLineageValueMappingAlloc(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        producer,
+        source_value,
+        &incoming,
+        &lineage_index,
+        &replay_index,
+    );
+    try std.testing.expect(mapping.value == null);
+
+    const authenticated_rewrites = [_]ir.CfgEdgeRewrite{
+        rewrites[0],
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(1),
+            .source = clone_one,
+            .kind = .jump,
+            .from = .{ .target = clone_one, .arguments = &.{clone_one_value} },
+            .to = .{ .target = clone_two, .arguments = &.{clone_two_value} },
+            .rule = .node_split,
+            .node_split_group = ir.NodeSplitGroupId.fromIndex(1),
+        },
+    };
+    var authenticated_program = program;
+    authenticated_program.edge_rewrites = &authenticated_rewrites;
+    var authenticated_lineage = try CloneLineageIndex.init(std.testing.allocator, &authenticated_program);
+    defer authenticated_lineage.deinit();
+    var authenticated_replay = try node_split.ReplayIndex.init(std.testing.allocator, &authenticated_program);
+    defer authenticated_replay.deinit();
+    const authenticated = try findIncomingCloneLineageValueMappingAlloc(
+        std.testing.allocator,
+        &authenticated_program,
+        &analysis,
+        producer,
+        source_value,
+        &incoming,
+        &authenticated_lineage,
+        &authenticated_replay,
+    );
+    try std.testing.expectEqual(clone_two_value, authenticated.value.?);
+}
+
+test "direct clone lookup rejects sibling mappings at a shared continuation" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const producer = ir.BlockId.fromIndex(1);
+    const sibling = ir.BlockId.fromIndex(2);
+    const continuation = ir.BlockId.fromIndex(3);
+    const clone_a = ir.BlockId.fromIndex(4);
+    const clone_b = ir.BlockId.fromIndex(5);
+    const selector = ir.ValueId.fromIndex(0);
+    const source_value = ir.ValueId.fromIndex(1);
+    const clone_a_value = ir.ValueId.fromIndex(2);
+    const clone_b_value = ir.ValueId.fromIndex(3);
+    const continuation_value = ir.ValueId.fromIndex(4);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = selector,
+            .then_edge = .{ .target = producer, .arguments = &.{selector} },
+            .else_edge = .{ .target = sibling },
+        } } },
+        .{ .id = producer, .function = function_id, .parameters = &.{source_value}, .terminator = .{ .jump = .{
+            .target = continuation,
+            .arguments = &.{source_value},
+        } } },
+        .{ .id = sibling, .function = function_id, .terminator = .{ .jump = .{ .target = continuation, .arguments = &.{selector} } } },
+        .{ .id = continuation, .function = function_id, .parameters = &.{continuation_value}, .terminator = .{ .return_values = &.{} } },
+        .{ .id = clone_a, .function = function_id, .parameters = &.{clone_a_value}, .terminator = .{ .return_values = &.{} } },
+        .{ .id = clone_b, .function = function_id, .parameters = &.{clone_b_value}, .terminator = .{ .return_values = &.{} } },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .parameters = &.{selector},
+        .blocks = &.{ entry, producer, sibling, continuation, clone_a, clone_b },
+        .entry_block = entry,
+    }};
+    const values = [_]ir.Value{
+        .{ .id = selector, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = source_value, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = producer, .index = 0 } } },
+        .{ .id = clone_a_value, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = clone_a, .index = 0 } } },
+        .{ .id = clone_b_value, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = clone_b, .index = 0 } } },
+        .{ .id = continuation_value, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = continuation, .index = 0 } } },
+    };
+    const rewrites = [_]ir.CfgEdgeRewrite{
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(0),
+            .source = entry,
+            .kind = .branch_then,
+            .from = .{ .target = producer, .arguments = &.{selector} },
+            .to = .{ .target = clone_a, .arguments = &.{selector} },
+            .rule = .node_split,
+            .node_split_group = ir.NodeSplitGroupId.fromIndex(0),
+        },
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(1),
+            .source = entry,
+            .kind = .branch_else,
+            .from = .{ .target = producer, .arguments = &.{selector} },
+            .to = .{ .target = clone_b, .arguments = &.{selector} },
+            .rule = .node_split,
+            .node_split_group = ir.NodeSplitGroupId.fromIndex(1),
+        },
+    };
+    const program: ir.Program = .{
+        .program_id = "direct-clone-sibling-ambiguity",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+        .edge_rewrites = &rewrites,
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, functions[0]);
+    defer analysis.deinit();
+    const incoming = [_]ir.CfgEdgeRef{.{
+        .source = sibling,
+        .kind = .jump,
+        .target = continuation,
+    }};
+    const closure = [_]ir.BlockId{ continuation, clone_a, clone_b };
+
+    try std.testing.expect(directValueCloneForIncoming(
+        &program,
+        &analysis,
+        producer,
+        source_value,
+        &incoming,
+        &closure,
+    ) == null);
+}
+
+fn cloneLineageAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    source: ir.BlockId,
+    clone: ir.BlockId,
+) std.mem.Allocator.Error!?[]CloneLineageStep {
+    return cloneLineageAllocCached(allocator, program, source, clone, null);
+}
+
 fn cloneLineageAllocCached(
     allocator: std.mem.Allocator,
     program: *const ir.Program,
@@ -5588,6 +5953,14 @@ fn cloneLineageAllocCached(
     }
     std.mem.reverse(CloneLineageStep, reversed.items);
     return try reversed.toOwnedSlice(allocator);
+}
+
+fn blockLineageContains(
+    program: *const ir.Program,
+    descendant: ir.BlockId,
+    ancestor: ir.BlockId,
+) bool {
+    return blockLineageContainsCached(program, descendant, ancestor, null);
 }
 
 fn blockLineageContainsCached(
@@ -6023,6 +6396,31 @@ fn cloneContextMatchesIncomingWithReplayCached(
     return true;
 }
 
+fn cloneGroupMatchesIncomingContext(
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    candidate: ir.BlockId,
+    incoming: []const ir.CfgEdgeRef,
+) std.mem.Allocator.Error!bool {
+    return cloneGroupMatchesIncomingContextCached(program, analysis, candidate, incoming, null);
+}
+
+fn cloneGroupMatchesIncomingContextCached(
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    candidate: ir.BlockId,
+    incoming: []const ir.CfgEdgeRef,
+    index: ?*const CloneLineageIndex,
+) std.mem.Allocator.Error!bool {
+    const candidate_step = cloneStepForTargetCached(program, candidate, index) orelse return false;
+    for (incoming) |reference| {
+        const incoming_step = cloneStepForTargetCached(program, reference.source, index) orelse return false;
+        if (incoming_step.group != candidate_step.group) return false;
+    }
+    if (incoming.len == 0) return false;
+    return try cloneContextMatchesIncomingCached(program, analysis, candidate, incoming, index);
+}
+
 fn cloneContextRankCached(
     allocator: std.mem.Allocator,
     program: *const ir.Program,
@@ -6063,6 +6461,37 @@ fn cloneContextRankCached(
     return if (same_group) 2 else 1;
 }
 
+fn mapValueThroughCloneLineageAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    source: ir.BlockId,
+    clone: ir.BlockId,
+    value: ir.ValueId,
+) std.mem.Allocator.Error!?ir.ValueId {
+    return mapValueThroughCloneLineageAllocCached(allocator, program, source, clone, value, null, null);
+}
+
+fn mapValueThroughCloneLineageAllocCached(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    source: ir.BlockId,
+    clone: ir.BlockId,
+    value: ir.ValueId,
+    index: ?*const CloneLineageIndex,
+    replay_index: ?*const node_split.ReplayIndex,
+) std.mem.Allocator.Error!?ir.ValueId {
+    return mapValueThroughCloneLineageAllocCachedWithReplayCache(
+        allocator,
+        program,
+        source,
+        clone,
+        value,
+        index,
+        replay_index,
+        null,
+    );
+}
+
 fn mapValueThroughCloneLineageAllocCachedWithReplayCache(
     allocator: std.mem.Allocator,
     program: *const ir.Program,
@@ -6091,6 +6520,37 @@ fn mapValueThroughCloneLineageAllocCachedWithReplayCache(
         current = mapped orelse return null;
     }
     return current;
+}
+
+fn mapPackThroughCloneLineageAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    source: ir.BlockId,
+    clone: ir.BlockId,
+    pack: ir.ValuePackId,
+) std.mem.Allocator.Error!?ir.ValuePackId {
+    return mapPackThroughCloneLineageAllocCached(allocator, program, source, clone, pack, null, null);
+}
+
+fn mapPackThroughCloneLineageAllocCached(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    source: ir.BlockId,
+    clone: ir.BlockId,
+    pack: ir.ValuePackId,
+    index: ?*const CloneLineageIndex,
+    replay_index: ?*const node_split.ReplayIndex,
+) std.mem.Allocator.Error!?ir.ValuePackId {
+    return mapPackThroughCloneLineageAllocCachedWithReplayCache(
+        allocator,
+        program,
+        source,
+        clone,
+        pack,
+        index,
+        replay_index,
+        null,
+    );
 }
 
 fn mapPackThroughCloneLineageAllocCachedWithReplayCache(
@@ -6235,6 +6695,74 @@ fn cloneLineageArgumentsMatchReplayCached(
         if (!found_step) return false;
     }
     return true;
+}
+
+/// Authenticate a split entry whose clone body was extended after the split.
+/// This is intentionally weaker than ordinary clone replay: it proves only
+/// the live rewrite, its stable incoming tuple, canonical parameter types,
+/// and the mapped entry terminator. Callers must separately prove ownership
+/// and replay the already-admitted effectful body.
+pub fn hasAuthenticatedEffectfulEntryBridgeForEdge(
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    reference: ir.CfgEdgeRef,
+    expected_arguments: []const ir.ValueId,
+) bool {
+    if (!incomingEdgeIsCanonical(program, analysis, reference)) return false;
+    const current_edge = cfg_edge.value(program, reference) orelse return false;
+    if (!std.mem.eql(ir.ValueId, current_edge.arguments, expected_arguments)) return false;
+
+    const clone = program.blocks[reference.target.index()];
+    if (clone.instructions.len == 0) return false;
+
+    var found = false;
+    for (program.edge_rewrites) |rewrite| {
+        if (rewrite.rule != .node_split or rewrite.node_split_group == null or
+            rewrite.source != reference.source or rewrite.kind != reference.kind or
+            rewrite.to.target != reference.target or rewrite.from.target == rewrite.to.target)
+        {
+            continue;
+        }
+        if (found or !nodeSplitRewriteArgumentsAreStable(program, rewrite) or
+            !activeNodeSplitRewrite(program, rewrite)) return false;
+
+        const source = program.blocks[rewrite.from.target.index()];
+        if (source.function != analysis.function.id or clone.function != source.function or
+            source.instructions.len >= clone.instructions.len or
+            !std.mem.eql(ir.ValueId, rewrite.to.arguments, expected_arguments) or
+            !node_split.entryShapeMatches(program, source, clone)) return false;
+        found = true;
+    }
+    return found;
+}
+
+// A clone lineage is only useful for an external value when the incoming
+// predecessor actually carries the composed value into the closure. Lineage
+// membership and CFG reachability alone are insufficient: sibling clones can
+// both reach the same continuation while representing different edge
+// arguments. Keep this proof at the boundary where the incoming edge is
+// available, before candidate ranking is considered.
+fn findIncomingCloneLineageValueMappingAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    producer: ir.BlockId,
+    source_value: ir.ValueId,
+    incoming: []const ir.CfgEdgeRef,
+    lineage_index: ?*const CloneLineageIndex,
+    replay_index: ?*const node_split.ReplayIndex,
+) std.mem.Allocator.Error!ContextualMapping {
+    return findIncomingCloneLineageValueMappingAllocWithReplayCache(
+        allocator,
+        program,
+        analysis,
+        producer,
+        source_value,
+        incoming,
+        lineage_index,
+        replay_index,
+        null,
+    );
 }
 
 // A cloned continuation may enter through a clone of the value's producer.
@@ -6422,6 +6950,14 @@ fn findIncomingCloneLineageValueMappingAllocWithReplayCache(
         }
     }
     return result;
+}
+
+fn cloneCandidateIsMoreSpecific(
+    program: *const ir.Program,
+    candidate: ir.BlockId,
+    existing: ir.BlockId,
+) ?bool {
+    return cloneCandidateIsMoreSpecificCached(program, candidate, existing, null);
 }
 
 fn cloneCandidateIsMoreSpecificCached(
@@ -7761,6 +8297,76 @@ fn mapInstructionResultClone(
     return null;
 }
 
+fn directValueCloneForIncoming(
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    producer: ir.BlockId,
+    source_value: ir.ValueId,
+    incoming: []const ir.CfgEdgeRef,
+    closure: []const ir.BlockId,
+) ?ir.ValueId {
+    var selected: ?ir.ValueId = null;
+    for (program.edge_rewrites) |rewrite| {
+        if (rewrite.rule != .node_split or rewrite.from.target != producer) continue;
+        const candidate = rewrite.to.target;
+        if (candidate == producer or candidate.index() >= program.blocks.len or
+            analysis.blockIndex(candidate) == null or
+            (!definitionDominatesIncoming(analysis, candidate, incoming) and !containsBlock(closure, candidate))) continue;
+        if (mapValueByCloneShape(program, producer, candidate, source_value)) |clone_value| {
+            if (selected) |existing| {
+                // A direct lookup is only sound when every admissible clone
+                // gives the same value.  Rewrite order is not semantic
+                // evidence when sibling contexts reach the same continuation.
+                if (existing != clone_value) return null;
+            } else {
+                selected = clone_value;
+            }
+        }
+    }
+    return selected;
+}
+
+fn directPackCloneForIncoming(
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    producer: ir.BlockId,
+    source_pack: ir.ValuePackId,
+    incoming: []const ir.CfgEdgeRef,
+    closure: []const ir.BlockId,
+) ?ir.ValuePackId {
+    var selected: ?ir.ValuePackId = null;
+    for (program.edge_rewrites) |rewrite| {
+        if (rewrite.rule != .node_split or rewrite.from.target != producer) continue;
+        const candidate = rewrite.to.target;
+        if (candidate == producer or candidate.index() >= program.blocks.len or
+            analysis.blockIndex(candidate) == null or
+            (!definitionDominatesIncoming(analysis, candidate, incoming) and !containsBlock(closure, candidate))) continue;
+        const source_block = program.blocks[producer.index()];
+        const clone_block = program.blocks[candidate.index()];
+        if (source_block.id != producer or clone_block.id != candidate or
+            source_block.instructions.len != clone_block.instructions.len) continue;
+        for (source_block.instructions, clone_block.instructions) |source_instruction_id, clone_instruction_id| {
+            if (source_instruction_id.index() >= program.instructions.len or clone_instruction_id.index() >= program.instructions.len) continue;
+            const source_instruction = program.instructions[source_instruction_id.index()];
+            const clone_instruction = program.instructions[clone_instruction_id.index()];
+            if (source_instruction.pack_result != source_pack) continue;
+            const clone_pack = clone_instruction.pack_result orelse continue;
+            if (clone_instruction.id == clone_instruction_id and clone_pack.index() < program.value_packs.len and
+                program.value_packs[clone_pack.index()].id == clone_pack)
+            {
+                if (selected) |existing| {
+                    // Keep pack identity deterministic across sibling clone
+                    // contexts; the first rewrite must not win by accident.
+                    if (existing != clone_pack) return null;
+                } else {
+                    selected = clone_pack;
+                }
+            }
+        }
+    }
+    return selected;
+}
+
 fn mapPackFromReplay(
     program: *const ir.Program,
     source_block_id: ir.BlockId,
@@ -7847,6 +8453,59 @@ fn externalPackProducerBlock(
         return null;
     }
     return instruction.block;
+}
+
+pub fn selectIterationConvergence(
+    allocator: std.mem.Allocator,
+    analysis: *const cfg.Analysis,
+    block: ir.BlockId,
+    allowed: ?[]const bool,
+) std.mem.Allocator.Error!?Selection {
+    const branch = switch (analysis.program.blocks[block.index()].terminator) {
+        .branch => |value| value,
+        else => return null,
+    };
+    const then_distances = try forwardDistancesAlloc(
+        allocator,
+        analysis,
+        branch.then_edge.target,
+        null,
+        allowed,
+    ) orelse return null;
+    defer allocator.free(then_distances);
+    const else_distances = try forwardDistancesAlloc(
+        allocator,
+        analysis,
+        branch.else_edge.target,
+        null,
+        allowed,
+    ) orelse return null;
+    defer allocator.free(else_distances);
+    const distances: DistancePair = .{
+        .then_distances = then_distances,
+        .else_distances = else_distances,
+    };
+    var selected: ?Selection = null;
+    for (analysis.function.blocks) |candidate| {
+        if (!isIterationTransitionHeader(analysis.program, candidate)) continue;
+        const then_distance = distanceAt(analysis, then_distances, candidate) orelse continue;
+        const else_distance = distanceAt(analysis, else_distances, candidate) orelse continue;
+        if (try analysis.immediateStructuralPostDominatorWithin(
+            allocator,
+            block,
+            candidate,
+            allowed,
+        ) == null) continue;
+        if (try convergenceIsBypassed(allocator, analysis, block, branch, candidate, allowed, distances)) continue;
+
+        const current: Selection = .{
+            .join = candidate,
+            .then_distance = then_distance,
+            .else_distance = else_distance,
+        };
+        if (selected == null or selectionLessThan(current, selected.?)) selected = current;
+    }
+    return selected;
 }
 
 const DirectValueUseDetector = struct {
@@ -9742,6 +10401,48 @@ pub fn isIterationTransitionHeader(program: *const ir.Program, block_id: ir.Bloc
     };
 }
 
+fn selectionLessThan(left: Selection, right: Selection) bool {
+    const left_max = @max(left.then_distance, left.else_distance);
+    const right_max = @max(right.then_distance, right.else_distance);
+    if (left_max != right_max) return left_max < right_max;
+    const left_sum = @as(u64, left.then_distance) + left.else_distance;
+    const right_sum = @as(u64, right.then_distance) + right.else_distance;
+    if (left_sum != right_sum) return left_sum < right_sum;
+    return left.join.index() < right.join.index();
+}
+
+fn convergenceIsBypassed(
+    allocator: std.mem.Allocator,
+    analysis: *const cfg.Analysis,
+    block: ir.BlockId,
+    branch: ir.Branch,
+    candidate: ir.BlockId,
+    allowed: ?[]const bool,
+    distances: ?DistancePair,
+) std.mem.Allocator.Error!bool {
+    for (analysis.function.blocks) |downstream| {
+        if (downstream == candidate or !isIterationTransitionHeader(analysis.program, downstream)) continue;
+        if (try forwardDistance(allocator, analysis, candidate, downstream, null, allowed) == null) continue;
+        const then_reaches = if (distances) |pair|
+            distanceAt(analysis, pair.then_distances, downstream) != null
+        else
+            try forwardDistance(allocator, analysis, branch.then_edge.target, downstream, null, allowed) != null;
+        if (!then_reaches) continue;
+        const else_reaches = if (distances) |pair|
+            distanceAt(analysis, pair.else_distances, downstream) != null
+        else
+            try forwardDistance(allocator, analysis, branch.else_edge.target, downstream, null, allowed) != null;
+        if (!else_reaches or
+            try analysis.immediateStructuralPostDominatorWithin(allocator, block, downstream, allowed) == null) continue;
+        if (try forwardDistance(allocator, analysis, branch.then_edge.target, downstream, candidate, allowed) != null or
+            try forwardDistance(allocator, analysis, branch.else_edge.target, downstream, candidate, allowed) != null)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 fn successorEdgeRef(
     program: *const ir.Program,
     source: ir.BlockId,
@@ -10962,6 +11663,68 @@ fn prepareClosureImpl(
     }
     @memcpy(closure, ordered);
     return true;
+}
+
+fn forwardDistance(
+    allocator: std.mem.Allocator,
+    analysis: *const cfg.Analysis,
+    start: ir.BlockId,
+    target: ir.BlockId,
+    blocked: ?ir.BlockId,
+    allowed: ?[]const bool,
+) std.mem.Allocator.Error!?u32 {
+    const target_index = analysis.blockIndex(target) orelse return null;
+    const distances = try forwardDistancesAlloc(allocator, analysis, start, blocked, allowed) orelse return null;
+    defer allocator.free(distances);
+    const distance = distances[target_index];
+    return if (distance == std.math.maxInt(u32)) null else distance;
+}
+
+fn distanceAt(analysis: *const cfg.Analysis, distances: []const u32, target: ir.BlockId) ?u32 {
+    const target_index = analysis.blockIndex(target) orelse return null;
+    if (target_index >= distances.len) return null;
+    const distance = distances[target_index];
+    return if (distance == std.math.maxInt(u32)) null else distance;
+}
+
+fn forwardDistancesAlloc(
+    allocator: std.mem.Allocator,
+    analysis: *const cfg.Analysis,
+    start: ir.BlockId,
+    blocked: ?ir.BlockId,
+    allowed: ?[]const bool,
+) std.mem.Allocator.Error!?[]u32 {
+    const block_count = analysis.function.blocks.len;
+    if (allowed) |membership| if (membership.len != block_count) return null;
+    const start_index = analysis.blockIndex(start) orelse return null;
+    const blocked_index = if (blocked) |blocked_id| analysis.blockIndex(blocked_id) orelse return null else null;
+    if (!analysis.isReachable(start) or blocked_index == start_index) return null;
+    if (allowed) |membership| if (!membership[start_index]) return null;
+
+    const distances = try allocator.alloc(u32, block_count);
+    errdefer allocator.free(distances);
+    @memset(distances, std.math.maxInt(u32));
+    const pending = try allocator.alloc(ir.BlockId, block_count);
+    defer allocator.free(pending);
+    distances[start_index] = 0;
+    pending[0] = start;
+    var cursor: usize = 0;
+    var pending_len: usize = 1;
+    while (cursor < pending_len) : (cursor += 1) {
+        const current = pending[cursor];
+        const current_index = analysis.blockIndex(current) orelse return null;
+        for (0..analysis.successorCount(current)) |successor_index| {
+            const successor = analysis.successorAt(current, successor_index) orelse return null;
+            const local_index = analysis.blockIndex(successor) orelse return null;
+            if (blocked_index == local_index) continue;
+            if (allowed) |membership| if (!membership[local_index]) continue;
+            if (distances[local_index] != std.math.maxInt(u32)) continue;
+            distances[local_index] = distances[current_index] + 1;
+            pending[pending_len] = successor;
+            pending_len += 1;
+        }
+    }
+    return distances;
 }
 
 test "one-parameter clone member authenticates its live edge tuple" {
