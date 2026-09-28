@@ -98,6 +98,281 @@ const CloneLineageStep = struct {
     group: ir.NodeSplitGroupId,
 };
 
+fn collectExternalCloneMappingsAllocWithReplayState(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    closure: []const ir.BlockId,
+    incoming: []const ir.CfgEdgeRef,
+    lineage_index: *const CloneLineageIndex,
+    replay_index: *const node_split.ReplayIndex,
+    replay_cache: *ReplayCache,
+) std.mem.Allocator.Error!?ExternalCloneMappings {
+    if (closure.len == 0 or incoming.len == 0) return null;
+    var used_values: std.ArrayList(ir.ValueId) = .empty;
+    defer used_values.deinit(allocator);
+    var used_packs: std.ArrayList(ir.ValuePackId) = .empty;
+    defer used_packs.deinit(allocator);
+    const trace_mapping_failure = trace_structural_phases and closure.len >= 140 and incoming.len == 1;
+    var out_of_memory = false;
+    const collector = UseCollector{
+        .allocator = allocator,
+        .values = &used_values,
+        .packs = &used_packs,
+        .out_of_memory = &out_of_memory,
+    };
+
+    for (closure) |block_id| {
+        if (block_id.index() >= program.blocks.len or analysis.blockIndex(block_id) == null) return null;
+        const block = program.blocks[block_id.index()];
+        if (block.id != block_id or block.function != analysis.function.id) return null;
+        for (block.instructions) |instruction_id| {
+            if (instruction_id.index() >= program.instructions.len) return null;
+            const instruction = program.instructions[instruction_id.index()];
+            if (instruction.id != instruction_id or instruction.block != block_id) return null;
+            runtime_uses.visitOperationUses(instruction.operation, collector);
+        }
+        runtime_uses.visitTerminatorUses(block.terminator, collector);
+    }
+    if (out_of_memory) return error.OutOfMemory;
+
+    if (trace_mapping_failure) {
+        std.debug.print("external_mapping_begin closure={} incoming={any} used_values={any} used_packs={any}\n", .{
+            closure.len,
+            incoming,
+            used_values.items,
+            used_packs.items,
+        });
+    }
+
+    for (incoming) |reference| {
+        if (!incomingEdgeIsCanonical(program, analysis, reference) or
+            !containsBlock(closure, reference.target)) return null;
+    }
+
+    var values: std.ArrayList(ir.ValueId) = .empty;
+    errdefer values.deinit(allocator);
+    var clone_values: std.ArrayList(ir.ValueId) = .empty;
+    errdefer clone_values.deinit(allocator);
+    for (used_values.items) |value_id| {
+        if (closureContainsValue(program, closure, value_id)) continue;
+        if (value_id.index() >= program.values.len) return null;
+        const value = program.values[value_id.index()];
+        if (value.id != value_id or value.function != analysis.function.id) return null;
+        switch (value.origin) {
+            .parameter, .capture => {
+                if (!valueAvailableAtIncomingSources(program, analysis, value_id, incoming)) {
+                    if (trace_mapping_failure) std.debug.print("external_mapping_reject value={} reason=parameter_unavailable\n", .{value_id.index()});
+                    return null;
+                }
+            },
+            .block_parameter => |origin| {
+                const producer = externalBlockParameterBlock(program, analysis, value_id, origin.block, origin.index) orelse {
+                    if (trace_mapping_failure) std.debug.print("external_mapping_reject value={} reason=invalid_block_parameter producer={} index={}\n", .{ value_id.index(), origin.block.index(), origin.index });
+                    return null;
+                };
+                // A dominating source definition is only a fallback.  A prior
+                // authenticated split may provide the value for this incoming
+                // context even when the original producer still dominates it.
+                const clone_value = if (incomingEdgesOriginateAtProducer(incoming, producer))
+                    value_id
+                else
+                    (try findExistingValueCloneAlloc(
+                        allocator,
+                        program,
+                        analysis,
+                        producer,
+                        value_id,
+                        incoming,
+                        closure,
+                        lineage_index,
+                        replay_index,
+                        replay_cache,
+                    )) orelse (try authenticatedBlockParameterIncomingValueAlloc(
+                        allocator,
+                        program,
+                        analysis,
+                        value_id,
+                        producer,
+                        origin.index,
+                        incoming,
+                        closure,
+                        lineage_index,
+                        replay_index,
+                        replay_cache,
+                    )) orelse if (definitionDominatesIncoming(analysis, producer, incoming))
+                        value_id
+                    else {
+                        if (trace_mapping_failure) std.debug.print("external_mapping_reject value={} reason=no_block_parameter_mapping producer={} index={}\n", .{ value_id.index(), producer.index(), origin.index });
+                        return null;
+                    };
+                const boundary_clone = selectBoundaryValueMapping(
+                    program,
+                    analysis,
+                    value_id,
+                    clone_value,
+                    incoming,
+                ) orelse {
+                    if (trace_mapping_failure) std.debug.print("external_mapping_reject value={} reason=boundary_unavailable mapped={} producer={}\n", .{ value_id.index(), clone_value.index(), producer.index() });
+                    return null;
+                };
+                if (!try appendValueMapping(allocator, program, &values, &clone_values, value_id, boundary_clone, false)) {
+                    if (!try isAuthenticatedValueAliasAlloc(
+                        allocator,
+                        program,
+                        analysis,
+                        producer,
+                        value_id,
+                        boundary_clone,
+                        incoming,
+                        lineage_index,
+                        replay_index,
+                        replay_cache,
+                    ) or !try appendValueMapping(allocator, program, &values, &clone_values, value_id, boundary_clone, true)) {
+                        if (trace_mapping_failure) std.debug.print("external_mapping_reject value={} reason=mapping_collision mapped={} producer={}\n", .{ value_id.index(), boundary_clone.index(), producer.index() });
+                        return null;
+                    }
+                    if (trace_mapping_failure) std.debug.print("external_mapping_authenticated_alias value={} mapped={} producer={}\n", .{ value_id.index(), boundary_clone.index(), producer.index() });
+                }
+            },
+            .instruction_result => |origin| {
+                const producer = externalInstructionProducerBlock(program, analysis.function.id, value_id, origin) orelse {
+                    if (trace_mapping_failure) std.debug.print("external_mapping_reject value={} reason=invalid_instruction_result instruction={} index={}\n", .{ value_id.index(), origin.instruction.index(), origin.index });
+                    return null;
+                };
+                const clone_value = if (incomingEdgesOriginateAtProducer(incoming, producer))
+                    value_id
+                else
+                    (try findExistingValueCloneAlloc(
+                        allocator,
+                        program,
+                        analysis,
+                        producer,
+                        value_id,
+                        incoming,
+                        closure,
+                        lineage_index,
+                        replay_index,
+                        replay_cache,
+                    )) orelse (try authenticatedInstructionResultIncomingValueAlloc(
+                        allocator,
+                        program,
+                        analysis,
+                        value_id,
+                        producer,
+                        incoming,
+                        closure,
+                        lineage_index,
+                        replay_index,
+                        replay_cache,
+                    )) orelse if (isRematerializableConstant(program, value_id, analysis.function.id))
+                        value_id
+                    else if (definitionDominatesIncoming(analysis, producer, incoming))
+                        value_id
+                    else {
+                        if (trace_mapping_failure) std.debug.print("external_mapping_reject value={} reason=no_instruction_mapping producer={} instruction={} index={}\n", .{ value_id.index(), producer.index(), origin.instruction.index(), origin.index });
+                        return null;
+                    };
+                const boundary_clone = selectBoundaryValueMapping(
+                    program,
+                    analysis,
+                    value_id,
+                    clone_value,
+                    incoming,
+                ) orelse {
+                    if (trace_mapping_failure) std.debug.print("external_mapping_reject value={} reason=boundary_unavailable mapped={} producer={}\n", .{ value_id.index(), clone_value.index(), producer.index() });
+                    return null;
+                };
+                if (!try appendValueMapping(allocator, program, &values, &clone_values, value_id, boundary_clone, false)) {
+                    if (!try isAuthenticatedValueAliasAlloc(
+                        allocator,
+                        program,
+                        analysis,
+                        producer,
+                        value_id,
+                        boundary_clone,
+                        incoming,
+                        lineage_index,
+                        replay_index,
+                        replay_cache,
+                    ) or !try appendValueMapping(allocator, program, &values, &clone_values, value_id, boundary_clone, true)) {
+                        if (trace_mapping_failure) std.debug.print("external_mapping_reject value={} reason=mapping_collision mapped={} producer={}\n", .{ value_id.index(), boundary_clone.index(), producer.index() });
+                        return null;
+                    }
+                    if (trace_mapping_failure) std.debug.print("external_mapping_authenticated_alias value={} mapped={} producer={}\n", .{ value_id.index(), boundary_clone.index(), producer.index() });
+                }
+            },
+        }
+    }
+
+    var packs: std.ArrayList(ir.ValuePackId) = .empty;
+    errdefer packs.deinit(allocator);
+    var clone_packs: std.ArrayList(ir.ValuePackId) = .empty;
+    errdefer clone_packs.deinit(allocator);
+    for (used_packs.items) |pack_id| {
+        if (closureContainsPack(program, closure, pack_id)) continue;
+        if (pack_id.index() >= program.value_packs.len) return null;
+        const pack = program.value_packs[pack_id.index()];
+        if (pack.id != pack_id or pack.function != analysis.function.id) return null;
+        switch (pack.origin) {
+            .varargs => {
+                if (!packAvailableAtIncomingSources(program, analysis, pack_id, incoming)) {
+                    if (trace_mapping_failure) std.debug.print("external_mapping_reject pack={} reason=varargs_unavailable\n", .{pack_id.index()});
+                    return null;
+                }
+            },
+            .instruction_result => |instruction_id| {
+                const producer = externalPackProducerBlock(program, analysis.function.id, pack_id, instruction_id) orelse {
+                    if (trace_mapping_failure) std.debug.print("external_mapping_reject pack={} reason=invalid_instruction_result instruction={}\n", .{ pack_id.index(), instruction_id.index() });
+                    return null;
+                };
+                const clone_pack = if (incomingEdgesOriginateAtProducer(incoming, producer))
+                    pack_id
+                else
+                    (try findExistingPackCloneAlloc(
+                        allocator,
+                        program,
+                        analysis,
+                        producer,
+                        pack_id,
+                        incoming,
+                        closure,
+                        lineage_index,
+                        replay_index,
+                        replay_cache,
+                    )) orelse if (definitionDominatesIncoming(analysis, producer, incoming))
+                        pack_id
+                    else {
+                        if (trace_mapping_failure) std.debug.print("external_mapping_reject pack={} reason=no_pack_mapping producer={} instruction={}\n", .{ pack_id.index(), producer.index(), instruction_id.index() });
+                        return null;
+                    };
+                const boundary_clone = selectBoundaryPackMapping(
+                    program,
+                    analysis,
+                    pack_id,
+                    clone_pack,
+                    incoming,
+                ) orelse {
+                    if (trace_mapping_failure) std.debug.print("external_mapping_reject pack={} reason=boundary_unavailable mapped={} producer={}\n", .{ pack_id.index(), clone_pack.index(), producer.index() });
+                    return null;
+                };
+                if (!try appendPackMapping(allocator, &packs, &clone_packs, pack_id, boundary_clone)) {
+                    if (trace_mapping_failure) std.debug.print("external_mapping_reject pack={} reason=mapping_collision mapped={} producer={}\n", .{ pack_id.index(), boundary_clone.index(), producer.index() });
+                    return null;
+                }
+            },
+        }
+    }
+
+    return .{
+        .allocator = allocator,
+        .values = try values.toOwnedSlice(allocator),
+        .clone_values = try clone_values.toOwnedSlice(allocator),
+        .packs = try packs.toOwnedSlice(allocator),
+        .clone_packs = try clone_packs.toOwnedSlice(allocator),
+    };
+}
+
 fn closureContainsValue(program: *const ir.Program, closure: []const ir.BlockId, target: ir.ValueId) bool {
     for (closure) |block_id| {
         if (block_id.index() >= program.blocks.len) continue;
@@ -555,6 +830,77 @@ const ReplayCache = struct {
     }
 };
 
+const ContinuationBridgeKey = struct {
+    source: ir.BlockId,
+    kind: ir.CfgEdgeKind,
+    target: ir.BlockId,
+};
+
+const ProjectionValueMatch = enum {
+    same,
+    forward,
+    reverse,
+    none,
+};
+
+const ComposedParameterProjectionResult = enum {
+    not_applicable,
+    matched,
+    rejected,
+};
+
+fn authenticatedComposedParameterProjectionAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    target: ir.BlockId,
+    expected: []const ir.ValueId,
+    actual: []const ir.ValueId,
+    lineage_index: *const CloneLineageIndex,
+    replay_index: *const node_split.ReplayIndex,
+    replay_cache: *ReplayCache,
+) std.mem.Allocator.Error!ComposedParameterProjectionResult {
+    if (target.index() >= program.blocks.len) return .not_applicable;
+    const target_block = program.blocks[target.index()];
+    if (target_block.id != target or target_block.parameters.len == 0 or
+        expected.len != target_block.parameters.len or
+        actual.len != target_block.parameters.len or
+        !node_split.parametersAreCanonical(program.values, target_block))
+    {
+        return .not_applicable;
+    }
+
+    // This rule applies only to the two live contexts being compared.  A
+    // value-only match is insufficient because an unrelated producer can have
+    // the same type and a valid clone root without carrying either edge into
+    // this continuation.
+    if (!hasLiveIncomingEdgeWithArguments(program, target, expected) or
+        !hasLiveIncomingEdgeWithArguments(program, target, actual))
+    {
+        return .not_applicable;
+    }
+
+    var projected = false;
+    for (target_block.parameters, expected, actual) |formal, expected_value, actual_value| {
+        if (!sameContinuationValueType(program, formal, expected_value) or
+            !sameContinuationValueType(program, formal, actual_value))
+        {
+            return .rejected;
+        }
+        if (expected_value == actual_value) continue;
+        projected = true;
+        if (!try authenticatedComposedCloneValueMatchAlloc(
+            allocator,
+            program,
+            expected_value,
+            actual_value,
+            lineage_index,
+            replay_index,
+            replay_cache,
+        )) return .rejected;
+    }
+    return if (projected) .matched else .matched;
+}
+
 fn activeNodeSplitRewrite(program: *const ir.Program, rewrite: ir.CfgEdgeRewrite) bool {
     if (rewrite.rule != .node_split or rewrite.node_split_group == null or
         rewrite.source.index() >= program.blocks.len or rewrite.to.target.index() >= program.blocks.len)
@@ -619,6 +965,136 @@ fn replayedEdgeArgumentsMatch(
         if (mapped != clone_value) return false;
     }
     return true;
+}
+
+// A node-split clone can retain an edge to a shared continuation when that
+// continuation was outside the cloned closure.  There is no edge_rewrite for
+// that unchanged successor edge, so authenticate the edge by replaying the
+// complete block lineage and comparing the ancestor's corresponding edge.
+fn hasAuthenticatedUnchangedCloneBridgeForEdgeAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    reference: ir.CfgEdgeRef,
+    lineage_index: *const CloneLineageIndex,
+    replay_index: *const node_split.ReplayIndex,
+    replay_cache: *ReplayCache,
+) std.mem.Allocator.Error!bool {
+    if (reference.source.index() >= program.blocks.len or reference.target.index() >= program.blocks.len) return false;
+    const source_block = program.blocks[reference.source.index()];
+    const target_block = program.blocks[reference.target.index()];
+    if (source_block.id != reference.source or target_block.id != reference.target or
+        source_block.function != analysis.function.id or target_block.function != source_block.function or
+        !analysis.isReachable(reference.source) or !analysis.isReachable(reference.target))
+    {
+        return false;
+    }
+
+    const position = cloneLineagePositionCached(program, reference.source, lineage_index) orelse {
+        return false;
+    };
+    if (position.depth == 0) {
+        return false;
+    }
+    const lineage = try cloneLineageAllocCached(
+        allocator,
+        program,
+        position.root,
+        reference.source,
+        lineage_index,
+    ) orelse {
+        return false;
+    };
+    defer allocator.free(lineage);
+    if (lineage.len == 0 or !cloneLineageArgumentsAreStableCached(program, reference.source, lineage_index)) {
+        return false;
+    }
+    if (!try cloneLineageArgumentsMatchReplayCached(
+        allocator,
+        program,
+        position.root,
+        reference.source,
+        lineage_index,
+        replay_index,
+        replay_cache,
+    )) {
+        return false;
+    }
+
+    const current_edge = cfg_edge.value(program, reference) orelse {
+        return false;
+    };
+    for (lineage) |step| {
+        const source_reference = edgeReferenceForKind(program, step.source, reference.kind) orelse {
+            return false;
+        };
+        const clone_reference = edgeReferenceForKind(program, step.clone, reference.kind) orelse {
+            return false;
+        };
+        const source_edge = cfg_edge.value(program, source_reference) orelse {
+            return false;
+        };
+        const clone_edge = cfg_edge.value(program, clone_reference) orelse {
+            return false;
+        };
+        const target_equivalent = try authenticatedCloneBranchEquivalentAlloc(
+            allocator,
+            program,
+            source_edge.target,
+            clone_edge.target,
+            lineage_index,
+            replay_index,
+            replay_cache,
+            0,
+        );
+        if (!target_equivalent) {
+            return false;
+        }
+        const replay = (try replay_cache.get(step.source, step.clone, step.group)) orelse {
+            return false;
+        };
+        if (!replayedEdgeArgumentsMatch(
+            program,
+            step.source,
+            step.clone,
+            source_edge,
+            clone_edge,
+            replay.*,
+            target_equivalent,
+        )) {
+            return false;
+        }
+    }
+
+    const final_reference = edgeReferenceForKind(program, reference.source, reference.kind) orelse {
+        return false;
+    };
+    const final_edge = cfg_edge.value(program, final_reference) orelse {
+        return false;
+    };
+    if (final_reference.target != reference.target or
+        !std.mem.eql(ir.ValueId, final_edge.arguments, current_edge.arguments))
+    {
+        return false;
+    }
+
+    const closure = [_]ir.BlockId{reference.target};
+    const incoming = [_]ir.CfgEdgeRef{reference};
+    var external = try collectExternalCloneMappingsAllocWithReplayState(
+        allocator,
+        program,
+        analysis,
+        &closure,
+        &incoming,
+        lineage_index,
+        replay_index,
+        replay_cache,
+    );
+    if (external) |*owned| {
+        owned.deinit();
+        return true;
+    }
+    return false;
 }
 
 test "replayed edge arguments require authenticated equivalent targets" {
@@ -1283,6 +1759,23 @@ test "value alias convergence remains closed without authenticated proof" {
     ));
     try std.testing.expectEqual(@as(usize, 1), sources.items.len);
     try std.testing.expectEqual(@as(usize, 1), clones.items.len);
+}
+
+fn appendPackMapping(
+    allocator: std.mem.Allocator,
+    sources: *std.ArrayList(ir.ValuePackId),
+    clones: *std.ArrayList(ir.ValuePackId),
+    source: ir.ValuePackId,
+    clone: ir.ValuePackId,
+) std.mem.Allocator.Error!bool {
+    for (sources.items, clones.items) |existing_source, existing_clone| {
+        if (existing_source == source or existing_clone == clone) {
+            return existing_source == source and existing_clone == clone;
+        }
+    }
+    try sources.append(allocator, source);
+    try clones.append(allocator, clone);
+    return true;
 }
 
 fn cloneStepForTarget(program: *const ir.Program, target: ir.BlockId) ?CloneLineageStep {
@@ -2709,6 +3202,36 @@ fn mapValueThroughCloneLineageAllocCachedWithReplayCache(
     return current;
 }
 
+fn mapPackThroughCloneLineageAllocCachedWithReplayCache(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    source: ir.BlockId,
+    clone: ir.BlockId,
+    pack: ir.ValuePackId,
+    index: ?*const CloneLineageIndex,
+    replay_index: ?*const node_split.ReplayIndex,
+    replay_cache: ?*ReplayCache,
+) std.mem.Allocator.Error!?ir.ValuePackId {
+    const lineage = try cloneLineageAllocCached(allocator, program, source, clone, index) orelse return null;
+    defer allocator.free(lineage);
+    var current = pack;
+    for (lineage) |step| {
+        const mapped = if (replay_cache) |cache| blk: {
+            const replay = (try cache.get(step.source, step.clone, step.group)) orelse return null;
+            break :blk mapPackFromReplay(program, step.source, step.clone, current, replay.*);
+        } else blk: {
+            var replay = if (replay_index) |cached|
+                (try node_split.replayMappingsForCloneAllocWithIndex(allocator, program, cached, step.source, step.clone, step.group)) orelse return null
+            else
+                (try node_split.replayMappingsForCloneAlloc(allocator, program, step.source, step.clone, step.group)) orelse return null;
+            defer replay.deinit();
+            break :blk mapPackFromReplay(program, step.source, step.clone, current, replay);
+        };
+        current = mapped orelse return null;
+    }
+    return current;
+}
+
 fn nodeSplitRewriteArgumentsMatchReplay(
     program: *const ir.Program,
     rewrite: ir.CfgEdgeRewrite,
@@ -4002,6 +4525,100 @@ fn findExistingValueCloneAlloc(
     return if (fallback_ambiguous) null else fallback;
 }
 
+fn findExistingPackCloneAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    producer: ir.BlockId,
+    source_pack: ir.ValuePackId,
+    incoming: []const ir.CfgEdgeRef,
+    _: []const ir.BlockId,
+    lineage_index: ?*const CloneLineageIndex,
+    replay_index: *const node_split.ReplayIndex,
+    replay_cache: ?*ReplayCache,
+) std.mem.Allocator.Error!?ir.ValuePackId {
+    const group_context = try findGroupContextPackMappingAlloc(
+        allocator,
+        program,
+        analysis,
+        source_pack,
+        incoming,
+        lineage_index,
+        replay_index,
+        replay_cache,
+    );
+    if (group_context.ambiguous) return null;
+    if (group_context.pack) |mapped| return mapped;
+
+    var authenticated: ?ir.ValuePackId = null;
+    var authenticated_candidate: ?ir.BlockId = null;
+    var authenticated_rank: u8 = 0;
+    var authenticated_ambiguous = false;
+    var fallback: ?ir.ValuePackId = null;
+    var fallback_ambiguous = false;
+    for (replay_index.candidateCloneTargetsForSource(program, producer)) |candidate| {
+        if (candidate == producer or analysis.blockIndex(candidate) == null or candidate.index() >= program.blocks.len) continue;
+        if (!blockLineageContainsCached(program, candidate, producer, lineage_index)) continue;
+        if (!try cloneLineageArgumentsMatchReplayCached(
+            allocator,
+            program,
+            producer,
+            candidate,
+            lineage_index,
+            replay_index,
+            replay_cache,
+        )) continue;
+        const context_rank = try cloneContextRankCached(
+            allocator,
+            program,
+            analysis,
+            candidate,
+            incoming,
+            lineage_index,
+            replay_index,
+            replay_cache,
+        );
+        const dominated = definitionDominatesIncoming(analysis, candidate, incoming);
+        if (context_rank == 0 and !dominated) continue;
+        const clone_pack = try mapPackThroughCloneLineageAllocCachedWithReplayCache(
+            allocator,
+            program,
+            producer,
+            candidate,
+            source_pack,
+            lineage_index,
+            replay_index,
+            replay_cache,
+        ) orelse continue;
+        if (context_rank != 0) {
+            const rank = context_rank;
+            if (authenticated == null or rank > authenticated_rank) {
+                authenticated = clone_pack;
+                authenticated_candidate = candidate;
+                authenticated_rank = rank;
+                authenticated_ambiguous = false;
+            } else if (rank == authenticated_rank) {
+                const existing = authenticated.?;
+                if (existing != clone_pack) {
+                    const existing_candidate = authenticated_candidate orelse return null;
+                    if (cloneCandidateIsMoreSpecificCached(program, candidate, existing_candidate, lineage_index)) |more_specific| {
+                        if (more_specific) {
+                            authenticated = clone_pack;
+                            authenticated_candidate = candidate;
+                        }
+                    } else {
+                        authenticated_ambiguous = true;
+                    }
+                }
+            }
+        } else if (fallback) |existing| {
+            if (existing != clone_pack) fallback_ambiguous = true;
+        } else fallback = clone_pack;
+    }
+    if (authenticated) |mapped| return if (authenticated_ambiguous) null else mapped;
+    return if (fallback_ambiguous) null else fallback;
+}
+
 fn mapValueFromReplay(
     program: *const ir.Program,
     source_block_id: ir.BlockId,
@@ -4253,6 +4870,94 @@ fn mapInstructionResultClone(
     return null;
 }
 
+fn mapPackFromReplay(
+    program: *const ir.Program,
+    source_block_id: ir.BlockId,
+    clone_block_id: ir.BlockId,
+    source_pack_id: ir.ValuePackId,
+    replay: node_split.ReplayMappings,
+) ?ir.ValuePackId {
+    for (replay.source_packs, replay.clone_packs) |source_pack, clone_pack| {
+        if (source_pack == source_pack_id) {
+            return if (packReplayPairIsCompatible(program, source_pack, clone_pack)) clone_pack else null;
+        }
+    }
+    if (source_block_id.index() >= program.blocks.len or clone_block_id.index() >= program.blocks.len) return null;
+    const source_block = program.blocks[source_block_id.index()];
+    const clone_block = program.blocks[clone_block_id.index()];
+    if (source_block.id != source_block_id or clone_block.id != clone_block_id or
+        source_block.function != clone_block.function)
+    {
+        return null;
+    }
+    for (source_block.instructions, 0..) |source_id, instruction_index| {
+        if (source_id.index() >= program.instructions.len or instruction_index >= clone_block.instructions.len) return null;
+        const source_instruction = program.instructions[source_id.index()];
+        const clone_id = clone_block.instructions[instruction_index];
+        if (source_instruction.id != source_id or clone_id.index() >= program.instructions.len) return null;
+        const clone_instruction = program.instructions[clone_id.index()];
+        if (source_instruction.pack_result != source_pack_id) continue;
+        if (clone_instruction.id != clone_id) return null;
+        const clone_pack_id = clone_instruction.pack_result orelse return null;
+        if (clone_pack_id.index() >= program.value_packs.len) return null;
+        const clone_pack = program.value_packs[clone_pack_id.index()];
+        if (clone_pack.id != clone_pack_id or clone_pack.function != clone_block.function or
+            !packReplayPairIsCompatible(program, source_pack_id, clone_pack_id)) return null;
+        return clone_pack_id;
+    }
+    return null;
+}
+
+fn packReplayPairIsCompatible(
+    program: *const ir.Program,
+    source_pack_id: ir.ValuePackId,
+    clone_pack_id: ir.ValuePackId,
+) bool {
+    if (source_pack_id.index() >= program.value_packs.len or clone_pack_id.index() >= program.value_packs.len) return false;
+    const source = program.value_packs[source_pack_id.index()];
+    const clone = program.value_packs[clone_pack_id.index()];
+    if (source.id != source_pack_id or clone.id != clone_pack_id or source.function != clone.function) return false;
+    if (source.shape.tail != clone.shape.tail or source.shape.prefix.len != clone.shape.prefix.len) return false;
+    for (source.shape.prefix, clone.shape.prefix) |source_type, clone_type| {
+        if (!std.meta.eql(source_type, clone_type)) return false;
+    }
+    return std.mem.eql(ir.EvidenceId, source.evidence, clone.evidence);
+}
+
+fn externalInstructionProducerBlock(
+    program: *const ir.Program,
+    function_id: ir.FunctionId,
+    value_id: ir.ValueId,
+    origin: anytype,
+) ?ir.BlockId {
+    if (origin.instruction.index() >= program.instructions.len) return null;
+    const instruction = program.instructions[origin.instruction.index()];
+    const result_index: usize = @intCast(origin.index);
+    if (instruction.id != origin.instruction or instruction.block.index() >= program.blocks.len or
+        program.blocks[instruction.block.index()].function != function_id or
+        result_index >= instruction.results.len or instruction.results[result_index] != value_id)
+    {
+        return null;
+    }
+    return instruction.block;
+}
+
+fn externalPackProducerBlock(
+    program: *const ir.Program,
+    function_id: ir.FunctionId,
+    pack_id: ir.ValuePackId,
+    instruction_id: ir.InstructionId,
+) ?ir.BlockId {
+    if (instruction_id.index() >= program.instructions.len) return null;
+    const instruction = program.instructions[instruction_id.index()];
+    if (instruction.id != instruction_id or instruction.block.index() >= program.blocks.len or
+        program.blocks[instruction.block.index()].function != function_id or instruction.pack_result != pack_id)
+    {
+        return null;
+    }
+    return instruction.block;
+}
+
 const DirectValueUseDetector = struct {
     target: ir.ValueId,
     found: bool = false,
@@ -4263,6 +4968,19 @@ const DirectValueUseDetector = struct {
 
     pub fn pack(_: *DirectValueUseDetector, _: ir.ValuePackId) void {}
     pub fn place(_: *DirectValueUseDetector, _: ir.PlaceId) void {}
+};
+
+const DirectPackUseDetector = struct {
+    target: ir.ValuePackId,
+    found: bool = false,
+
+    pub fn value(_: *DirectPackUseDetector, _: ir.ValueId) void {}
+
+    pub fn pack(self: *DirectPackUseDetector, pack_id: ir.ValuePackId) void {
+        if (pack_id == self.target) self.found = true;
+    }
+
+    pub fn place(_: *DirectPackUseDetector, _: ir.PlaceId) void {}
 };
 
 const ContextualMapping = struct {
@@ -4450,6 +5168,66 @@ fn findGroupContextValueMappingAlloc(
                 if (existing != mapped_value) result.ambiguous = true;
             } else {
                 result.value = mapped_value;
+            }
+        }
+    }
+    return result;
+}
+
+fn findGroupContextPackMappingAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    source_pack: ir.ValuePackId,
+    incoming: []const ir.CfgEdgeRef,
+    lineage_index: ?*const CloneLineageIndex,
+    replay_index: *const node_split.ReplayIndex,
+    replay_cache: ?*ReplayCache,
+) std.mem.Allocator.Error!ContextualMapping {
+    var result = ContextualMapping{};
+    if (incoming.len == 0) return result;
+    const normalized = try normalizeIncomingThroughForwardingAlloc(allocator, program, analysis, incoming);
+    defer allocator.free(normalized);
+    for (normalized) |reference| {
+        const incoming_step = cloneStepForTargetCached(program, reference.source, lineage_index) orelse continue;
+        for (replay_index.nodeSplitRewriteIndicesForGroup(incoming_step.group)) |rewrite_index| {
+            if (rewrite_index >= program.edge_rewrites.len) continue;
+            const rewrite = program.edge_rewrites[rewrite_index];
+            const source_id = rewrite.from.target;
+            const clone_id = rewrite.to.target;
+            if (source_id.index() >= program.blocks.len or clone_id.index() >= program.blocks.len or
+                analysis.blockIndex(clone_id) == null or !try analysis.canReach(clone_id, reference.source)) continue;
+            const source_block = program.blocks[source_id.index()];
+            if (source_block.id != source_id) continue;
+            var detector = DirectPackUseDetector{ .target = source_pack };
+            for (source_block.instructions) |instruction_id| {
+                if (instruction_id.index() >= program.instructions.len) continue;
+                runtime_uses.visitOperationUses(program.instructions[instruction_id.index()].operation, &detector);
+            }
+            runtime_uses.visitTerminatorUses(source_block.terminator, &detector);
+            if (!detector.found) continue;
+            const mapped = if (replay_cache) |cache| blk: {
+                const replay = (try cache.get(source_id, clone_id, incoming_step.group)) orelse continue;
+                if (!nodeSplitRewriteArgumentsMatchReplay(program, rewrite, replay.*)) continue;
+                break :blk mapPackFromReplay(program, source_id, clone_id, source_pack, replay.*);
+            } else blk: {
+                var replay = (try node_split.replayMappingsForCloneAllocWithIndex(
+                    allocator,
+                    program,
+                    replay_index,
+                    source_id,
+                    clone_id,
+                    incoming_step.group,
+                )) orelse continue;
+                defer replay.deinit();
+                if (!nodeSplitRewriteArgumentsMatchReplay(program, rewrite, replay)) continue;
+                break :blk mapPackFromReplay(program, source_id, clone_id, source_pack, replay);
+            };
+            const mapped_pack = mapped orelse continue;
+            if (result.pack) |existing| {
+                if (existing != mapped_pack) result.ambiguous = true;
+            } else {
+                result.pack = mapped_pack;
             }
         }
     }
