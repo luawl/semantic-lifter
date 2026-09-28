@@ -8508,6 +8508,64 @@ pub fn selectIterationConvergence(
     return selected;
 }
 
+fn selectOverlapConvergence(
+    allocator: std.mem.Allocator,
+    analysis: *const cfg.Analysis,
+    block: ir.BlockId,
+) std.mem.Allocator.Error!?Selection {
+    const branch = switch (analysis.program.blocks[block.index()].terminator) {
+        .branch => |value| value,
+        else => return null,
+    };
+    const then_distances = try forwardDistancesAlloc(
+        allocator,
+        analysis,
+        branch.then_edge.target,
+        null,
+        null,
+    ) orelse return null;
+    defer allocator.free(then_distances);
+    const else_distances = try forwardDistancesAlloc(
+        allocator,
+        analysis,
+        branch.else_edge.target,
+        null,
+        null,
+    ) orelse return null;
+    defer allocator.free(else_distances);
+    const distances: DistancePair = .{
+        .then_distances = then_distances,
+        .else_distances = else_distances,
+    };
+    var selected: ?Selection = null;
+    for (analysis.function.blocks) |candidate| {
+        if (!isIterationTransitionHeader(analysis.program, candidate)) {
+            var membership = natural_loop.collect(allocator, analysis, candidate) catch |err| switch (err) {
+                error.UnsupportedShape => continue,
+                error.OutOfMemory => return error.OutOfMemory,
+            } orelse continue;
+            membership.deinit();
+        }
+        const then_distance = distanceAt(analysis, then_distances, candidate) orelse continue;
+        const else_distance = distanceAt(analysis, else_distances, candidate) orelse continue;
+        if (try analysis.immediateStructuralPostDominatorWithin(
+            allocator,
+            block,
+            candidate,
+            null,
+        ) == null) continue;
+        if (try convergenceIsBypassed(allocator, analysis, block, branch, candidate, null, distances)) continue;
+
+        const current: Selection = .{
+            .join = candidate,
+            .then_distance = then_distance,
+            .else_distance = else_distance,
+        };
+        if (selected == null or selectionLessThan(current, selected.?)) selected = current;
+    }
+    return selected;
+}
+
 const DirectValueUseDetector = struct {
     target: ir.ValueId,
     found: bool = false,
@@ -9338,6 +9396,17 @@ fn hasAuthenticatedEffectfulParameterizedCompoundProjectionAlloc(
     return true;
 }
 
+fn packProducerBlock(program: *const ir.Program, pack_id: ir.ValuePackId) ?ir.BlockId {
+    if (pack_id.index() >= program.value_packs.len) return null;
+    return switch (program.value_packs[pack_id.index()].origin) {
+        .instruction_result => |instruction_id| if (instruction_id.index() < program.instructions.len)
+            program.instructions[instruction_id.index()].block
+        else
+            null,
+        .varargs => null,
+    };
+}
+
 test "non-dominating exact constants remain rematerializable continuation values" {
     const function_id = ir.FunctionId.fromIndex(0);
     const entry = ir.BlockId.fromIndex(0);
@@ -9948,6 +10017,204 @@ test "compound iteration projection accepts concrete owners for dynamic formals"
     ));
 }
 
+test "authenticated positional continuation projection uses live canonical parameters" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const source = ir.BlockId.fromIndex(1);
+    const target = ir.BlockId.fromIndex(2);
+    const exit = ir.BlockId.fromIndex(3);
+    const seed_dynamic = ir.ValueId.fromIndex(0);
+    const seed_integer = ir.ValueId.fromIndex(1);
+    const target_dynamic = ir.ValueId.fromIndex(2);
+    const target_integer = ir.ValueId.fromIndex(3);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .jump = .{ .target = source } } },
+        .{ .id = source, .function = function_id, .terminator = .{ .jump = .{
+            .target = target,
+            .arguments = &.{ seed_dynamic, seed_integer },
+        } } },
+        .{ .id = target, .function = function_id, .parameters = &.{ target_dynamic, target_integer }, .terminator = .{ .jump = .{ .target = exit } } },
+        .{ .id = exit, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .parameters = &.{ seed_dynamic, seed_integer },
+        .blocks = &.{ entry, source, target, exit },
+        .entry_block = entry,
+    }};
+    const values = [_]ir.Value{
+        .{ .id = seed_dynamic, .function = function_id, .type = .dynamic, .origin = .{ .parameter = 0 } },
+        .{ .id = seed_integer, .function = function_id, .type = .integer, .origin = .{ .parameter = 1 } },
+        .{ .id = target_dynamic, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = target, .index = 0 } } },
+        .{ .id = target_integer, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = target, .index = 1 } } },
+    };
+    const incoming = [_]ir.CfgEdgeRef{.{ .source = source, .kind = .jump, .target = target }};
+    var program: ir.Program = .{
+        .program_id = "authenticated-positional-continuation-projection",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, functions[0]);
+    defer analysis.deinit();
+    var lineage_index = try CloneLineageIndex.init(std.testing.allocator, &program);
+    defer lineage_index.deinit();
+    var replay_index = try node_split.ReplayIndex.init(std.testing.allocator, &program);
+    defer replay_index.deinit();
+    var replay_cache = ReplayCache.init(std.testing.allocator, &program, &replay_index);
+    defer replay_cache.deinit();
+
+    try std.testing.expect(try authenticatedParameterProjectionForEdge(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        source,
+        .jump,
+        target,
+        &.{ seed_dynamic, seed_integer },
+        &.{target},
+        &.{target},
+        &incoming,
+        &lineage_index,
+        &replay_index,
+        &replay_cache,
+    ));
+
+    var reordered_blocks = blocks;
+    reordered_blocks[target.index()].parameters = &.{ target_integer, target_dynamic };
+    program.blocks = &reordered_blocks;
+    try std.testing.expect(!try authenticatedParameterProjectionForEdge(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        source,
+        .jump,
+        target,
+        &.{ seed_dynamic, seed_integer },
+        &.{target},
+        &.{target},
+        &incoming,
+        &lineage_index,
+        &replay_index,
+        &replay_cache,
+    ));
+
+    program.blocks = &blocks;
+    var mismatched_values = values;
+    mismatched_values[target_integer.index()].type = .boolean;
+    program.values = &mismatched_values;
+    try std.testing.expect(!try authenticatedParameterProjectionForEdge(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        source,
+        .jump,
+        target,
+        &.{ seed_dynamic, seed_integer },
+        &.{target},
+        &.{target},
+        &incoming,
+        &lineage_index,
+        &replay_index,
+        &replay_cache,
+    ));
+
+    program.values = &values;
+    var stale_blocks = blocks;
+    stale_blocks[source.index()].terminator = .{ .jump = .{ .target = exit, .arguments = &.{ seed_dynamic, seed_integer } } };
+    program.blocks = &stale_blocks;
+    try std.testing.expect(!try authenticatedParameterProjectionForEdge(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        source,
+        .jump,
+        target,
+        &.{ seed_dynamic, seed_integer },
+        &.{target},
+        &.{target},
+        &incoming,
+        &lineage_index,
+        &replay_index,
+        &replay_cache,
+    ));
+}
+
+test "positional continuation projection rejects unauthenticated edge values" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const producer = ir.BlockId.fromIndex(1);
+    const source = ir.BlockId.fromIndex(2);
+    const target = ir.BlockId.fromIndex(3);
+    const selector = ir.ValueId.fromIndex(0);
+    const producer_value = ir.ValueId.fromIndex(1);
+    const target_value = ir.ValueId.fromIndex(2);
+    const instruction_id = ir.InstructionId.fromIndex(0);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = selector,
+            .then_edge = .{ .target = producer },
+            .else_edge = .{ .target = source },
+        } } },
+        .{ .id = producer, .function = function_id, .instructions = &.{instruction_id}, .terminator = .{ .return_values = &.{} } },
+        .{ .id = source, .function = function_id, .terminator = .{ .jump = .{ .target = target, .arguments = &.{producer_value} } } },
+        .{ .id = target, .function = function_id, .parameters = &.{target_value}, .terminator = .{ .return_values = &.{target_value} } },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .parameters = &.{selector},
+        .blocks = &.{ entry, producer, source, target },
+        .entry_block = entry,
+    }};
+    const values = [_]ir.Value{
+        .{ .id = selector, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = producer_value, .function = function_id, .type = .integer, .origin = .{ .instruction_result = .{ .instruction = instruction_id, .index = 0 } } },
+        .{ .id = target_value, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = target, .index = 0 } } },
+    };
+    const instructions = [_]ir.Instruction{.{
+        .id = instruction_id,
+        .block = producer,
+        .operation = .{ .constant = .{ .number = 1 } },
+        .results = &.{producer_value},
+        .effects = .pure,
+    }};
+    const incoming = [_]ir.CfgEdgeRef{.{ .source = source, .kind = .jump, .target = target }};
+    var program: ir.Program = .{
+        .program_id = "reject-unauthenticated-positional-continuation-projection",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, functions[0]);
+    defer analysis.deinit();
+    var lineage_index = try CloneLineageIndex.init(std.testing.allocator, &program);
+    defer lineage_index.deinit();
+    var replay_index = try node_split.ReplayIndex.init(std.testing.allocator, &program);
+    defer replay_index.deinit();
+    var replay_cache = ReplayCache.init(std.testing.allocator, &program, &replay_index);
+    defer replay_cache.deinit();
+
+    try std.testing.expect(!try authenticatedParameterProjectionForEdge(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        source,
+        .jump,
+        target,
+        &.{producer_value},
+        &.{target},
+        &.{target},
+        &incoming,
+        &lineage_index,
+        &replay_index,
+        &replay_cache,
+    ));
+}
+
 test "parameterized continuation rejects unavailable arguments despite stop reachability" {
     const function_id = ir.FunctionId.fromIndex(0);
     const entry = ir.BlockId.fromIndex(0);
@@ -10014,6 +10281,149 @@ test "parameterized continuation rejects unavailable arguments despite stop reac
         null,
         null,
     ));
+}
+
+test "authenticated pack continuation follows transparent forwarding provenance" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const producer = ir.BlockId.fromIndex(1);
+    const clone = ir.BlockId.fromIndex(2);
+    const forwarding = ir.BlockId.fromIndex(3);
+    const closure = ir.BlockId.fromIndex(4);
+    const consumer = ir.BlockId.fromIndex(5);
+    const stop = ir.BlockId.fromIndex(6);
+    const selector = ir.ValueId.fromIndex(0);
+    const callee = ir.ValueId.fromIndex(1);
+    const source_call = ir.InstructionId.fromIndex(0);
+    const clone_call = ir.InstructionId.fromIndex(1);
+    const consumer_call = ir.InstructionId.fromIndex(2);
+    const source_pack = ir.ValuePackId.fromIndex(0);
+    const clone_pack = ir.ValuePackId.fromIndex(1);
+
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = selector,
+            .then_edge = .{ .target = producer },
+            .else_edge = .{ .target = clone },
+        } } },
+        .{ .id = producer, .function = function_id, .instructions = &.{source_call}, .terminator = .{ .jump = .{ .target = closure } } },
+        .{ .id = clone, .function = function_id, .instructions = &.{clone_call}, .terminator = .{ .jump = .{ .target = forwarding } } },
+        .{ .id = forwarding, .function = function_id, .terminator = .{ .jump = .{ .target = closure } } },
+        .{ .id = closure, .function = function_id, .terminator = .{ .jump = .{ .target = consumer } } },
+        .{ .id = consumer, .function = function_id, .instructions = &.{consumer_call}, .terminator = .{ .jump = .{ .target = stop } } },
+        .{ .id = stop, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .parameters = &.{ selector, callee },
+        .blocks = &.{ entry, producer, clone, forwarding, closure, consumer, stop },
+        .entry_block = entry,
+    }};
+    const values = [_]ir.Value{
+        .{ .id = selector, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = callee, .function = function_id, .type = .dynamic, .origin = .{ .parameter = 1 } },
+    };
+    const instructions = [_]ir.Instruction{
+        .{
+            .id = source_call,
+            .block = producer,
+            .operation = .{ .call = .{ .callee = callee, .arguments = &.{}, .result_arity = .{ .variadic = {} } } },
+            .results = &.{},
+            .pack_result = source_pack,
+            .effects = ir.EffectSummary.dynamic_call,
+        },
+        .{
+            .id = clone_call,
+            .block = clone,
+            .operation = .{ .call = .{ .callee = callee, .arguments = &.{}, .result_arity = .{ .variadic = {} } } },
+            .results = &.{},
+            .pack_result = clone_pack,
+            .effects = ir.EffectSummary.dynamic_call,
+        },
+        .{
+            .id = consumer_call,
+            .block = consumer,
+            .operation = .{ .call = .{ .callee = callee, .arguments = &.{}, .argument_pack = source_pack, .result_arity = .{ .fixed = 0 } } },
+            .results = &.{},
+            .effects = ir.EffectSummary.dynamic_call,
+        },
+    };
+    const packs = [_]ir.ValuePack{
+        .{ .id = source_pack, .function = function_id, .origin = .{ .instruction_result = source_call } },
+        .{ .id = clone_pack, .function = function_id, .origin = .{ .instruction_result = clone_call } },
+    };
+    const rewrite = [_]ir.CfgEdgeRewrite{.{
+        .id = ir.EdgeRewriteId.fromIndex(0),
+        .source = entry,
+        .kind = .branch_else,
+        .from = .{ .target = producer },
+        .to = .{ .target = clone },
+        .rule = .node_split,
+        .node_split_group = ir.NodeSplitGroupId.fromIndex(0),
+    }};
+    var program: ir.Program = .{
+        .program_id = "authenticated-pack-forwarding-provenance",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+        .value_packs = &packs,
+        .edge_rewrites = &rewrite,
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, functions[0]);
+    defer analysis.deinit();
+    const incoming = [_]ir.CfgEdgeRef{.{ .source = forwarding, .kind = .jump, .target = closure }};
+
+    var lineage_index = try CloneLineageIndex.init(std.testing.allocator, &program);
+    defer lineage_index.deinit();
+    var replay_index = try node_split.ReplayIndex.init(std.testing.allocator, &program);
+    defer replay_index.deinit();
+    var replay_cache = ReplayCache.init(std.testing.allocator, &program, &replay_index);
+    defer replay_cache.deinit();
+
+    try std.testing.expectEqual(
+        ContinuationValueContext.contextual,
+        try packCarriesContinuationContext(
+            std.testing.allocator,
+            &program,
+            &analysis,
+            source_pack,
+            consumer,
+            &.{closure},
+            &.{consumer},
+            &incoming,
+            &lineage_index,
+            &replay_index,
+            &replay_cache,
+        ),
+    );
+
+    var tampered_rewrite = rewrite;
+    tampered_rewrite[0].to.arguments = &.{selector};
+    program.edge_rewrites = &tampered_rewrite;
+    var tampered_lineage_index = try CloneLineageIndex.init(std.testing.allocator, &program);
+    defer tampered_lineage_index.deinit();
+    var tampered_replay_index = try node_split.ReplayIndex.init(std.testing.allocator, &program);
+    defer tampered_replay_index.deinit();
+    var tampered_replay_cache = ReplayCache.init(std.testing.allocator, &program, &tampered_replay_index);
+    defer tampered_replay_cache.deinit();
+    try std.testing.expectEqual(
+        ContinuationValueContext.unavailable,
+        try packCarriesContinuationContext(
+            std.testing.allocator,
+            &program,
+            &analysis,
+            source_pack,
+            consumer,
+            &.{closure},
+            &.{consumer},
+            &incoming,
+            &tampered_lineage_index,
+            &tampered_replay_index,
+            &tampered_replay_cache,
+        ),
+    );
 }
 
 test "multi-result carrier maps through every authenticated clone step" {
@@ -10372,6 +10782,238 @@ test "same-root iteration clones compare fresh results across split groups" {
     ));
 }
 
+fn collectConditionalLoopClosureAlloc(
+    allocator: std.mem.Allocator,
+    analysis: *const cfg.Analysis,
+    membership: []const bool,
+) std.mem.Allocator.Error![]ir.BlockId {
+    const owned = try allocator.dupe(bool, membership);
+    defer allocator.free(owned);
+    var closure: std.ArrayList(ir.BlockId) = .empty;
+    defer closure.deinit(allocator);
+    for (analysis.function.blocks, membership) |source, is_member| {
+        if (!is_member) continue;
+        try closure.append(allocator, source);
+    }
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (analysis.function.blocks, 0..) |candidate, candidate_index| {
+            if (owned[candidate_index] or !analysis.isReachable(candidate)) continue;
+            if (analysis.program.blocks[candidate.index()].terminator != .jump) continue;
+            const predecessor_count = analysis.predecessorCount(candidate);
+            if (predecessor_count == 0) continue;
+            var exclusively_owned = true;
+            for (0..predecessor_count) |predecessor_index| {
+                const predecessor = analysis.predecessorAt(candidate, predecessor_index) orelse {
+                    exclusively_owned = false;
+                    break;
+                };
+                const local_index = analysis.blockIndex(predecessor) orelse {
+                    exclusively_owned = false;
+                    break;
+                };
+                if (!owned[local_index]) {
+                    exclusively_owned = false;
+                    break;
+                }
+            }
+            if (!exclusively_owned) continue;
+            try closure.append(allocator, candidate);
+            owned[candidate_index] = true;
+            changed = true;
+        }
+    }
+    return try closure.toOwnedSlice(allocator);
+}
+
+fn countConditionalLoopEntries(
+    analysis: *const cfg.Analysis,
+    header: ir.BlockId,
+    membership: []const bool,
+) std.mem.Allocator.Error!usize {
+    var count: usize = 0;
+    for (analysis.function.blocks, 0..) |source, source_index| {
+        if (!analysis.isReachable(source) or membership[source_index]) continue;
+        if (try conditionalLoopEntryRef(analysis, header, source, membership) != null) count += 1;
+    }
+    return count;
+}
+
+fn collectExternalLoopEntryEdgesAlloc(
+    allocator: std.mem.Allocator,
+    analysis: *const cfg.Analysis,
+    header: ir.BlockId,
+    membership: []const bool,
+) std.mem.Allocator.Error![]ir.CfgEdgeRef {
+    var entries: std.ArrayList(ir.CfgEdgeRef) = .empty;
+    errdefer entries.deinit(allocator);
+    for (analysis.function.blocks, 0..) |source, source_index| {
+        if (!analysis.isReachable(source) or membership[source_index]) continue;
+        const block = analysis.program.blocks[source.index()];
+        switch (block.terminator) {
+            .jump => |edge| {
+                if (edge.target == header) {
+                    const reference: ir.CfgEdgeRef = .{ .source = source, .kind = .jump, .target = header };
+                    if (!edgeHasNodeSplitHistory(analysis.program, reference)) {
+                        try entries.append(allocator, reference);
+                    }
+                }
+            },
+            .branch => |branch| {
+                // A branch with both arms targeting the same block has no
+                // unique edge slot to authenticate for a node split.
+                if (branch.then_edge.target == header and branch.else_edge.target != header) {
+                    const reference: ir.CfgEdgeRef = .{ .source = source, .kind = .branch_then, .target = header };
+                    if (!edgeHasNodeSplitHistory(analysis.program, reference)) {
+                        try entries.append(allocator, reference);
+                    }
+                } else if (branch.else_edge.target == header and branch.then_edge.target != header) {
+                    const reference: ir.CfgEdgeRef = .{ .source = source, .kind = .branch_else, .target = header };
+                    if (!edgeHasNodeSplitHistory(analysis.program, reference)) {
+                        try entries.append(allocator, reference);
+                    }
+                }
+            },
+            .return_values, .return_pack, .return_expanded, .throw_error, .unreachable_block => {},
+        }
+    }
+    return try entries.toOwnedSlice(allocator);
+}
+
+fn countExternalLoopEntries(
+    analysis: *const cfg.Analysis,
+    header: ir.BlockId,
+    membership: []const bool,
+) usize {
+    var count: usize = 0;
+    for (0..analysis.predecessorCount(header)) |predecessor_index| {
+        const predecessor = analysis.predecessorAt(header, predecessor_index) orelse continue;
+        const local_index = analysis.blockIndex(predecessor) orelse continue;
+        if (analysis.isReachable(predecessor) and !membership[local_index]) count += 1;
+    }
+    return count;
+}
+
+fn edgeHasNodeSplitHistory(program: *const ir.Program, reference: ir.CfgEdgeRef) bool {
+    var current = reference.target;
+    var remaining = program.edge_rewrites.len;
+    while (remaining != 0) : (remaining -= 1) {
+        var found = false;
+        var index = program.edge_rewrites.len;
+        while (index != 0) {
+            index -= 1;
+            const rewrite = program.edge_rewrites[index];
+            if (rewrite.source != reference.source or
+                rewrite.kind != reference.kind or
+                rewrite.to.target != current)
+            {
+                continue;
+            }
+            found = true;
+            switch (rewrite.rule) {
+                .node_split, .clone_fold => return true,
+                .forwarding_jump => {
+                    if (rewrite.from.target == current) return false;
+                    current = rewrite.from.target;
+                },
+                .proved_branch => return false,
+            }
+            break;
+        }
+        if (!found) return false;
+    }
+    return false;
+}
+
+fn selectConditionalLoopEntry(
+    analysis: *const cfg.Analysis,
+    header: ir.BlockId,
+    membership: []const bool,
+) std.mem.Allocator.Error!?ir.CfgEdgeRef {
+    var selected: ?ir.CfgEdgeRef = null;
+    for (analysis.function.blocks, 0..) |source, source_index| {
+        if (!analysis.isReachable(source) or membership[source_index]) continue;
+        const candidate = try conditionalLoopEntryRef(analysis, header, source, membership) orelse continue;
+        if (selected == null or edgeRefLessThan(candidate, selected.?)) selected = candidate;
+    }
+    return selected;
+}
+
+fn conditionalLoopEntryRef(
+    analysis: *const cfg.Analysis,
+    header: ir.BlockId,
+    source: ir.BlockId,
+    membership: []const bool,
+) std.mem.Allocator.Error!?ir.CfgEdgeRef {
+    const terminator = analysis.program.blocks[source.index()].terminator;
+    switch (terminator) {
+        .branch => |branch| {
+            if (branch.then_edge.target == header and branch.else_edge.target != header and
+                !try analysis.canReach(branch.else_edge.target, header) and
+                !edgeHasNodeSplitHistory(analysis.program, .{
+                    .source = source,
+                    .kind = .branch_then,
+                    .target = header,
+                }))
+            {
+                return .{ .source = source, .kind = .branch_then, .target = header };
+            }
+            if (branch.else_edge.target == header and branch.then_edge.target != header and
+                !try analysis.canReach(branch.then_edge.target, header) and
+                !edgeHasNodeSplitHistory(analysis.program, .{
+                    .source = source,
+                    .kind = .branch_else,
+                    .target = header,
+                }))
+            {
+                return .{ .source = source, .kind = .branch_else, .target = header };
+            }
+            return null;
+        },
+        .jump => |edge| {
+            if (edge.target != header or
+                edgeHasNodeSplitHistory(analysis.program, .{ .source = source, .kind = .jump, .target = header }))
+            {
+                return null;
+            }
+        },
+        else => return null,
+    }
+
+    var current = source;
+    var remaining = analysis.function.blocks.len;
+    while (remaining != 0) : (remaining -= 1) {
+        if (analysis.predecessorCount(current) != 1) return null;
+        const predecessor = analysis.predecessorAt(current, 0) orelse return null;
+        const predecessor_index = analysis.blockIndex(predecessor) orelse return null;
+        if (membership[predecessor_index]) return null;
+        switch (analysis.program.blocks[predecessor.index()].terminator) {
+            .jump => |edge| {
+                if (edge.target != current) return null;
+                current = predecessor;
+            },
+            .branch => |branch| {
+                const sibling = if (branch.then_edge.target == current and branch.else_edge.target != current)
+                    branch.else_edge.target
+                else if (branch.else_edge.target == current and branch.then_edge.target != current)
+                    branch.then_edge.target
+                else
+                    return null;
+                if (try analysis.canReach(sibling, header)) return null;
+                return .{ .source = source, .kind = .jump, .target = header };
+            },
+            else => return null,
+        }
+    }
+    return null;
+}
+
+fn edgeRefLessThan(left: ir.CfgEdgeRef, right: ir.CfgEdgeRef) bool {
+    if (left.source != right.source) return left.source.index() < right.source.index();
+    return @intFromEnum(left.kind) < @intFromEnum(right.kind);
+}
+
 pub fn isIterationTransitionHeader(program: *const ir.Program, block_id: ir.BlockId) bool {
     if (block_id.index() >= program.blocks.len) return false;
     const block = program.blocks[block_id.index()];
@@ -10441,6 +11083,123 @@ fn convergenceIsBypassed(
         }
     }
     return false;
+}
+
+fn isEffectfulZeroParameterBlock(
+    program: *const ir.Program,
+    block_id: ir.BlockId,
+) bool {
+    if (block_id.index() >= program.blocks.len) return false;
+    const block = program.blocks[block_id.index()];
+    if (block.id != block_id or block.parameters.len != 0) return false;
+    for (block.instructions) |instruction_id| {
+        if (instruction_id.index() >= program.instructions.len) return false;
+        const instruction = program.instructions[instruction_id.index()];
+        if (instruction.id != instruction_id or instruction.block != block_id) return false;
+        if (proof_effect_closure.hasObservableEffects(instruction.effects)) return true;
+    }
+    return false;
+}
+
+// A continuation edge may carry context through the target's formal block
+// parameters.  Treat that as a projection only when the live edge, canonical
+// parameter identities, exact value types, and replay-authenticated argument
+// provenance all agree.  This keeps a shared continuation reusable without
+// inventing a value or relying on a same-typed substitute.
+fn authenticatedParameterProjectionForEdge(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    source: ir.BlockId,
+    kind: ir.CfgEdgeKind,
+    target: ir.BlockId,
+    arguments: []const ir.ValueId,
+    closure: []const ir.BlockId,
+    continuation: []const ir.BlockId,
+    incoming: []const ir.CfgEdgeRef,
+    lineage_index: *const CloneLineageIndex,
+    replay_index: *const node_split.ReplayIndex,
+    replay_cache: *ReplayCache,
+) std.mem.Allocator.Error!bool {
+    if (target.index() >= program.blocks.len) return false;
+    const target_block = program.blocks[target.index()];
+    if (target_block.id != target or target_block.parameters.len == 0) return false;
+    if (!containsBlock(continuation, target) and !containsBlock(closure, target)) return false;
+    const reference = edgeReferenceForKind(program, source, kind) orelse return false;
+    if (reference.target != target) return false;
+    const edge = cfg_edge.value(program, reference) orelse return false;
+    if (!std.mem.eql(ir.ValueId, edge.arguments, arguments)) return false;
+    // A formal target does not make an edge context-independent when one of
+    // its arguments was produced by the closure being cloned.  A source that
+    // is itself in the continuation is cloned with the authenticated edge,
+    // so its tuple is remapped before the shared target receives its formal
+    // value.  A source outside the continuation still needs the conservative
+    // rejection below because no remapping boundary is present here.
+    const source_remaps_closure_tuple = containsBlock(continuation, source) and
+        isEffectfulZeroParameterBlock(program, source);
+    for (edge.arguments) |argument| {
+        if (projectionValueProducer(program, argument)) |producer| {
+            if (containsBlock(closure, producer) and !source_remaps_closure_tuple) return false;
+        }
+    }
+    if (!try parameterizedContinuationArgumentsAreAuthenticated(
+        allocator,
+        program,
+        analysis,
+        source,
+        target,
+        edge.arguments,
+        incoming,
+        closure,
+        continuation,
+        lineage_index,
+        replay_index,
+        replay_cache,
+        .authenticated_parameter,
+    )) return false;
+
+    // If the target is itself a clone, its formal tuple must be backed by the
+    // complete replay mapping for that clone step.  A live edge alone cannot
+    // authenticate a forged or partial clone history.
+    if (cloneStepForTargetCached(program, target, lineage_index)) |step| {
+        const direct_bridge = hasIncomingCloneBridgeCached(
+            program,
+            reference,
+            target,
+            lineage_index,
+        ) or try hasAuthenticatedComposedCloneBridgeAlloc(
+            allocator,
+            program,
+            analysis,
+            reference,
+            lineage_index,
+            replay_index,
+            replay_cache,
+        );
+        const unchanged_bridge = if (direct_bridge)
+            true
+        else
+            try hasAuthenticatedUnchangedCloneBridgeForEdgeAlloc(
+                allocator,
+                program,
+                analysis,
+                reference,
+                lineage_index,
+                replay_index,
+                replay_cache,
+            );
+        if (!direct_bridge and !unchanged_bridge) return false;
+        if (!try cloneLineageArgumentsMatchReplayCached(
+            allocator,
+            program,
+            step.source,
+            step.clone,
+            lineage_index,
+            replay_index,
+            replay_cache,
+        )) return false;
+    }
+    return true;
 }
 
 fn successorEdgeRef(
@@ -10708,6 +11467,98 @@ fn valueCarriesContinuationContextWithPolicy(
     // A bypassed producer is usable only when an earlier authenticated split
     // already maps this value into the incoming context. Non-dominance alone
     // is not evidence that the value can be reconstructed.
+    return .unavailable;
+}
+
+fn hasAuthenticatedPackCloneForIncoming(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    producer: ir.BlockId,
+    source_pack: ir.ValuePackId,
+    incoming: []const ir.CfgEdgeRef,
+    closure: []const ir.BlockId,
+    lineage_index: ?*const CloneLineageIndex,
+    replay_index: ?*const node_split.ReplayIndex,
+    replay_cache: ?*ReplayCache,
+) std.mem.Allocator.Error!bool {
+    const replay = replay_index orelse return false;
+    if (incoming.len == 0) return false;
+    const mapped = try findExistingPackCloneAlloc(
+        allocator,
+        program,
+        analysis,
+        producer,
+        source_pack,
+        incoming,
+        closure,
+        lineage_index,
+        replay,
+        replay_cache,
+    ) orelse return false;
+
+    // A non-dominating producer can only be projected through a distinct pack
+    // identity. Reusing the source identity would not establish which branch
+    // produced the pack at the continuation boundary.
+    return mapped != source_pack;
+}
+
+fn packCarriesContinuationContext(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    pack_id: ir.ValuePackId,
+    source: ir.BlockId,
+    closure: []const ir.BlockId,
+    continuation: []const ir.BlockId,
+    incoming: []const ir.CfgEdgeRef,
+    lineage_index: ?*const CloneLineageIndex,
+    replay_index: ?*const node_split.ReplayIndex,
+    replay_cache: ?*ReplayCache,
+) std.mem.Allocator.Error!ContinuationValueContext {
+    if (pack_id.index() >= program.value_packs.len) return .unavailable;
+    const pack = program.value_packs[pack_id.index()];
+    if (pack.id != pack_id or pack.function != analysis.function.id) return .unavailable;
+    const producer = switch (pack.origin) {
+        .varargs => return .available,
+        .instruction_result => |instruction_id| blk: {
+            if (instruction_id.index() >= program.instructions.len) return .unavailable;
+            const instruction = program.instructions[instruction_id.index()];
+            if (instruction.id != instruction_id or instruction.block.index() >= program.blocks.len) return .unavailable;
+            break :blk instruction.block;
+        },
+    };
+    if (producer == source or containsBlock(closure, producer) or containsBlock(continuation, producer)) {
+        if (containsBlock(continuation, producer) and
+            analysis.dominates(producer, source))
+        {
+            return .available;
+        }
+        return .contextual;
+    }
+
+    const replay = replay_index orelse return if (definitionDominatesIncoming(analysis, producer, incoming))
+        .available
+    else
+        .unavailable;
+    if (!hasCloneLineageCandidateForSource(replay, program, producer)) {
+        return if (definitionDominatesIncoming(analysis, producer, incoming)) .available else .unavailable;
+    }
+
+    if (try hasAuthenticatedPackCloneForIncoming(
+        allocator,
+        program,
+        analysis,
+        producer,
+        pack_id,
+        incoming,
+        closure,
+        lineage_index,
+        replay_index,
+        replay_cache,
+    )) return .contextual;
+
+    if (definitionDominatesIncoming(analysis, producer, incoming)) return .available;
     return .unavailable;
 }
 
