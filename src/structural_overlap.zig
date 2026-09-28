@@ -849,6 +849,1305 @@ const ComposedParameterProjectionResult = enum {
     rejected,
 };
 
+/// Immutable clone/replay state used by structure building.  A structured
+/// continuation may compare different SSA ids only when the complete entry
+/// tuple is authenticated by the same replay machinery used for external
+/// clone mappings.
+pub const ReplayProjectionContext = struct {
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    lineage_index: CloneLineageIndex,
+    replay_index: node_split.ReplayIndex,
+    replay_cache: ReplayCache,
+    continuation_bridge_cache: std.AutoHashMapUnmanaged(ContinuationBridgeKey, bool) = .empty,
+    owner_composed_bridge_cache: std.AutoHashMapUnmanaged(ContinuationBridgeKey, bool) = .empty,
+    one_parameter_trace_budget: usize = 512,
+
+    pub fn init(allocator: std.mem.Allocator, program: *const ir.Program) std.mem.Allocator.Error!ReplayProjectionContext {
+        return initForFunction(allocator, program, null);
+    }
+
+    pub fn initForFunction(
+        allocator: std.mem.Allocator,
+        program: *const ir.Program,
+        function_id: ?ir.FunctionId,
+    ) std.mem.Allocator.Error!ReplayProjectionContext {
+        var lineage_index = if (function_id) |selected|
+            try CloneLineageIndex.initForFunction(allocator, program, selected)
+        else
+            try CloneLineageIndex.init(allocator, program);
+        errdefer lineage_index.deinit();
+        var replay_index = if (function_id) |selected|
+            try node_split.ReplayIndex.initForFunction(allocator, program, selected)
+        else
+            try node_split.ReplayIndex.init(allocator, program);
+        errdefer replay_index.deinit();
+        return .{
+            .allocator = allocator,
+            .program = program,
+            .lineage_index = lineage_index,
+            .replay_index = replay_index,
+            .replay_cache = ReplayCache.init(allocator, program, &replay_index),
+        };
+    }
+
+    pub fn deinit(self: *ReplayProjectionContext) void {
+        self.continuation_bridge_cache.deinit(self.allocator);
+        self.owner_composed_bridge_cache.deinit(self.allocator);
+        self.replay_cache.deinit();
+        self.replay_index.deinit();
+        self.lineage_index.deinit();
+        self.* = undefined;
+    }
+
+    pub const CloneLineageParent = struct {
+        block: ir.BlockId,
+        group: ir.NodeSplitGroupId,
+    };
+
+    /// Return one authenticated clone parent from the immutable feedback
+    /// lineage. A malformed or conflicting target is deliberately absent.
+    pub fn cloneLineageParent(
+        self: *const ReplayProjectionContext,
+        block: ir.BlockId,
+    ) ?CloneLineageParent {
+        const step = self.lineage_index.step(self.program, block) orelse return null;
+        return .{ .block = step.source, .group = step.group };
+    }
+
+    pub fn cloneLineageRoot(
+        self: *const ReplayProjectionContext,
+        block: ir.BlockId,
+    ) ?ir.BlockId {
+        if (block.index() >= self.program.blocks.len or
+            self.program.blocks[block.index()].id != block or
+            self.lineage_index.isMalformed(block)) return null;
+        var current = block;
+        var depth: usize = 0;
+        while (true) {
+            const parent = self.cloneLineageParent(current) orelse return current;
+            if (parent.block == current or depth >= self.program.blocks.len) return null;
+            current = parent.block;
+            depth += 1;
+        }
+    }
+
+    pub fn blockCount(self: *const ReplayProjectionContext) usize {
+        return self.program.blocks.len;
+    }
+
+    pub fn sameCloneLineage(
+        self: *const ReplayProjectionContext,
+        left: ir.BlockId,
+        right: ir.BlockId,
+    ) bool {
+        const left_root = self.cloneLineageRoot(left) orelse return false;
+        const right_root = self.cloneLineageRoot(right) orelse return false;
+        if (left_root != right_root) return false;
+
+        var left_current = left;
+        var right_current = right;
+        var depth: usize = 0;
+        while (depth <= self.program.blocks.len) : (depth += 1) {
+            const left_parent = self.cloneLineageParent(left_current);
+            const right_parent = self.cloneLineageParent(right_current);
+            if (left_parent == null or right_parent == null) return left_parent == null and right_parent == null;
+            if (left_parent.?.block != right_parent.?.block or
+                left_parent.?.group != right_parent.?.group) return false;
+            left_current = left_parent.?.block;
+            right_current = right_parent.?.block;
+        }
+        return false;
+    }
+
+    /// Test exact split-edge ownership using the function-scoped rewrite
+    /// index. This is metadata lookup only; callers still perform replay and
+    /// live-edge authentication before consuming the result.
+    pub fn hasNodeSplitArmEdge(
+        self: *const ReplayProjectionContext,
+        source: ir.BlockId,
+        kind: ir.CfgEdgeKind,
+        from: ir.BlockId,
+        to: ir.BlockId,
+        group: ?ir.NodeSplitGroupId,
+    ) bool {
+        const rewrite_indices = if (group) |selected_group|
+            self.replay_index.nodeSplitRewriteIndicesForGroup(selected_group)
+        else
+            self.replay_index.nodeSplitRewriteIndices();
+        for (rewrite_indices) |rewrite_index| {
+            const rewrite = self.program.edge_rewrites[rewrite_index];
+            if (rewrite.source == source and rewrite.kind == kind and
+                rewrite.from.target == from and rewrite.to.target == to and
+                (group == null or rewrite.node_split_group == group)) return true;
+        }
+        return false;
+    }
+
+    /// Return the function-scoped rewrite records for one authenticated
+    /// node-split group.  Structure coverage uses this immutable index when
+    /// repeatedly validating clone-group boundaries.
+    pub fn nodeSplitRewriteIndicesForGroup(
+        self: *const ReplayProjectionContext,
+        group: ir.NodeSplitGroupId,
+    ) []const usize {
+        return self.replay_index.nodeSplitRewriteIndicesForGroup(group);
+    }
+
+    pub fn hasNodeSplitEntryEdge(
+        self: *const ReplayProjectionContext,
+        source: ir.BlockId,
+        kind: ir.CfgEdgeKind,
+        target: ir.BlockId,
+        group: ir.NodeSplitGroupId,
+    ) bool {
+        for (self.nodeSplitRewriteIndicesForGroup(group)) |rewrite_index| {
+            const rewrite = self.program.edge_rewrites[rewrite_index];
+            if (rewrite.source == source and rewrite.kind == kind and rewrite.to.target == target) return true;
+        }
+        return false;
+    }
+
+    /// Reuse the function-scoped lineage and replay indexes for bridge
+    /// authentication.  Structure building asks this question repeatedly;
+    /// rebuilding the indexes for each edge turns a bounded proof into a
+    /// quadratic allocation cost on large irreducible functions.
+    pub fn hasAuthenticatedContinuationBridgeForEdge(
+        self: *ReplayProjectionContext,
+        analysis: *const cfg.Analysis,
+        reference: ir.CfgEdgeRef,
+    ) std.mem.Allocator.Error!bool {
+        const key = ContinuationBridgeKey{
+            .source = reference.source,
+            .kind = reference.kind,
+            .target = reference.target,
+        };
+        if (self.continuation_bridge_cache.get(key)) |cached| return cached;
+        const result = try self.hasAuthenticatedContinuationBridgeForEdgeUncached(analysis, reference);
+        try self.continuation_bridge_cache.put(self.allocator, key, result);
+        return result;
+    }
+
+    /// Authenticate a cloned effectful-prefix handoff into an already-owned
+    /// parameterized continuation. The live handoff edge is outside the
+    /// continuation's SCC in this shape, so SCC reachability is not evidence;
+    /// the incoming source must be a replay-authenticated descendant of the
+    /// owner's edge source and carry the owner's mapped tuple.
+    pub fn hasAuthenticatedParameterizedCloneHandoffForEdge(
+        self: *ReplayProjectionContext,
+        analysis: *const cfg.Analysis,
+        owner_reference: ir.CfgEdgeRef,
+        incoming_reference: ir.CfgEdgeRef,
+    ) std.mem.Allocator.Error!bool {
+        if (owner_reference.source == incoming_reference.source or
+            owner_reference.kind != incoming_reference.kind or
+            owner_reference.target != incoming_reference.target or
+            !incomingEdgeIsCanonical(self.program, analysis, owner_reference) or
+            !incomingEdgeIsCanonical(self.program, analysis, incoming_reference))
+        {
+            return false;
+        }
+
+        const owner_edge = cfg_edge.value(self.program, owner_reference) orelse return false;
+        const incoming_edge = cfg_edge.value(self.program, incoming_reference) orelse return false;
+        if (owner_edge.target != owner_reference.target or
+            incoming_edge.target != incoming_reference.target or
+            owner_edge.arguments.len != incoming_edge.arguments.len or
+            incoming_reference.target.index() >= self.program.blocks.len)
+        {
+            return false;
+        }
+
+        const target = self.program.blocks[incoming_reference.target.index()];
+        if (target.id != incoming_reference.target or target.parameters.len == 0 or
+            !node_split.parametersAreCanonical(self.program.values, target) or
+            owner_edge.arguments.len != target.parameters.len)
+        {
+            return false;
+        }
+
+        const lineage = (try cloneLineageAllocCached(
+            self.allocator,
+            self.program,
+            owner_reference.source,
+            incoming_reference.source,
+            &self.lineage_index,
+        )) orelse return false;
+        defer self.allocator.free(lineage);
+        if (lineage.len == 0 or
+            !cloneLineageArgumentsAreStableCached(self.program, incoming_reference.source, &self.lineage_index) or
+            !try cloneLineageArgumentsMatchReplayCached(
+                self.allocator,
+                self.program,
+                owner_reference.source,
+                incoming_reference.source,
+                &self.lineage_index,
+                &self.replay_index,
+                &self.replay_cache,
+            ))
+        {
+            return false;
+        }
+
+        for (lineage) |step| {
+            const source_reference = edgeReferenceForKind(
+                self.program,
+                step.source,
+                owner_reference.kind,
+            ) orelse return false;
+            const clone_reference = edgeReferenceForKind(
+                self.program,
+                step.clone,
+                incoming_reference.kind,
+            ) orelse return false;
+            const source_edge = cfg_edge.value(self.program, source_reference) orelse return false;
+            const clone_edge = cfg_edge.value(self.program, clone_reference) orelse return false;
+            if (source_edge.target != owner_reference.target or
+                clone_edge.target != incoming_reference.target)
+            {
+                return false;
+            }
+            const replay = (try self.replay_cache.get(step.source, step.clone, step.group)) orelse return false;
+            if (!replayedEdgeArgumentsMatch(
+                self.program,
+                step.source,
+                step.clone,
+                source_edge,
+                clone_edge,
+                replay.*,
+                true,
+            )) return false;
+        }
+
+        for (owner_edge.arguments, incoming_edge.arguments) |owner_value, incoming_value| {
+            const mapped = try mapValueThroughCloneLineageAllocCachedWithReplayCache(
+                self.allocator,
+                self.program,
+                owner_reference.source,
+                incoming_reference.source,
+                owner_value,
+                &self.lineage_index,
+                &self.replay_index,
+                &self.replay_cache,
+            ) orelse return false;
+            if (mapped != incoming_value) return false;
+        }
+
+        const closure = [_]ir.BlockId{incoming_reference.target};
+        const incoming = [_]ir.CfgEdgeRef{incoming_reference};
+        var external = try collectExternalCloneMappingsAllocWithReplayState(
+            self.allocator,
+            self.program,
+            analysis,
+            &closure,
+            &incoming,
+            &self.lineage_index,
+            &self.replay_index,
+            &self.replay_cache,
+        );
+        if (external) |*owned| {
+            owned.deinit();
+            return true;
+        }
+        return false;
+    }
+
+    /// Owner-composed collision history needs the stricter bridge proof.  The
+    /// general continuation predicate also admits unchanged shared suffixes,
+    /// which is correct for structure reuse but cannot authenticate a new
+    /// collision arm's complete external tuple.
+    pub fn hasAuthenticatedOwnerComposedContinuationBridgeForEdge(
+        self: *ReplayProjectionContext,
+        analysis: *const cfg.Analysis,
+        reference: ir.CfgEdgeRef,
+    ) std.mem.Allocator.Error!bool {
+        const key = ContinuationBridgeKey{
+            .source = reference.source,
+            .kind = reference.kind,
+            .target = reference.target,
+        };
+        if (self.owner_composed_bridge_cache.get(key)) |cached| return cached;
+        const result = try hasAuthenticatedOwnerComposedCloneBridgeAlloc(
+            self.allocator,
+            self.program,
+            analysis,
+            reference,
+            &self.lineage_index,
+            &self.replay_index,
+            &self.replay_cache,
+        );
+        try self.owner_composed_bridge_cache.put(self.allocator, key, result);
+        return result;
+    }
+
+    fn hasAuthenticatedContinuationBridgeForEdgeUncached(
+        self: *ReplayProjectionContext,
+        analysis: *const cfg.Analysis,
+        reference: ir.CfgEdgeRef,
+    ) std.mem.Allocator.Error!bool {
+        if (!incomingEdgeIsCanonical(self.program, analysis, reference)) return false;
+        const current_edge = cfg_edge.value(self.program, reference) orelse return false;
+        const closure = [_]ir.BlockId{reference.target};
+        const incoming = [_]ir.CfgEdgeRef{reference};
+
+        var found = false;
+        var selected_source: ?ir.BlockId = null;
+        var selected_group: ?ir.NodeSplitGroupId = null;
+        for (self.program.edge_rewrites) |rewrite| {
+            if (rewrite.rule != .node_split or rewrite.source != reference.source or
+                rewrite.kind != reference.kind or rewrite.to.target != reference.target or
+                rewrite.from.target == rewrite.to.target or rewrite.node_split_group == null)
+            {
+                continue;
+            }
+            found = true;
+            if (!std.mem.eql(ir.ValueId, current_edge.arguments, rewrite.to.arguments)) return false;
+            const group = rewrite.node_split_group.?;
+            var replay = (try node_split.replayMappingsForCloneAllocWithIndex(
+                self.allocator,
+                self.program,
+                &self.replay_index,
+                rewrite.from.target,
+                rewrite.to.target,
+                group,
+            )) orelse return false;
+            defer replay.deinit();
+            if (!nodeSplitRewriteArgumentsMatchReplay(self.program, rewrite, replay)) return false;
+            if (!try cloneLineageArgumentsMatchReplayCached(
+                self.allocator,
+                self.program,
+                rewrite.from.target,
+                rewrite.to.target,
+                &self.lineage_index,
+                &self.replay_index,
+                &self.replay_cache,
+            )) return false;
+            var external = try collectExternalCloneMappingsAllocWithReplayState(
+                self.allocator,
+                self.program,
+                analysis,
+                &closure,
+                &incoming,
+                &self.lineage_index,
+                &self.replay_index,
+                &self.replay_cache,
+            );
+            if (external) |*owned| {
+                owned.deinit();
+            } else return false;
+
+            if (selected_source) |source| {
+                if (source != rewrite.from.target or selected_group.? != group) return false;
+            } else {
+                selected_source = rewrite.from.target;
+                selected_group = group;
+            }
+        }
+        if (found) return true;
+        if (try hasAuthenticatedComposedCloneBridgeAlloc(
+            self.allocator,
+            self.program,
+            analysis,
+            reference,
+            &self.lineage_index,
+            &self.replay_index,
+            &self.replay_cache,
+        )) return true;
+        if (try hasAuthenticatedNestedCloneTargetBridgeForEdgeAlloc(
+            self.allocator,
+            self.program,
+            analysis,
+            reference,
+            &self.lineage_index,
+            &self.replay_index,
+            &self.replay_cache,
+        )) return true;
+        return try hasAuthenticatedUnchangedCloneBridgeForEdgeAlloc(
+            self.allocator,
+            self.program,
+            analysis,
+            reference,
+            &self.lineage_index,
+            &self.replay_index,
+            &self.replay_cache,
+        );
+    }
+
+    pub const ContinuationCloneProjection = struct {
+        root: ir.BlockId,
+        group: ir.NodeSplitGroupId,
+    };
+
+    // Return the canonical root and split group for a live cloned entry only
+    // after the same edge-level replay proof used by continuation reuse has
+    // succeeded.  The group is needed by structure building to cover the
+    // cloned body when the canonical boundary already owns its semantics.
+    pub fn authenticatedContinuationCloneForEdge(
+        self: *ReplayProjectionContext,
+        analysis: *const cfg.Analysis,
+        reference: ir.CfgEdgeRef,
+    ) std.mem.Allocator.Error!?ContinuationCloneProjection {
+        const current_edge = cfg_edge.value(self.program, reference) orelse return null;
+        var selected_group: ?ir.NodeSplitGroupId = null;
+        var has_direct_split = false;
+        for (self.program.edge_rewrites) |rewrite| {
+            if (rewrite.rule != .node_split or rewrite.source != reference.source or
+                rewrite.kind != reference.kind or rewrite.to.target != reference.target or
+                rewrite.node_split_group == null or
+                !std.mem.eql(ir.ValueId, rewrite.to.arguments, current_edge.arguments))
+            {
+                continue;
+            }
+            has_direct_split = true;
+            if (selected_group) |group| {
+                if (group != rewrite.node_split_group.?) return null;
+            } else {
+                selected_group = rewrite.node_split_group.?;
+            }
+        }
+        if (!has_direct_split) return null;
+        if (!try self.hasAuthenticatedContinuationBridgeForEdge(analysis, reference)) return null;
+        const group = selected_group orelse return null;
+        const position = cloneLineagePositionCached(self.program, reference.target, &self.lineage_index) orelse return null;
+        if (position.depth == 0 or position.root == reference.target) return null;
+        return .{ .root = position.root, .group = group };
+    }
+
+    /// Authenticate a zero-parameter entry into a shared clone target when
+    /// the incoming source is a nested clone of one target arm and the owner
+    /// context came through another arm of the same split group.  A unique
+    /// clone parent is insufficient here: several authenticated edge arms
+    /// may intentionally converge on one cloned block.  Require the shared
+    /// target replay, every arm's live edge, and the complete nested lineage.
+    pub fn hasAuthenticatedSharedCloneTargetArmForEdge(
+        self: *ReplayProjectionContext,
+        analysis: *const cfg.Analysis,
+        owner: ir.BlockId,
+        reference: ir.CfgEdgeRef,
+    ) std.mem.Allocator.Error!bool {
+        if (owner == reference.source or
+            !incomingEdgeIsCanonical(self.program, analysis, reference) or
+            reference.target.index() >= self.program.blocks.len)
+        {
+            return false;
+        }
+        const target = self.program.blocks[reference.target.index()];
+        const current_edge = cfg_edge.value(self.program, reference) orelse return false;
+        if (target.id != reference.target or target.parameters.len != 0 or
+            current_edge.arguments.len != 0)
+        {
+            return false;
+        }
+
+        var selected_group: ?ir.NodeSplitGroupId = null;
+        var selected_source: ?ir.BlockId = null;
+        var selected_arguments: ?[]const ir.ValueId = null;
+        var found_arm = false;
+        var owner_arm = false;
+        for (self.program.edge_rewrites) |rewrite| {
+            if (rewrite.rule != .node_split or rewrite.to.target != reference.target) continue;
+            const group = rewrite.node_split_group orelse return false;
+            if (rewrite.kind != reference.kind or
+                !nodeSplitRewriteArgumentsAreStable(self.program, rewrite) or
+                !activeNodeSplitRewrite(self.program, rewrite))
+            {
+                return false;
+            }
+            if (selected_group) |existing| {
+                if (existing != group or selected_source.? != rewrite.from.target or
+                    !std.mem.eql(ir.ValueId, selected_arguments.?, rewrite.to.arguments))
+                {
+                    return false;
+                }
+            } else {
+                selected_group = group;
+                selected_source = rewrite.from.target;
+                selected_arguments = rewrite.to.arguments;
+            }
+            const arm_reference = edgeReferenceForKind(self.program, rewrite.source, rewrite.kind) orelse return false;
+            const arm_edge = cfg_edge.value(self.program, arm_reference) orelse return false;
+            if (arm_reference.target != reference.target or
+                !std.mem.eql(ir.ValueId, arm_edge.arguments, rewrite.to.arguments))
+            {
+                return false;
+            }
+            var replay = (try node_split.replayMappingsForCloneAllocWithIndex(
+                self.allocator,
+                self.program,
+                &self.replay_index,
+                rewrite.from.target,
+                rewrite.to.target,
+                group,
+            )) orelse return false;
+            defer replay.deinit();
+            if (!nodeSplitRewriteArgumentsMatchReplay(self.program, rewrite, replay)) return false;
+            found_arm = true;
+            owner_arm = owner_arm or rewrite.source == owner;
+        }
+        const group = selected_group orelse return false;
+        const source = selected_source orelse return false;
+        if (!found_arm or !owner_arm or
+            !std.mem.eql(ir.ValueId, selected_arguments.?, current_edge.arguments))
+        {
+            return false;
+        }
+        const target_parent = self.cloneLineageParent(reference.target) orelse return false;
+        if (target_parent.block != source or target_parent.group != group) return false;
+
+        const closure = [_]ir.BlockId{reference.target};
+        const incoming = [_]ir.CfgEdgeRef{reference};
+        var external = try collectExternalCloneMappingsAllocWithReplayState(
+            self.allocator,
+            self.program,
+            analysis,
+            &closure,
+            &incoming,
+            &self.lineage_index,
+            &self.replay_index,
+            &self.replay_cache,
+        );
+        if (external) |*owned| {
+            owned.deinit();
+        } else return false;
+
+        for (self.replay_index.nodeSplitRewriteIndicesForGroup(group)) |rewrite_index| {
+            const rewrite = self.program.edge_rewrites[rewrite_index];
+            if (rewrite.to.target != reference.target or rewrite.kind != reference.kind) continue;
+            var lineage_valid = true;
+            if (rewrite.source != reference.source) {
+                const lineage = try cloneLineageAllocCached(
+                    self.allocator,
+                    self.program,
+                    rewrite.source,
+                    reference.source,
+                    &self.lineage_index,
+                ) orelse continue;
+                defer self.allocator.free(lineage);
+                if (!try cloneLineageArgumentsMatchReplayCached(
+                    self.allocator,
+                    self.program,
+                    rewrite.source,
+                    reference.source,
+                    &self.lineage_index,
+                    &self.replay_index,
+                    &self.replay_cache,
+                )) continue;
+                for (lineage) |step| {
+                    const source_reference = edgeReferenceForKind(self.program, step.source, reference.kind) orelse {
+                        lineage_valid = false;
+                        break;
+                    };
+                    const clone_reference = edgeReferenceForKind(self.program, step.clone, reference.kind) orelse {
+                        lineage_valid = false;
+                        break;
+                    };
+                    const source_edge = cfg_edge.value(self.program, source_reference) orelse {
+                        lineage_valid = false;
+                        break;
+                    };
+                    const clone_edge = cfg_edge.value(self.program, clone_reference) orelse {
+                        lineage_valid = false;
+                        break;
+                    };
+                    if (source_edge.target != reference.target or clone_edge.target != reference.target) {
+                        lineage_valid = false;
+                        break;
+                    }
+                    const replay = (try self.replay_cache.get(step.source, step.clone, step.group)) orelse {
+                        lineage_valid = false;
+                        break;
+                    };
+                    if (!replayedEdgeArgumentsMatch(
+                        self.program,
+                        step.source,
+                        step.clone,
+                        source_edge,
+                        clone_edge,
+                        replay.*,
+                        true,
+                    )) {
+                        lineage_valid = false;
+                        break;
+                    }
+                }
+            } else {
+                const arm_reference = edgeReferenceForKind(self.program, rewrite.source, reference.kind) orelse continue;
+                const arm_edge = cfg_edge.value(self.program, arm_reference) orelse continue;
+                lineage_valid = arm_edge.target == reference.target and
+                    std.mem.eql(ir.ValueId, arm_edge.arguments, current_edge.arguments);
+            }
+            if (lineage_valid) return true;
+        }
+        return false;
+    }
+
+    /// A loop-carried transition can authenticate a contextual entry even
+    /// when the incoming edge has no standalone clone-bridge record. Keep the
+    /// expected owner tuple explicit so this cannot become a reachability or
+    /// type-only bridge.
+    pub fn hasAuthenticatedIterationContextualProjectionForEdge(
+        self: *ReplayProjectionContext,
+        analysis: *const cfg.Analysis,
+        reference: ir.CfgEdgeRef,
+        expected: []const ir.ValueId,
+    ) std.mem.Allocator.Error!bool {
+        if (expected.len == 0) return false;
+        return try hasAuthenticatedIterationContextualProjectionAlloc(
+            self.allocator,
+            self.program,
+            analysis,
+            reference.target,
+            reference,
+            expected,
+            &self.lineage_index,
+            &self.replay_index,
+            &self.replay_cache,
+        );
+    }
+
+    /// Authenticate a distinct tuple entering a numeric transition through a
+    /// parameterized carrier.  The carrier formal tuple must be the incoming
+    /// tuple, and the existing iteration-state re-entry proof must identify
+    /// that same carrier as the target of the normalized state edge.
+    pub fn hasAuthenticatedNumericIterationCarrierReentryForEdge(
+        self: *ReplayProjectionContext,
+        analysis: *const cfg.Analysis,
+        header: ir.BlockId,
+        incoming: ir.CfgEdgeRef,
+    ) std.mem.Allocator.Error!bool {
+        if (!isIterationTransitionHeader(self.program, header) or
+            header.index() >= self.program.blocks.len or
+            !incomingEdgeIsCanonical(self.program, analysis, incoming) or
+            incoming.target != header or
+            !analysis.isReachable(incoming.source))
+        {
+            return false;
+        }
+        const header_block = self.program.blocks[header.index()];
+        if (header_block.id != header or
+            !node_split.parametersAreCanonical(self.program.values, header_block) or
+            header_block.instructions.len != 1)
+        {
+            return false;
+        }
+        const transition_id = header_block.instructions[0];
+        if (transition_id.index() >= self.program.instructions.len) return false;
+        const transition = self.program.instructions[transition_id.index()];
+        if (transition.id != transition_id or transition.results.len == 0) return false;
+        switch (transition.operation) {
+            .numeric_for_next => {},
+            else => return false,
+        }
+        const transition_result = iterationTransitionResult(
+            self.program,
+            transition.results[0],
+        ) orelse return false;
+        const incoming_edge = cfg_edge.value(self.program, incoming) orelse return false;
+        if (incoming_edge.target != header or
+            incoming_edge.arguments.len != header_block.parameters.len)
+        {
+            return false;
+        }
+
+        var selected_carrier: ?ir.BlockId = null;
+        for (analysis.function.blocks) |carrier_id| {
+            if (carrier_id == header or
+                carrier_id.index() >= self.program.blocks.len or
+                !analysis.isReachable(carrier_id)) continue;
+            const carrier = self.program.blocks[carrier_id.index()];
+            if (carrier.id != carrier_id or
+                carrier.function != analysis.function.id or
+                carrier.parameters.len != incoming_edge.arguments.len or
+                !node_split.parametersAreCanonical(self.program.values, carrier) or
+                !std.mem.eql(ir.ValueId, carrier.parameters, incoming_edge.arguments) or
+                !try analysis.canReach(carrier_id, incoming.source)) continue;
+            if (!try authenticatedIterationStateReentry(
+                self.program,
+                analysis,
+                transition_result,
+                self.allocator,
+                &self.lineage_index,
+                &self.replay_index,
+                &self.replay_cache,
+                false,
+                carrier_id,
+            )) continue;
+            if (selected_carrier != null) return false;
+            selected_carrier = carrier_id;
+        }
+        return selected_carrier != null;
+    }
+
+    /// Authenticate a non-iteration parameterized continuation whose live
+    /// edge carries a replay-equivalent tuple from a distinct incoming
+    /// context. This is narrower than `parametersEquivalent`: equal tuples
+    /// still need an ordinary bridge or an identity proof, while a changed
+    /// tuple must have both live entry evidence and positional replay proof.
+    pub fn hasAuthenticatedParameterizedContinuationProjectionForEdge(
+        self: *ReplayProjectionContext,
+        analysis: *const cfg.Analysis,
+        reference: ir.CfgEdgeRef,
+        expected: []const ir.ValueId,
+    ) std.mem.Allocator.Error!bool {
+        if (expected.len == 0 or
+            !incomingEdgeIsCanonical(self.program, analysis, reference) or
+            reference.target.index() >= self.program.blocks.len)
+        {
+            return false;
+        }
+        const block = self.program.blocks[reference.target.index()];
+        if (block.id != reference.target or block.parameters.len != expected.len) return false;
+        const edge = cfg_edge.value(self.program, reference) orelse return false;
+        if (edge.target != reference.target or edge.arguments.len != block.parameters.len or
+            std.mem.eql(ir.ValueId, expected, edge.arguments) or
+            !hasLiveIncomingEdgeWithArguments(self.program, reference.target, expected))
+        {
+            return false;
+        }
+        // A parameterized clone may be an effectful prefix whose formal
+        // tuple is consumed only by a nested numeric transition.  The
+        // incoming tuple is intentionally not itself a transition-result
+        // tuple in that shape; authenticate the complete prefix and its
+        // positional handoff before trying value-level replay projection.
+        const compound_projection = try hasAuthenticatedCompoundIterationContextualProjectionAlloc(
+            self.program,
+            analysis,
+            reference.target,
+            reference,
+            expected,
+        );
+        const mixed_iteration_projection = try hasAuthenticatedMixedParameterizedIterationProjectionAlloc(
+            self.program,
+            analysis,
+            reference.target,
+            reference,
+            expected,
+        );
+        const numeric_projection = try authenticatedNumericLoopCarriedTupleProjection(
+            self.program,
+            analysis,
+            reference,
+            expected,
+            edge.arguments,
+        );
+        const equivalent = try self.parametersEquivalent(reference.target, expected, edge.arguments);
+        traceStructural(
+            "structural_phase parameterized_projection target={} source={} compound={} mixed_iteration={} numeric={} equivalent={} expected={any} actual={any}\n",
+            .{
+                reference.target.index(),
+                reference.source.index(),
+                compound_projection,
+                mixed_iteration_projection,
+                numeric_projection,
+                equivalent,
+                expected,
+                edge.arguments,
+            },
+        );
+        return compound_projection or mixed_iteration_projection or numeric_projection or equivalent;
+    }
+
+    fn rejectOneParameterProof(
+        self: *ReplayProjectionContext,
+        reference: ir.CfgEdgeRef,
+        reason: []const u8,
+    ) bool {
+        if (trace_structural_phases and self.one_parameter_trace_budget != 0) {
+            self.one_parameter_trace_budget -= 1;
+            traceStructural("one_parameter_proof target={} source={} kind={s} reason={s}\n", .{
+                reference.target.index(),
+                reference.source.index(),
+                @tagName(reference.kind),
+                reason,
+            });
+        }
+        return false;
+    }
+
+    fn rejectOneParameterSuccessorReplay(
+        self: *ReplayProjectionContext,
+        analysis: *const cfg.Analysis,
+        reference: ir.CfgEdgeRef,
+        source_block: ir.BlockId,
+        target_block: ir.BlockId,
+        source_edge: ir.Edge,
+        target_edge: ir.Edge,
+        replay: node_split.ReplayMappings,
+    ) bool {
+        if (trace_structural_phases and self.one_parameter_trace_budget != 0) {
+            traceStructural("one_parameter_successor_replay source_target={} target_target={} source_args={any} target_args={any} replay_values={} replay_packs={}\n", .{
+                source_edge.target.index(),
+                target_edge.target.index(),
+                source_edge.arguments,
+                target_edge.arguments,
+                replay.source_values.len,
+                replay.source_packs.len,
+            });
+            traceStructural("one_parameter_successor_state source_reachable={} target_reachable={} source_function_matches={} target_function_matches={}\n", .{
+                source_edge.target.index() < self.program.blocks.len and analysis.isReachable(source_edge.target),
+                target_edge.target.index() < self.program.blocks.len and analysis.isReachable(target_edge.target),
+                source_edge.target.index() < self.program.blocks.len and
+                    self.program.blocks[source_edge.target.index()].function == self.program.blocks[target_block.index()].function,
+                target_edge.target.index() < self.program.blocks.len and
+                    self.program.blocks[target_edge.target.index()].function == self.program.blocks[target_block.index()].function,
+            });
+            for (source_edge.arguments, target_edge.arguments) |source_value, target_value| {
+                traceStructural("one_parameter_successor_argument source={} target={} mapped={?d}\n", .{
+                    source_value.index(),
+                    target_value.index(),
+                    mapValueFromReplay(self.program, source_block, target_block, source_value, replay),
+                });
+            }
+        }
+        return self.rejectOneParameterProof(reference, "successor_edge_replay_mismatch");
+    }
+
+    /// Authenticate the narrow one-parameter continuation shape used when a
+    /// cloned effectful prefix has no distinct external value mapping.  The
+    /// edge tuple must be preserved by a direct split rewrite, the one
+    /// instruction must replay exactly, and its successor must have its own
+    /// authenticated lineage.  The successor must either re-enter the
+    /// numeric header that supplied the tuple or be a terminal block.
+    pub fn hasAuthenticatedOneParameterContinuationForEdge(
+        self: *ReplayProjectionContext,
+        analysis: *const cfg.Analysis,
+        reference: ir.CfgEdgeRef,
+        expected: []const ir.ValueId,
+    ) std.mem.Allocator.Error!bool {
+        if (expected.len != 1 or
+            !incomingEdgeIsCanonical(self.program, analysis, reference) or
+            !analysis.isReachable(reference.source) or
+            !analysis.isReachable(reference.target))
+        {
+            return self.rejectOneParameterProof(reference, "entry_shape");
+        }
+
+        const target = self.program.blocks[reference.target.index()];
+        const incoming_edge = cfg_edge.value(self.program, reference) orelse
+            return self.rejectOneParameterProof(reference, "incoming_edge_missing");
+        if (target.id != reference.target or target.function != analysis.function.id or
+            target.parameters.len != 1 or
+            !node_split.parametersAreCanonical(self.program.values, target) or
+            incoming_edge.target != reference.target or
+            incoming_edge.arguments.len != 1 or
+            incoming_edge.arguments[0] != expected[0] or
+            !continuationParameterAcceptsValueType(self.program, target.parameters[0], expected[0]))
+        {
+            return self.rejectOneParameterProof(reference, "incoming_shape");
+        }
+
+        var source_id: ?ir.BlockId = null;
+        var selected_group: ?ir.NodeSplitGroupId = null;
+        for (self.program.edge_rewrites) |rewrite| {
+            if (rewrite.rule != .node_split or rewrite.node_split_group == null or
+                rewrite.source != reference.source or rewrite.kind != reference.kind or
+                rewrite.to.target != reference.target or
+                rewrite.from.target == rewrite.to.target)
+            {
+                continue;
+            }
+            if (source_id != null or
+                !nodeSplitRewriteArgumentsAreStable(self.program, rewrite) or
+                !activeNodeSplitRewrite(self.program, rewrite) or
+                !std.mem.eql(ir.ValueId, rewrite.from.arguments, expected) or
+                !std.mem.eql(ir.ValueId, rewrite.to.arguments, expected))
+            {
+                return self.rejectOneParameterProof(reference, "ambiguous_or_unstable_clone_rewrite");
+            }
+            source_id = rewrite.from.target;
+            selected_group = rewrite.node_split_group.?;
+        }
+
+        const source_block_id = source_id orelse
+            return self.rejectOneParameterProof(reference, "clone_rewrite_missing");
+        const group = selected_group orelse
+            return self.rejectOneParameterProof(reference, "clone_group_missing");
+        const lineage_parent = self.cloneLineageParent(reference.target) orelse
+            return self.rejectOneParameterProof(reference, "lineage_parent_missing");
+        if (lineage_parent.block != source_block_id or lineage_parent.group != group) {
+            return self.rejectOneParameterProof(reference, "lineage_parent_mismatch");
+        }
+
+        const source = if (source_block_id.index() < self.program.blocks.len)
+            self.program.blocks[source_block_id.index()]
+        else
+            return self.rejectOneParameterProof(reference, "source_block_missing");
+        if (source.id != source_block_id or source.function != target.function or
+            source.parameters.len != 1 or
+            !node_split.parametersAreCanonical(self.program.values, source) or
+            !continuationParameterAcceptsValueType(self.program, source.parameters[0], expected[0]) or
+            source.instructions.len != 1 or target.instructions.len != 1)
+        {
+            return self.rejectOneParameterProof(reference, "source_target_shape");
+        }
+
+        if (!try cloneLineageArgumentsMatchReplayCached(
+            self.allocator,
+            self.program,
+            source_block_id,
+            reference.target,
+            &self.lineage_index,
+            &self.replay_index,
+            &self.replay_cache,
+        )) {
+            return self.rejectOneParameterProof(reference, "lineage_replay_mismatch");
+        }
+        const replay = (try self.replay_cache.get(source_block_id, reference.target, group)) orelse
+            return self.rejectOneParameterProof(reference, "clone_replay_missing");
+        if (!nodeSplitRewriteArgumentsMatchReplay(self.program, .{
+            .id = ir.EdgeRewriteId.fromIndex(0),
+            .source = reference.source,
+            .kind = reference.kind,
+            .from = .{ .target = source_block_id, .arguments = expected },
+            .to = .{ .target = reference.target, .arguments = expected },
+            .rule = .node_split,
+            .node_split_group = group,
+        }, replay.*)) {
+            return self.rejectOneParameterProof(reference, "clone_rewrite_replay_mismatch");
+        }
+        const mapped_parameter = mapValueFromReplay(
+            self.program,
+            source_block_id,
+            reference.target,
+            source.parameters[0],
+            replay.*,
+        ) orelse {
+            return self.rejectOneParameterProof(reference, "parameter_mapping_missing");
+        };
+        if (mapped_parameter != target.parameters[0]) {
+            return self.rejectOneParameterProof(reference, "parameter_mapping_mismatch");
+        }
+
+        const source_instruction_id = source.instructions[0];
+        const target_instruction_id = target.instructions[0];
+        if (source_instruction_id.index() >= self.program.instructions.len or
+            target_instruction_id.index() >= self.program.instructions.len)
+        {
+            return self.rejectOneParameterProof(reference, "instruction_missing");
+        }
+        const source_instruction = self.program.instructions[source_instruction_id.index()];
+        const target_instruction = self.program.instructions[target_instruction_id.index()];
+        if (source_instruction.id != source_instruction_id or
+            target_instruction.id != target_instruction_id or
+            source_instruction.block != source.id or
+            target_instruction.block != target.id or
+            source_instruction.results.len != target_instruction.results.len or
+            (source_instruction.pack_result == null) != (target_instruction.pack_result == null) or
+            !proof_effect_closure.hasObservableEffects(source_instruction.effects) or
+            !proof_effect_closure.hasObservableEffects(target_instruction.effects) or
+            !node_split_instruction.sameEffects(source_instruction.effects, target_instruction.effects) or
+            !std.mem.eql(ir.EvidenceId, source_instruction.evidence, target_instruction.evidence))
+        {
+            return self.rejectOneParameterProof(reference, "instruction_semantics_mismatch");
+        }
+
+        const mapped_operation = (try node_split_instruction.remapOperation(
+            self.allocator,
+            self.program,
+            self.program.values,
+            source.function,
+            source_instruction.operation,
+            replay.source_values,
+            replay.clone_values,
+            replay.source_packs,
+            replay.clone_packs,
+        )) orelse return self.rejectOneParameterProof(reference, "operation_remap_missing");
+        defer node_split_instruction.deinitRemappedOperation(self.allocator, mapped_operation);
+        if (!node_split_instruction.sameOperation(mapped_operation, target_instruction.operation)) {
+            return self.rejectOneParameterProof(reference, "operation_mismatch");
+        }
+        for (source_instruction.results, target_instruction.results) |source_result, target_result| {
+            const mapped_result = mapValueFromReplay(
+                self.program,
+                source_block_id,
+                reference.target,
+                source_result,
+                replay.*,
+            ) orelse return self.rejectOneParameterProof(reference, "result_mapping_missing");
+            if (mapped_result != target_result) {
+                return self.rejectOneParameterProof(reference, "result_mapping_mismatch");
+            }
+        }
+        if (source_instruction.pack_result) |source_pack| {
+            const mapped_pack = mapPackFromReplay(
+                self.program,
+                source_block_id,
+                reference.target,
+                source_pack,
+                replay.*,
+            ) orelse return self.rejectOneParameterProof(reference, "pack_mapping_missing");
+            if (mapped_pack != target_instruction.pack_result.?) {
+                return self.rejectOneParameterProof(reference, "pack_mapping_mismatch");
+            }
+        }
+
+        const source_edge = switch (source.terminator) {
+            .jump => |edge| edge,
+            .branch, .return_values, .return_pack, .return_expanded, .throw_error, .unreachable_block => return self.rejectOneParameterProof(reference, "source_not_jump"),
+        };
+        const target_edge = switch (target.terminator) {
+            .jump => |edge| edge,
+            .branch, .return_values, .return_pack, .return_expanded, .throw_error, .unreachable_block => return self.rejectOneParameterProof(reference, "target_not_jump"),
+        };
+        // The source successor may be historical and unreachable after an
+        // earlier authenticated split.  The active clone successor remains
+        // live; its lineage and rewrite record provide the correspondence.
+        if (source_edge.target.index() >= self.program.blocks.len or
+            target_edge.target.index() >= self.program.blocks.len or
+            !analysis.isReachable(target_edge.target) or
+            self.program.blocks[source_edge.target.index()].function != target.function or
+            self.program.blocks[target_edge.target.index()].function != target.function or
+            !replayedEdgeArgumentsMatch(
+                self.program,
+                source.id,
+                target.id,
+                source_edge,
+                target_edge,
+                replay.*,
+                true,
+            ))
+        {
+            return self.rejectOneParameterSuccessorReplay(analysis, reference, source.id, target.id, source_edge, target_edge, replay.*);
+        }
+
+        const successor_parent = self.cloneLineageParent(target_edge.target) orelse
+            return self.rejectOneParameterProof(reference, "successor_lineage_parent_missing");
+        if (successor_parent.block != source_edge.target or successor_parent.group != group) {
+            return self.rejectOneParameterProof(reference, "successor_lineage_parent_mismatch");
+        }
+        var successor_rewrite_found = false;
+        for (self.program.edge_rewrites) |rewrite| {
+            if (rewrite.rule != .node_split or rewrite.node_split_group != group or
+                rewrite.source != reference.target or rewrite.kind != .jump or
+                rewrite.from.target != source_edge.target or
+                rewrite.to.target != target_edge.target)
+            {
+                continue;
+            }
+            if (successor_rewrite_found or
+                !nodeSplitRewriteArgumentsAreStable(self.program, rewrite) or
+                !activeNodeSplitRewrite(self.program, rewrite))
+            {
+                return self.rejectOneParameterProof(reference, "ambiguous_or_unstable_successor_rewrite");
+            }
+            const successor_replay = (try self.replay_cache.get(
+                source_edge.target,
+                target_edge.target,
+                group,
+            )) orelse return self.rejectOneParameterProof(reference, "successor_replay_missing");
+            if (!nodeSplitRewriteArgumentsMatchReplay(self.program, rewrite, successor_replay.*) or
+                !try cloneLineageArgumentsMatchReplayCached(
+                    self.allocator,
+                    self.program,
+                    source_edge.target,
+                    target_edge.target,
+                    &self.lineage_index,
+                    &self.replay_index,
+                    &self.replay_cache,
+                )) return self.rejectOneParameterProof(reference, "successor_replay_mismatch");
+            successor_rewrite_found = true;
+        }
+        if (!successor_rewrite_found) {
+            return self.rejectOneParameterProof(reference, "successor_rewrite_missing");
+        }
+
+        const successor = self.program.blocks[target_edge.target.index()];
+        const numeric_reentry = isIterationTransitionHeader(self.program, reference.source) and
+            try analysis.canReach(target_edge.target, reference.source);
+        const terminal_exit = switch (successor.terminator) {
+            .return_values, .return_pack, .return_expanded, .throw_error, .unreachable_block => true,
+            .jump, .branch => false,
+        };
+        if (numeric_reentry or terminal_exit) return true;
+        return self.rejectOneParameterProof(reference, "not_numeric_reentry_or_terminal");
+    }
+
+    pub fn parametersEquivalent(
+        self: *ReplayProjectionContext,
+        block_id: ir.BlockId,
+        expected: ?[]const ir.ValueId,
+        actual: ?[]const ir.ValueId,
+    ) std.mem.Allocator.Error!bool {
+        if (block_id.index() >= self.program.blocks.len) return false;
+        const block = self.program.blocks[block_id.index()];
+        if (block.id != block_id) return false;
+        if (block.parameters.len == 0) {
+            return (expected == null or expected.?.len == 0) and
+                (actual == null or actual.?.len == 0);
+        }
+        const expected_arguments = expected orelse return false;
+        const actual_arguments = actual orelse return false;
+        if (expected_arguments.len != block.parameters.len or
+            actual_arguments.len != block.parameters.len)
+        {
+            return false;
+        }
+        if (std.mem.eql(ir.ValueId, expected_arguments, actual_arguments)) return true;
+
+        // A parameterized continuation may re-enter through a loop-carried
+        // edge that forwards the target's own canonical formal tuple.  This
+        // is a semantic state transition, not a clone-value identity match.
+        // Keep the incoming tuple and split lineage authenticated before
+        // allowing the visit context to be reused.
+        if (try parameterizedForwardingReentryMatches(
+            self.allocator,
+            self.program,
+            block_id,
+            expected_arguments,
+            actual_arguments,
+            &self.lineage_index,
+            &self.replay_index,
+            &self.replay_cache,
+        )) {
+            return true;
+        }
+
+        // A numeric loop's internal state is intentionally fresh on every
+        // transition. Accept it only when the expected tuple is an
+        // authenticated forwarding entry for the same transition. The edge
+        // may be represented only in rewrite history after a node split.
+        if (try self.numericHeaderReentryMatches(block_id, expected_arguments, actual_arguments)) {
+            return true;
+        }
+
+        // A structured continuation may contain the iteration transition
+        // alongside setup instructions. In that shape the block is not a
+        // bare iteration header, but its four-argument context can still be
+        // proven by composing the complete authenticated transition lineage.
+        if (try authenticatedIterationStateTupleEquivalentAlloc(
+            self.allocator,
+            self.program,
+            block_id,
+            expected_arguments,
+            actual_arguments,
+            &self.lineage_index,
+            &self.replay_index,
+            &self.replay_cache,
+        )) {
+            return true;
+        }
+
+        switch (try authenticatedComposedParameterProjectionAlloc(
+            self.allocator,
+            self.program,
+            block_id,
+            expected_arguments,
+            actual_arguments,
+            &self.lineage_index,
+            &self.replay_index,
+            &self.replay_cache,
+        )) {
+            .matched => {
+                return true;
+            },
+            .rejected => return false,
+            .not_applicable => {},
+        }
+
+        // Clone lineage proves how values can be projected, but it does not
+        // prove that this projection is the tuple entering the current
+        // continuation. Require the expected tuple to remain on a live edge
+        // (or its active split record) before using value-only fallback. A
+        // canonical formal tuple is allowed to have no second edge because
+        // that case was already authenticated by the reentry rule above.
+        const expected_edge_authenticated =
+            hasLiveIncomingEdgeWithArguments(self.program, block_id, expected_arguments) or
+            hasActiveNodeSplitIntoTargetWithArguments(self.program, block_id, expected_arguments);
+        if (!expected_edge_authenticated and hasLiveIncomingEdgeToTarget(self.program, block_id)) return false;
+        const actual_is_formal_tuple = std.mem.eql(ir.ValueId, actual_arguments, block.parameters);
+        const actual_edge_authenticated = actual_is_formal_tuple or
+            hasLiveIncomingEdgeWithArguments(self.program, block_id, actual_arguments) or
+            hasActiveNodeSplitIntoTargetWithArguments(self.program, block_id, actual_arguments);
+        if (!actual_edge_authenticated and hasLiveIncomingEdgeToTarget(self.program, block_id)) return false;
+
+        var direction: ?ProjectionValueMatch = null;
+        for (expected_arguments, actual_arguments) |expected_value, actual_value| {
+            const match = try authenticatedProjectionValueMatchAlloc(
+                self.allocator,
+                self.program,
+                expected_value,
+                actual_value,
+                &self.lineage_index,
+                &self.replay_index,
+                &self.replay_cache,
+            );
+            switch (match) {
+                .same => {},
+                .none => return false,
+                .forward, .reverse => |candidate_direction| {
+                    if (direction) |selected| {
+                        if (selected != candidate_direction) return false;
+                    } else {
+                        direction = candidate_direction;
+                    }
+                },
+            }
+        }
+        return direction != null;
+    }
+
+    fn numericHeaderReentryMatches(
+        self: *ReplayProjectionContext,
+        block_id: ir.BlockId,
+        expected: []const ir.ValueId,
+        actual: []const ir.ValueId,
+    ) std.mem.Allocator.Error!bool {
+        if (block_id.index() >= self.program.blocks.len) return false;
+        const block = self.program.blocks[block_id.index()];
+        const candidate = iteration_state.numericHeaderReentryCandidate(
+            self.program,
+            block,
+            expected,
+            actual,
+        ) orelse return false;
+        if (candidate.has_direct_incoming) return true;
+        return try self.hasAuthenticatedNumericReentryBridge(candidate.ancestor, block_id, expected);
+    }
+
+    fn hasAuthenticatedNumericReentryBridge(
+        self: *ReplayProjectionContext,
+        ancestor: ir.BlockId,
+        current: ir.BlockId,
+        arguments: []const ir.ValueId,
+    ) std.mem.Allocator.Error!bool {
+        const lineage = (try cloneLineageAllocCached(
+            self.allocator,
+            self.program,
+            ancestor,
+            current,
+            &self.lineage_index,
+        )) orelse return false;
+        defer self.allocator.free(lineage);
+        if (lineage.len == 0) return false;
+
+        for (lineage) |step| {
+            if (!try cloneLineageArgumentsMatchReplayCached(
+                self.allocator,
+                self.program,
+                step.source,
+                step.clone,
+                &self.lineage_index,
+                &self.replay_index,
+                &self.replay_cache,
+            )) return false;
+        }
+
+        var found_active_edge = false;
+        const final_step = lineage[lineage.len - 1];
+        for (self.program.edge_rewrites) |rewrite| {
+            if (rewrite.rule != .node_split or
+                rewrite.from.target != final_step.source or
+                rewrite.to.target != final_step.clone or
+                rewrite.node_split_group != final_step.group or
+                !std.mem.eql(ir.ValueId, rewrite.to.arguments, arguments)) continue;
+            if (!activeNodeSplitRewrite(self.program, rewrite)) continue;
+            if (found_active_edge) return false;
+            found_active_edge = true;
+        }
+        return found_active_edge;
+    }
+};
+
 fn authenticatedComposedParameterProjectionAlloc(
     allocator: std.mem.Allocator,
     program: *const ir.Program,
