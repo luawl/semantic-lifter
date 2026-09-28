@@ -5285,6 +5285,200 @@ test "authenticated producer clone projects a block parameter from its incoming 
     ));
 }
 
+test "authenticated producer clone forwards original parameters through zero-argument chain" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const producer = ir.BlockId.fromIndex(1);
+    const incoming_source = ir.BlockId.fromIndex(2);
+    const clone = ir.BlockId.fromIndex(3);
+    const forward_first = ir.BlockId.fromIndex(4);
+    const forward_second = ir.BlockId.fromIndex(5);
+    const consumer = ir.BlockId.fromIndex(6);
+    const exit = ir.BlockId.fromIndex(7);
+
+    const owner_first = ir.ValueId.fromIndex(0);
+    const owner_second = ir.ValueId.fromIndex(1);
+    const owner_third = ir.ValueId.fromIndex(2);
+    const owner_fourth = ir.ValueId.fromIndex(3);
+    const selector = ir.ValueId.fromIndex(4);
+    const producer_first = ir.ValueId.fromIndex(5);
+    const producer_second = ir.ValueId.fromIndex(6);
+    const producer_third = ir.ValueId.fromIndex(7);
+    const producer_fourth = ir.ValueId.fromIndex(8);
+    const clone_first = ir.ValueId.fromIndex(9);
+    const clone_second = ir.ValueId.fromIndex(10);
+    const clone_third = ir.ValueId.fromIndex(11);
+    const clone_fourth = ir.ValueId.fromIndex(12);
+    const consumer_first = ir.ValueId.fromIndex(13);
+    const consumer_second = ir.ValueId.fromIndex(14);
+    const consumer_third = ir.ValueId.fromIndex(15);
+    const consumer_fourth = ir.ValueId.fromIndex(16);
+    const owners = [_]ir.ValueId{ owner_first, owner_second, owner_third, owner_fourth };
+    const producer_values = [_]ir.ValueId{ producer_first, producer_second, producer_third, producer_fourth };
+    const clone_values = [_]ir.ValueId{ clone_first, clone_second, clone_third, clone_fourth };
+    const consumer_values = [_]ir.ValueId{ consumer_first, consumer_second, consumer_third, consumer_fourth };
+
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = selector,
+            .then_edge = .{ .target = producer, .arguments = owners[0..] },
+            .else_edge = .{ .target = incoming_source },
+        } } },
+        .{ .id = producer, .function = function_id, .parameters = producer_values[0..], .terminator = .{ .return_values = &.{} } },
+        .{ .id = incoming_source, .function = function_id, .terminator = .{ .jump = .{
+            .target = clone,
+            .arguments = owners[0..],
+        } } },
+        .{ .id = clone, .function = function_id, .parameters = clone_values[0..], .terminator = .{ .jump = .{ .target = forward_first } } },
+        .{ .id = forward_first, .function = function_id, .terminator = .{ .jump = .{ .target = forward_second } } },
+        .{ .id = forward_second, .function = function_id, .terminator = .{ .jump = .{
+            .target = consumer,
+            .arguments = producer_values[0..],
+        } } },
+        .{ .id = consumer, .function = function_id, .parameters = consumer_values[0..], .terminator = .{ .jump = .{ .target = exit } } },
+        .{ .id = exit, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .parameters = &.{ selector, owner_first, owner_second, owner_third, owner_fourth },
+        .blocks = &.{ entry, producer, incoming_source, clone, forward_first, forward_second, consumer, exit },
+        .entry_block = entry,
+    }};
+    const values = [_]ir.Value{
+        .{ .id = owner_first, .function = function_id, .type = .integer, .origin = .{ .parameter = 1 } },
+        .{ .id = owner_second, .function = function_id, .type = .integer, .origin = .{ .parameter = 2 } },
+        .{ .id = owner_third, .function = function_id, .type = .integer, .origin = .{ .parameter = 3 } },
+        .{ .id = owner_fourth, .function = function_id, .type = .integer, .origin = .{ .parameter = 4 } },
+        .{ .id = selector, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = producer_first, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = producer, .index = 0 } } },
+        .{ .id = producer_second, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = producer, .index = 1 } } },
+        .{ .id = producer_third, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = producer, .index = 2 } } },
+        .{ .id = producer_fourth, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = producer, .index = 3 } } },
+        .{ .id = clone_first, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = clone, .index = 0 } } },
+        .{ .id = clone_second, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = clone, .index = 1 } } },
+        .{ .id = clone_third, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = clone, .index = 2 } } },
+        .{ .id = clone_fourth, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = clone, .index = 3 } } },
+        .{ .id = consumer_first, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = consumer, .index = 0 } } },
+        .{ .id = consumer_second, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = consumer, .index = 1 } } },
+        .{ .id = consumer_third, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = consumer, .index = 2 } } },
+        .{ .id = consumer_fourth, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = consumer, .index = 3 } } },
+    };
+    const rewrite = [_]ir.CfgEdgeRewrite{.{
+        .id = ir.EdgeRewriteId.fromIndex(0),
+        .source = incoming_source,
+        .kind = .jump,
+        .from = .{ .target = producer, .arguments = owners[0..] },
+        .to = .{ .target = clone, .arguments = owners[0..] },
+        .rule = .node_split,
+        .node_split_group = ir.NodeSplitGroupId.fromIndex(0),
+    }};
+    const program: ir.Program = .{
+        .program_id = "authenticated-clone-forwarded-original-parameters",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+        .edge_rewrites = &rewrite,
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, functions[0]);
+    defer analysis.deinit();
+    const incoming = [_]ir.CfgEdgeRef{.{
+        .source = clone,
+        .kind = .jump,
+        .target = forward_first,
+    }};
+    var lineage_index = try CloneLineageIndex.init(std.testing.allocator, &program);
+    defer lineage_index.deinit();
+    var replay_index = try node_split.ReplayIndex.init(std.testing.allocator, &program);
+    defer replay_index.deinit();
+    var replay_cache = ReplayCache.init(std.testing.allocator, &program, &replay_index);
+    defer replay_cache.deinit();
+
+    try std.testing.expectEqual(
+        clone_first,
+        (try findExistingValueCloneAlloc(
+            std.testing.allocator,
+            &program,
+            &analysis,
+            producer,
+            producer_first,
+            &incoming,
+            &.{ clone, forward_first, forward_second },
+            &lineage_index,
+            &replay_index,
+            &replay_cache,
+        )).?,
+    );
+
+    try std.testing.expect(try parameterizedContinuationBridge(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        forward_second,
+        0,
+        consumer,
+        exit,
+        &.{ clone, forward_first, forward_second },
+        &.{},
+        &incoming,
+        &lineage_index,
+        &replay_index,
+        &replay_cache,
+    ));
+
+    var closure = [_]ir.BlockId{ clone, forward_first, forward_second };
+    try std.testing.expect(prepareClosure(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        closure[0..],
+        &incoming,
+    ));
+
+    var tampered_rewrite = rewrite;
+    tampered_rewrite[0].to.arguments = &.{ owner_first, selector, owner_third, owner_fourth };
+    var tampered_program = program;
+    tampered_program.edge_rewrites = &tampered_rewrite;
+    var tampered_analysis = try cfg.Analysis.init(
+        std.testing.allocator,
+        &tampered_program,
+        functions[0],
+    );
+    defer tampered_analysis.deinit();
+    var tampered_lineage_index = try CloneLineageIndex.init(
+        std.testing.allocator,
+        &tampered_program,
+    );
+    defer tampered_lineage_index.deinit();
+    var tampered_replay_index = try node_split.ReplayIndex.init(
+        std.testing.allocator,
+        &tampered_program,
+    );
+    defer tampered_replay_index.deinit();
+    var tampered_replay_cache = ReplayCache.init(
+        std.testing.allocator,
+        &tampered_program,
+        &tampered_replay_index,
+    );
+    defer tampered_replay_cache.deinit();
+    try std.testing.expect(!try parameterizedContinuationBridge(
+        std.testing.allocator,
+        &tampered_program,
+        &tampered_analysis,
+        forward_second,
+        0,
+        consumer,
+        exit,
+        &closure,
+        &.{},
+        &incoming,
+        &tampered_lineage_index,
+        &tampered_replay_index,
+        &tampered_replay_cache,
+    ));
+}
+
 test "incoming-source definitions are not remapped through a downstream clone" {
     const function_id = ir.FunctionId.fromIndex(0);
     const entry = ir.BlockId.fromIndex(0);
@@ -7680,6 +7874,113 @@ const DirectPackUseDetector = struct {
     pub fn place(_: *DirectPackUseDetector, _: ir.PlaceId) void {}
 };
 
+const BoundaryUseProjection = struct {
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    closure: []const ir.BlockId,
+    incoming: []const ir.CfgEdgeRef,
+    use_block: ir.BlockId,
+    invalid: bool = false,
+    producer: ?ir.BlockId = null,
+    predecessor: ?ir.BlockId = null,
+
+    pub fn value(self: *BoundaryUseProjection, value_id: ir.ValueId) void {
+        if (self.invalid) return;
+        const producer = projectionValueProducer(self.program, value_id) orelse return;
+        if (!containsBlock(self.closure, producer)) return;
+
+        if (!containsBlock(self.closure, self.use_block)) {
+            if (!self.analysis.isReachable(self.use_block)) return;
+            const clone_can_reach_use = self.analysis.canReach(producer, self.use_block) catch {
+                self.invalid = true;
+                self.producer = producer;
+                return;
+            };
+            if (!self.analysis.dominates(producer, self.use_block) or clone_can_reach_use) {
+                self.invalid = true;
+                self.producer = producer;
+            }
+            return;
+        }
+
+        if (producer == self.use_block) return;
+        var predecessor_index: usize = 0;
+        while (predecessor_index < self.analysis.predecessorCount(self.use_block)) : (predecessor_index += 1) {
+            const predecessor = self.analysis.predecessorAt(self.use_block, predecessor_index) orelse {
+                self.invalid = true;
+                return;
+            };
+            if (containsBlock(self.closure, predecessor)) continue;
+            var selected_incoming = false;
+            for (self.incoming) |reference| {
+                if (reference.source == predecessor and reference.target == self.use_block) {
+                    selected_incoming = true;
+                    break;
+                }
+            }
+            const clone_can_reach_predecessor = self.analysis.canReach(self.use_block, predecessor) catch {
+                self.invalid = true;
+                self.producer = producer;
+                self.predecessor = predecessor;
+                return;
+            };
+            if (selected_incoming or
+                (self.analysis.dominates(producer, predecessor) and !clone_can_reach_predecessor)) continue;
+            self.invalid = true;
+            self.producer = producer;
+            self.predecessor = predecessor;
+            return;
+        }
+    }
+
+    pub fn pack(_: *BoundaryUseProjection, _: ir.ValuePackId) void {}
+    pub fn place(_: *BoundaryUseProjection, _: ir.PlaceId) void {}
+};
+
+// A closure-local definition cannot be left behind a shared predecessor.
+// After the selected incoming edge is redirected, the clone owns the
+// definition while the original consumer may remain reachable through that
+// predecessor.  Reject the candidate before mutation unless the original
+// definition already dominates that predecessor (or the predecessor is the
+// selected boundary itself).  This is a generic boundary proof; it does not
+// infer a value or weaken the post-apply availability gate.
+fn closureLocalUsesHaveProjectedBoundary(
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    closure: []const ir.BlockId,
+    incoming: []const ir.CfgEdgeRef,
+) bool {
+    if (closure.len == 0 or incoming.len == 0) return false;
+    for (analysis.function.blocks) |block_id| {
+        if (block_id.index() >= program.blocks.len) return false;
+        const block = program.blocks[block_id.index()];
+        if (block.id != block_id or block.function != analysis.function.id) return false;
+        var visitor = BoundaryUseProjection{
+            .program = program,
+            .analysis = analysis,
+            .closure = closure,
+            .incoming = incoming,
+            .use_block = block_id,
+        };
+        for (block.instructions) |instruction_id| {
+            if (instruction_id.index() >= program.instructions.len) return false;
+            const instruction = program.instructions[instruction_id.index()];
+            if (instruction.id != instruction_id or instruction.block != block_id) return false;
+            runtime_uses.visitOperationUses(instruction.operation, &visitor);
+            if (visitor.invalid) break;
+        }
+        if (!visitor.invalid) runtime_uses.visitTerminatorUses(block.terminator, &visitor);
+        if (!visitor.invalid) continue;
+        traceStructural("structural_boundary_projection_reject use={} producer={} predecessor={?}\n", .{
+            block_id.index(),
+            if (visitor.producer) |producer| producer.index() else 0,
+            if (visitor.predecessor) |predecessor| predecessor.index() else null,
+        });
+        return false;
+    }
+    return true;
+}
+
 const ContextualMapping = struct {
     value: ?ir.ValueId = null,
     pack: ?ir.ValuePackId = null,
@@ -8465,6 +8766,69 @@ test "non-dominating exact constants remain rematerializable continuation values
             null,
         ),
     );
+}
+
+test "contextual boundary rejects an unprojected shared predecessor" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const incoming_source = ir.BlockId.fromIndex(1);
+    const target = ir.BlockId.fromIndex(2);
+    const shared_predecessor = ir.BlockId.fromIndex(3);
+    const shared_consumer = ir.BlockId.fromIndex(4);
+    const selector = ir.ValueId.fromIndex(0);
+    const seed = ir.ValueId.fromIndex(1);
+    const target_value = ir.ValueId.fromIndex(2);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = selector,
+            .then_edge = .{ .target = incoming_source },
+            .else_edge = .{ .target = shared_predecessor },
+        } } },
+        .{ .id = incoming_source, .function = function_id, .terminator = .{ .jump = .{
+            .target = target,
+            .arguments = &.{seed},
+        } } },
+        .{ .id = target, .function = function_id, .parameters = &.{target_value}, .terminator = .{ .jump = .{
+            .target = shared_consumer,
+        } } },
+        .{ .id = shared_predecessor, .function = function_id, .terminator = .{ .jump = .{
+            .target = shared_consumer,
+        } } },
+        .{ .id = shared_consumer, .function = function_id, .terminator = .{ .return_values = &.{target_value} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &.{ selector, seed },
+        .blocks = &.{ entry, incoming_source, target, shared_predecessor, shared_consumer },
+        .entry_block = entry,
+    };
+    const values = [_]ir.Value{
+        .{ .id = selector, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = seed, .function = function_id, .type = .dynamic, .origin = .{ .parameter = 1 } },
+        .{ .id = target_value, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = target, .index = 0 } } },
+    };
+    const program = ir.Program{
+        .program_id = "contextual-boundary-shared-predecessor",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, function);
+    defer analysis.deinit();
+    const incoming = [_]ir.CfgEdgeRef{.{
+        .source = incoming_source,
+        .kind = .jump,
+        .target = target,
+    }};
+    const closure = [_]ir.BlockId{ target, shared_consumer };
+    try std.testing.expect(!closureLocalUsesHaveProjectedBoundary(
+        &program,
+        &analysis,
+        &closure,
+        &incoming,
+    ));
 }
 
 test "parameterized continuation admits an authenticated loop-carried SCC" {
@@ -10215,9 +10579,389 @@ fn sharedIterationHeaderBoundaryAtIncoming(
     return true;
 }
 
+test "contextual continuation stops before a shared iteration header" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const header = ir.BlockId.fromIndex(1);
+    const body = ir.BlockId.fromIndex(2);
+    const incoming_source = ir.BlockId.fromIndex(3);
+    const continuation = ir.BlockId.fromIndex(4);
+
+    const control = ir.ValueId.fromIndex(0);
+    const limit = ir.ValueId.fromIndex(1);
+    const step = ir.ValueId.fromIndex(2);
+    const header_control = ir.ValueId.fromIndex(3);
+    const header_limit = ir.ValueId.fromIndex(4);
+    const header_step = ir.ValueId.fromIndex(5);
+    const header_initial = ir.ValueId.fromIndex(6);
+    const false_value = ir.ValueId.fromIndex(7);
+    const has_next = ir.ValueId.fromIndex(8);
+    const normalized_limit = ir.ValueId.fromIndex(9);
+    const normalized_step = ir.ValueId.fromIndex(10);
+    const next_control = ir.ValueId.fromIndex(11);
+    const false_instruction = ir.InstructionId.fromIndex(0);
+    const transition_instruction = ir.InstructionId.fromIndex(1);
+
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .instructions = &.{false_instruction}, .terminator = .{ .jump = .{
+            .target = header,
+            .arguments = &.{ control, limit, step, false_value },
+        } } },
+        .{ .id = header, .function = function_id, .parameters = &.{
+            header_control, header_limit, header_step, header_initial,
+        }, .instructions = &.{transition_instruction}, .terminator = .{ .branch = .{
+            .condition = has_next,
+            .then_edge = .{ .target = body },
+            .else_edge = .{ .target = incoming_source },
+        } } },
+        .{ .id = body, .function = function_id, .terminator = .{ .jump = .{
+            .target = header,
+            .arguments = &.{ next_control, normalized_limit, normalized_step, false_value },
+        } } },
+        .{ .id = incoming_source, .function = function_id, .terminator = .{ .jump = .{ .target = continuation } } },
+        .{ .id = continuation, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &.{ control, limit, step },
+        .blocks = &.{ entry, header, body, incoming_source, continuation },
+        .entry_block = entry,
+    };
+    const values = [_]ir.Value{
+        .{ .id = control, .function = function_id, .type = .dynamic, .origin = .{ .parameter = 0 } },
+        .{ .id = limit, .function = function_id, .type = .dynamic, .origin = .{ .parameter = 1 } },
+        .{ .id = step, .function = function_id, .type = .dynamic, .origin = .{ .parameter = 2 } },
+        .{ .id = header_control, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = header, .index = 0 } } },
+        .{ .id = header_limit, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = header, .index = 1 } } },
+        .{ .id = header_step, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = header, .index = 2 } } },
+        .{ .id = header_initial, .function = function_id, .type = .boolean, .origin = .{ .block_parameter = .{ .block = header, .index = 3 } } },
+        .{ .id = false_value, .function = function_id, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = false_instruction, .index = 0 } } },
+        .{ .id = has_next, .function = function_id, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = transition_instruction, .index = 0 } } },
+        .{ .id = normalized_limit, .function = function_id, .type = .dynamic, .origin = .{ .instruction_result = .{ .instruction = transition_instruction, .index = 1 } } },
+        .{ .id = normalized_step, .function = function_id, .type = .dynamic, .origin = .{ .instruction_result = .{ .instruction = transition_instruction, .index = 2 } } },
+        .{ .id = next_control, .function = function_id, .type = .dynamic, .origin = .{ .instruction_result = .{ .instruction = transition_instruction, .index = 3 } } },
+    };
+    const instructions = [_]ir.Instruction{
+        .{ .id = false_instruction, .block = entry, .operation = .{ .constant = .{ .boolean = false } }, .results = &.{false_value}, .effects = .pure },
+        .{ .id = transition_instruction, .block = header, .operation = .{ .numeric_for_next = .{
+            .control = header_control,
+            .limit = header_limit,
+            .step = header_step,
+            .initial = header_initial,
+            .mode = .semantic_normalized,
+        } }, .results = &.{ has_next, normalized_limit, normalized_step, next_control }, .effects = .numeric_for_next },
+    };
+    const program = ir.Program{
+        .program_id = "shared-iteration-header-boundary",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, function);
+    defer analysis.deinit();
+
+    const incoming = [_]ir.CfgEdgeRef{.{
+        .source = incoming_source,
+        .kind = .jump,
+        .target = continuation,
+    }};
+    try std.testing.expect(sharedIterationHeaderBoundaryAtIncoming(
+        &program,
+        &analysis,
+        header,
+        &.{ next_control, normalized_limit, normalized_step, false_value },
+        &incoming,
+    ));
+    try std.testing.expect(!try parameterizedContinuationBridge(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        body,
+        0,
+        header,
+        continuation,
+        &.{continuation},
+        &.{},
+        &incoming,
+        null,
+        null,
+        null,
+    ));
+}
+
 fn containsBlock(blocks: []const ir.BlockId, target: ir.BlockId) bool {
     for (blocks) |block_id| if (block_id == target) return true;
     return false;
+}
+
+pub fn prepareClosure(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    closure: []ir.BlockId,
+    incoming: []const ir.CfgEdgeRef,
+) bool {
+    return prepareClosureImpl(allocator, program, analysis, closure, incoming, null, false);
+}
+
+fn tracePrepareClosureReject(reason: []const u8, closure_len: usize, incoming_len: usize) void {
+    if (trace_structural_phases) {
+        traceStructural("prepare_closure_reject reason={s} closure={} incoming={}\n", .{
+            reason,
+            closure_len,
+            incoming_len,
+        });
+    }
+}
+
+fn prepareClosureImpl(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    closure: []ir.BlockId,
+    incoming: []const ir.CfgEdgeRef,
+    replay_context: ?*ReplayProjectionContext,
+    root_at_targets: bool,
+) bool {
+    if (closure.len == 0) return false;
+    const external_result = if (replay_context) |context|
+        collectExternalCloneMappingsAllocWithReplayState(
+            allocator,
+            program,
+            analysis,
+            closure,
+            incoming,
+            &context.lineage_index,
+            &context.replay_index,
+            &context.replay_cache,
+        ) catch {
+            tracePrepareClosureReject("external_mapping_error", closure.len, incoming.len);
+            return false;
+        }
+    else
+        collectExternalCloneMappingsAlloc(allocator, program, analysis, closure, incoming) catch {
+            tracePrepareClosureReject("external_mapping_error", closure.len, incoming.len);
+            return false;
+        };
+    var external = external_result orelse {
+        tracePrepareClosureReject("external_mapping_missing", closure.len, incoming.len);
+        return false;
+    };
+    defer external.deinit();
+    if (!closureLocalUsesHaveProjectedBoundary(program, analysis, closure, incoming)) {
+        tracePrepareClosureReject("projected_boundary", closure.len, incoming.len);
+        return false;
+    }
+    for (closure) |block_id| {
+        if (block_id.index() >= program.blocks.len) return false;
+        const block = program.blocks[block_id.index()];
+        if (block.id != block_id or !node_split.parametersAreCanonical(program.values, block)) {
+            tracePrepareClosureReject("noncanonical_block", closure.len, incoming.len);
+            return false;
+        }
+    }
+    const available = if (root_at_targets)
+        clone_availability.cloneClosureUsesAreAvailableFromTargets(
+            allocator,
+            program,
+            analysis,
+            closure,
+            incoming,
+            external.values,
+            external.clone_values,
+            external.packs,
+            external.clone_packs,
+        ) catch {
+            tracePrepareClosureReject("availability_error", closure.len, incoming.len);
+            return false;
+        }
+    else
+        clone_availability.cloneClosureUsesAreAvailable(
+            allocator,
+            program,
+            analysis,
+            closure,
+            incoming,
+            external.values,
+            external.clone_values,
+            external.packs,
+            external.clone_packs,
+        ) catch {
+            tracePrepareClosureReject("availability_error", closure.len, incoming.len);
+            return false;
+        };
+    if (!available) {
+        tracePrepareClosureReject("availability", closure.len, incoming.len);
+        return false;
+    }
+
+    // Irreducible regions can contain a value producer that does not dominate
+    // every consumer in the clone closure.  Dominance sorting therefore puts a
+    // valid producer after a consumer whose edge carries its value.  Build the
+    // clone order from actual instruction/terminator availability instead:
+    // each block is admitted only after all values and packs it uses can be
+    // remapped from the external context or an already admitted block.
+    const ordered = allocator.alloc(ir.BlockId, closure.len) catch return false;
+    defer allocator.free(ordered);
+    const processed = allocator.alloc(bool, closure.len) catch return false;
+    defer allocator.free(processed);
+    @memset(processed, false);
+
+    const mapped_values = allocator.alloc(bool, program.values.len) catch return false;
+    defer allocator.free(mapped_values);
+    const mapped_packs = allocator.alloc(bool, program.value_packs.len) catch return false;
+    defer allocator.free(mapped_packs);
+    @memset(mapped_values, false);
+    @memset(mapped_packs, false);
+    for (external.values) |value_id| {
+        if (value_id.index() >= mapped_values.len) return false;
+        mapped_values[value_id.index()] = true;
+    }
+    for (external.packs) |pack_id| {
+        if (pack_id.index() >= mapped_packs.len) return false;
+        mapped_packs[pack_id.index()] = true;
+    }
+    var candidate_values: std.ArrayList(ir.ValueId) = .empty;
+    defer candidate_values.deinit(allocator);
+    var candidate_packs: std.ArrayList(ir.ValuePackId) = .empty;
+    defer candidate_packs.deinit(allocator);
+    var processed_count: usize = 0;
+    while (processed_count < closure.len) {
+        var selected_index: ?usize = null;
+        var selected_order: usize = std.math.maxInt(usize);
+        for (closure, 0..) |block_id, closure_index| {
+            if (processed[closure_index]) continue;
+            const block = program.blocks[block_id.index()];
+            if (!node_split.instructionStructureIsCloneableWithMappedFlags(
+                program,
+                block,
+                mapped_values,
+                mapped_packs,
+            )) continue;
+
+            candidate_values.clearRetainingCapacity();
+            candidate_packs.clearRetainingCapacity();
+            var valid = true;
+            for (block.parameters) |parameter_id| {
+                if (parameter_id.index() >= mapped_values.len) {
+                    valid = false;
+                    break;
+                }
+                if (!mapped_values[parameter_id.index()]) {
+                    mapped_values[parameter_id.index()] = true;
+                    candidate_values.append(allocator, parameter_id) catch return false;
+                }
+            }
+            for (block.instructions) |instruction_id| {
+                if (!valid) break;
+                if (instruction_id.index() >= program.instructions.len) {
+                    valid = false;
+                    break;
+                }
+                const instruction = program.instructions[instruction_id.index()];
+                if (instruction.id != instruction_id or instruction.block != block.id) {
+                    valid = false;
+                    break;
+                }
+                for (instruction.results) |result_id| {
+                    if (result_id.index() >= mapped_values.len) {
+                        valid = false;
+                        break;
+                    }
+                    if (!mapped_values[result_id.index()]) {
+                        mapped_values[result_id.index()] = true;
+                        candidate_values.append(allocator, result_id) catch return false;
+                    }
+                }
+                if (instruction.pack_result) |pack_id| {
+                    if (pack_id.index() >= mapped_packs.len) {
+                        valid = false;
+                        break;
+                    }
+                    if (!mapped_packs[pack_id.index()]) {
+                        mapped_packs[pack_id.index()] = true;
+                        candidate_packs.append(allocator, pack_id) catch return false;
+                    }
+                }
+            }
+            if (!valid or !node_split.terminatorIsCloneableWithMappedFlags(program, block.terminator, mapped_values)) {
+                for (candidate_values.items) |value_id| mapped_values[value_id.index()] = false;
+                for (candidate_packs.items) |pack_id| mapped_packs[pack_id.index()] = false;
+                continue;
+            }
+            for (candidate_values.items) |value_id| mapped_values[value_id.index()] = false;
+            for (candidate_packs.items) |pack_id| mapped_packs[pack_id.index()] = false;
+            const order = analysis.blockIndex(block_id) orelse return false;
+            if (selected_index == null or order < selected_order) {
+                selected_index = closure_index;
+                selected_order = order;
+            }
+        }
+        const closure_index = selected_index orelse {
+            tracePrepareClosureReject("clone_order", closure.len, incoming.len);
+            return false;
+        };
+        const block_id = closure[closure_index];
+        const block = program.blocks[block_id.index()];
+        candidate_values.clearRetainingCapacity();
+        candidate_packs.clearRetainingCapacity();
+        var valid = true;
+        for (block.parameters) |parameter_id| {
+            if (parameter_id.index() >= mapped_values.len) {
+                valid = false;
+                break;
+            }
+            if (!mapped_values[parameter_id.index()]) {
+                mapped_values[parameter_id.index()] = true;
+                candidate_values.append(allocator, parameter_id) catch return false;
+            }
+        }
+        for (block.instructions) |instruction_id| {
+            if (!valid) break;
+            if (instruction_id.index() >= program.instructions.len) {
+                valid = false;
+                break;
+            }
+            const instruction = program.instructions[instruction_id.index()];
+            if (instruction.id != instruction_id or instruction.block != block.id) {
+                valid = false;
+                break;
+            }
+            for (instruction.results) |result_id| {
+                if (result_id.index() >= mapped_values.len) {
+                    valid = false;
+                    break;
+                }
+                if (!mapped_values[result_id.index()]) {
+                    mapped_values[result_id.index()] = true;
+                    candidate_values.append(allocator, result_id) catch return false;
+                }
+            }
+            if (instruction.pack_result) |pack_id| {
+                if (pack_id.index() >= mapped_packs.len) {
+                    valid = false;
+                    break;
+                }
+                if (!mapped_packs[pack_id.index()]) {
+                    mapped_packs[pack_id.index()] = true;
+                    candidate_packs.append(allocator, pack_id) catch return false;
+                }
+            }
+        }
+        if (!valid or !node_split.terminatorIsCloneableWithMappedFlags(program, block.terminator, mapped_values)) {
+            for (candidate_values.items) |value_id| mapped_values[value_id.index()] = false;
+            for (candidate_packs.items) |pack_id| mapped_packs[pack_id.index()] = false;
+            tracePrepareClosureReject("clone_order_invalid", closure.len, incoming.len);
+            return false;
+        }
+        processed[closure_index] = true;
+        ordered[processed_count] = block_id;
+        processed_count += 1;
+    }
+    @memcpy(closure, ordered);
+    return true;
 }
 
 test "one-parameter clone member authenticates its live edge tuple" {
