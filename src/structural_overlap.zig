@@ -1097,6 +1097,167 @@ fn hasAuthenticatedUnchangedCloneBridgeForEdgeAlloc(
     return false;
 }
 
+// A continuation target may already be a clone when a later authenticated
+// clone keeps an incoming edge unchanged.  The ordinary unchanged-edge proof
+// compares the whole source lineage against one target lineage and can reject
+// this valid owner handoff when nested split groups differ.  Authenticate the
+// handoff from the target clone's own split owner instead: the owner/source
+// suffix, target lineage, rewrite tuples, and external uses must all replay.
+fn hasAuthenticatedNestedCloneTargetBridgeForEdgeAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    reference: ir.CfgEdgeRef,
+    lineage_index: *const CloneLineageIndex,
+    replay_index: *const node_split.ReplayIndex,
+    replay_cache: *ReplayCache,
+) std.mem.Allocator.Error!bool {
+    if (!incomingEdgeIsCanonical(program, analysis, reference)) return false;
+    const current_edge = cfg_edge.value(program, reference) orelse return false;
+    const target_position = cloneLineagePositionCached(program, reference.target, lineage_index) orelse return false;
+    if (target_position.depth == 0) return false;
+    if (!try cloneLineageArgumentsMatchReplayCached(
+        allocator,
+        program,
+        target_position.root,
+        reference.target,
+        lineage_index,
+        replay_index,
+        replay_cache,
+    )) return false;
+
+    for (program.edge_rewrites) |rewrite| {
+        if (rewrite.rule != .node_split or rewrite.node_split_group == null or
+            rewrite.kind != reference.kind or rewrite.to.target != reference.target or
+            rewrite.from.target == rewrite.to.target)
+        {
+            continue;
+        }
+        const owner = rewrite.source;
+        const owner_edge_reference = edgeReferenceForKind(program, owner, rewrite.kind) orelse continue;
+        const owner_edge = cfg_edge.value(program, owner_edge_reference) orelse continue;
+        if (owner_edge_reference.target != reference.target or
+            !std.mem.eql(ir.ValueId, owner_edge.arguments, rewrite.to.arguments))
+        {
+            continue;
+        }
+
+        const target_step = cloneStepForTargetCached(program, reference.target, lineage_index) orelse continue;
+        if (target_step.source != rewrite.from.target or target_step.group != rewrite.node_split_group.?) continue;
+        if (!try cloneLineageArgumentsMatchReplayCached(
+            allocator,
+            program,
+            target_step.source,
+            reference.target,
+            lineage_index,
+            replay_index,
+            replay_cache,
+        )) continue;
+
+        const suffix = try cloneLineageAllocCached(
+            allocator,
+            program,
+            owner,
+            reference.source,
+            lineage_index,
+        ) orelse continue;
+        defer allocator.free(suffix);
+        if (!try cloneLineageArgumentsMatchReplayCached(
+            allocator,
+            program,
+            owner,
+            reference.source,
+            lineage_index,
+            replay_index,
+            replay_cache,
+        )) continue;
+
+        var suffix_valid = true;
+        for (suffix) |step| {
+            const source_reference = edgeReferenceForKind(program, step.source, reference.kind) orelse {
+                suffix_valid = false;
+                break;
+            };
+            const clone_reference = edgeReferenceForKind(program, step.clone, reference.kind) orelse {
+                suffix_valid = false;
+                break;
+            };
+            const source_edge = cfg_edge.value(program, source_reference) orelse {
+                suffix_valid = false;
+                break;
+            };
+            const clone_edge = cfg_edge.value(program, clone_reference) orelse {
+                suffix_valid = false;
+                break;
+            };
+            if (source_edge.target != reference.target or clone_edge.target != reference.target) {
+                suffix_valid = false;
+                break;
+            }
+            const replay = (try replay_cache.get(step.source, step.clone, step.group)) orelse {
+                suffix_valid = false;
+                break;
+            };
+            if (!replayedEdgeArgumentsMatch(
+                program,
+                step.source,
+                step.clone,
+                source_edge,
+                clone_edge,
+                replay.*,
+                true,
+            )) {
+                suffix_valid = false;
+                break;
+            }
+        }
+        if (!suffix_valid) continue;
+
+        // The owner edge is expressed in the owner block's value namespace.
+        // A later clone may carry the same edge through a renamed suffix, so
+        // compare the owner tuple with the live tuple only after replaying
+        // every suffix mapping.
+        if (owner_edge.arguments.len != current_edge.arguments.len) continue;
+        var suffix_arguments_valid = true;
+        for (owner_edge.arguments, current_edge.arguments) |owner_value, current_value| {
+            var mapped = owner_value;
+            for (suffix) |step| {
+                const replay = (try replay_cache.get(step.source, step.clone, step.group)) orelse {
+                    suffix_arguments_valid = false;
+                    break;
+                };
+                mapped = mapValueFromReplay(program, step.source, step.clone, mapped, replay.*) orelse {
+                    suffix_arguments_valid = false;
+                    break;
+                };
+            }
+            if (!suffix_arguments_valid or mapped != current_value) {
+                suffix_arguments_valid = false;
+                break;
+            }
+        }
+        if (!suffix_arguments_valid) continue;
+
+        const closure = [_]ir.BlockId{reference.target};
+        const incoming = [_]ir.CfgEdgeRef{reference};
+        var external = try collectExternalCloneMappingsAllocWithReplayState(
+            allocator,
+            program,
+            analysis,
+            &closure,
+            &incoming,
+            lineage_index,
+            replay_index,
+            replay_cache,
+        );
+        if (external) |*owned| {
+            owned.deinit();
+            return true;
+        }
+    }
+    return false;
+}
+
 test "replayed edge arguments require authenticated equivalent targets" {
     const function_id = ir.FunctionId.fromIndex(0);
     const source = ir.BlockId.fromIndex(0);
@@ -1286,6 +1447,127 @@ fn authenticatedCloneBranchEquivalentAlloc(
         replay_cache,
         depth + 1,
     );
+}
+
+fn authenticatedBranchProjectionValueMapAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    source: ir.BlockId,
+    clone: ir.BlockId,
+    value: ir.ValueId,
+    lineage_index: *const CloneLineageIndex,
+    replay_index: *const node_split.ReplayIndex,
+    replay_cache: *ReplayCache,
+) std.mem.Allocator.Error!?ir.ValueId {
+    if (!try authenticatedCloneBranchEquivalentAlloc(
+        allocator,
+        program,
+        source,
+        clone,
+        lineage_index,
+        replay_index,
+        replay_cache,
+        0,
+    )) return null;
+    return mapValueByCloneShape(program, source, clone, value);
+}
+
+fn authenticatedProjectionValueMatchAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    expected: ir.ValueId,
+    actual: ir.ValueId,
+    lineage_index: *const CloneLineageIndex,
+    replay_index: *const node_split.ReplayIndex,
+    replay_cache: *ReplayCache,
+) std.mem.Allocator.Error!ProjectionValueMatch {
+    if (expected == actual) return .same;
+    if (expected.index() >= program.values.len or actual.index() >= program.values.len) return .none;
+    const expected_value = program.values[expected.index()];
+    const actual_value = program.values[actual.index()];
+    if (expected_value.id != expected or actual_value.id != actual or
+        expected_value.function != actual_value.function)
+    {
+        return .none;
+    }
+    const expected_producer = projectionValueProducer(program, expected) orelse return .none;
+    const actual_producer = projectionValueProducer(program, actual) orelse return .none;
+    if (expected_producer == actual_producer) return .none;
+
+    if (blockLineageContainsCached(program, actual_producer, expected_producer, lineage_index) and
+        try cloneLineageArgumentsMatchReplayCached(
+            allocator,
+            program,
+            expected_producer,
+            actual_producer,
+            lineage_index,
+            replay_index,
+            replay_cache,
+        ))
+    {
+        const mapped = try mapValueThroughCloneLineageAllocCachedWithReplayCache(
+            allocator,
+            program,
+            expected_producer,
+            actual_producer,
+            expected,
+            lineage_index,
+            replay_index,
+            replay_cache,
+        );
+        if (mapped == actual) return .forward;
+    }
+
+    if (blockLineageContainsCached(program, expected_producer, actual_producer, lineage_index) and
+        try cloneLineageArgumentsMatchReplayCached(
+            allocator,
+            program,
+            actual_producer,
+            expected_producer,
+            lineage_index,
+            replay_index,
+            replay_cache,
+        ))
+    {
+        const mapped = try mapValueThroughCloneLineageAllocCachedWithReplayCache(
+            allocator,
+            program,
+            actual_producer,
+            expected_producer,
+            actual,
+            lineage_index,
+            replay_index,
+            replay_cache,
+        );
+        if (mapped == expected) return .reverse;
+    }
+
+    if (try authenticatedBranchProjectionValueMapAlloc(
+        allocator,
+        program,
+        expected_producer,
+        actual_producer,
+        expected,
+        lineage_index,
+        replay_index,
+        replay_cache,
+    )) |mapped| {
+        if (mapped == actual) return .forward;
+    }
+
+    if (try authenticatedBranchProjectionValueMapAlloc(
+        allocator,
+        program,
+        actual_producer,
+        expected_producer,
+        actual,
+        lineage_index,
+        replay_index,
+        replay_cache,
+    )) |mapped| {
+        if (mapped == expected) return .reverse;
+    }
+    return .none;
 }
 
 fn cloneLineageArgumentsAreStableCached(
@@ -5234,6 +5516,453 @@ fn findGroupContextPackMappingAlloc(
     return result;
 }
 
+// An identity-only external mapping can still represent a distinct incoming
+// context when the collision proof has already supplied the owner tuple and
+// the live edge carries the complete result tuple of an authenticated numeric
+// iteration transition. Type or shape equality, and a partial tuple match,
+// are not sufficient for this boundary.
+fn hasAuthenticatedIterationContextualProjectionAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    target: ir.BlockId,
+    incoming: ir.CfgEdgeRef,
+    expected: []const ir.ValueId,
+    lineage_index: *const CloneLineageIndex,
+    replay_index: *const node_split.ReplayIndex,
+    replay_cache: *ReplayCache,
+) std.mem.Allocator.Error!bool {
+    const incoming_canonical = incomingEdgeIsCanonical(program, analysis, incoming);
+    const expected_edge_live = hasLiveIncomingEdgeWithArguments(program, target, expected);
+    if (!incoming_canonical or !expected_edge_live) return false;
+    const edge = cfg_edge.value(program, incoming) orelse return false;
+    if (!isIterationTransitionHeader(program, target)) {
+        return try hasAuthenticatedCompoundIterationContextualProjectionAlloc(
+            program,
+            analysis,
+            target,
+            incoming,
+            expected,
+        );
+    }
+    if (expected.len != edge.arguments.len or
+        std.mem.eql(ir.ValueId, expected, edge.arguments) or
+        edge.arguments.len != 4 or
+        !iteration_state.isBooleanLiteral(program, edge.arguments[3], false)) return false;
+
+    const block = program.blocks[target.index()];
+    const transition_id = block.instructions[0];
+    if (transition_id.index() >= program.instructions.len) return false;
+    const transition = program.instructions[transition_id.index()];
+    if (transition.id != transition_id or transition.results.len != 4) return false;
+
+    var mapped_slots = [_]bool{ false, false, false, false };
+    for (transition.results, 0..) |source_value, result_index| {
+        const slot = iterationStateArgumentIndex(transition, result_index) orelse continue;
+        const mapping = try findAuthenticatedIterationStateResultMappingAlloc(
+            allocator,
+            program,
+            analysis,
+            source_value,
+            &.{incoming},
+            lineage_index,
+            replay_index,
+            replay_cache,
+            false,
+        );
+        if (mapping.ambiguous or mapping.value == null or mapping.value.? != edge.arguments[slot]) return false;
+        mapped_slots[slot] = true;
+    }
+    return mapped_slots[0] and mapped_slots[1] and mapped_slots[2];
+}
+
+// A compound continuation may forward its formal tuple into a nested
+// iteration header after an effectful straight-line prefix.  The target is
+// context-dependent even when its instructions use only its own block
+// parameters, so no external value-use witness exists.  Require the complete
+// owner/incoming edge pair and the formal-to-transition forwarding edge; an
+// arbitrary four-value edge is not sufficient.  The iteration header may
+// terminate or continue elsewhere: the prefix itself is the context-sensitive
+// region that must be split, so requiring a return to the incoming predecessor
+// would reject valid acyclic continuations.
+fn hasAuthenticatedCompoundIterationContextualProjectionAlloc(
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    target: ir.BlockId,
+    incoming: ir.CfgEdgeRef,
+    expected: []const ir.ValueId,
+) std.mem.Allocator.Error!bool {
+    if (target.index() >= program.blocks.len or
+        incoming.target != target or
+        expected.len != 4)
+    {
+        return false;
+    }
+    const target_block = program.blocks[target.index()];
+    if (target_block.id != target or target_block.parameters.len != expected.len or
+        !node_split.parametersAreCanonical(program.values, target_block))
+    {
+        return false;
+    }
+    const edge = cfg_edge.value(program, incoming) orelse return false;
+    if (edge.target != target or edge.arguments.len != target_block.parameters.len or
+        std.mem.eql(ir.ValueId, expected, edge.arguments))
+    {
+        return false;
+    }
+    for (target_block.parameters, expected, edge.arguments) |formal, owner, actual| {
+        if (!continuationParameterAcceptsValueType(program, formal, owner) or
+            !continuationParameterAcceptsValueType(program, formal, actual)) return false;
+    }
+
+    // A compound continuation can carry arbitrary state values into an
+    // effectful prefix before forwarding its own formal tuple into the next
+    // iteration header.  The incoming tuple is therefore not itself an
+    // iteration result tuple.  Authenticate this shape separately before the
+    // narrower result-tuple rule below; otherwise a valid parameterized
+    // prefix is mistaken for an unauthenticated value collision.
+    if (try hasAuthenticatedEffectfulParameterizedCompoundProjectionAlloc(
+        program,
+        analysis,
+        target,
+        incoming,
+        expected,
+    )) return true;
+
+    if (!iteration_state.isBooleanLiteral(program, edge.arguments[3], false)) return false;
+
+    const transition = iterationStateTupleTransition(program, edge.arguments) orelse return false;
+    if (transition.block == target or !isIterationTransitionHeader(program, transition.block)) return false;
+    if (!try analysis.canReach(target, transition.block) or
+        !try analysis.canReach(transition.block, incoming.source) or
+        !try analysis.canReach(incoming.source, target))
+    {
+        return false;
+    }
+
+    for (program.blocks) |source| {
+        if (source.function != analysis.function.id or
+            !analysis.isReachable(source.id) or
+            !try analysis.canReach(target, source.id)) continue;
+        switch (source.terminator) {
+            .jump => |forward| {
+                if (forward.target == transition.block and
+                    std.mem.eql(ir.ValueId, forward.arguments, target_block.parameters)) return true;
+            },
+            .branch => |branch| {
+                if ((branch.then_edge.target == transition.block and
+                    std.mem.eql(ir.ValueId, branch.then_edge.arguments, target_block.parameters)) or
+                    (branch.else_edge.target == transition.block and
+                        std.mem.eql(ir.ValueId, branch.else_edge.arguments, target_block.parameters))) return true;
+            },
+            .return_values, .return_pack, .return_expanded, .throw_error, .unreachable_block => {},
+        }
+    }
+    return false;
+}
+
+// A parameterized continuation can combine a canonical formal prefix with a
+// complete nested iteration state.  The prefix is forwarded unchanged by the
+// re-entry edge while the state suffix is produced by the nested transition;
+// the owner edge may carry the same contract from a different transition.
+// Authenticate the composition as a tuple shape.  This is intentionally
+// independent of clone names, block ids, or source layout.
+fn hasAuthenticatedMixedParameterizedIterationProjectionAlloc(
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    target: ir.BlockId,
+    incoming: ir.CfgEdgeRef,
+    expected: []const ir.ValueId,
+) std.mem.Allocator.Error!bool {
+    const state_width: usize = 4;
+    if (target.index() >= program.blocks.len or
+        incoming.target != target or
+        expected.len <= state_width)
+    {
+        return false;
+    }
+
+    const target_block = program.blocks[target.index()];
+    if (target_block.id != target or
+        target_block.function != analysis.function.id or
+        target_block.parameters.len != expected.len or
+        !node_split.parametersAreCanonical(program.values, target_block) or
+        !analysis.isReachable(target))
+    {
+        return false;
+    }
+
+    const incoming_edge = cfg_edge.value(program, incoming) orelse return false;
+    if (!incomingEdgeIsCanonical(program, analysis, incoming) or
+        incoming_edge.target != target or
+        incoming_edge.arguments.len != target_block.parameters.len or
+        std.mem.eql(ir.ValueId, expected, incoming_edge.arguments))
+    {
+        return false;
+    }
+
+    const prefix_len = expected.len - state_width;
+    if (prefix_len == 0 or
+        !std.mem.eql(ir.ValueId, target_block.parameters[0..prefix_len], incoming_edge.arguments[0..prefix_len]))
+    {
+        return false;
+    }
+
+    for (target_block.parameters, expected, incoming_edge.arguments) |formal, owner, actual| {
+        if (!continuationParameterAcceptsValueType(program, formal, owner) or
+            !continuationParameterAcceptsValueType(program, formal, actual)) return false;
+    }
+
+    const expected_state = expected[prefix_len..];
+    const actual_state = incoming_edge.arguments[prefix_len..];
+    const expected_transition = iterationStateTupleTransition(program, expected_state) orelse return false;
+    const actual_transition = iterationStateTupleTransition(program, actual_state) orelse return false;
+    if (!isIterationTransitionHeader(program, expected_transition.block) or
+        !isIterationTransitionHeader(program, actual_transition.block))
+    {
+        return false;
+    }
+
+    // Find the unique live owner edge.  A merely type-compatible predecessor
+    // is not enough to establish which context owns the target tuple.
+    var owner_source: ?ir.BlockId = null;
+    for (analysis.function.blocks) |source| {
+        if (!analysis.isReachable(source) or source.index() >= program.blocks.len) continue;
+        const source_block = program.blocks[source.index()];
+        if (source_block.id != source or source_block.function != analysis.function.id) return false;
+        switch (source_block.terminator) {
+            .jump => |edge| {
+                if (edge.target == target and std.mem.eql(ir.ValueId, edge.arguments, expected)) {
+                    if (owner_source != null) return false;
+                    owner_source = source;
+                }
+            },
+            .branch => |branch| {
+                if (branch.then_edge.target == target and
+                    std.mem.eql(ir.ValueId, branch.then_edge.arguments, expected))
+                {
+                    if (owner_source != null) return false;
+                    owner_source = source;
+                }
+                if (branch.else_edge.target == target and
+                    std.mem.eql(ir.ValueId, branch.else_edge.arguments, expected))
+                {
+                    if (owner_source != null) return false;
+                    owner_source = source;
+                }
+            },
+            .return_values, .return_pack, .return_expanded, .throw_error, .unreachable_block => {},
+        }
+    }
+    const owner = owner_source orelse return false;
+    if (owner == incoming.source or
+        try analysis.canReach(target, owner) or
+        !try analysis.canReach(expected_transition.block, owner) or
+        !try analysis.canReach(owner, target))
+    {
+        return false;
+    }
+
+    // The incoming suffix must be a real state transfer through the current
+    // SCC, not an arbitrary four-value tuple with matching types.
+    if (!try analysis.canReach(target, actual_transition.block) or
+        !try analysis.canReach(actual_transition.block, incoming.source) or
+        !try analysis.canReach(incoming.source, target))
+    {
+        return false;
+    }
+
+    // Follow only zero-argument blocks after the target until the nested
+    // transition consumes the target's state suffix.  This preserves the
+    // operation ordering and prevents an unrelated reachable transition from
+    // authenticating the tuple.
+    const PathState = struct {
+        block: ir.BlockId,
+        effectful: bool,
+    };
+    const seen_without_effect = try analysis.allocator.alloc(bool, analysis.function.blocks.len);
+    defer analysis.allocator.free(seen_without_effect);
+    const seen_with_effect = try analysis.allocator.alloc(bool, analysis.function.blocks.len);
+    defer analysis.allocator.free(seen_with_effect);
+    @memset(seen_without_effect, false);
+    @memset(seen_with_effect, false);
+
+    var pending: std.ArrayList(PathState) = .empty;
+    defer pending.deinit(analysis.allocator);
+    try pending.append(analysis.allocator, .{ .block = target, .effectful = false });
+
+    while (pending.pop()) |state| {
+        const local_index = analysis.blockIndex(state.block) orelse return false;
+        const seen = if (state.effectful) seen_with_effect else seen_without_effect;
+        if (seen[local_index]) continue;
+        seen[local_index] = true;
+
+        if (state.block.index() >= program.blocks.len) return false;
+        const block = program.blocks[state.block.index()];
+        if (block.id != state.block or block.function != analysis.function.id) return false;
+        var path_effectful = state.effectful;
+        for (block.instructions) |instruction_id| {
+            if (instruction_id.index() >= program.instructions.len) return false;
+            const instruction = program.instructions[instruction_id.index()];
+            if (instruction.id != instruction_id or instruction.block != state.block) return false;
+            path_effectful = path_effectful or proof_effect_closure.hasObservableEffects(instruction.effects);
+        }
+
+        switch (block.terminator) {
+            .jump => |edge| {
+                if (edge.target == actual_transition.block and
+                    std.mem.eql(ir.ValueId, edge.arguments, target_block.parameters[prefix_len..]))
+                {
+                    if (path_effectful) return true;
+                    continue;
+                }
+                if (edge.arguments.len != 0 or edge.target == target) continue;
+                if (edge.target.index() >= program.blocks.len) return false;
+                if (program.blocks[edge.target.index()].parameters.len != 0) continue;
+                try pending.append(analysis.allocator, .{ .block = edge.target, .effectful = path_effectful });
+            },
+            .branch => |branch| {
+                const edges = [_]ir.Edge{ branch.then_edge, branch.else_edge };
+                for (edges) |edge| {
+                    if (edge.target == actual_transition.block and
+                        std.mem.eql(ir.ValueId, edge.arguments, target_block.parameters[prefix_len..]))
+                    {
+                        if (path_effectful) return true;
+                        continue;
+                    }
+                    if (edge.arguments.len != 0 or edge.target == target) continue;
+                    if (edge.target.index() >= program.blocks.len) return false;
+                    if (program.blocks[edge.target.index()].parameters.len != 0) continue;
+                    try pending.append(analysis.allocator, .{ .block = edge.target, .effectful = path_effectful });
+                }
+            },
+            .return_values, .return_pack, .return_expanded, .throw_error, .unreachable_block => {},
+        }
+    }
+    return false;
+}
+
+fn hasAuthenticatedEffectfulParameterizedCompoundProjectionAlloc(
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    target: ir.BlockId,
+    incoming: ir.CfgEdgeRef,
+    expected: []const ir.ValueId,
+) std.mem.Allocator.Error!bool {
+    if (target.index() >= program.blocks.len or
+        incoming.target != target or
+        expected.len != 4)
+    {
+        return false;
+    }
+    const target_block = program.blocks[target.index()];
+    if (target_block.id != target or target_block.function != analysis.function.id or
+        target_block.parameters.len != expected.len or
+        !node_split.parametersAreCanonical(program.values, target_block) or
+        !analysis.isReachable(target))
+    {
+        return false;
+    }
+    const incoming_edge = cfg_edge.value(program, incoming) orelse return false;
+    if (!analysis.isReachable(incoming.source) or
+        incoming_edge.target != target or
+        incoming_edge.arguments.len != target_block.parameters.len or
+        std.mem.eql(ir.ValueId, expected, incoming_edge.arguments))
+    {
+        return false;
+    }
+
+    // The owner tuple must be a distinct, reachable entry into this target.
+    // A type-compatible tuple or a dead edge does not establish ownership.
+    var owner_entry: ?ir.BlockId = null;
+    for (analysis.function.blocks) |source| {
+        if (source == incoming.source or !analysis.isReachable(source)) continue;
+        if (source.index() >= program.blocks.len) return false;
+        const source_block = program.blocks[source.index()];
+        if (source_block.id != source or source_block.function != analysis.function.id) return false;
+        switch (source_block.terminator) {
+            .jump => |edge| {
+                if (edge.target == target and std.mem.eql(ir.ValueId, edge.arguments, expected)) {
+                    if (owner_entry != null) return false;
+                    owner_entry = source;
+                }
+            },
+            .branch => |branch| {
+                if (branch.then_edge.target == target and
+                    std.mem.eql(ir.ValueId, branch.then_edge.arguments, expected))
+                {
+                    if (owner_entry != null) return false;
+                    owner_entry = source;
+                }
+                if (branch.else_edge.target == target and
+                    std.mem.eql(ir.ValueId, branch.else_edge.arguments, expected))
+                {
+                    if (owner_entry != null) return false;
+                    owner_entry = source;
+                }
+            },
+            .return_values, .return_pack, .return_expanded, .throw_error, .unreachable_block => {},
+        }
+    }
+    if (owner_entry == null) return false;
+
+    for (target_block.parameters, expected, incoming_edge.arguments) |formal, owner, actual| {
+        if (!continuationParameterAcceptsValueType(program, formal, owner) or
+            !continuationParameterAcceptsValueType(program, formal, actual)) return false;
+    }
+
+    // Walk only the straight-line compound prefix.  Every hop before the
+    // iteration header must be a zero-argument jump; this keeps branch
+    // choices and hidden context transfers out of the projection proof.
+    const seen = try analysis.allocator.alloc(bool, analysis.function.blocks.len);
+    defer analysis.allocator.free(seen);
+    @memset(seen, false);
+
+    var cursor = target;
+    var transition: ?ir.BlockId = null;
+    var has_effect = false;
+    while (true) {
+        const local_index = analysis.blockIndex(cursor) orelse return false;
+        if (local_index >= seen.len or seen[local_index]) return false;
+        seen[local_index] = true;
+        if (cursor.index() >= program.blocks.len) return false;
+        const block = program.blocks[cursor.index()];
+        if (block.id != cursor or block.function != analysis.function.id or
+            (cursor != target and block.parameters.len != 0)) return false;
+        for (block.instructions) |instruction_id| {
+            if (instruction_id.index() >= program.instructions.len) return false;
+            const instruction = program.instructions[instruction_id.index()];
+            if (instruction.id != instruction_id or instruction.block != cursor) return false;
+            if (proof_effect_closure.hasObservableEffects(instruction.effects)) has_effect = true;
+        }
+
+        switch (block.terminator) {
+            .jump => |edge| {
+                if (edge.target.index() >= program.blocks.len or
+                    !analysis.isReachable(edge.target)) return false;
+                if (isIterationTransitionHeader(program, edge.target)) {
+                    if (transition != null or
+                        !std.mem.eql(ir.ValueId, edge.arguments, target_block.parameters)) return false;
+                    transition = edge.target;
+                    break;
+                }
+                if (edge.arguments.len != 0) return false;
+                cursor = edge.target;
+            },
+            .branch, .return_values, .return_pack, .return_expanded, .throw_error, .unreachable_block => return false,
+        }
+    }
+
+    const transition_block = transition orelse return false;
+    if (!has_effect or transition_block == target or transition_block == incoming.source or
+        !try analysis.canReach(target, transition_block) or
+        !try analysis.canReach(incoming.source, target))
+    {
+        return false;
+    }
+    return true;
+}
+
 test "multi-result carrier maps through every authenticated clone step" {
     const function_id = ir.FunctionId.fromIndex(0);
     const entry = ir.BlockId.fromIndex(0);
@@ -5722,6 +6451,129 @@ fn hasLiveIncomingEdgeWithArguments(
         }
     }
     return false;
+}
+
+fn hasLiveIncomingEdgeToTarget(
+    program: *const ir.Program,
+    target: ir.BlockId,
+) bool {
+    if (target.index() >= program.blocks.len) return false;
+    const target_block = program.blocks[target.index()];
+    if (target_block.id != target) return false;
+
+    for (program.blocks) |source| {
+        if (source.id.index() >= program.blocks.len or source.function != target_block.function) continue;
+        switch (source.terminator) {
+            .jump => |edge| if (edge.target == target) return true,
+            .branch => |branch| if (branch.then_edge.target == target or branch.else_edge.target == target) return true,
+            .return_values, .return_pack, .return_expanded, .throw_error, .unreachable_block => {},
+        }
+    }
+    return false;
+}
+
+// A numeric transition consumes a fresh four-slot state tuple on every
+// iteration.  When that tuple is carried through an effectful or branched
+// continuation, its SSA identities need not be the direct results of the
+// transition instruction.  A canonical complete back edge into the same
+// numeric header is still a semantic loop-state entry: the header's
+// `numeric_for_next` operation defines how those slots are consumed.  Keep
+// this proof separate from generic value equivalence so arbitrary same-typed
+// values or acyclic joins cannot cross the continuation boundary.
+fn authenticatedNumericLoopCarriedTupleProjection(
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    reference: ir.CfgEdgeRef,
+    expected: []const ir.ValueId,
+    actual: []const ir.ValueId,
+) std.mem.Allocator.Error!bool {
+    if (reference.target.index() >= program.blocks.len or
+        expected.len != 4 or actual.len != 4 or
+        std.mem.eql(ir.ValueId, expected, actual) or
+        !incomingEdgeIsCanonical(program, analysis, reference) or
+        !isIterationTransitionHeader(program, reference.target) or
+        !try analysis.canReach(reference.target, reference.source) or
+        !try analysis.canReach(reference.source, reference.target) or
+        !hasLiveIncomingEdgeWithArguments(program, reference.target, expected))
+    {
+        return false;
+    }
+
+    const block = program.blocks[reference.target.index()];
+    if (block.id != reference.target or
+        block.function != analysis.function.id or
+        !node_split.parametersAreCanonical(program.values, block) or
+        actual.len != block.parameters.len)
+    {
+        return false;
+    }
+    for (block.parameters, actual) |formal, argument| {
+        if (!sameContinuationValueType(program, formal, argument)) return false;
+    }
+    return true;
+}
+
+fn hasActiveNodeSplitIntoTargetWithArguments(
+    program: *const ir.Program,
+    target: ir.BlockId,
+    arguments: []const ir.ValueId,
+) bool {
+    for (program.edge_rewrites) |rewrite| {
+        if (rewrite.rule != .node_split or rewrite.to.target != target or
+            !std.mem.eql(ir.ValueId, rewrite.to.arguments, arguments)) continue;
+        if (activeNodeSplitRewrite(program, rewrite)) return true;
+    }
+    return false;
+}
+
+// Authenticate the common non-numeric loop-carried parameter shape.  The
+// target formal tuple must be canonical, the owner tuple must be a live edge
+// into that target, and a split target must retain complete replay lineage.
+// Requiring the re-entry tuple to be the target's own formals prevents a
+// same-typed value from being promoted merely because it reaches the block.
+fn parameterizedForwardingReentryMatches(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    target: ir.BlockId,
+    expected: []const ir.ValueId,
+    actual: []const ir.ValueId,
+    lineage_index: *const CloneLineageIndex,
+    replay_index: *const node_split.ReplayIndex,
+    replay_cache: *ReplayCache,
+) std.mem.Allocator.Error!bool {
+    if (target.index() >= program.blocks.len) return false;
+    const target_block = program.blocks[target.index()];
+    if (target_block.id != target or target_block.parameters.len == 0 or
+        expected.len != target_block.parameters.len or
+        actual.len != target_block.parameters.len or
+        !node_split.parametersAreCanonical(program.values, target_block) or
+        !std.mem.eql(ir.ValueId, actual, target_block.parameters))
+    {
+        return false;
+    }
+
+    for (target_block.parameters, expected) |formal, incoming| {
+        if (!sameContinuationValueType(program, formal, incoming)) return false;
+    }
+    // `actual` is the target's canonical formal tuple, so it is represented
+    // by the block entry contract rather than by a second edge.  The owner
+    // tuple must still be carried by a live edge; requiring another edge with
+    // the formal IDs rejects legitimate cloned continuation entries.
+    if (!hasLiveIncomingEdgeWithArguments(program, target, expected)) return false;
+
+    if (cloneStepForTargetCached(program, target, lineage_index)) |step| {
+        if (!hasActiveNodeSplitIntoTargetWithArguments(program, target, expected) or
+            !try cloneLineageArgumentsMatchReplayCached(
+                allocator,
+                program,
+                step.source,
+                target,
+                lineage_index,
+                replay_index,
+                replay_cache,
+            )) return false;
+    }
+    return true;
 }
 
 // A parameterized continuation can carry a loop state tuple whose producers
