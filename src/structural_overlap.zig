@@ -2637,6 +2637,763 @@ test "replayed edge arguments require authenticated equivalent targets" {
     ));
 }
 
+test "numeric loop-carried tuple projection accepts a complete SCC state" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const owner = ir.BlockId.fromIndex(1);
+    const header = ir.BlockId.fromIndex(2);
+    const body = ir.BlockId.fromIndex(3);
+    const exit = ir.BlockId.fromIndex(4);
+    const transition = ir.InstructionId.fromIndex(0);
+
+    const selector = ir.ValueId.fromIndex(0);
+    const expected_control = ir.ValueId.fromIndex(1);
+    const expected_limit = ir.ValueId.fromIndex(2);
+    const expected_step = ir.ValueId.fromIndex(3);
+    const expected_initial = ir.ValueId.fromIndex(4);
+    const actual_control = ir.ValueId.fromIndex(5);
+    const actual_limit = ir.ValueId.fromIndex(6);
+    const actual_step = ir.ValueId.fromIndex(7);
+    const actual_initial = ir.ValueId.fromIndex(8);
+    const formal_control = ir.ValueId.fromIndex(9);
+    const formal_limit = ir.ValueId.fromIndex(10);
+    const formal_step = ir.ValueId.fromIndex(11);
+    const formal_initial = ir.ValueId.fromIndex(12);
+    const has_next = ir.ValueId.fromIndex(13);
+    const normalized_limit = ir.ValueId.fromIndex(14);
+    const normalized_step = ir.ValueId.fromIndex(15);
+    const next_control = ir.ValueId.fromIndex(16);
+
+    const expected_arguments = [_]ir.ValueId{
+        expected_control,
+        expected_limit,
+        expected_step,
+        expected_initial,
+    };
+    const actual_arguments = [_]ir.ValueId{
+        actual_control,
+        actual_limit,
+        actual_step,
+        actual_initial,
+    };
+    const formal_parameters = [_]ir.ValueId{
+        formal_control,
+        formal_limit,
+        formal_step,
+        formal_initial,
+    };
+    const function_parameters = [_]ir.ValueId{
+        selector,
+        expected_control,
+        expected_limit,
+        expected_step,
+        expected_initial,
+        actual_control,
+        actual_limit,
+        actual_step,
+        actual_initial,
+    };
+    const values = [_]ir.Value{
+        .{ .id = selector, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = expected_control, .function = function_id, .origin = .{ .parameter = 1 } },
+        .{ .id = expected_limit, .function = function_id, .origin = .{ .parameter = 2 } },
+        .{ .id = expected_step, .function = function_id, .origin = .{ .parameter = 3 } },
+        .{ .id = expected_initial, .function = function_id, .type = .boolean, .origin = .{ .parameter = 4 } },
+        .{ .id = actual_control, .function = function_id, .origin = .{ .parameter = 5 } },
+        .{ .id = actual_limit, .function = function_id, .origin = .{ .parameter = 6 } },
+        .{ .id = actual_step, .function = function_id, .origin = .{ .parameter = 7 } },
+        .{ .id = actual_initial, .function = function_id, .type = .boolean, .origin = .{ .parameter = 8 } },
+        .{ .id = formal_control, .function = function_id, .origin = .{ .block_parameter = .{ .block = header, .index = 0 } } },
+        .{ .id = formal_limit, .function = function_id, .origin = .{ .block_parameter = .{ .block = header, .index = 1 } } },
+        .{ .id = formal_step, .function = function_id, .origin = .{ .block_parameter = .{ .block = header, .index = 2 } } },
+        .{ .id = formal_initial, .function = function_id, .type = .boolean, .origin = .{ .block_parameter = .{ .block = header, .index = 3 } } },
+        .{ .id = has_next, .function = function_id, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = transition, .index = 0 } } },
+        .{ .id = normalized_limit, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = transition, .index = 1 } } },
+        .{ .id = normalized_step, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = transition, .index = 2 } } },
+        .{ .id = next_control, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = transition, .index = 3 } } },
+    };
+    const instructions = [_]ir.Instruction{.{
+        .id = transition,
+        .block = header,
+        .operation = .{ .numeric_for_next = .{
+            .control = formal_control,
+            .limit = formal_limit,
+            .step = formal_step,
+            .initial = formal_initial,
+            .mode = .semantic_normalized,
+        } },
+        .results = &.{ has_next, normalized_limit, normalized_step, next_control },
+        .effects = .numeric_for_next,
+    }};
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = selector,
+            .then_edge = .{ .target = owner },
+            .else_edge = .{ .target = header, .arguments = actual_arguments[0..] },
+        } } },
+        .{ .id = owner, .function = function_id, .terminator = .{ .jump = .{
+            .target = header,
+            .arguments = expected_arguments[0..],
+        } } },
+        .{ .id = header, .function = function_id, .parameters = formal_parameters[0..], .instructions = &.{transition}, .terminator = .{ .branch = .{
+            .condition = has_next,
+            .then_edge = .{ .target = body },
+            .else_edge = .{ .target = exit },
+        } } },
+        .{ .id = body, .function = function_id, .terminator = .{ .jump = .{
+            .target = header,
+            .arguments = actual_arguments[0..],
+        } } },
+        .{ .id = exit, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = function_parameters[0..],
+        .blocks = &.{ entry, owner, header, body, exit },
+        .entry_block = entry,
+    };
+    const program = ir.Program{
+        .program_id = "numeric-loop-carried-tuple-projection",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+    };
+
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, function);
+    defer analysis.deinit();
+    var context = try ReplayProjectionContext.initForFunction(
+        std.testing.allocator,
+        &program,
+        function_id,
+    );
+    defer context.deinit();
+    try std.testing.expect(try context.hasAuthenticatedParameterizedContinuationProjectionForEdge(
+        &analysis,
+        .{ .source = body, .kind = .jump, .target = header },
+        expected_arguments[0..],
+    ));
+
+    var disconnected_blocks = blocks;
+    disconnected_blocks[body.index()].terminator = .{ .return_values = &.{} };
+    var disconnected_program = program;
+    disconnected_program.blocks = &disconnected_blocks;
+    var disconnected_analysis = try cfg.Analysis.init(std.testing.allocator, &disconnected_program, function);
+    defer disconnected_analysis.deinit();
+    var disconnected_context = try ReplayProjectionContext.initForFunction(
+        std.testing.allocator,
+        &disconnected_program,
+        function_id,
+    );
+    defer disconnected_context.deinit();
+    try std.testing.expect(!try disconnected_context.hasAuthenticatedParameterizedContinuationProjectionForEdge(
+        &disconnected_analysis,
+        .{ .source = body, .kind = .jump, .target = header },
+        expected_arguments[0..],
+    ));
+
+    var non_numeric_instructions = instructions;
+    non_numeric_instructions[transition.index()].operation = .{ .copy = formal_control };
+    var non_numeric_program = program;
+    non_numeric_program.instructions = &non_numeric_instructions;
+    var non_numeric_analysis = try cfg.Analysis.init(std.testing.allocator, &non_numeric_program, function);
+    defer non_numeric_analysis.deinit();
+    var non_numeric_context = try ReplayProjectionContext.initForFunction(
+        std.testing.allocator,
+        &non_numeric_program,
+        function_id,
+    );
+    defer non_numeric_context.deinit();
+    try std.testing.expect(!try non_numeric_context.hasAuthenticatedParameterizedContinuationProjectionForEdge(
+        &non_numeric_analysis,
+        .{ .source = body, .kind = .jump, .target = header },
+        expected_arguments[0..],
+    ));
+}
+
+test "numeric reentry accepts only an active replay-authenticated node split" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const header = ir.BlockId.fromIndex(1);
+    const clone = ir.BlockId.fromIndex(2);
+    const false_instruction = ir.InstructionId.fromIndex(0);
+    const source_transition = ir.InstructionId.fromIndex(1);
+    const clone_transition = ir.InstructionId.fromIndex(2);
+    const source_control = ir.ValueId.fromIndex(0);
+    const source_limit = ir.ValueId.fromIndex(1);
+    const source_step = ir.ValueId.fromIndex(2);
+    const source_initial = ir.ValueId.fromIndex(3);
+    const false_value = ir.ValueId.fromIndex(4);
+    const source_has = ir.ValueId.fromIndex(5);
+    const source_normalized_limit = ir.ValueId.fromIndex(6);
+    const source_normalized_step = ir.ValueId.fromIndex(7);
+    const source_next_control = ir.ValueId.fromIndex(8);
+    const clone_control = ir.ValueId.fromIndex(9);
+    const clone_limit = ir.ValueId.fromIndex(10);
+    const clone_step = ir.ValueId.fromIndex(11);
+    const clone_initial = ir.ValueId.fromIndex(12);
+    const clone_has = ir.ValueId.fromIndex(13);
+    const clone_normalized_limit = ir.ValueId.fromIndex(14);
+    const clone_normalized_step = ir.ValueId.fromIndex(15);
+    const clone_next_control = ir.ValueId.fromIndex(16);
+
+    const expected_arguments = [_]ir.ValueId{ source_control, source_limit, source_step, source_initial };
+    const actual_arguments = [_]ir.ValueId{ clone_next_control, clone_normalized_limit, clone_normalized_step, false_value };
+    const values = [_]ir.Value{
+        .{ .id = source_control, .function = function_id, .origin = .{ .block_parameter = .{ .block = header, .index = 0 } } },
+        .{ .id = source_limit, .function = function_id, .origin = .{ .block_parameter = .{ .block = header, .index = 1 } } },
+        .{ .id = source_step, .function = function_id, .origin = .{ .block_parameter = .{ .block = header, .index = 2 } } },
+        .{ .id = source_initial, .function = function_id, .type = .boolean, .origin = .{ .block_parameter = .{ .block = header, .index = 3 } } },
+        .{ .id = false_value, .function = function_id, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = false_instruction, .index = 0 } } },
+        .{ .id = source_has, .function = function_id, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = source_transition, .index = 0 } } },
+        .{ .id = source_normalized_limit, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = source_transition, .index = 1 } } },
+        .{ .id = source_normalized_step, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = source_transition, .index = 2 } } },
+        .{ .id = source_next_control, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = source_transition, .index = 3 } } },
+        .{ .id = clone_control, .function = function_id, .origin = .{ .block_parameter = .{ .block = clone, .index = 0 } } },
+        .{ .id = clone_limit, .function = function_id, .origin = .{ .block_parameter = .{ .block = clone, .index = 1 } } },
+        .{ .id = clone_step, .function = function_id, .origin = .{ .block_parameter = .{ .block = clone, .index = 2 } } },
+        .{ .id = clone_initial, .function = function_id, .type = .boolean, .origin = .{ .block_parameter = .{ .block = clone, .index = 3 } } },
+        .{ .id = clone_has, .function = function_id, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = clone_transition, .index = 0 } } },
+        .{ .id = clone_normalized_limit, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = clone_transition, .index = 1 } } },
+        .{ .id = clone_normalized_step, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = clone_transition, .index = 2 } } },
+        .{ .id = clone_next_control, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = clone_transition, .index = 3 } } },
+    };
+    const instructions = [_]ir.Instruction{
+        .{ .id = false_instruction, .block = entry, .operation = .{ .constant = .{ .boolean = false } }, .results = &.{false_value}, .effects = .pure },
+        .{ .id = source_transition, .block = header, .operation = .{ .numeric_for_next = .{
+            .control = source_control,
+            .limit = source_limit,
+            .step = source_step,
+            .initial = source_initial,
+            .mode = .semantic_normalized,
+        } }, .results = &.{ source_has, source_normalized_limit, source_normalized_step, source_next_control }, .effects = .numeric_for_next },
+        .{ .id = clone_transition, .block = clone, .operation = .{ .numeric_for_next = .{
+            .control = clone_control,
+            .limit = clone_limit,
+            .step = clone_step,
+            .initial = clone_initial,
+            .mode = .semantic_normalized,
+        } }, .results = &.{ clone_has, clone_normalized_limit, clone_normalized_step, clone_next_control }, .effects = .numeric_for_next },
+    };
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .instructions = &.{false_instruction}, .terminator = .{ .jump = .{ .target = clone, .arguments = expected_arguments[0..] } } },
+        .{ .id = header, .function = function_id, .parameters = expected_arguments[0..], .instructions = &.{source_transition}, .terminator = .{ .return_values = &.{} } },
+        .{ .id = clone, .function = function_id, .parameters = &.{ clone_control, clone_limit, clone_step, clone_initial }, .instructions = &.{clone_transition}, .terminator = .{ .return_values = &.{} } },
+    };
+    const function = ir.Function{ .id = function_id, .blocks = &.{ entry, header, clone }, .entry_block = entry };
+    const rewrites = [_]ir.CfgEdgeRewrite{.{
+        .id = ir.EdgeRewriteId.fromIndex(0),
+        .source = entry,
+        .kind = .jump,
+        .from = .{ .target = header, .arguments = expected_arguments[0..] },
+        .to = .{ .target = clone, .arguments = expected_arguments[0..] },
+        .rule = .node_split,
+        .node_split_group = ir.NodeSplitGroupId.fromIndex(0),
+    }};
+    const program = ir.Program{
+        .program_id = "numeric-reentry-replay-history",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+        .edge_rewrites = &rewrites,
+    };
+
+    var context = try ReplayProjectionContext.init(std.testing.allocator, &program);
+    defer context.deinit();
+    try std.testing.expect(try context.parametersEquivalent(clone, expected_arguments[0..], actual_arguments[0..]));
+
+    var tampered_blocks = blocks;
+    tampered_blocks[entry.index()].terminator = .{ .jump = .{
+        .target = clone,
+        .arguments = &.{ source_control, source_limit, source_step, false_value },
+    } };
+    var tampered_program = program;
+    tampered_program.blocks = &tampered_blocks;
+    var tampered_context = try ReplayProjectionContext.init(std.testing.allocator, &tampered_program);
+    defer tampered_context.deinit();
+    try std.testing.expect(!try tampered_context.parametersEquivalent(clone, expected_arguments[0..], actual_arguments[0..]));
+}
+
+test "compound continuation reuses authenticated iteration state across clone lineage" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const source = ir.BlockId.fromIndex(1);
+    const clone = ir.BlockId.fromIndex(2);
+    const state_entry = ir.BlockId.fromIndex(3);
+    const actual_entry = ir.BlockId.fromIndex(4);
+    const false_instruction = ir.InstructionId.fromIndex(0);
+    const source_extra_instruction = ir.InstructionId.fromIndex(1);
+    const source_transition = ir.InstructionId.fromIndex(2);
+    const clone_extra_instruction = ir.InstructionId.fromIndex(3);
+    const clone_transition = ir.InstructionId.fromIndex(4);
+    const source_control = ir.ValueId.fromIndex(0);
+    const source_limit = ir.ValueId.fromIndex(1);
+    const source_step = ir.ValueId.fromIndex(2);
+    const source_initial = ir.ValueId.fromIndex(3);
+    const false_value = ir.ValueId.fromIndex(4);
+    const source_extra = ir.ValueId.fromIndex(5);
+    const source_has = ir.ValueId.fromIndex(6);
+    const source_normalized_limit = ir.ValueId.fromIndex(7);
+    const source_normalized_step = ir.ValueId.fromIndex(8);
+    const source_next_control = ir.ValueId.fromIndex(9);
+    const clone_control = ir.ValueId.fromIndex(10);
+    const clone_limit = ir.ValueId.fromIndex(11);
+    const clone_step = ir.ValueId.fromIndex(12);
+    const clone_initial = ir.ValueId.fromIndex(13);
+    const clone_extra = ir.ValueId.fromIndex(14);
+    const clone_has = ir.ValueId.fromIndex(15);
+    const clone_normalized_limit = ir.ValueId.fromIndex(16);
+    const clone_normalized_step = ir.ValueId.fromIndex(17);
+    const clone_next_control = ir.ValueId.fromIndex(18);
+    const expected_arguments = [_]ir.ValueId{
+        source_next_control,
+        source_normalized_limit,
+        source_normalized_step,
+        false_value,
+    };
+    const actual_arguments = [_]ir.ValueId{
+        clone_next_control,
+        clone_normalized_limit,
+        clone_normalized_step,
+        false_value,
+    };
+    const source_parameters = [_]ir.ValueId{ source_control, source_limit, source_step, source_initial };
+    const clone_parameters = [_]ir.ValueId{ clone_control, clone_limit, clone_step, clone_initial };
+    const values = [_]ir.Value{
+        .{ .id = source_control, .function = function_id, .origin = .{ .block_parameter = .{ .block = source, .index = 0 } } },
+        .{ .id = source_limit, .function = function_id, .origin = .{ .block_parameter = .{ .block = source, .index = 1 } } },
+        .{ .id = source_step, .function = function_id, .origin = .{ .block_parameter = .{ .block = source, .index = 2 } } },
+        .{ .id = source_initial, .function = function_id, .type = .boolean, .origin = .{ .block_parameter = .{ .block = source, .index = 3 } } },
+        .{ .id = false_value, .function = function_id, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = false_instruction, .index = 0 } } },
+        .{ .id = source_extra, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = source_extra_instruction, .index = 0 } } },
+        .{ .id = source_has, .function = function_id, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = source_transition, .index = 0 } } },
+        .{ .id = source_normalized_limit, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = source_transition, .index = 1 } } },
+        .{ .id = source_normalized_step, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = source_transition, .index = 2 } } },
+        .{ .id = source_next_control, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = source_transition, .index = 3 } } },
+        .{ .id = clone_control, .function = function_id, .origin = .{ .block_parameter = .{ .block = clone, .index = 0 } } },
+        .{ .id = clone_limit, .function = function_id, .origin = .{ .block_parameter = .{ .block = clone, .index = 1 } } },
+        .{ .id = clone_step, .function = function_id, .origin = .{ .block_parameter = .{ .block = clone, .index = 2 } } },
+        .{ .id = clone_initial, .function = function_id, .type = .boolean, .origin = .{ .block_parameter = .{ .block = clone, .index = 3 } } },
+        .{ .id = clone_extra, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = clone_extra_instruction, .index = 0 } } },
+        .{ .id = clone_has, .function = function_id, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = clone_transition, .index = 0 } } },
+        .{ .id = clone_normalized_limit, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = clone_transition, .index = 1 } } },
+        .{ .id = clone_normalized_step, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = clone_transition, .index = 2 } } },
+        .{ .id = clone_next_control, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = clone_transition, .index = 3 } } },
+    };
+    const instructions = [_]ir.Instruction{
+        .{ .id = false_instruction, .block = entry, .operation = .{ .constant = .{ .boolean = false } }, .results = &.{false_value}, .effects = .pure },
+        .{ .id = source_extra_instruction, .block = source, .operation = .{ .copy = source_control }, .results = &.{source_extra}, .effects = .pure },
+        .{ .id = source_transition, .block = source, .operation = .{ .numeric_for_next = .{
+            .control = source_control,
+            .limit = source_limit,
+            .step = source_step,
+            .initial = source_initial,
+            .mode = .semantic_normalized,
+        } }, .results = &.{ source_has, source_normalized_limit, source_normalized_step, source_next_control }, .effects = .numeric_for_next },
+        .{ .id = clone_extra_instruction, .block = clone, .operation = .{ .copy = clone_control }, .results = &.{clone_extra}, .effects = .pure },
+        .{ .id = clone_transition, .block = clone, .operation = .{ .numeric_for_next = .{
+            .control = clone_control,
+            .limit = clone_limit,
+            .step = clone_step,
+            .initial = clone_initial,
+            .mode = .semantic_normalized,
+        } }, .results = &.{ clone_has, clone_normalized_limit, clone_normalized_step, clone_next_control }, .effects = .numeric_for_next },
+    };
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .instructions = &.{false_instruction}, .terminator = .{ .branch = .{
+            .condition = false_value,
+            .then_edge = .{ .target = source, .arguments = source_parameters[0..] },
+            .else_edge = .{ .target = clone, .arguments = source_parameters[0..] },
+        } } },
+        .{ .id = source, .function = function_id, .parameters = source_parameters[0..], .instructions = &.{ source_extra_instruction, source_transition }, .terminator = .{ .return_values = &.{} } },
+        .{ .id = clone, .function = function_id, .parameters = clone_parameters[0..], .instructions = &.{ clone_extra_instruction, clone_transition }, .terminator = .{ .return_values = &.{} } },
+        .{ .id = state_entry, .function = function_id, .terminator = .{ .jump = .{ .target = clone, .arguments = expected_arguments[0..] } } },
+        .{ .id = actual_entry, .function = function_id, .terminator = .{ .jump = .{ .target = clone, .arguments = actual_arguments[0..] } } },
+    };
+    const function = ir.Function{ .id = function_id, .blocks = &.{ entry, source, clone, state_entry, actual_entry }, .entry_block = entry };
+    const rewrites = [_]ir.CfgEdgeRewrite{.{
+        .id = ir.EdgeRewriteId.fromIndex(0),
+        .source = entry,
+        .kind = .branch_else,
+        .from = .{ .target = source, .arguments = source_parameters[0..] },
+        .to = .{ .target = clone, .arguments = source_parameters[0..] },
+        .rule = .node_split,
+        .node_split_group = ir.NodeSplitGroupId.fromIndex(0),
+    }};
+    const program = ir.Program{
+        .program_id = "compound-iteration-context-replay",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+        .edge_rewrites = &rewrites,
+    };
+
+    var context = try ReplayProjectionContext.init(std.testing.allocator, &program);
+    defer context.deinit();
+    try std.testing.expect(try context.parametersEquivalent(clone, expected_arguments[0..], actual_arguments[0..]));
+
+    var tampered_instructions = instructions;
+    tampered_instructions[clone_transition.index()].operation = .{ .numeric_for_next = .{
+        .control = clone_limit,
+        .limit = clone_limit,
+        .step = clone_step,
+        .initial = clone_initial,
+        .mode = .semantic_normalized,
+    } };
+    var tampered_program = program;
+    tampered_program.instructions = &tampered_instructions;
+    var tampered_context = try ReplayProjectionContext.init(std.testing.allocator, &tampered_program);
+    defer tampered_context.deinit();
+    try std.testing.expect(!try tampered_context.parametersEquivalent(
+        clone,
+        expected_arguments[0..],
+        actual_arguments[0..],
+    ));
+}
+
+test "parameterized forwarding reentry requires canonical formals and live owner edges" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const target = ir.BlockId.fromIndex(1);
+    const reentry = ir.BlockId.fromIndex(2);
+    const owner_first = ir.ValueId.fromIndex(0);
+    const owner_second = ir.ValueId.fromIndex(1);
+    const formal_first = ir.ValueId.fromIndex(2);
+    const formal_second = ir.ValueId.fromIndex(3);
+    const unrelated_first = ir.ValueId.fromIndex(4);
+    const unrelated_second = ir.ValueId.fromIndex(5);
+    const condition = ir.ValueId.fromIndex(6);
+    const expected_arguments = [_]ir.ValueId{ owner_first, owner_second };
+    const actual_arguments = [_]ir.ValueId{ formal_first, formal_second };
+    const unrelated_arguments = [_]ir.ValueId{ unrelated_first, unrelated_second };
+    const target_parameters = [_]ir.ValueId{ formal_first, formal_second };
+    const values = [_]ir.Value{
+        .{ .id = owner_first, .function = function_id, .type = ir.ValueType.integer, .origin = .{ .parameter = 0 } },
+        .{ .id = owner_second, .function = function_id, .type = ir.ValueType.integer, .origin = .{ .parameter = 1 } },
+        .{ .id = formal_first, .function = function_id, .type = ir.ValueType.integer, .origin = .{ .block_parameter = .{ .block = target, .index = 0 } } },
+        .{ .id = formal_second, .function = function_id, .type = ir.ValueType.integer, .origin = .{ .block_parameter = .{ .block = target, .index = 1 } } },
+        .{ .id = unrelated_first, .function = function_id, .type = ir.ValueType.integer, .origin = .{ .parameter = 0 } },
+        .{ .id = unrelated_second, .function = function_id, .type = ir.ValueType.integer, .origin = .{ .parameter = 1 } },
+        .{ .id = condition, .function = function_id, .type = ir.ValueType.boolean, .origin = .{ .parameter = 2 } },
+    };
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = condition,
+            .then_edge = .{ .target = target, .arguments = expected_arguments[0..] },
+            .else_edge = .{ .target = reentry },
+        } } },
+        .{ .id = target, .function = function_id, .parameters = target_parameters[0..], .terminator = .{ .return_values = &.{} } },
+        .{ .id = reentry, .function = function_id, .terminator = .{ .jump = .{ .target = target, .arguments = actual_arguments[0..] } } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .blocks = &.{ entry, target, reentry },
+        .entry_block = entry,
+    };
+    const program = ir.Program{
+        .program_id = "parameterized-forwarding-formal-contract",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+    };
+
+    var context = try ReplayProjectionContext.init(std.testing.allocator, &program);
+    defer context.deinit();
+    try std.testing.expect(try context.parametersEquivalent(target, expected_arguments[0..], actual_arguments[0..]));
+    try std.testing.expect(!try context.parametersEquivalent(target, expected_arguments[0..], unrelated_arguments[0..]));
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, function);
+    defer analysis.deinit();
+    try std.testing.expect(try context.hasAuthenticatedParameterizedContinuationProjectionForEdge(
+        &analysis,
+        .{ .source = reentry, .kind = .jump, .target = target },
+        expected_arguments[0..],
+    ));
+
+    var missing_owner_blocks = blocks;
+    missing_owner_blocks[entry.index()].terminator = .{ .branch = .{
+        .condition = condition,
+        .then_edge = .{ .target = target, .arguments = actual_arguments[0..] },
+        .else_edge = .{ .target = reentry },
+    } };
+    var missing_owner_program = program;
+    missing_owner_program.blocks = &missing_owner_blocks;
+    var missing_owner_context = try ReplayProjectionContext.init(std.testing.allocator, &missing_owner_program);
+    defer missing_owner_context.deinit();
+    try std.testing.expect(!try missing_owner_context.parametersEquivalent(
+        target,
+        expected_arguments[0..],
+        actual_arguments[0..],
+    ));
+    var missing_owner_analysis = try cfg.Analysis.init(
+        std.testing.allocator,
+        &missing_owner_program,
+        function,
+    );
+    defer missing_owner_analysis.deinit();
+    try std.testing.expect(!try missing_owner_context.hasAuthenticatedParameterizedContinuationProjectionForEdge(
+        &missing_owner_analysis,
+        .{ .source = reentry, .kind = .jump, .target = target },
+        expected_arguments[0..],
+    ));
+}
+
+test "parameterized forwarding reentry authenticates clone replay without a formal edge" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const source = ir.BlockId.fromIndex(1);
+    const clone = ir.BlockId.fromIndex(2);
+    const reentry = ir.BlockId.fromIndex(3);
+    const source_first = ir.ValueId.fromIndex(0);
+    const source_second = ir.ValueId.fromIndex(1);
+    const clone_first = ir.ValueId.fromIndex(2);
+    const clone_second = ir.ValueId.fromIndex(3);
+    const unrelated_first = ir.ValueId.fromIndex(4);
+    const unrelated_second = ir.ValueId.fromIndex(5);
+    const expected_arguments = [_]ir.ValueId{ source_first, source_second };
+    const actual_arguments = [_]ir.ValueId{ clone_first, clone_second };
+    const unrelated_arguments = [_]ir.ValueId{ unrelated_first, unrelated_second };
+    const source_parameters = [_]ir.ValueId{ source_first, source_second };
+    const clone_parameters = [_]ir.ValueId{ clone_first, clone_second };
+    const values = [_]ir.Value{
+        .{ .id = source_first, .function = function_id, .type = ir.ValueType.integer, .origin = .{ .block_parameter = .{ .block = source, .index = 0 } } },
+        .{ .id = source_second, .function = function_id, .type = ir.ValueType.integer, .origin = .{ .block_parameter = .{ .block = source, .index = 1 } } },
+        .{ .id = clone_first, .function = function_id, .type = ir.ValueType.integer, .origin = .{ .block_parameter = .{ .block = clone, .index = 0 } } },
+        .{ .id = clone_second, .function = function_id, .type = ir.ValueType.integer, .origin = .{ .block_parameter = .{ .block = clone, .index = 1 } } },
+        .{ .id = unrelated_first, .function = function_id, .type = ir.ValueType.integer, .origin = .{ .parameter = 0 } },
+        .{ .id = unrelated_second, .function = function_id, .type = ir.ValueType.integer, .origin = .{ .parameter = 1 } },
+    };
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .jump = .{ .target = clone, .arguments = expected_arguments[0..] } } },
+        .{ .id = source, .function = function_id, .parameters = source_parameters[0..], .terminator = .{ .return_values = &.{} } },
+        .{ .id = clone, .function = function_id, .parameters = clone_parameters[0..], .terminator = .{ .return_values = &.{} } },
+        // The clone's formal tuple is the actual projection. It does not need
+        // a separate CFG edge that carries the formal value IDs.
+        .{ .id = reentry, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .blocks = &.{ entry, source, clone, reentry },
+        .entry_block = entry,
+    };
+    const rewrites = [_]ir.CfgEdgeRewrite{.{
+        .id = ir.EdgeRewriteId.fromIndex(0),
+        .source = entry,
+        .kind = .jump,
+        .from = .{ .target = source, .arguments = expected_arguments[0..] },
+        .to = .{ .target = clone, .arguments = expected_arguments[0..] },
+        .rule = .node_split,
+        .node_split_group = ir.NodeSplitGroupId.fromIndex(0),
+    }};
+    const program = ir.Program{
+        .program_id = "parameterized-forwarding-clone-contract",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+        .edge_rewrites = &rewrites,
+    };
+
+    var context = try ReplayProjectionContext.init(std.testing.allocator, &program);
+    defer context.deinit();
+    try std.testing.expect(try context.parametersEquivalent(clone, expected_arguments[0..], actual_arguments[0..]));
+
+    var tampered_rewrites = rewrites;
+    tampered_rewrites[0].from.arguments = unrelated_arguments[0..];
+    var tampered_replay_program = program;
+    tampered_replay_program.edge_rewrites = &tampered_rewrites;
+    var tampered_replay_context = try ReplayProjectionContext.init(std.testing.allocator, &tampered_replay_program);
+    defer tampered_replay_context.deinit();
+    try std.testing.expect(!try parameterizedForwardingReentryMatches(
+        std.testing.allocator,
+        tampered_replay_context.program,
+        clone,
+        expected_arguments[0..],
+        actual_arguments[0..],
+        &tampered_replay_context.lineage_index,
+        &tampered_replay_context.replay_index,
+        &tampered_replay_context.replay_cache,
+    ));
+
+    var tampered_edge_blocks = blocks;
+    tampered_edge_blocks[entry.index()].terminator = .{ .jump = .{
+        .target = clone,
+        .arguments = unrelated_arguments[0..],
+    } };
+    var tampered_edge_program = program;
+    tampered_edge_program.blocks = &tampered_edge_blocks;
+    var tampered_edge_context = try ReplayProjectionContext.init(std.testing.allocator, &tampered_edge_program);
+    defer tampered_edge_context.deinit();
+    try std.testing.expect(!try parameterizedForwardingReentryMatches(
+        std.testing.allocator,
+        tampered_edge_context.program,
+        clone,
+        expected_arguments[0..],
+        actual_arguments[0..],
+        &tampered_edge_context.lineage_index,
+        &tampered_edge_context.replay_index,
+        &tampered_edge_context.replay_cache,
+    ));
+}
+
+test "parameterized projection composes authenticated clone lineage positionally" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const root = ir.BlockId.fromIndex(1);
+    const expected_block = ir.BlockId.fromIndex(2);
+    const middle = ir.BlockId.fromIndex(3);
+    const actual_block = ir.BlockId.fromIndex(4);
+    const target = ir.BlockId.fromIndex(5);
+
+    const selector = ir.ValueId.fromIndex(0);
+    const root_first = ir.ValueId.fromIndex(1);
+    const root_second = ir.ValueId.fromIndex(2);
+    const expected_first = ir.ValueId.fromIndex(3);
+    const expected_second = ir.ValueId.fromIndex(4);
+    const middle_first = ir.ValueId.fromIndex(5);
+    const middle_second = ir.ValueId.fromIndex(6);
+    const actual_first = ir.ValueId.fromIndex(7);
+    const actual_second = ir.ValueId.fromIndex(8);
+    const formal_first = ir.ValueId.fromIndex(9);
+    const formal_second = ir.ValueId.fromIndex(10);
+    const unrelated_first = ir.ValueId.fromIndex(11);
+    const unrelated_second = ir.ValueId.fromIndex(12);
+
+    const root_parameters = [_]ir.ValueId{ root_first, root_second };
+    const expected_parameters = [_]ir.ValueId{ expected_first, expected_second };
+    const middle_parameters = [_]ir.ValueId{ middle_first, middle_second };
+    const actual_parameters = [_]ir.ValueId{ actual_first, actual_second };
+    const target_parameters = [_]ir.ValueId{ formal_first, formal_second };
+
+    const values = [_]ir.Value{
+        .{ .id = selector, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = root_first, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = root, .index = 0 } } },
+        .{ .id = root_second, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = root, .index = 1 } } },
+        .{ .id = expected_first, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = expected_block, .index = 0 } } },
+        .{ .id = expected_second, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = expected_block, .index = 1 } } },
+        .{ .id = middle_first, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = middle, .index = 0 } } },
+        .{ .id = middle_second, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = middle, .index = 1 } } },
+        .{ .id = actual_first, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = actual_block, .index = 0 } } },
+        .{ .id = actual_second, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = actual_block, .index = 1 } } },
+        .{ .id = formal_first, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = target, .index = 0 } } },
+        .{ .id = formal_second, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = target, .index = 1 } } },
+        .{ .id = unrelated_first, .function = function_id, .type = .integer, .origin = .{ .parameter = 1 } },
+        .{ .id = unrelated_second, .function = function_id, .type = .integer, .origin = .{ .parameter = 2 } },
+    };
+
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = selector,
+            .then_edge = .{ .target = expected_block, .arguments = root_parameters[0..] },
+            .else_edge = .{ .target = middle, .arguments = root_parameters[0..] },
+        } } },
+        .{ .id = root, .function = function_id, .parameters = root_parameters[0..], .terminator = .{ .jump = .{ .target = target, .arguments = root_parameters[0..] } } },
+        .{ .id = expected_block, .function = function_id, .parameters = expected_parameters[0..], .terminator = .{ .jump = .{ .target = target, .arguments = expected_parameters[0..] } } },
+        .{ .id = middle, .function = function_id, .parameters = middle_parameters[0..], .terminator = .{ .jump = .{ .target = target, .arguments = middle_parameters[0..] } } },
+        .{ .id = actual_block, .function = function_id, .parameters = actual_parameters[0..], .terminator = .{ .jump = .{ .target = target, .arguments = actual_parameters[0..] } } },
+        .{ .id = target, .function = function_id, .parameters = target_parameters[0..], .terminator = .{ .return_values = &.{} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &.{ selector, unrelated_first, unrelated_second },
+        .blocks = &.{ entry, root, expected_block, middle, actual_block, target },
+        .entry_block = entry,
+    };
+    const group_final = ir.NodeSplitGroupId.fromIndex(0);
+    const group_forward = ir.NodeSplitGroupId.fromIndex(1);
+    const root_arguments = root_parameters[0..];
+    const middle_arguments = middle_parameters[0..];
+    const rewrites = [_]ir.CfgEdgeRewrite{
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(0),
+            .source = entry,
+            .kind = .branch_then,
+            .from = .{ .target = root, .arguments = root_arguments },
+            .to = .{ .target = expected_block, .arguments = root_arguments },
+            .rule = .node_split,
+            .node_split_group = group_final,
+        },
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(1),
+            .source = entry,
+            .kind = .branch_else,
+            .from = .{ .target = root, .arguments = root_arguments },
+            .to = .{ .target = middle, .arguments = root_arguments },
+            .rule = .node_split,
+            .node_split_group = group_forward,
+        },
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(2),
+            .source = middle,
+            .kind = .jump,
+            .from = .{ .target = middle, .arguments = middle_arguments },
+            .to = .{ .target = actual_block, .arguments = middle_arguments },
+            .rule = .node_split,
+            .node_split_group = group_final,
+        },
+    };
+    var program = ir.Program{
+        .program_id = "authenticated-two-hop-positional-projection",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+        .edge_rewrites = &rewrites,
+    };
+
+    var context = try ReplayProjectionContext.init(std.testing.allocator, &program);
+    defer context.deinit();
+    try std.testing.expect(try context.parametersEquivalent(
+        target,
+        expected_parameters[0..],
+        actual_parameters[0..],
+    ));
+    try std.testing.expect(try authenticatedComposedCloneValueMatchAlloc(
+        std.testing.allocator,
+        &program,
+        expected_first,
+        actual_first,
+        &context.lineage_index,
+        &context.replay_index,
+        &context.replay_cache,
+    ));
+
+    var tampered_rewrites = rewrites;
+    tampered_rewrites[1].to.arguments = &.{ unrelated_first, unrelated_second };
+    var tampered_replay_program = program;
+    tampered_replay_program.edge_rewrites = &tampered_rewrites;
+    var tampered_replay_context = try ReplayProjectionContext.init(std.testing.allocator, &tampered_replay_program);
+    defer tampered_replay_context.deinit();
+    try std.testing.expect(!try tampered_replay_context.parametersEquivalent(
+        target,
+        expected_parameters[0..],
+        actual_parameters[0..],
+    ));
+
+    var tampered_blocks = blocks;
+    tampered_blocks[actual_block.index()].terminator = .{ .jump = .{
+        .target = target,
+        .arguments = &.{ unrelated_first, unrelated_second },
+    } };
+    var tampered_edge_program = program;
+    tampered_edge_program.blocks = &tampered_blocks;
+    var tampered_edge_context = try ReplayProjectionContext.init(std.testing.allocator, &tampered_edge_program);
+    defer tampered_edge_context.deinit();
+    try std.testing.expect(!try tampered_edge_context.parametersEquivalent(
+        target,
+        expected_parameters[0..],
+        &.{ unrelated_first, unrelated_second },
+    ));
+}
+
 fn projectionValueProducer(program: *const ir.Program, value_id: ir.ValueId) ?ir.BlockId {
     if (value_id.index() >= program.values.len) return null;
     const value = program.values[value_id.index()];
