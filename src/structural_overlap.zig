@@ -716,6 +716,102 @@ fn projectionValueProducer(program: *const ir.Program, value_id: ir.ValueId) ?ir
     };
 }
 
+// Clone composition can produce equivalent sibling branches at one lineage
+// depth and then continue cloning from only one sibling.  Ancestor checks are
+// intentionally insufficient for that shape.  Match the final split group,
+// recursively authenticate the source branches, and keep every replay step in
+// the proof before allowing positional value mapping.
+fn authenticatedCloneBranchEquivalentAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    left: ir.BlockId,
+    right: ir.BlockId,
+    lineage_index: *const CloneLineageIndex,
+    replay_index: *const node_split.ReplayIndex,
+    replay_cache: *ReplayCache,
+    depth: usize,
+) std.mem.Allocator.Error!bool {
+    if (left == right) return true;
+    if (depth > program.blocks.len) return false;
+    const left_position = cloneLineagePositionCached(program, left, lineage_index) orelse return false;
+    const right_position = cloneLineagePositionCached(program, right, lineage_index) orelse return false;
+    if (left_position.root != right_position.root) return false;
+
+    const left_step = cloneStepForTargetCached(program, left, lineage_index);
+    const right_step = cloneStepForTargetCached(program, right, lineage_index);
+    if (left_step) |left_value| {
+        if (right_step) |right_value| {
+            if (left_value.group != right_value.group) return false;
+            if (!try cloneLineageArgumentsMatchReplayCached(
+                allocator,
+                program,
+                left_value.source,
+                left_value.clone,
+                lineage_index,
+                replay_index,
+                replay_cache,
+            ) or !try cloneLineageArgumentsMatchReplayCached(
+                allocator,
+                program,
+                right_value.source,
+                right_value.clone,
+                lineage_index,
+                replay_index,
+                replay_cache,
+            )) return false;
+            return try authenticatedCloneBranchEquivalentAlloc(
+                allocator,
+                program,
+                left_value.source,
+                right_value.source,
+                lineage_index,
+                replay_index,
+                replay_cache,
+                depth + 1,
+            );
+        }
+        if (!try cloneLineageArgumentsMatchReplayCached(
+            allocator,
+            program,
+            left_value.source,
+            left_value.clone,
+            lineage_index,
+            replay_index,
+            replay_cache,
+        )) return false;
+        return try authenticatedCloneBranchEquivalentAlloc(
+            allocator,
+            program,
+            left_value.source,
+            right,
+            lineage_index,
+            replay_index,
+            replay_cache,
+            depth + 1,
+        );
+    }
+    const right_value = right_step orelse return false;
+    if (!try cloneLineageArgumentsMatchReplayCached(
+        allocator,
+        program,
+        right_value.source,
+        right_value.clone,
+        lineage_index,
+        replay_index,
+        replay_cache,
+    )) return false;
+    return try authenticatedCloneBranchEquivalentAlloc(
+        allocator,
+        program,
+        left,
+        right_value.source,
+        lineage_index,
+        replay_index,
+        replay_cache,
+        depth + 1,
+    );
+}
+
 fn cloneLineageArgumentsAreStableCached(
     program: *const ir.Program,
     block: ir.BlockId,
@@ -1837,6 +1933,25 @@ fn hasAuthenticatedOwnerComposedCloneBridgeAlloc(
     return found;
 }
 
+fn cloneContextMatchesIncomingCached(
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    candidate: ir.BlockId,
+    incoming: []const ir.CfgEdgeRef,
+    index: ?*const CloneLineageIndex,
+) std.mem.Allocator.Error!bool {
+    return cloneContextMatchesIncomingWithReplayCached(
+        null,
+        program,
+        analysis,
+        candidate,
+        incoming,
+        index,
+        null,
+        null,
+    );
+}
+
 fn cloneContextMatchesIncomingWithReplayCached(
     allocator: ?std.mem.Allocator,
     program: *const ir.Program,
@@ -2398,6 +2513,267 @@ fn sameIterationTransitionKind(
         },
         else => false,
     };
+}
+
+fn iterationStateTupleTransition(
+    program: *const ir.Program,
+    arguments: []const ir.ValueId,
+) ?IterationTransitionResult {
+    if (arguments.len != 4 or !iteration_state.isBooleanLiteral(program, arguments[3], false)) return null;
+    const transition = iterationTransitionResult(program, arguments[0]) orelse return null;
+    if (iterationStateArgumentIndex(transition.instruction, transition.index) != 0 or
+        !iteration_state.transitionStateMatches(program, transition.instruction, arguments))
+    {
+        return null;
+    }
+    return transition;
+}
+
+fn authenticatedIterationValuesEquivalentAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    expected: []const ir.ValueId,
+    actual: []const ir.ValueId,
+    lineage_index: *const CloneLineageIndex,
+    replay_index: *const node_split.ReplayIndex,
+    replay_cache: *ReplayCache,
+) std.mem.Allocator.Error!bool {
+    if (expected.len != actual.len) return false;
+    for (expected, actual) |expected_value, actual_value| {
+        if (try authenticatedComposedCloneValueMatchAlloc(
+            allocator,
+            program,
+            expected_value,
+            actual_value,
+            lineage_index,
+            replay_index,
+            replay_cache,
+        )) continue;
+
+        // A loop may be cloned repeatedly through different split groups.
+        // The changing SSA values are equivalent only when each producer has
+        // a complete replay-authenticated lineage to the same root and both
+        // values map back to that root's identical definition.
+        if (!try authenticatedSameRootCloneValueMatchAlloc(
+            allocator,
+            program,
+            expected_value,
+            actual_value,
+            lineage_index,
+            replay_index,
+            replay_cache,
+        )) return false;
+    }
+    return true;
+}
+
+fn authenticatedSameRootCloneValueMatchAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    expected: ir.ValueId,
+    actual: ir.ValueId,
+    lineage_index: *const CloneLineageIndex,
+    replay_index: *const node_split.ReplayIndex,
+    replay_cache: *ReplayCache,
+) std.mem.Allocator.Error!bool {
+    if (expected == actual) return true;
+    if (!sameContinuationValueType(program, expected, actual)) return false;
+
+    const expected_producer = projectionValueProducer(program, expected) orelse return false;
+    const actual_producer = projectionValueProducer(program, actual) orelse return false;
+    const expected_position = cloneLineagePositionCached(program, expected_producer, lineage_index) orelse return false;
+    const actual_position = cloneLineagePositionCached(program, actual_producer, lineage_index) orelse return false;
+    if (expected_position.root != actual_position.root) return false;
+
+    if (!cloneLineageArgumentsAreStableCached(program, expected_producer, lineage_index) or
+        !cloneLineageArgumentsAreStableCached(program, actual_producer, lineage_index) or
+        !try cloneLineageArgumentsMatchReplayCached(
+            allocator,
+            program,
+            expected_position.root,
+            expected_producer,
+            lineage_index,
+            replay_index,
+            replay_cache,
+        ) or
+        !try cloneLineageArgumentsMatchReplayCached(
+            allocator,
+            program,
+            actual_position.root,
+            actual_producer,
+            lineage_index,
+            replay_index,
+            replay_cache,
+        )) return false;
+
+    const expected_root = try mapValueBackThroughCloneLineageAllocCachedWithReplayCache(
+        allocator,
+        program,
+        expected_position.root,
+        expected_producer,
+        expected,
+        lineage_index,
+        replay_index,
+        replay_cache,
+    ) orelse return false;
+    const actual_root = try mapValueBackThroughCloneLineageAllocCachedWithReplayCache(
+        allocator,
+        program,
+        actual_position.root,
+        actual_producer,
+        actual,
+        lineage_index,
+        replay_index,
+        replay_cache,
+    ) orelse return false;
+    return expected_root == actual_root;
+}
+
+fn authenticatedIterationTransitionEquivalentAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    expected: IterationTransitionResult,
+    actual: IterationTransitionResult,
+    lineage_index: *const CloneLineageIndex,
+    replay_index: *const node_split.ReplayIndex,
+    replay_cache: *ReplayCache,
+) std.mem.Allocator.Error!bool {
+    if (!sameIterationTransitionKind(expected.instruction, actual.instruction) or
+        !std.meta.eql(expected.instruction.effects, actual.instruction.effects)) return false;
+
+    const operands_match = switch (expected.instruction.operation) {
+        .numeric_for_next => |expected_operation| switch (actual.instruction.operation) {
+            .numeric_for_next => |actual_operation| try authenticatedIterationValuesEquivalentAlloc(
+                allocator,
+                program,
+                &.{
+                    expected_operation.control,
+                    expected_operation.limit,
+                    expected_operation.step,
+                    expected_operation.initial,
+                },
+                &.{
+                    actual_operation.control,
+                    actual_operation.limit,
+                    actual_operation.step,
+                    actual_operation.initial,
+                },
+                lineage_index,
+                replay_index,
+                replay_cache,
+            ),
+            else => false,
+        },
+        .generic_for_next => |expected_operation| switch (actual.instruction.operation) {
+            .generic_for_next => |actual_operation| try authenticatedIterationValuesEquivalentAlloc(
+                allocator,
+                program,
+                &.{
+                    expected_operation.iterator,
+                    expected_operation.state,
+                    expected_operation.control,
+                    expected_operation.initial,
+                },
+                &.{
+                    actual_operation.iterator,
+                    actual_operation.state,
+                    actual_operation.control,
+                    actual_operation.initial,
+                },
+                lineage_index,
+                replay_index,
+                replay_cache,
+            ),
+            else => false,
+        },
+        else => false,
+    };
+    if (!operands_match) return false;
+
+    return try authenticatedIterationValuesEquivalentAlloc(
+        allocator,
+        program,
+        expected.instruction.results,
+        actual.instruction.results,
+        lineage_index,
+        replay_index,
+        replay_cache,
+    );
+}
+
+// A context tuple may be produced by a compound continuation block rather
+// than by a one-instruction loop header. Accept that tuple only when both
+// entries are live, both are exact iteration-state tuples, and their complete
+// transition inputs/results are authenticated through clone replay.
+fn authenticatedIterationStateTupleEquivalentAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    target: ir.BlockId,
+    expected: []const ir.ValueId,
+    actual: []const ir.ValueId,
+    lineage_index: *const CloneLineageIndex,
+    replay_index: *const node_split.ReplayIndex,
+    replay_cache: *ReplayCache,
+) std.mem.Allocator.Error!bool {
+    if (target.index() >= program.blocks.len) return false;
+    const target_block = program.blocks[target.index()];
+    if (target_block.id != target or target_block.parameters.len != expected.len or
+        expected.len != actual.len or expected.len != 4 or
+        !hasLiveIncomingEdgeWithArguments(program, target, expected) or
+        !hasLiveIncomingEdgeWithArguments(program, target, actual)) return false;
+
+    for (target_block.parameters, expected, actual) |formal, expected_value, actual_value| {
+        if (!sameContinuationValueType(program, formal, expected_value) or
+            !sameContinuationValueType(program, formal, actual_value)) return false;
+    }
+
+    const expected_transition = iterationStateTupleTransition(program, expected) orelse return false;
+    const actual_transition = iterationStateTupleTransition(program, actual) orelse return false;
+    var branch_match = true;
+    if (expected_transition.block == actual_transition.block) {
+        branch_match = std.meta.eql(expected_transition.instruction, actual_transition.instruction);
+    } else if (!try authenticatedCloneBranchEquivalentAlloc(
+        allocator,
+        program,
+        expected_transition.block,
+        actual_transition.block,
+        lineage_index,
+        replay_index,
+        replay_cache,
+        0,
+    )) {
+        // Independent node-split groups can clone the same transition block
+        // into sibling continuation contexts.  The strict branch proof above
+        // intentionally rejects that shape because its final groups differ.
+        // In this iteration-only contract, positional replay of every result
+        // is the stronger identity proof: the transition kind, effects,
+        // operands, and results are checked again below.  Do not use this
+        // fallback for general value projection; it is limited to a complete
+        // iteration-state tuple.
+        branch_match = try authenticatedIterationValuesEquivalentAlloc(
+            allocator,
+            program,
+            expected_transition.instruction.results,
+            actual_transition.instruction.results,
+            lineage_index,
+            replay_index,
+            replay_cache,
+        );
+    }
+    if (!branch_match) {
+        return false;
+    }
+
+    const transition_match = try authenticatedIterationTransitionEquivalentAlloc(
+        allocator,
+        program,
+        expected_transition,
+        actual_transition,
+        lineage_index,
+        replay_index,
+        replay_cache,
+    );
+    return transition_match;
 }
 
 fn iterationStateArgumentIndex(
@@ -3007,6 +3383,177 @@ fn mapValueFromReplay(
     return null;
 }
 
+fn commonCloneAncestorCached(
+    program: *const ir.Program,
+    left: ir.BlockId,
+    right: ir.BlockId,
+    lineage_index: *const CloneLineageIndex,
+) ?ir.BlockId {
+    if (left.index() >= program.blocks.len or right.index() >= program.blocks.len or
+        program.blocks[left.index()].function != program.blocks[right.index()].function)
+    {
+        return null;
+    }
+    const left_position = cloneLineagePositionCached(program, left, lineage_index) orelse return null;
+    const right_position = cloneLineagePositionCached(program, right, lineage_index) orelse return null;
+    if (left_position.root != right_position.root) return null;
+
+    var left_current = left;
+    var right_current = right;
+    var left_depth = left_position.depth;
+    var right_depth = right_position.depth;
+    while (left_depth > right_depth) : (left_depth -= 1) {
+        left_current = (cloneStepForTargetCached(program, left_current, lineage_index) orelse return null).source;
+    }
+    while (right_depth > left_depth) : (right_depth -= 1) {
+        right_current = (cloneStepForTargetCached(program, right_current, lineage_index) orelse return null).source;
+    }
+    while (left_current != right_current) {
+        left_current = (cloneStepForTargetCached(program, left_current, lineage_index) orelse return null).source;
+        right_current = (cloneStepForTargetCached(program, right_current, lineage_index) orelse return null).source;
+    }
+    return left_current;
+}
+
+fn mapValueToReplay(
+    program: *const ir.Program,
+    source_block_id: ir.BlockId,
+    clone_block_id: ir.BlockId,
+    clone_value_id: ir.ValueId,
+    replay: node_split.ReplayMappings,
+) ?ir.ValueId {
+    var selected: ?ir.ValueId = mapValueByCloneShape(
+        program,
+        clone_block_id,
+        source_block_id,
+        clone_value_id,
+    );
+    for (replay.clone_values, replay.source_values) |candidate_clone, candidate_source| {
+        if (candidate_clone != clone_value_id) continue;
+        if (selected) |existing| {
+            if (existing != candidate_source) return null;
+        } else {
+            selected = candidate_source;
+        }
+    }
+    return selected;
+}
+
+fn mapValueBackThroughCloneLineageAllocCachedWithReplayCache(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    ancestor: ir.BlockId,
+    descendant: ir.BlockId,
+    value: ir.ValueId,
+    lineage_index: *const CloneLineageIndex,
+    replay_index: *const node_split.ReplayIndex,
+    replay_cache: *ReplayCache,
+) std.mem.Allocator.Error!?ir.ValueId {
+    const lineage = try cloneLineageAllocCached(allocator, program, ancestor, descendant, lineage_index) orelse return null;
+    defer allocator.free(lineage);
+
+    var current = value;
+    var index = lineage.len;
+    while (index > 0) {
+        index -= 1;
+        const step = lineage[index];
+        const replay = (try replay_cache.get(step.source, step.clone, step.group)) orelse return null;
+        const mapped = mapValueToReplay(program, step.source, step.clone, current, replay.*) orelse return null;
+        if (!sameContinuationValueType(program, current, mapped)) return null;
+        current = mapped;
+    }
+    _ = replay_index;
+    return current;
+}
+
+// Compare values produced in sibling clone branches by composing every
+// authenticated positional map through their nearest common clone ancestor.
+// The inverse walk is required because the expected value may be produced in
+// a different branch from the actual value; a direct source-to-clone shape
+// lookup cannot represent that composition.
+fn authenticatedComposedCloneValueMatchAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    expected: ir.ValueId,
+    actual: ir.ValueId,
+    lineage_index: *const CloneLineageIndex,
+    replay_index: *const node_split.ReplayIndex,
+    replay_cache: *ReplayCache,
+) std.mem.Allocator.Error!bool {
+    if (expected == actual) return true;
+    if (!sameContinuationValueType(program, expected, actual)) return false;
+    const expected_producer = projectionValueProducer(program, expected) orelse return false;
+    const actual_producer = projectionValueProducer(program, actual) orelse return false;
+    if (expected_producer == actual_producer) return false;
+
+    const ancestor = commonCloneAncestorCached(
+        program,
+        expected_producer,
+        actual_producer,
+        lineage_index,
+    ) orelse return false;
+    if (!try authenticatedCloneBranchEquivalentAlloc(
+        allocator,
+        program,
+        expected_producer,
+        actual_producer,
+        lineage_index,
+        replay_index,
+        replay_cache,
+        0,
+    )) return false;
+    if (!try cloneLineageArgumentsMatchReplayCached(
+        allocator,
+        program,
+        ancestor,
+        expected_producer,
+        lineage_index,
+        replay_index,
+        replay_cache,
+    ) or !try cloneLineageArgumentsMatchReplayCached(
+        allocator,
+        program,
+        ancestor,
+        actual_producer,
+        lineage_index,
+        replay_index,
+        replay_cache,
+    )) return false;
+
+    const expected_root = try mapValueBackThroughCloneLineageAllocCachedWithReplayCache(
+        allocator,
+        program,
+        ancestor,
+        expected_producer,
+        expected,
+        lineage_index,
+        replay_index,
+        replay_cache,
+    ) orelse return false;
+    const actual_root = try mapValueBackThroughCloneLineageAllocCachedWithReplayCache(
+        allocator,
+        program,
+        ancestor,
+        actual_producer,
+        actual,
+        lineage_index,
+        replay_index,
+        replay_cache,
+    ) orelse return false;
+    if (expected_root != actual_root) return false;
+    const mapped = try mapValueThroughCloneLineageAllocCachedWithReplayCache(
+        allocator,
+        program,
+        ancestor,
+        actual_producer,
+        expected_root,
+        lineage_index,
+        replay_index,
+        replay_cache,
+    ) orelse return false;
+    return mapped == actual and sameContinuationValueType(program, expected_root, mapped);
+}
+
 fn mapValueByCloneShape(
     program: *const ir.Program,
     source_block_id: ir.BlockId,
@@ -3490,6 +4037,226 @@ const ContinuationValuePolicy = enum {
     incoming_parameter_bridge,
 };
 
+fn hasCloneLineageCandidateForSource(
+    replay_index: *const node_split.ReplayIndex,
+    program: *const ir.Program,
+    source: ir.BlockId,
+) bool {
+    if (source.index() >= program.blocks.len or program.blocks[source.index()].id != source) return false;
+    const source_function = program.blocks[source.index()].function;
+    for (replay_index.candidateCloneTargetsForSource(program, source)) |candidate| {
+        if (candidate.index() >= program.blocks.len or program.blocks[candidate.index()].id != candidate) continue;
+        if (candidate != source and program.blocks[candidate.index()].function == source_function) return true;
+    }
+    return false;
+}
+
+fn hasAuthenticatedDirectValueCloneForIncoming(
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    producer: ir.BlockId,
+    source_value: ir.ValueId,
+    incoming: []const ir.CfgEdgeRef,
+    lineage_index: ?*const CloneLineageIndex,
+) std.mem.Allocator.Error!bool {
+    if (incoming.len == 0) return false;
+    for (incoming) |reference| {
+        const edge = cfg_edge.value(program, reference) orelse return false;
+        var carried = false;
+        for (program.edge_rewrites) |rewrite| {
+            if (rewrite.rule != .node_split or rewrite.from.target != producer) continue;
+            const candidate = rewrite.to.target;
+            if (candidate == producer or candidate.index() >= program.blocks.len or
+                analysis.blockIndex(candidate) == null)
+            {
+                continue;
+            }
+            // Context reachability authenticates which clone is live for this
+            // incoming edge, while the edge argument authenticates the value
+            // identity.  Lineage alone is insufficient because a descendant
+            // clone may carry a different mapped value.
+            const one = [_]ir.CfgEdgeRef{reference};
+            if (!try cloneContextMatchesIncomingCached(program, analysis, candidate, &one, lineage_index)) continue;
+            const mapped = mapValueByCloneShape(program, producer, candidate, source_value) orelse continue;
+            for (edge.arguments) |argument| {
+                if (argument == mapped) {
+                    carried = true;
+                    break;
+                }
+            }
+            if (carried) break;
+        }
+        if (!carried) return false;
+    }
+    return true;
+}
+
+fn hasAuthenticatedComposedValueCloneForIncoming(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    producer: ir.BlockId,
+    source_value: ir.ValueId,
+    incoming: []const ir.CfgEdgeRef,
+    lineage_index: ?*const CloneLineageIndex,
+    replay_index: ?*const node_split.ReplayIndex,
+    replay_cache: ?*ReplayCache,
+) std.mem.Allocator.Error!bool {
+    if (incoming.len == 0 or lineage_index == null or replay_index == null) return false;
+    for (incoming) |reference| {
+        const one = [_]ir.CfgEdgeRef{reference};
+        const mapping = try findIncomingCloneLineageValueMappingAllocWithReplayCache(
+            allocator,
+            program,
+            analysis,
+            producer,
+            source_value,
+            &one,
+            lineage_index,
+            replay_index,
+            replay_cache,
+        );
+        if (mapping.ambiguous or mapping.value == null) return false;
+    }
+    return true;
+}
+
+fn isRematerializableConstant(
+    program: *const ir.Program,
+    value_id: ir.ValueId,
+    function_id: ir.FunctionId,
+) bool {
+    if (value_id.index() >= program.values.len) return false;
+    const value = program.values[value_id.index()];
+    const origin = switch (value.origin) {
+        .instruction_result => |instruction_origin| instruction_origin,
+        .parameter, .capture, .block_parameter => return false,
+    };
+    if (origin.instruction.index() >= program.instructions.len) return false;
+    const instruction = program.instructions[origin.instruction.index()];
+    if (instruction.id != origin.instruction or instruction.block.index() >= program.blocks.len) {
+        return false;
+    }
+    if (instruction.results.len <= origin.index or instruction.results[origin.index] != value_id or
+        program.blocks[instruction.block.index()].function != function_id or
+        !std.meta.eql(instruction.effects, ir.EffectSummary.pure))
+    {
+        return false;
+    }
+    return switch (instruction.operation) {
+        .constant => true,
+        else => false,
+    };
+}
+
+fn valueCarriesContinuationContextWithPolicy(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    value_id: ir.ValueId,
+    source: ir.BlockId,
+    closure: []const ir.BlockId,
+    continuation: []const ir.BlockId,
+    incoming: []const ir.CfgEdgeRef,
+    lineage_index: ?*const CloneLineageIndex,
+    replay_index: ?*const node_split.ReplayIndex,
+    replay_cache: ?*ReplayCache,
+    policy: ContinuationValuePolicy,
+) std.mem.Allocator.Error!ContinuationValueContext {
+    if (value_id.index() >= program.values.len) return .unavailable;
+    const value = program.values[value_id.index()];
+    if (value.id != value_id or value.function != analysis.function.id) return .unavailable;
+    const producer = switch (value.origin) {
+        .parameter, .capture => return .available,
+        .block_parameter => |origin| origin.block,
+        .instruction_result => |origin| blk: {
+            if (origin.instruction.index() >= program.instructions.len) return .unavailable;
+            const instruction = program.instructions[origin.instruction.index()];
+            if (instruction.id != origin.instruction or instruction.block.index() >= program.blocks.len) return .unavailable;
+            break :blk instruction.block;
+        },
+    };
+    if (producer == source or containsBlock(closure, producer) or containsBlock(continuation, producer)) return .contextual;
+    if ((policy == .ordinary or policy == .incoming_parameter_bridge) and
+        isRematerializableConstant(program, value_id, analysis.function.id)) return .available;
+
+    if (replay_index) |cached| {
+        if (!hasCloneLineageCandidateForSource(cached, program, producer)) {
+            return if (definitionDominatesIncoming(analysis, producer, incoming)) .available else .unavailable;
+        }
+    }
+
+    // A clone lineage is a stronger ownership fact than ordinary CFG
+    // dominance.  The latter describes the unrewritten graph and can still
+    // report a source producer as dominant after a contextual edge has been
+    // redirected through a clone.
+    if (try hasAuthenticatedDirectValueCloneForIncoming(
+        program,
+        analysis,
+        producer,
+        value_id,
+        incoming,
+        lineage_index,
+    )) return .contextual;
+
+    if (try hasAuthenticatedComposedValueCloneForIncoming(
+        allocator,
+        program,
+        analysis,
+        producer,
+        value_id,
+        incoming,
+        lineage_index,
+        replay_index,
+        replay_cache,
+    )) return .contextual;
+
+    // A clone can hand control to a shared continuation without carrying its
+    // formal IDs on every intervening edge.  The original value is still
+    // usable only when the existing external-mapping proof selects one
+    // replay-authenticated clone that dominates every incoming edge source.
+    // Reuse that mapping here so closure discovery and closure remapping agree
+    // on the same ownership fact.
+    if (policy != .ordinary and lineage_index != null and replay_index != null) {
+        if (try findExistingValueCloneAlloc(
+            allocator,
+            program,
+            analysis,
+            producer,
+            value_id,
+            incoming,
+            closure,
+            lineage_index,
+            replay_index.?,
+            replay_cache,
+        )) |mapped| {
+            if (mapped != value_id) return .contextual;
+        }
+    }
+
+    if (definitionDominatesIncoming(analysis, producer, incoming)) return .available;
+
+    // A bypassed producer is usable only when an earlier authenticated split
+    // already maps this value into the incoming context. Non-dominance alone
+    // is not evidence that the value can be reconstructed.
+    return .unavailable;
+}
+
+fn sameContinuationValueType(
+    program: *const ir.Program,
+    left: ir.ValueId,
+    right: ir.ValueId,
+) bool {
+    if (left.index() >= program.values.len or right.index() >= program.values.len) return false;
+    const left_value = program.values[left.index()];
+    const right_value = program.values[right.index()];
+    return left_value.id == left and right_value.id == right and
+        left_value.function == right_value.function and
+        left_value.type.kind == right_value.type.kind and
+        left_value.type.bit_width == right_value.type.bit_width and
+        left_value.type.signed == right_value.type.signed;
+}
+
 // A dynamic block formal is an open Luau parameter contract.  It can receive
 // a concretely typed owner value or a dynamic value, while a concrete formal
 // must not be matched by an unresolved dynamic value.
@@ -3511,4 +4278,99 @@ pub fn continuationParameterAcceptsValueType(
     return formal_value.type.kind == argument_value.type.kind and
         formal_value.type.bit_width == argument_value.type.bit_width and
         formal_value.type.signed == argument_value.type.signed;
+}
+
+fn hasLiveIncomingEdgeWithArguments(
+    program: *const ir.Program,
+    target: ir.BlockId,
+    arguments: []const ir.ValueId,
+) bool {
+    if (target.index() >= program.blocks.len) return false;
+    const target_block = program.blocks[target.index()];
+    if (target_block.id != target or arguments.len != target_block.parameters.len) return false;
+
+    for (program.blocks) |source| {
+        if (source.id.index() >= program.blocks.len or source.id == target and source.function != target_block.function) continue;
+        if (source.function != target_block.function) continue;
+        switch (source.terminator) {
+            .jump => |edge| {
+                if (edge.target == target and std.mem.eql(ir.ValueId, edge.arguments, arguments)) return true;
+            },
+            .branch => |branch| {
+                if ((branch.then_edge.target == target and
+                    std.mem.eql(ir.ValueId, branch.then_edge.arguments, arguments)) or
+                    (branch.else_edge.target == target and
+                        std.mem.eql(ir.ValueId, branch.else_edge.arguments, arguments))) return true;
+            },
+            .return_values, .return_pack, .return_expanded, .throw_error, .unreachable_block => {},
+        }
+    }
+    return false;
+}
+
+// A parameterized continuation can carry a loop state tuple whose producers
+// are reached only after the target is entered.  Admit that cycle as one
+// authenticated unit: every deferred producer must be in the same reachable
+// SCC as the edge source and target.  Values outside the SCC still need the
+// ordinary incoming-context proof below.
+fn loopCarriedValueIsInContinuationScc(
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    source: ir.BlockId,
+    target: ir.BlockId,
+    value_id: ir.ValueId,
+) std.mem.Allocator.Error!bool {
+    if (source.index() >= program.blocks.len or target.index() >= program.blocks.len or
+        program.blocks[source.index()].function != analysis.function.id or
+        program.blocks[target.index()].function != analysis.function.id or
+        !try analysis.canReach(target, source)) return false;
+    const producer = projectionValueProducer(program, value_id) orelse return false;
+    if (producer.index() >= program.blocks.len or
+        program.blocks[producer.index()].function != analysis.function.id)
+    {
+        return false;
+    }
+    return try analysis.canReach(target, producer) and
+        try analysis.canReach(producer, source);
+}
+
+// A block-parameter projection may cross a loop-carried source clone rather
+// than a direct node-split bridge. Require the value producer to be reachable
+// after the incoming context and to dominate the replay-stable source edge.
+// This authenticates an existing value on the carried path; it does not invent
+// a value or relax ordinary dominance.
+fn valueIsAvailableFromIncomingContext(
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    source: ir.BlockId,
+    incoming: []const ir.CfgEdgeRef,
+    value_id: ir.ValueId,
+) std.mem.Allocator.Error!bool {
+    if (incoming.len == 0 or source.index() >= program.blocks.len or
+        program.blocks[source.index()].function != analysis.function.id)
+    {
+        return false;
+    }
+    const producer = projectionValueProducer(program, value_id) orelse return false;
+    if (producer.index() >= program.blocks.len or
+        program.blocks[producer.index()].function != analysis.function.id)
+    {
+        return false;
+    }
+    for (incoming) |reference| {
+        if (!incomingEdgeIsCanonical(program, analysis, reference) or
+            !try analysis.canReach(reference.target, source) or
+            !try analysis.canReach(reference.target, producer) or
+            !try analysis.canReach(producer, source) or
+            !analysis.dominates(producer, source))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn containsBlock(blocks: []const ir.BlockId, target: ir.BlockId) bool {
+    for (blocks) |block_id| if (block_id == target) return true;
+    return false;
 }
