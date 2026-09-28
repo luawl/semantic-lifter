@@ -3626,6 +3626,13 @@ fn authenticatedProjectionValueMatchAlloc(
     return .none;
 }
 
+fn cloneLineageArgumentsAreStable(
+    program: *const ir.Program,
+    block: ir.BlockId,
+) bool {
+    return cloneLineageArgumentsAreStableCached(program, block, null);
+}
+
 fn cloneLineageArgumentsAreStableCached(
     program: *const ir.Program,
     block: ir.BlockId,
@@ -3643,6 +3650,22 @@ fn cloneLineageArgumentsAreStableCached(
         current = step.source;
     }
     return true;
+}
+
+fn externalBlockParameterIsAvailable(
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    value_id: ir.ValueId,
+    block_id: ir.BlockId,
+    parameter_index: u32,
+    incoming: []const ir.CfgEdgeRef,
+) bool {
+    if (block_id.index() >= program.blocks.len) return false;
+    const block = program.blocks[block_id.index()];
+    const index: usize = @intCast(parameter_index);
+    return block.id == block_id and block.function == analysis.function.id and
+        index < block.parameters.len and block.parameters[index] == value_id and
+        definitionDominatesIncoming(analysis, block_id, incoming);
 }
 
 fn externalBlockParameterBlock(
@@ -4153,6 +4176,10 @@ const CloneLineagePosition = struct {
     root: ir.BlockId,
     depth: usize,
 };
+
+fn cloneLineagePosition(program: *const ir.Program, block: ir.BlockId) ?CloneLineagePosition {
+    return cloneLineagePositionCached(program, block, null);
+}
 
 fn cloneLineagePositionCached(
     program: *const ir.Program,
@@ -8019,6 +8046,367 @@ fn hasAuthenticatedEffectfulParameterizedCompoundProjectionAlloc(
     return true;
 }
 
+test "authenticated numeric continuation projection requires a complete transition tuple" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const owner = ir.BlockId.fromIndex(1);
+    const candidate = ir.BlockId.fromIndex(2);
+    const target = ir.BlockId.fromIndex(3);
+    const exit = ir.BlockId.fromIndex(4);
+
+    const selector = ir.ValueId.fromIndex(0);
+    const owner_control = ir.ValueId.fromIndex(1);
+    const owner_limit = ir.ValueId.fromIndex(2);
+    const owner_step = ir.ValueId.fromIndex(3);
+    const owner_initial = ir.ValueId.fromIndex(4);
+    const candidate_control = ir.ValueId.fromIndex(5);
+    const candidate_limit = ir.ValueId.fromIndex(6);
+    const candidate_step = ir.ValueId.fromIndex(7);
+    const candidate_initial = ir.ValueId.fromIndex(8);
+    const target_control = ir.ValueId.fromIndex(9);
+    const target_limit = ir.ValueId.fromIndex(10);
+    const target_step = ir.ValueId.fromIndex(11);
+    const target_initial = ir.ValueId.fromIndex(12);
+    const false_value = ir.ValueId.fromIndex(13);
+    const candidate_has = ir.ValueId.fromIndex(14);
+    const candidate_result_limit = ir.ValueId.fromIndex(15);
+    const candidate_result_step = ir.ValueId.fromIndex(16);
+    const candidate_next = ir.ValueId.fromIndex(17);
+    const target_has = ir.ValueId.fromIndex(18);
+    const target_result_limit = ir.ValueId.fromIndex(19);
+    const target_result_step = ir.ValueId.fromIndex(20);
+    const target_next = ir.ValueId.fromIndex(21);
+
+    const false_instruction = ir.InstructionId.fromIndex(0);
+    const candidate_instruction = ir.InstructionId.fromIndex(1);
+    const target_instruction = ir.InstructionId.fromIndex(2);
+
+    const values = [_]ir.Value{
+        .{ .id = selector, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = owner_control, .function = function_id, .type = .number, .origin = .{ .parameter = 1 } },
+        .{ .id = owner_limit, .function = function_id, .type = .number, .origin = .{ .parameter = 2 } },
+        .{ .id = owner_step, .function = function_id, .type = .number, .origin = .{ .parameter = 3 } },
+        .{ .id = owner_initial, .function = function_id, .type = .boolean, .origin = .{ .parameter = 4 } },
+        .{ .id = candidate_control, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = candidate, .index = 0 } } },
+        .{ .id = candidate_limit, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = candidate, .index = 1 } } },
+        .{ .id = candidate_step, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = candidate, .index = 2 } } },
+        .{ .id = candidate_initial, .function = function_id, .type = .boolean, .origin = .{ .block_parameter = .{ .block = candidate, .index = 3 } } },
+        .{ .id = target_control, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = target, .index = 0 } } },
+        .{ .id = target_limit, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = target, .index = 1 } } },
+        .{ .id = target_step, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = target, .index = 2 } } },
+        .{ .id = target_initial, .function = function_id, .type = .boolean, .origin = .{ .block_parameter = .{ .block = target, .index = 3 } } },
+        .{ .id = false_value, .function = function_id, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = false_instruction, .index = 0 } } },
+        .{ .id = candidate_has, .function = function_id, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = candidate_instruction, .index = 0 } } },
+        .{ .id = candidate_result_limit, .function = function_id, .type = .dynamic, .origin = .{ .instruction_result = .{ .instruction = candidate_instruction, .index = 1 } } },
+        .{ .id = candidate_result_step, .function = function_id, .type = .dynamic, .origin = .{ .instruction_result = .{ .instruction = candidate_instruction, .index = 2 } } },
+        .{ .id = candidate_next, .function = function_id, .type = .dynamic, .origin = .{ .instruction_result = .{ .instruction = candidate_instruction, .index = 3 } } },
+        .{ .id = target_has, .function = function_id, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = target_instruction, .index = 0 } } },
+        .{ .id = target_result_limit, .function = function_id, .type = .dynamic, .origin = .{ .instruction_result = .{ .instruction = target_instruction, .index = 1 } } },
+        .{ .id = target_result_step, .function = function_id, .type = .dynamic, .origin = .{ .instruction_result = .{ .instruction = target_instruction, .index = 2 } } },
+        .{ .id = target_next, .function = function_id, .type = .dynamic, .origin = .{ .instruction_result = .{ .instruction = target_instruction, .index = 3 } } },
+    };
+
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .instructions = &.{false_instruction}, .terminator = .{ .branch = .{
+            .condition = selector,
+            .then_edge = .{ .target = owner },
+            .else_edge = .{ .target = candidate, .arguments = &.{ owner_control, owner_limit, owner_step, owner_initial } },
+        } } },
+        .{ .id = owner, .function = function_id, .terminator = .{ .jump = .{
+            .target = target,
+            .arguments = &.{ owner_control, owner_limit, owner_step, owner_initial },
+        } } },
+        .{ .id = candidate, .function = function_id, .parameters = &.{ candidate_control, candidate_limit, candidate_step, candidate_initial }, .instructions = &.{candidate_instruction}, .terminator = .{ .branch = .{
+            .condition = candidate_has,
+            .then_edge = .{ .target = target, .arguments = &.{ candidate_next, candidate_result_limit, candidate_result_step, false_value } },
+            .else_edge = .{ .target = exit },
+        } } },
+        .{ .id = target, .function = function_id, .parameters = &.{ target_control, target_limit, target_step, target_initial }, .instructions = &.{target_instruction}, .terminator = .{ .branch = .{
+            .condition = target_has,
+            .then_edge = .{ .target = target, .arguments = &.{ target_next, target_result_limit, target_result_step, false_value } },
+            .else_edge = .{ .target = exit },
+        } } },
+        .{ .id = exit, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .parameters = &.{ selector, owner_control, owner_limit, owner_step, owner_initial },
+        .blocks = &.{ entry, owner, candidate, target, exit },
+        .entry_block = entry,
+    }};
+    const instructions = [_]ir.Instruction{
+        .{ .id = false_instruction, .block = entry, .operation = .{ .constant = .{ .boolean = false } }, .results = &.{false_value}, .effects = .pure },
+        .{ .id = candidate_instruction, .block = candidate, .operation = .{ .numeric_for_next = .{
+            .control = candidate_control,
+            .limit = candidate_limit,
+            .step = candidate_step,
+            .initial = candidate_initial,
+            .mode = .semantic_normalized,
+        } }, .results = &.{ candidate_has, candidate_result_limit, candidate_result_step, candidate_next }, .effects = .numeric_for_next },
+        .{ .id = target_instruction, .block = target, .operation = .{ .numeric_for_next = .{
+            .control = target_control,
+            .limit = target_limit,
+            .step = target_step,
+            .initial = target_initial,
+            .mode = .semantic_normalized,
+        } }, .results = &.{ target_has, target_result_limit, target_result_step, target_next }, .effects = .numeric_for_next },
+    };
+    var program: ir.Program = .{
+        .program_id = "authenticated-numeric-continuation-projection",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, functions[0]);
+    defer analysis.deinit();
+    var lineage_index = try CloneLineageIndex.init(std.testing.allocator, &program);
+    defer lineage_index.deinit();
+    var replay_index = try node_split.ReplayIndex.init(std.testing.allocator, &program);
+    defer replay_index.deinit();
+    var replay_cache = ReplayCache.init(std.testing.allocator, &program, &replay_index);
+    defer replay_cache.deinit();
+    const expected = [_]ir.ValueId{ owner_control, owner_limit, owner_step, owner_initial };
+    const incoming = ir.CfgEdgeRef{ .source = candidate, .kind = .branch_then, .target = target };
+
+    try std.testing.expect(try hasAuthenticatedIterationContextualProjectionAlloc(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        target,
+        incoming,
+        &expected,
+        &lineage_index,
+        &replay_index,
+        &replay_cache,
+    ));
+
+    var projection_context = try ReplayProjectionContext.initForFunction(
+        std.testing.allocator,
+        &program,
+        function_id,
+    );
+    defer projection_context.deinit();
+    try std.testing.expect(!try projection_context.hasAuthenticatedContinuationBridgeForEdge(
+        &analysis,
+        incoming,
+    ));
+    try std.testing.expect(try projection_context.hasAuthenticatedIterationContextualProjectionForEdge(
+        &analysis,
+        incoming,
+        &expected,
+    ));
+
+    const self_reentry = ir.CfgEdgeRef{
+        .source = target,
+        .kind = .branch_then,
+        .target = target,
+    };
+    const self_tuple = [_]ir.ValueId{ target_next, target_result_limit, target_result_step, false_value };
+    try std.testing.expect(try authenticatedIterationTupleForwardingForIncomingAlloc(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        target,
+        target,
+        &self_tuple,
+        &.{self_reentry},
+        &lineage_index,
+        &replay_index,
+        &replay_cache,
+    ));
+
+    var cross_transition_tuple = self_tuple;
+    cross_transition_tuple[0] = candidate_next;
+    try std.testing.expect(!try authenticatedIterationTupleForwardingForIncomingAlloc(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        target,
+        target,
+        &cross_transition_tuple,
+        &.{self_reentry},
+        &lineage_index,
+        &replay_index,
+        &replay_cache,
+    ));
+
+    var tampered_blocks = blocks;
+    tampered_blocks[candidate.index()].terminator = .{ .branch = .{
+        .condition = candidate_has,
+        .then_edge = .{ .target = target, .arguments = &.{ candidate_next, candidate_result_limit, candidate_result_step, selector } },
+        .else_edge = .{ .target = exit },
+    } };
+    var tampered_program = program;
+    tampered_program.blocks = &tampered_blocks;
+    var tampered_analysis = try cfg.Analysis.init(std.testing.allocator, &tampered_program, functions[0]);
+    defer tampered_analysis.deinit();
+    var tampered_lineage_index = try CloneLineageIndex.init(std.testing.allocator, &tampered_program);
+    defer tampered_lineage_index.deinit();
+    var tampered_replay_index = try node_split.ReplayIndex.init(std.testing.allocator, &tampered_program);
+    defer tampered_replay_index.deinit();
+    var tampered_replay_cache = ReplayCache.init(std.testing.allocator, &tampered_program, &tampered_replay_index);
+    defer tampered_replay_cache.deinit();
+    try std.testing.expect(!try hasAuthenticatedIterationContextualProjectionAlloc(
+        std.testing.allocator,
+        &tampered_program,
+        &tampered_analysis,
+        target,
+        incoming,
+        &expected,
+        &tampered_lineage_index,
+        &tampered_replay_index,
+        &tampered_replay_cache,
+    ));
+}
+
+test "compound iteration projection accepts concrete owners for dynamic formals" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const target = ir.BlockId.fromIndex(1);
+    const forward = ir.BlockId.fromIndex(2);
+    const header = ir.BlockId.fromIndex(3);
+    const source = ir.BlockId.fromIndex(4);
+    const exit = ir.BlockId.fromIndex(5);
+
+    const owner_control = ir.ValueId.fromIndex(0);
+    const owner_limit = ir.ValueId.fromIndex(1);
+    const owner_step = ir.ValueId.fromIndex(2);
+    const false_value = ir.ValueId.fromIndex(3);
+    const target_control = ir.ValueId.fromIndex(4);
+    const target_limit = ir.ValueId.fromIndex(5);
+    const target_step = ir.ValueId.fromIndex(6);
+    const target_initial = ir.ValueId.fromIndex(7);
+    const header_control = ir.ValueId.fromIndex(8);
+    const header_limit = ir.ValueId.fromIndex(9);
+    const header_step = ir.ValueId.fromIndex(10);
+    const header_initial = ir.ValueId.fromIndex(11);
+    const has_value = ir.ValueId.fromIndex(12);
+    const normalized_limit = ir.ValueId.fromIndex(13);
+    const normalized_step = ir.ValueId.fromIndex(14);
+    const next_control = ir.ValueId.fromIndex(15);
+
+    const false_instruction = ir.InstructionId.fromIndex(0);
+    const transition_instruction = ir.InstructionId.fromIndex(1);
+    const values = [_]ir.Value{
+        .{ .id = owner_control, .function = function_id, .type = .number, .origin = .{ .parameter = 0 } },
+        .{ .id = owner_limit, .function = function_id, .type = .number, .origin = .{ .parameter = 1 } },
+        .{ .id = owner_step, .function = function_id, .type = .number, .origin = .{ .parameter = 2 } },
+        .{ .id = false_value, .function = function_id, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = false_instruction, .index = 0 } } },
+        .{ .id = target_control, .function = function_id, .origin = .{ .block_parameter = .{ .block = target, .index = 0 } } },
+        .{ .id = target_limit, .function = function_id, .origin = .{ .block_parameter = .{ .block = target, .index = 1 } } },
+        .{ .id = target_step, .function = function_id, .origin = .{ .block_parameter = .{ .block = target, .index = 2 } } },
+        .{ .id = target_initial, .function = function_id, .type = .boolean, .origin = .{ .block_parameter = .{ .block = target, .index = 3 } } },
+        .{ .id = header_control, .function = function_id, .origin = .{ .block_parameter = .{ .block = header, .index = 0 } } },
+        .{ .id = header_limit, .function = function_id, .origin = .{ .block_parameter = .{ .block = header, .index = 1 } } },
+        .{ .id = header_step, .function = function_id, .origin = .{ .block_parameter = .{ .block = header, .index = 2 } } },
+        .{ .id = header_initial, .function = function_id, .type = .boolean, .origin = .{ .block_parameter = .{ .block = header, .index = 3 } } },
+        .{ .id = has_value, .function = function_id, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = transition_instruction, .index = 0 } } },
+        .{ .id = normalized_limit, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = transition_instruction, .index = 1 } } },
+        .{ .id = normalized_step, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = transition_instruction, .index = 2 } } },
+        .{ .id = next_control, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = transition_instruction, .index = 3 } } },
+    };
+    const instructions = [_]ir.Instruction{
+        .{ .id = false_instruction, .block = entry, .operation = .{ .constant = .{ .boolean = false } }, .results = &.{false_value}, .effects = .pure },
+        .{ .id = transition_instruction, .block = header, .operation = .{ .numeric_for_next = .{
+            .control = header_control,
+            .limit = header_limit,
+            .step = header_step,
+            .initial = header_initial,
+            .mode = .semantic_normalized,
+        } }, .results = &.{ has_value, normalized_limit, normalized_step, next_control }, .effects = .numeric_for_next },
+    };
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .instructions = &.{false_instruction}, .terminator = .{ .jump = .{
+            .target = target,
+            .arguments = &.{ owner_control, owner_limit, owner_step, false_value },
+        } } },
+        .{ .id = target, .function = function_id, .parameters = &.{ target_control, target_limit, target_step, target_initial }, .terminator = .{ .jump = .{ .target = forward } } },
+        .{ .id = forward, .function = function_id, .terminator = .{ .jump = .{
+            .target = header,
+            .arguments = &.{ target_control, target_limit, target_step, target_initial },
+        } } },
+        .{ .id = header, .function = function_id, .parameters = &.{ header_control, header_limit, header_step, header_initial }, .instructions = &.{transition_instruction}, .terminator = .{ .branch = .{
+            .condition = has_value,
+            .then_edge = .{ .target = source },
+            .else_edge = .{ .target = exit },
+        } } },
+        .{ .id = source, .function = function_id, .terminator = .{ .jump = .{
+            .target = target,
+            .arguments = &.{ next_control, normalized_limit, normalized_step, false_value },
+        } } },
+        .{ .id = exit, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &.{ owner_control, owner_limit, owner_step },
+        .blocks = &.{ entry, target, forward, header, source, exit },
+        .entry_block = entry,
+    };
+    var program = ir.Program{
+        .program_id = "compound-dynamic-formal-projection",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, function);
+    defer analysis.deinit();
+    const expected = [_]ir.ValueId{ owner_control, owner_limit, owner_step, false_value };
+    const incoming = ir.CfgEdgeRef{ .source = source, .kind = .jump, .target = target };
+
+    try std.testing.expect(try hasAuthenticatedCompoundIterationContextualProjectionAlloc(
+        &program,
+        &analysis,
+        target,
+        incoming,
+        &expected,
+    ));
+
+    var replay_context = try ReplayProjectionContext.initForFunction(
+        std.testing.allocator,
+        &program,
+        function_id,
+    );
+    defer replay_context.deinit();
+    try std.testing.expect(try replay_context.hasAuthenticatedParameterizedContinuationProjectionForEdge(
+        &analysis,
+        incoming,
+        &expected,
+    ));
+
+    var tampered_blocks = blocks;
+    tampered_blocks[forward.index()].terminator = .{ .jump = .{
+        .target = header,
+        .arguments = &.{ header_control, header_limit, header_step, header_initial },
+    } };
+    var tampered_program = program;
+    tampered_program.blocks = &tampered_blocks;
+    var tampered_analysis = try cfg.Analysis.init(std.testing.allocator, &tampered_program, function);
+    defer tampered_analysis.deinit();
+    try std.testing.expect(!try hasAuthenticatedCompoundIterationContextualProjectionAlloc(
+        &tampered_program,
+        &tampered_analysis,
+        target,
+        incoming,
+        &expected,
+    ));
+
+    var tampered_replay_context = try ReplayProjectionContext.initForFunction(
+        std.testing.allocator,
+        &tampered_program,
+        function_id,
+    );
+    defer tampered_replay_context.deinit();
+    try std.testing.expect(!try tampered_replay_context.hasAuthenticatedParameterizedContinuationProjectionForEdge(
+        &tampered_analysis,
+        incoming,
+        &expected,
+    ));
+}
+
 test "multi-result carrier maps through every authenticated clone step" {
     const function_id = ir.FunctionId.fromIndex(0);
     const entry = ir.BlockId.fromIndex(0);
@@ -8195,6 +8583,184 @@ test "multi-result carrier maps through every authenticated clone step" {
         &tampered_replay_index,
         &tampered_replay_cache,
     )) == null);
+}
+
+test "same-root iteration clones compare fresh results across split groups" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const root = ir.BlockId.fromIndex(1);
+    const first_clone = ir.BlockId.fromIndex(2);
+    const second_clone = ir.BlockId.fromIndex(3);
+    const continuation = ir.BlockId.fromIndex(4);
+
+    const control = ir.ValueId.fromIndex(0);
+    const limit = ir.ValueId.fromIndex(1);
+    const step = ir.ValueId.fromIndex(2);
+    const initial = ir.ValueId.fromIndex(3);
+    const root_control = ir.ValueId.fromIndex(4);
+    const root_limit = ir.ValueId.fromIndex(5);
+    const root_step = ir.ValueId.fromIndex(6);
+    const root_initial = ir.ValueId.fromIndex(7);
+    const first_control = ir.ValueId.fromIndex(8);
+    const first_limit = ir.ValueId.fromIndex(9);
+    const first_step = ir.ValueId.fromIndex(10);
+    const first_initial = ir.ValueId.fromIndex(11);
+    const second_control = ir.ValueId.fromIndex(12);
+    const second_limit = ir.ValueId.fromIndex(13);
+    const second_step = ir.ValueId.fromIndex(14);
+    const second_initial = ir.ValueId.fromIndex(15);
+    const false_value = ir.ValueId.fromIndex(16);
+    const root_has = ir.ValueId.fromIndex(17);
+    const root_limit_result = ir.ValueId.fromIndex(18);
+    const root_step_result = ir.ValueId.fromIndex(19);
+    const root_next = ir.ValueId.fromIndex(20);
+    const first_has = ir.ValueId.fromIndex(21);
+    const first_limit_result = ir.ValueId.fromIndex(22);
+    const first_step_result = ir.ValueId.fromIndex(23);
+    const first_next = ir.ValueId.fromIndex(24);
+    const second_has = ir.ValueId.fromIndex(25);
+    const second_limit_result = ir.ValueId.fromIndex(26);
+    const second_step_result = ir.ValueId.fromIndex(27);
+    const second_next = ir.ValueId.fromIndex(28);
+    const continuation_has = ir.ValueId.fromIndex(29);
+    const continuation_limit = ir.ValueId.fromIndex(30);
+    const continuation_step = ir.ValueId.fromIndex(31);
+    const continuation_next = ir.ValueId.fromIndex(32);
+
+    const root_parameters = [_]ir.ValueId{ root_control, root_limit, root_step, root_initial };
+    const first_parameters = [_]ir.ValueId{ first_control, first_limit, first_step, first_initial };
+    const second_parameters = [_]ir.ValueId{ second_control, second_limit, second_step, second_initial };
+    const root_results = [_]ir.ValueId{ root_has, root_limit_result, root_step_result, root_next };
+    const first_results = [_]ir.ValueId{ first_has, first_limit_result, first_step_result, first_next };
+    const second_results = [_]ir.ValueId{ second_has, second_limit_result, second_step_result, second_next };
+    const entry_then_arguments = [_]ir.ValueId{ control, limit, step, initial };
+    const root_entry_arguments = [_]ir.ValueId{ control, limit, step, initial };
+    const root_state_arguments = [_]ir.ValueId{ root_next, root_limit_result, root_step_result, false_value };
+
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = control,
+            .then_edge = .{ .target = first_clone, .arguments = entry_then_arguments[0..] },
+            .else_edge = .{ .target = second_clone, .arguments = entry_then_arguments[0..] },
+        } } },
+        .{ .id = root, .function = function_id, .parameters = root_parameters[0..], .instructions = &.{ir.InstructionId.fromIndex(0)}, .terminator = .{ .jump = .{
+            .target = continuation,
+            .arguments = root_state_arguments[0..],
+        } } },
+        .{ .id = first_clone, .function = function_id, .parameters = first_parameters[0..], .instructions = &.{ir.InstructionId.fromIndex(1)}, .terminator = .{ .jump = .{
+            .target = continuation,
+            .arguments = &.{ first_next, first_limit_result, first_step_result, false_value },
+        } } },
+        .{ .id = second_clone, .function = function_id, .parameters = second_parameters[0..], .instructions = &.{ir.InstructionId.fromIndex(2)}, .terminator = .{ .jump = .{
+            .target = continuation,
+            .arguments = &.{ second_next, second_limit_result, second_step_result, false_value },
+        } } },
+        .{ .id = continuation, .function = function_id, .parameters = &.{ continuation_has, continuation_limit, continuation_step, continuation_next }, .terminator = .{ .return_values = &.{} } },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .parameters = &.{ control, limit, step, initial },
+        .blocks = &.{ entry, root, first_clone, second_clone, continuation },
+        .entry_block = entry,
+    }};
+    const values = [_]ir.Value{
+        .{ .id = control, .function = function_id, .type = .dynamic, .origin = .{ .parameter = 0 } },
+        .{ .id = limit, .function = function_id, .type = .dynamic, .origin = .{ .parameter = 1 } },
+        .{ .id = step, .function = function_id, .type = .dynamic, .origin = .{ .parameter = 2 } },
+        .{ .id = initial, .function = function_id, .type = .dynamic, .origin = .{ .parameter = 3 } },
+        .{ .id = root_control, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = root, .index = 0 } } },
+        .{ .id = root_limit, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = root, .index = 1 } } },
+        .{ .id = root_step, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = root, .index = 2 } } },
+        .{ .id = root_initial, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = root, .index = 3 } } },
+        .{ .id = first_control, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = first_clone, .index = 0 } } },
+        .{ .id = first_limit, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = first_clone, .index = 1 } } },
+        .{ .id = first_step, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = first_clone, .index = 2 } } },
+        .{ .id = first_initial, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = first_clone, .index = 3 } } },
+        .{ .id = second_control, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = second_clone, .index = 0 } } },
+        .{ .id = second_limit, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = second_clone, .index = 1 } } },
+        .{ .id = second_step, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = second_clone, .index = 2 } } },
+        .{ .id = second_initial, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = second_clone, .index = 3 } } },
+        .{ .id = false_value, .function = function_id, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(3), .index = 0 } } },
+        .{ .id = root_has, .function = function_id, .type = .dynamic, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(0), .index = 0 } } },
+        .{ .id = root_limit_result, .function = function_id, .type = .dynamic, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(0), .index = 1 } } },
+        .{ .id = root_step_result, .function = function_id, .type = .dynamic, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(0), .index = 2 } } },
+        .{ .id = root_next, .function = function_id, .type = .dynamic, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(0), .index = 3 } } },
+        .{ .id = first_has, .function = function_id, .type = .dynamic, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(1), .index = 0 } } },
+        .{ .id = first_limit_result, .function = function_id, .type = .dynamic, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(1), .index = 1 } } },
+        .{ .id = first_step_result, .function = function_id, .type = .dynamic, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(1), .index = 2 } } },
+        .{ .id = first_next, .function = function_id, .type = .dynamic, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(1), .index = 3 } } },
+        .{ .id = second_has, .function = function_id, .type = .dynamic, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(2), .index = 0 } } },
+        .{ .id = second_limit_result, .function = function_id, .type = .dynamic, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(2), .index = 1 } } },
+        .{ .id = second_step_result, .function = function_id, .type = .dynamic, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(2), .index = 2 } } },
+        .{ .id = second_next, .function = function_id, .type = .dynamic, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(2), .index = 3 } } },
+        .{ .id = continuation_has, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = continuation, .index = 0 } } },
+        .{ .id = continuation_limit, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = continuation, .index = 1 } } },
+        .{ .id = continuation_step, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = continuation, .index = 2 } } },
+        .{ .id = continuation_next, .function = function_id, .type = .boolean, .origin = .{ .block_parameter = .{ .block = continuation, .index = 3 } } },
+    };
+    const instructions = [_]ir.Instruction{
+        .{ .id = ir.InstructionId.fromIndex(0), .block = root, .operation = .{ .numeric_for_next = .{ .control = root_control, .limit = root_limit, .step = root_step, .initial = root_initial, .mode = .semantic_normalized } }, .results = root_results[0..], .effects = .numeric_for_next },
+        .{ .id = ir.InstructionId.fromIndex(1), .block = first_clone, .operation = .{ .numeric_for_next = .{ .control = first_control, .limit = first_limit, .step = first_step, .initial = first_initial, .mode = .semantic_normalized } }, .results = first_results[0..], .effects = .numeric_for_next },
+        .{ .id = ir.InstructionId.fromIndex(2), .block = second_clone, .operation = .{ .numeric_for_next = .{ .control = second_control, .limit = second_limit, .step = second_step, .initial = second_initial, .mode = .semantic_normalized } }, .results = second_results[0..], .effects = .numeric_for_next },
+        .{ .id = ir.InstructionId.fromIndex(3), .block = entry, .operation = .{ .constant = .{ .boolean = false } }, .results = &.{false_value}, .effects = .pure },
+    };
+    const rewrites = [_]ir.CfgEdgeRewrite{
+        .{ .id = ir.EdgeRewriteId.fromIndex(0), .source = entry, .kind = .branch_then, .from = .{ .target = root, .arguments = root_entry_arguments[0..] }, .to = .{ .target = first_clone, .arguments = root_entry_arguments[0..] }, .rule = .node_split, .node_split_group = ir.NodeSplitGroupId.fromIndex(0) },
+        .{ .id = ir.EdgeRewriteId.fromIndex(1), .source = entry, .kind = .branch_else, .from = .{ .target = root, .arguments = root_entry_arguments[0..] }, .to = .{ .target = second_clone, .arguments = root_entry_arguments[0..] }, .rule = .node_split, .node_split_group = ir.NodeSplitGroupId.fromIndex(1) },
+    };
+    const program: ir.Program = .{
+        .program_id = "same-root-iteration-sibling-groups",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+        .edge_rewrites = &rewrites,
+    };
+    var lineage_index = try CloneLineageIndex.init(std.testing.allocator, &program);
+    defer lineage_index.deinit();
+    var replay_index = try node_split.ReplayIndex.init(std.testing.allocator, &program);
+    defer replay_index.deinit();
+    var replay_cache = ReplayCache.init(std.testing.allocator, &program, &replay_index);
+    defer replay_cache.deinit();
+
+    var projection_context = try ReplayProjectionContext.init(std.testing.allocator, &program);
+    defer projection_context.deinit();
+    try std.testing.expect(try projection_context.parametersEquivalent(
+        continuation,
+        &.{ first_next, first_limit_result, first_step_result, false_value },
+        &.{ second_next, second_limit_result, second_step_result, false_value },
+    ));
+
+    try std.testing.expect(try authenticatedSameRootCloneValueMatchAlloc(
+        std.testing.allocator,
+        &program,
+        first_next,
+        second_next,
+        &lineage_index,
+        &replay_index,
+        &replay_cache,
+    ));
+
+    var tampered_rewrites = rewrites;
+    tampered_rewrites[1].to.arguments = &.{ root_control, limit, step, initial };
+    var tampered_program = program;
+    tampered_program.edge_rewrites = &tampered_rewrites;
+    var tampered_lineage = try CloneLineageIndex.init(std.testing.allocator, &tampered_program);
+    defer tampered_lineage.deinit();
+    var tampered_replay = try node_split.ReplayIndex.init(std.testing.allocator, &tampered_program);
+    defer tampered_replay.deinit();
+    var tampered_cache = ReplayCache.init(std.testing.allocator, &tampered_program, &tampered_replay);
+    defer tampered_cache.deinit();
+    try std.testing.expect(!try authenticatedSameRootCloneValueMatchAlloc(
+        std.testing.allocator,
+        &tampered_program,
+        first_next,
+        second_next,
+        &tampered_lineage,
+        &tampered_replay,
+        &tampered_cache,
+    ));
 }
 
 pub fn isIterationTransitionHeader(program: *const ir.Program, block_id: ir.BlockId) bool {
@@ -8884,4 +9450,154 @@ fn parameterizedContinuationArgumentsAreAuthenticated(
 fn containsBlock(blocks: []const ir.BlockId, target: ir.BlockId) bool {
     for (blocks) |block_id| if (block_id == target) return true;
     return false;
+}
+
+test "one-parameter clone member authenticates its live edge tuple" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const source = ir.BlockId.fromIndex(1);
+    const source_successor = ir.BlockId.fromIndex(2);
+    const incoming_source = ir.BlockId.fromIndex(3);
+    const clone = ir.BlockId.fromIndex(4);
+    const clone_successor = ir.BlockId.fromIndex(5);
+    const selector = ir.ValueId.fromIndex(0);
+    const seed = ir.ValueId.fromIndex(1);
+    const alternate = ir.ValueId.fromIndex(2);
+    const source_parameter = ir.ValueId.fromIndex(3);
+    const clone_parameter = ir.ValueId.fromIndex(4);
+    const source_result = ir.ValueId.fromIndex(5);
+    const clone_result = ir.ValueId.fromIndex(6);
+    const source_instruction = ir.InstructionId.fromIndex(0);
+    const clone_instruction = ir.InstructionId.fromIndex(1);
+    const group = ir.NodeSplitGroupId.fromIndex(0);
+    const source_parameters = [_]ir.ValueId{source_parameter};
+    const clone_parameters = [_]ir.ValueId{clone_parameter};
+    const expected = [_]ir.ValueId{seed};
+
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = selector,
+            .then_edge = .{ .target = source, .arguments = expected[0..] },
+            .else_edge = .{ .target = incoming_source },
+        } } },
+        .{ .id = source, .function = function_id, .parameters = source_parameters[0..], .instructions = &.{source_instruction}, .terminator = .{ .jump = .{ .target = source_successor } } },
+        .{ .id = source_successor, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = incoming_source, .function = function_id, .terminator = .{ .jump = .{
+            .target = clone,
+            .arguments = expected[0..],
+        } } },
+        .{ .id = clone, .function = function_id, .parameters = clone_parameters[0..], .instructions = &.{clone_instruction}, .terminator = .{ .jump = .{ .target = clone_successor } } },
+        .{ .id = clone_successor, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .parameters = &.{ selector, seed, alternate },
+        .blocks = &.{ entry, source, source_successor, incoming_source, clone, clone_successor },
+        .entry_block = entry,
+    }};
+    const values = [_]ir.Value{
+        .{ .id = selector, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = seed, .function = function_id, .type = .integer, .origin = .{ .parameter = 1 } },
+        .{ .id = alternate, .function = function_id, .type = .integer, .origin = .{ .parameter = 2 } },
+        .{ .id = source_parameter, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = source, .index = 0 } } },
+        .{ .id = clone_parameter, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = clone, .index = 0 } } },
+        .{ .id = source_result, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = source_instruction, .index = 0 } } },
+        .{ .id = clone_result, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = clone_instruction, .index = 0 } } },
+    };
+    const instructions = [_]ir.Instruction{
+        .{ .id = source_instruction, .block = source, .operation = .{ .environment_get = .{
+            .target = .{ .ambient = {} },
+            .name = "shared",
+        } }, .results = &.{source_result}, .effects = ir.EffectSummary.semantic_environment_read },
+        .{ .id = clone_instruction, .block = clone, .operation = .{ .environment_get = .{
+            .target = .{ .ambient = {} },
+            .name = "shared",
+        } }, .results = &.{clone_result}, .effects = ir.EffectSummary.semantic_environment_read },
+    };
+    const rewrites = [_]ir.CfgEdgeRewrite{
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(0),
+            .source = incoming_source,
+            .kind = .jump,
+            .from = .{ .target = source, .arguments = expected[0..] },
+            .to = .{ .target = clone, .arguments = expected[0..] },
+            .rule = .node_split,
+            .node_split_group = group,
+        },
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(1),
+            .source = clone,
+            .kind = .jump,
+            .from = .{ .target = source_successor },
+            .to = .{ .target = clone_successor },
+            .rule = .node_split,
+            .node_split_group = group,
+        },
+    };
+    var program: ir.Program = .{
+        .program_id = "one-parameter-clone-member",
+        .entry_function = function_id,
+        .functions = &.{functions[0]},
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+        .edge_rewrites = &rewrites,
+    };
+    const incoming = ir.CfgEdgeRef{ .source = incoming_source, .kind = .jump, .target = clone };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, functions[0]);
+    defer analysis.deinit();
+    var replay = try ReplayProjectionContext.initForFunction(std.testing.allocator, &program, function_id);
+    defer replay.deinit();
+    try std.testing.expect(try replay.hasAuthenticatedOneParameterContinuationForEdge(
+        &analysis,
+        incoming,
+        expected[0..],
+    ));
+
+    // A source-side successor can become unreachable after an earlier
+    // authenticated split while the live clone-side successor remains the
+    // continuation being validated.
+    var dead_source_blocks = blocks;
+    dead_source_blocks[entry.index()].terminator = .{ .jump = .{ .target = incoming_source } };
+    var dead_source_program = program;
+    dead_source_program.blocks = &dead_source_blocks;
+    var dead_source_analysis = try cfg.Analysis.init(
+        std.testing.allocator,
+        &dead_source_program,
+        functions[0],
+    );
+    defer dead_source_analysis.deinit();
+    try std.testing.expect(!dead_source_analysis.isReachable(source_successor));
+    var dead_source_replay = try ReplayProjectionContext.initForFunction(
+        std.testing.allocator,
+        &dead_source_program,
+        function_id,
+    );
+    defer dead_source_replay.deinit();
+    try std.testing.expect(try dead_source_replay.hasAuthenticatedOneParameterContinuationForEdge(
+        &dead_source_analysis,
+        incoming,
+        expected[0..],
+    ));
+
+    var tampered_blocks = blocks;
+    tampered_blocks[incoming_source.index()].terminator = .{ .jump = .{
+        .target = clone,
+        .arguments = &.{alternate},
+    } };
+    var tampered_program = program;
+    tampered_program.blocks = &tampered_blocks;
+    var tampered_analysis = try cfg.Analysis.init(std.testing.allocator, &tampered_program, functions[0]);
+    defer tampered_analysis.deinit();
+    var tampered_replay = try ReplayProjectionContext.initForFunction(
+        std.testing.allocator,
+        &tampered_program,
+        function_id,
+    );
+    defer tampered_replay.deinit();
+    try std.testing.expect(!try tampered_replay.hasAuthenticatedOneParameterContinuationForEdge(
+        &tampered_analysis,
+        incoming,
+        expected[0..],
+    ));
 }
