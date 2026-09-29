@@ -6707,6 +6707,21 @@ fn cloneLineageArgumentsMatchReplayCached(
     return true;
 }
 
+/// A structured continuation may be reused only when the edge that enters it
+/// is an authenticated node-split bridge.  Equal raw arguments are not enough:
+/// nested splits must replay their complete value/pack lineage, and the
+/// continuation's external uses must be remappable for that same edge.
+pub fn hasAuthenticatedContinuationBridgeForEdgeAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    reference: ir.CfgEdgeRef,
+) std.mem.Allocator.Error!bool {
+    var context = try ReplayProjectionContext.initForFunction(allocator, program, analysis.function.id);
+    defer context.deinit();
+    return context.hasAuthenticatedContinuationBridgeForEdge(analysis, reference);
+}
+
 /// Authenticate a split entry whose clone body was extended after the split.
 /// This is intentionally weaker than ordinary clone replay: it proves only
 /// the live rewrite, its stable incoming tuple, canonical parameter types,
@@ -14808,6 +14823,201 @@ test "effectful tuple prefix reuses an authenticated parameterized suffix" {
     ));
 }
 
+test "parameterized continuation requires authenticated producer context" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const incoming_source = ir.BlockId.fromIndex(1);
+    const producer = ir.BlockId.fromIndex(2);
+    const producer_clone = ir.BlockId.fromIndex(3);
+    const closure = ir.BlockId.fromIndex(4);
+    const bridge = ir.BlockId.fromIndex(5);
+    const stop = ir.BlockId.fromIndex(6);
+    const selector = ir.ValueId.fromIndex(0);
+    const seed = ir.ValueId.fromIndex(1);
+    const producer_value = ir.ValueId.fromIndex(2);
+    const clone_value = ir.ValueId.fromIndex(3);
+    const closure_value = ir.ValueId.fromIndex(4);
+    var blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = selector,
+            .then_edge = .{ .target = incoming_source },
+            .else_edge = .{ .target = producer },
+        } } },
+        .{ .id = incoming_source, .function = function_id, .terminator = .{ .branch = .{
+            .condition = selector,
+            .then_edge = .{ .target = closure },
+            .else_edge = .{ .target = producer_clone, .arguments = &.{seed} },
+        } } },
+        .{ .id = producer, .function = function_id, .parameters = &.{producer_value}, .terminator = .{ .jump = .{
+            .target = closure,
+            .arguments = &.{producer_value},
+        } } },
+        .{ .id = producer_clone, .function = function_id, .parameters = &.{clone_value}, .terminator = .{ .jump = .{
+            .target = closure,
+            .arguments = &.{clone_value},
+        } } },
+        .{ .id = closure, .function = function_id, .parameters = &.{closure_value}, .terminator = .{ .jump = .{
+            .target = bridge,
+            .arguments = &.{producer_value},
+        } } },
+        .{ .id = bridge, .function = function_id, .terminator = .{ .jump = .{
+            .target = producer_clone,
+            .arguments = &.{producer_value},
+        } } },
+        .{ .id = stop, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .parameters = &.{ selector, seed },
+        .blocks = &.{ entry, incoming_source, producer, producer_clone, closure, bridge, stop },
+        .entry_block = entry,
+    }};
+    const values = [_]ir.Value{
+        .{ .id = selector, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = seed, .function = function_id, .type = .integer, .origin = .{ .parameter = 1 } },
+        .{ .id = producer_value, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = producer, .index = 0 } } },
+        .{ .id = clone_value, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = producer_clone, .index = 0 } } },
+        .{ .id = closure_value, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = closure, .index = 0 } } },
+    };
+    const incoming = [_]ir.CfgEdgeRef{.{
+        .source = producer_clone,
+        .kind = .jump,
+        .target = closure,
+    }};
+    var program: ir.Program = .{
+        .program_id = "parameterized-continuation-authentication",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, functions[0]);
+    defer analysis.deinit();
+
+    try std.testing.expect(!try parameterizedContinuationBridge(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        closure,
+        0,
+        producer_clone,
+        stop,
+        &.{closure},
+        &.{},
+        &incoming,
+        null,
+        null,
+        null,
+    ));
+
+    const initial = try std.testing.allocator.dupe(ir.BlockId, &.{closure});
+    const unauthenticated = try extendContinuationClosureAlloc(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        stop,
+        initial,
+        &incoming,
+    );
+    defer std.testing.allocator.free(unauthenticated);
+    try std.testing.expectEqualSlices(ir.BlockId, &.{ closure, bridge }, unauthenticated);
+
+    const rewrite = [_]ir.CfgEdgeRewrite{.{
+        .id = ir.EdgeRewriteId.fromIndex(0),
+        .source = incoming_source,
+        .kind = .branch_else,
+        .from = .{ .target = producer, .arguments = &.{seed} },
+        .to = .{ .target = producer_clone, .arguments = &.{seed} },
+        .rule = .node_split,
+        .node_split_group = ir.NodeSplitGroupId.fromIndex(0),
+    }};
+    program.edge_rewrites = &rewrite;
+    const bridge_edge = ir.CfgEdgeRef{
+        .source = incoming_source,
+        .kind = .branch_else,
+        .target = producer_clone,
+    };
+    try std.testing.expect(try hasAuthenticatedContinuationBridgeForEdgeAlloc(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        bridge_edge,
+    ));
+    const composed_edge = ir.CfgEdgeRef{
+        .source = producer_clone,
+        .kind = .jump,
+        .target = closure,
+    };
+    try std.testing.expect(try hasAuthenticatedContinuationBridgeForEdgeAlloc(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        composed_edge,
+    ));
+    const original_clone_terminator = blocks[producer_clone.index()].terminator;
+    blocks[producer_clone.index()].terminator = .{ .jump = .{
+        .target = closure,
+        .arguments = &.{producer_value},
+    } };
+    try std.testing.expect(!try hasAuthenticatedContinuationBridgeForEdgeAlloc(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        composed_edge,
+    ));
+    blocks[producer_clone.index()].terminator = original_clone_terminator;
+    const mutated_rewrite = [_]ir.CfgEdgeRewrite{.{
+        .id = rewrite[0].id,
+        .source = rewrite[0].source,
+        .kind = rewrite[0].kind,
+        .from = rewrite[0].from,
+        .to = .{ .target = producer_clone, .arguments = &.{selector} },
+        .rule = rewrite[0].rule,
+        .node_split_group = rewrite[0].node_split_group,
+    }};
+    program.edge_rewrites = &mutated_rewrite;
+    try std.testing.expect(!try hasAuthenticatedContinuationBridgeForEdgeAlloc(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        bridge_edge,
+    ));
+    program.edge_rewrites = &rewrite;
+    var lineage_index = try CloneLineageIndex.init(std.testing.allocator, &program);
+    defer lineage_index.deinit();
+    var replay_index = try node_split.ReplayIndex.init(std.testing.allocator, &program);
+    defer replay_index.deinit();
+    var replay_cache = ReplayCache.init(std.testing.allocator, &program, &replay_index);
+    defer replay_cache.deinit();
+    try std.testing.expect(try parameterizedContinuationBridge(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        closure,
+        0,
+        producer_clone,
+        stop,
+        &.{closure},
+        &.{bridge},
+        &incoming,
+        &lineage_index,
+        &replay_index,
+        &replay_cache,
+    ));
+    const authenticated_initial = try std.testing.allocator.dupe(ir.BlockId, &.{closure});
+    const authenticated = try extendContinuationClosureAlloc(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        stop,
+        authenticated_initial,
+        &incoming,
+    );
+    defer std.testing.allocator.free(authenticated);
+    try std.testing.expectEqualSlices(ir.BlockId, &.{ closure, bridge }, authenticated);
+}
+
 test "authenticated numeric continuation projection requires a complete transition tuple" {
     const function_id = ir.FunctionId.fromIndex(0);
     const entry = ir.BlockId.fromIndex(0);
@@ -15749,6 +15959,303 @@ test "authenticated pack continuation follows transparent forwarding provenance"
     );
 }
 
+test "parameterized clone can reach a shared zero-argument open-pack continuation" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const source = ir.BlockId.fromIndex(1);
+    const clone = ir.BlockId.fromIndex(2);
+    const continuation = ir.BlockId.fromIndex(3);
+    const producer = ir.BlockId.fromIndex(4);
+    const consumer = ir.BlockId.fromIndex(5);
+    const stop = ir.BlockId.fromIndex(6);
+    const selector = ir.ValueId.fromIndex(0);
+    const seed = ir.ValueId.fromIndex(1);
+    const callee = ir.ValueId.fromIndex(2);
+    const source_value = ir.ValueId.fromIndex(3);
+    const clone_value = ir.ValueId.fromIndex(4);
+    const source_call = ir.InstructionId.fromIndex(0);
+    const consumer_call = ir.InstructionId.fromIndex(1);
+    const source_pack = ir.ValuePackId.fromIndex(0);
+
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = selector,
+            .then_edge = .{ .target = source, .arguments = &.{seed} },
+            .else_edge = .{ .target = clone, .arguments = &.{seed} },
+        } } },
+        .{ .id = source, .function = function_id, .parameters = &.{source_value}, .terminator = .{ .jump = .{ .target = continuation } } },
+        .{ .id = clone, .function = function_id, .parameters = &.{clone_value}, .terminator = .{ .jump = .{ .target = continuation } } },
+        .{ .id = continuation, .function = function_id, .terminator = .{ .jump = .{ .target = producer } } },
+        .{ .id = producer, .function = function_id, .instructions = &.{source_call}, .terminator = .{ .jump = .{ .target = consumer } } },
+        .{ .id = consumer, .function = function_id, .instructions = &.{consumer_call}, .terminator = .{ .jump = .{ .target = stop } } },
+        .{ .id = stop, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .parameters = &.{ selector, seed, callee },
+        .blocks = &.{ entry, source, clone, continuation, producer, consumer, stop },
+        .entry_block = entry,
+    }};
+    const values = [_]ir.Value{
+        .{ .id = selector, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = seed, .function = function_id, .type = .integer, .origin = .{ .parameter = 1 } },
+        .{ .id = callee, .function = function_id, .type = .dynamic, .origin = .{ .parameter = 2 } },
+        .{ .id = source_value, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = source, .index = 0 } } },
+        .{ .id = clone_value, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = clone, .index = 0 } } },
+    };
+    const instructions = [_]ir.Instruction{
+        .{
+            .id = source_call,
+            .block = producer,
+            .operation = .{ .call = .{ .callee = callee, .arguments = &.{}, .result_arity = .{ .variadic = {} } } },
+            .results = &.{},
+            .pack_result = source_pack,
+            .effects = ir.EffectSummary.dynamic_call,
+        },
+        .{
+            .id = consumer_call,
+            .block = consumer,
+            .operation = .{ .call = .{ .callee = callee, .arguments = &.{}, .argument_pack = source_pack, .result_arity = .{ .fixed = 0 } } },
+            .results = &.{},
+            .effects = ir.EffectSummary.dynamic_call,
+        },
+    };
+    const packs = [_]ir.ValuePack{.{
+        .id = source_pack,
+        .function = function_id,
+        .origin = .{ .instruction_result = source_call },
+    }};
+    const rewrites = [_]ir.CfgEdgeRewrite{.{
+        .id = ir.EdgeRewriteId.fromIndex(0),
+        .source = entry,
+        .kind = .branch_else,
+        .from = .{ .target = source, .arguments = &.{seed} },
+        .to = .{ .target = clone, .arguments = &.{seed} },
+        .rule = .node_split,
+        .node_split_group = ir.NodeSplitGroupId.fromIndex(0),
+    }};
+    var program: ir.Program = .{
+        .program_id = "parameterized-zero-argument-open-pack-continuation",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+        .value_packs = &packs,
+        .edge_rewrites = &rewrites,
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, functions[0]);
+    defer analysis.deinit();
+
+    const clone_edge: ir.CfgEdgeRef = .{ .source = entry, .kind = .branch_else, .target = clone };
+    try std.testing.expect(try hasAuthenticatedContinuationBridgeForEdgeAlloc(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        clone_edge,
+    ));
+
+    const incoming = [_]ir.CfgEdgeRef{.{ .source = clone, .kind = .jump, .target = continuation }};
+    const initial = try std.testing.allocator.dupe(ir.BlockId, &.{continuation});
+    const extended = try extendContinuationClosureAlloc(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        continuation,
+        initial,
+        &incoming,
+    );
+    defer std.testing.allocator.free(extended);
+    try std.testing.expectEqualSlices(ir.BlockId, &.{continuation}, extended);
+}
+
+test "four-parameter clone preserves an unchanged shared continuation bridge" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const source = ir.BlockId.fromIndex(1);
+    const clone = ir.BlockId.fromIndex(2);
+    const continuation = ir.BlockId.fromIndex(3);
+    const stop = ir.BlockId.fromIndex(4);
+
+    const selector = ir.ValueId.fromIndex(0);
+    const input_first = ir.ValueId.fromIndex(1);
+    const input_second = ir.ValueId.fromIndex(2);
+    const input_third = ir.ValueId.fromIndex(3);
+    const input_fourth = ir.ValueId.fromIndex(4);
+    const source_first = ir.ValueId.fromIndex(5);
+    const source_second = ir.ValueId.fromIndex(6);
+    const source_third = ir.ValueId.fromIndex(7);
+    const source_fourth = ir.ValueId.fromIndex(8);
+    const clone_first = ir.ValueId.fromIndex(9);
+    const clone_second = ir.ValueId.fromIndex(10);
+    const clone_third = ir.ValueId.fromIndex(11);
+    const clone_fourth = ir.ValueId.fromIndex(12);
+    const continuation_first = ir.ValueId.fromIndex(13);
+    const continuation_second = ir.ValueId.fromIndex(14);
+    const continuation_third = ir.ValueId.fromIndex(15);
+    const continuation_fourth = ir.ValueId.fromIndex(16);
+
+    const input_tuple = [_]ir.ValueId{ input_first, input_second, input_third, input_fourth };
+    const source_tuple = [_]ir.ValueId{ source_first, source_second, source_third, source_fourth };
+    const clone_tuple = [_]ir.ValueId{ clone_first, clone_second, clone_third, clone_fourth };
+    const continuation_tuple = [_]ir.ValueId{
+        continuation_first,
+        continuation_second,
+        continuation_third,
+        continuation_fourth,
+    };
+
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = selector,
+            .then_edge = .{ .target = clone, .arguments = input_tuple[0..] },
+            .else_edge = .{ .target = stop },
+        } } },
+        .{ .id = source, .function = function_id, .parameters = source_tuple[0..], .terminator = .{ .branch = .{
+            .condition = source_first,
+            .then_edge = .{ .target = continuation, .arguments = source_tuple[0..] },
+            .else_edge = .{ .target = stop },
+        } } },
+        .{ .id = clone, .function = function_id, .parameters = clone_tuple[0..], .terminator = .{ .branch = .{
+            .condition = clone_first,
+            .then_edge = .{ .target = continuation, .arguments = clone_tuple[0..] },
+            .else_edge = .{ .target = stop },
+        } } },
+        .{ .id = continuation, .function = function_id, .parameters = continuation_tuple[0..], .terminator = .{ .jump = .{
+            .target = stop,
+        } } },
+        .{ .id = stop, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const function_parameters = [_]ir.ValueId{
+        selector,
+        input_first,
+        input_second,
+        input_third,
+        input_fourth,
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .parameters = function_parameters[0..],
+        .blocks = &.{ entry, source, clone, continuation, stop },
+        .entry_block = entry,
+    }};
+    const values = [_]ir.Value{
+        .{ .id = selector, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = input_first, .function = function_id, .type = .dynamic, .origin = .{ .parameter = 1 } },
+        .{ .id = input_second, .function = function_id, .type = .dynamic, .origin = .{ .parameter = 2 } },
+        .{ .id = input_third, .function = function_id, .type = .dynamic, .origin = .{ .parameter = 3 } },
+        .{ .id = input_fourth, .function = function_id, .type = .dynamic, .origin = .{ .parameter = 4 } },
+        .{ .id = source_first, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = source, .index = 0 } } },
+        .{ .id = source_second, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = source, .index = 1 } } },
+        .{ .id = source_third, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = source, .index = 2 } } },
+        .{ .id = source_fourth, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = source, .index = 3 } } },
+        .{ .id = clone_first, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = clone, .index = 0 } } },
+        .{ .id = clone_second, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = clone, .index = 1 } } },
+        .{ .id = clone_third, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = clone, .index = 2 } } },
+        .{ .id = clone_fourth, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = clone, .index = 3 } } },
+        .{ .id = continuation_first, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = continuation, .index = 0 } } },
+        .{ .id = continuation_second, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = continuation, .index = 1 } } },
+        .{ .id = continuation_third, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = continuation, .index = 2 } } },
+        .{ .id = continuation_fourth, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = continuation, .index = 3 } } },
+    };
+    const rewrites = [_]ir.CfgEdgeRewrite{.{
+        .id = ir.EdgeRewriteId.fromIndex(0),
+        .source = entry,
+        .kind = .branch_then,
+        .from = .{ .target = source, .arguments = input_tuple[0..] },
+        .to = .{ .target = clone, .arguments = input_tuple[0..] },
+        .rule = .node_split,
+        .node_split_group = ir.NodeSplitGroupId.fromIndex(0),
+    }};
+    const program = ir.Program{
+        .program_id = "four-parameter-unchanged-shared-continuation",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+        .edge_rewrites = &rewrites,
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, functions[0]);
+    defer analysis.deinit();
+
+    const shared_edge = ir.CfgEdgeRef{
+        .source = clone,
+        .kind = .branch_then,
+        .target = continuation,
+    };
+    try std.testing.expect(try hasAuthenticatedContinuationBridgeForEdgeAlloc(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        shared_edge,
+    ));
+
+    var handoff_context = try ReplayProjectionContext.initForFunction(
+        std.testing.allocator,
+        &program,
+        function_id,
+    );
+    defer handoff_context.deinit();
+    const owner_edge = ir.CfgEdgeRef{
+        .source = source,
+        .kind = .branch_then,
+        .target = continuation,
+    };
+    try std.testing.expect(try handoff_context.hasAuthenticatedParameterizedCloneHandoffForEdge(
+        &analysis,
+        owner_edge,
+        shared_edge,
+    ));
+
+    var tampered_blocks = blocks;
+    var tampered_clone_tuple = clone_tuple;
+    tampered_clone_tuple[0] = input_first;
+    tampered_blocks[clone.index()].terminator = .{ .branch = .{
+        .condition = clone_first,
+        .then_edge = .{ .target = continuation, .arguments = tampered_clone_tuple[0..] },
+        .else_edge = .{ .target = stop },
+    } };
+    var tampered_program = program;
+    tampered_program.blocks = &tampered_blocks;
+    var tampered_analysis = try cfg.Analysis.init(std.testing.allocator, &tampered_program, functions[0]);
+    defer tampered_analysis.deinit();
+    try std.testing.expect(!try hasAuthenticatedContinuationBridgeForEdgeAlloc(
+        std.testing.allocator,
+        &tampered_program,
+        &tampered_analysis,
+        shared_edge,
+    ));
+    var tampered_handoff_context = try ReplayProjectionContext.initForFunction(
+        std.testing.allocator,
+        &tampered_program,
+        function_id,
+    );
+    defer tampered_handoff_context.deinit();
+    try std.testing.expect(!try tampered_handoff_context.hasAuthenticatedParameterizedCloneHandoffForEdge(
+        &tampered_analysis,
+        owner_edge,
+        shared_edge,
+    ));
+
+    var tampered_rewrites = rewrites;
+    tampered_rewrites[0].to.arguments = &.{ input_first, input_second, input_third, selector };
+    var tampered_rewrite_program = program;
+    tampered_rewrite_program.edge_rewrites = &tampered_rewrites;
+    var tampered_rewrite_analysis = try cfg.Analysis.init(
+        std.testing.allocator,
+        &tampered_rewrite_program,
+        functions[0],
+    );
+    defer tampered_rewrite_analysis.deinit();
+    try std.testing.expect(!try hasAuthenticatedContinuationBridgeForEdgeAlloc(
+        std.testing.allocator,
+        &tampered_rewrite_program,
+        &tampered_rewrite_analysis,
+        shared_edge,
+    ));
+}
+
 test "multi-result carrier maps through every authenticated clone step" {
     const function_id = ir.FunctionId.fromIndex(0);
     const entry = ir.BlockId.fromIndex(0);
@@ -16220,6 +16727,62 @@ fn findConditionalLoopEntrySplitAlloc(
     return null;
 }
 
+fn findInteriorLoopEntrySplitAlloc(
+    allocator: std.mem.Allocator,
+    analysis: *const cfg.Analysis,
+    function_index: usize,
+) std.mem.Allocator.Error!?Split {
+    for (analysis.function.blocks) |header| {
+        var membership = natural_loop.collect(allocator, analysis, header) catch |err| switch (err) {
+            error.UnsupportedShape => continue,
+            error.OutOfMemory => return error.OutOfMemory,
+        } orelse continue;
+        defer membership.deinit();
+
+        const entry_count = countInteriorLoopEntries(analysis, header, membership.bits);
+        if (entry_count == 0 or countExternalLoopEntries(analysis, header, membership.bits) == 0) continue;
+        const selected = selectInteriorLoopEntry(analysis, header, membership.bits) orelse continue;
+        var owned_closure = try collectConditionalLoopClosureAlloc(allocator, analysis, membership.bits);
+        errdefer allocator.free(owned_closure);
+        const incoming = [_]ir.CfgEdgeRef{selected};
+        const has_external_use = try hasReachableExternalClosureUseAlloc(
+            allocator,
+            analysis.program,
+            analysis,
+            owned_closure,
+        );
+        var prepared = prepareClosure(allocator, analysis.program, analysis, owned_closure, &incoming);
+        if (!prepared or has_external_use) {
+            owned_closure = try extendClosureForExternalUsesAlloc(
+                allocator,
+                analysis.program,
+                analysis,
+                header,
+                owned_closure,
+                &incoming,
+            );
+            prepared = prepareClosure(allocator, analysis.program, analysis, owned_closure, &incoming);
+        }
+        if (!prepared) {
+            allocator.free(owned_closure);
+            continue;
+        }
+        const owned_incoming = try allocator.dupe(ir.CfgEdgeRef, &incoming);
+        return .{
+            .allocator = allocator,
+            .function_index = function_index,
+            .branch = selected.source,
+            .entry = selected.target,
+            .join = header,
+            .incoming = owned_incoming,
+            .closure = owned_closure,
+            .entry_measure = entry_count,
+            .entry_measure_kind = .interior,
+        };
+    }
+    return null;
+}
+
 fn collectConditionalLoopClosureAlloc(
     allocator: std.mem.Allocator,
     analysis: *const cfg.Analysis,
@@ -16354,6 +16917,36 @@ fn countInteriorLoopEntries(
         }
     }
     return count;
+}
+
+fn selectInteriorLoopEntry(
+    analysis: *const cfg.Analysis,
+    header: ir.BlockId,
+    membership: []const bool,
+) ?ir.CfgEdgeRef {
+    var selected: ?ir.CfgEdgeRef = null;
+    for (analysis.function.blocks, 0..) |source, source_index| {
+        if (!analysis.isReachable(source) or membership[source_index]) continue;
+        const terminator = analysis.program.blocks[source.index()].terminator;
+        switch (terminator) {
+            .jump => |edge| if (isInteriorLoopTarget(analysis, header, membership, edge.target)) {
+                const reference: ir.CfgEdgeRef = .{ .source = source, .kind = .jump, .target = edge.target };
+                if (selected == null or edgeRefLessThan(reference, selected.?)) selected = reference;
+            },
+            .branch => |branch| {
+                if (isInteriorLoopTarget(analysis, header, membership, branch.then_edge.target)) {
+                    const reference: ir.CfgEdgeRef = .{ .source = source, .kind = .branch_then, .target = branch.then_edge.target };
+                    if (selected == null or edgeRefLessThan(reference, selected.?)) selected = reference;
+                }
+                if (isInteriorLoopTarget(analysis, header, membership, branch.else_edge.target)) {
+                    const reference: ir.CfgEdgeRef = .{ .source = source, .kind = .branch_else, .target = branch.else_edge.target };
+                    if (selected == null or edgeRefLessThan(reference, selected.?)) selected = reference;
+                }
+            },
+            else => {},
+        }
+    }
+    return selected;
 }
 
 fn isInteriorLoopTarget(
@@ -18562,6 +19155,18 @@ fn blockUsesSharedSuffixContext(
     }
     runtime_uses.visitTerminatorUses(block.terminator, &detector);
     return detector.found;
+}
+
+fn hasExternalPredecessor(
+    analysis: *const cfg.Analysis,
+    closure: []const ir.BlockId,
+    block: ir.BlockId,
+) bool {
+    for (0..analysis.predecessorCount(block)) |predecessor_index| {
+        const predecessor = analysis.predecessorAt(block, predecessor_index) orelse return false;
+        if (!containsBlock(closure, predecessor) and analysis.isReachable(predecessor)) return true;
+    }
+    return false;
 }
 
 fn isSharedSuffixBoundary(
