@@ -9014,6 +9014,28 @@ fn closureLocalUsesHaveProjectedBoundary(
     return true;
 }
 
+fn hasAuthenticatedCloneArmIntoClosure(
+    program: *const ir.Program,
+    replay_index: *const node_split.ReplayIndex,
+    source: ir.BlockId,
+    membership: []const ir.BlockId,
+) bool {
+    for (replay_index.nodeSplitRewriteIndices()) |rewrite_index| {
+        const rewrite = program.edge_rewrites[rewrite_index];
+        if (rewrite.node_split_group == null or rewrite.from.target != source or
+            !containsBlock(membership, rewrite.source) or
+            !containsBlock(membership, rewrite.to.target) or
+            !replay_index.isAuthenticatedCloneBlock(program, rewrite.source) or
+            !replay_index.isAuthenticatedCloneBlock(program, rewrite.to.target)) continue;
+        if (rewrite.source.index() >= program.blocks.len or
+            rewrite.to.target.index() >= program.blocks.len or
+            !node_split.parametersAreCanonical(program.values, program.blocks[rewrite.source.index()]) or
+            !node_split.parametersAreCanonical(program.values, program.blocks[rewrite.to.target.index()])) continue;
+        return true;
+    }
+    return false;
+}
+
 // A node-split group can contain a pure carrier path that is not selected by
 // the ordinary delayed-use walk.  If that path rejoins a closure-local value
 // consumer, leaving it outside the clone would make the original consumer
@@ -11722,6 +11744,36 @@ fn boundaryCloneSplitAlloc(
     };
 }
 
+pub fn findCollisionSplitAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    function_index: usize,
+    block: ir.BlockId,
+    incoming: []const ir.CfgEdgeRef,
+) std.mem.Allocator.Error!?Split {
+    if (function_index >= program.functions.len or incoming.len == 0) return null;
+    var analysis = cfg.Analysis.init(allocator, program, program.functions[function_index]) catch |err| switch (err) {
+        error.InvalidCfg => return null,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    defer analysis.deinit();
+    var replay_context = try ReplayProjectionContext.initForFunction(
+        allocator,
+        program,
+        program.functions[function_index].id,
+    );
+    defer replay_context.deinit();
+    return findCollisionSplitAllocWithAnalysisAndReplayContext(
+        allocator,
+        program,
+        &analysis,
+        function_index,
+        block,
+        incoming,
+        &replay_context,
+    );
+}
+
 pub fn findCollisionSplitAllocWithAnalysisAndReplayContext(
     allocator: std.mem.Allocator,
     program: *const ir.Program,
@@ -12192,6 +12244,355 @@ test "branching internal SCC boundary clones only its authenticated block" {
     try std.testing.expectEqualSlices(ir.BlockId, &.{target}, split.closure);
 }
 
+test "parameterized branching loop boundary clones its authenticated entry block" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const source = ir.BlockId.fromIndex(1);
+    const target = ir.BlockId.fromIndex(2);
+    const body = ir.BlockId.fromIndex(3);
+    const exit = ir.BlockId.fromIndex(4);
+    const selector = ir.ValueId.fromIndex(0);
+    const seed = ir.ValueId.fromIndex(1);
+    const target_parameter = ir.ValueId.fromIndex(2);
+    const observed = ir.ValueId.fromIndex(3);
+    const read = ir.InstructionId.fromIndex(0);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .jump = .{ .target = source } } },
+        .{ .id = source, .function = function_id, .terminator = .{ .jump = .{
+            .target = target,
+            .arguments = &.{seed},
+        } } },
+        .{ .id = target, .function = function_id, .parameters = &.{target_parameter}, .instructions = &.{read}, .terminator = .{ .branch = .{
+            .condition = observed,
+            .then_edge = .{ .target = body },
+            .else_edge = .{ .target = exit },
+        } } },
+        .{ .id = body, .function = function_id, .terminator = .{ .jump = .{ .target = source } } },
+        .{ .id = exit, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &.{ selector, seed },
+        .blocks = &.{ entry, source, target, body, exit },
+        .entry_block = entry,
+    };
+    const values = [_]ir.Value{
+        .{ .id = selector, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = seed, .function = function_id, .type = .integer, .origin = .{ .parameter = 1 } },
+        .{ .id = target_parameter, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = target, .index = 0 } } },
+        .{ .id = observed, .function = function_id, .type = .dynamic, .origin = .{ .instruction_result = .{ .instruction = read, .index = 0 } } },
+    };
+    const instructions = [_]ir.Instruction{.{
+        .id = read,
+        .block = target,
+        .operation = .{ .environment_get = .{ .target = .{ .ambient = {} }, .name = "shared" } },
+        .results = &.{observed},
+        .effects = ir.EffectSummary.semantic_environment_read,
+    }};
+    const program = ir.Program{
+        .program_id = "parameterized-branching-loop-boundary",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, function);
+    defer analysis.deinit();
+    var replay = try ReplayProjectionContext.initForFunction(
+        std.testing.allocator,
+        &program,
+        function_id,
+    );
+    defer replay.deinit();
+    const incoming = [_]ir.CfgEdgeRef{.{
+        .source = source,
+        .kind = .jump,
+        .target = target,
+    }};
+
+    var split = (try findCollisionSplitAllocWithAnalysisAndReplayContext(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        0,
+        target,
+        &incoming,
+        &replay,
+    )) orelse return error.TestUnexpectedResult;
+    defer split.deinit();
+    try std.testing.expectEqual(target, split.entry);
+    try std.testing.expectEqual(target, split.join);
+    try std.testing.expectEqualSlices(ir.BlockId, &.{target}, split.closure);
+}
+
+test "jumping internal SCC boundary clones only its authenticated block" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const source = ir.BlockId.fromIndex(1);
+    const target = ir.BlockId.fromIndex(2);
+    const body = ir.BlockId.fromIndex(3);
+    const exit = ir.BlockId.fromIndex(4);
+    const observed = ir.ValueId.fromIndex(0);
+    const read = ir.InstructionId.fromIndex(0);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .jump = .{ .target = source } } },
+        .{ .id = source, .function = function_id, .terminator = .{ .jump = .{ .target = target } } },
+        .{ .id = target, .function = function_id, .instructions = &.{read}, .terminator = .{ .jump = .{ .target = body } } },
+        .{ .id = body, .function = function_id, .terminator = .{ .jump = .{ .target = source } } },
+        .{ .id = exit, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .blocks = &.{ entry, source, target, body, exit },
+        .entry_block = entry,
+    };
+    const values = [_]ir.Value{.{
+        .id = observed,
+        .function = function_id,
+        .type = .dynamic,
+        .origin = .{ .instruction_result = .{ .instruction = read, .index = 0 } },
+    }};
+    const instructions = [_]ir.Instruction{.{
+        .id = read,
+        .block = target,
+        .operation = .{ .environment_get = .{ .target = .{ .ambient = {} }, .name = "shared" } },
+        .results = &.{observed},
+        .effects = ir.EffectSummary.semantic_environment_read,
+    }};
+    const program = ir.Program{
+        .program_id = "jumping-internal-scc-boundary",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, function);
+    defer analysis.deinit();
+    var replay = try ReplayProjectionContext.initForFunction(
+        std.testing.allocator,
+        &program,
+        function_id,
+    );
+    defer replay.deinit();
+    const incoming = [_]ir.CfgEdgeRef{.{
+        .source = source,
+        .kind = .jump,
+        .target = target,
+    }};
+
+    var split = (try findCollisionSplitAllocWithAnalysisAndReplayContext(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        0,
+        target,
+        &incoming,
+        &replay,
+    )) orelse return error.TestUnexpectedResult;
+    defer split.deinit();
+    try std.testing.expectEqual(target, split.entry);
+    try std.testing.expectEqual(target, split.join);
+    try std.testing.expectEqualSlices(ir.BlockId, &.{target}, split.closure);
+}
+
+test "internal loop collision clones a bounded effectful suffix" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const header = ir.BlockId.fromIndex(1);
+    const source = ir.BlockId.fromIndex(2);
+    const target = ir.BlockId.fromIndex(3);
+    const suffix = ir.BlockId.fromIndex(4);
+    const exit = ir.BlockId.fromIndex(5);
+
+    const control = ir.ValueId.fromIndex(0);
+    const limit = ir.ValueId.fromIndex(1);
+    const step = ir.ValueId.fromIndex(2);
+    const header_control = ir.ValueId.fromIndex(3);
+    const header_limit = ir.ValueId.fromIndex(4);
+    const header_step = ir.ValueId.fromIndex(5);
+    const header_initial = ir.ValueId.fromIndex(6);
+    const false_value = ir.ValueId.fromIndex(7);
+    const has_next = ir.ValueId.fromIndex(8);
+    const normalized_limit = ir.ValueId.fromIndex(9);
+    const normalized_step = ir.ValueId.fromIndex(10);
+    const next_control = ir.ValueId.fromIndex(11);
+    const target_value = ir.ValueId.fromIndex(12);
+    const suffix_value = ir.ValueId.fromIndex(13);
+    const false_instruction = ir.InstructionId.fromIndex(0);
+    const transition_instruction = ir.InstructionId.fromIndex(1);
+    const target_value_instruction = ir.InstructionId.fromIndex(2);
+    const target_write = ir.InstructionId.fromIndex(3);
+    const suffix_read = ir.InstructionId.fromIndex(4);
+    const suffix_write = ir.InstructionId.fromIndex(5);
+    const target_place = ir.PlaceId.fromIndex(0);
+    const output_place = ir.PlaceId.fromIndex(1);
+
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .instructions = &.{false_instruction}, .terminator = .{ .jump = .{
+            .target = header,
+            .arguments = &.{ control, limit, step, false_value },
+        } } },
+        .{ .id = header, .function = function_id, .parameters = &.{
+            header_control, header_limit, header_step, header_initial,
+        }, .instructions = &.{transition_instruction}, .terminator = .{ .branch = .{
+            .condition = has_next,
+            .then_edge = .{ .target = source },
+            .else_edge = .{ .target = exit },
+        } } },
+        .{ .id = source, .function = function_id, .terminator = .{ .jump = .{ .target = target } } },
+        .{ .id = target, .function = function_id, .instructions = &.{ target_value_instruction, target_write }, .terminator = .{ .jump = .{ .target = suffix } } },
+        .{ .id = suffix, .function = function_id, .instructions = &.{ suffix_read, suffix_write }, .terminator = .{ .jump = .{
+            .target = header,
+            .arguments = &.{ next_control, normalized_limit, normalized_step, false_value },
+        } } },
+        .{ .id = exit, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &.{ control, limit, step },
+        .local_places = &.{ target_place, output_place },
+        .blocks = &.{ entry, header, source, target, suffix, exit },
+        .entry_block = entry,
+    };
+    const values = [_]ir.Value{
+        .{ .id = control, .function = function_id, .type = .dynamic, .origin = .{ .parameter = 0 } },
+        .{ .id = limit, .function = function_id, .type = .dynamic, .origin = .{ .parameter = 1 } },
+        .{ .id = step, .function = function_id, .type = .dynamic, .origin = .{ .parameter = 2 } },
+        .{ .id = header_control, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = header, .index = 0 } } },
+        .{ .id = header_limit, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = header, .index = 1 } } },
+        .{ .id = header_step, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = header, .index = 2 } } },
+        .{ .id = header_initial, .function = function_id, .type = .boolean, .origin = .{ .block_parameter = .{ .block = header, .index = 3 } } },
+        .{ .id = false_value, .function = function_id, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = false_instruction, .index = 0 } } },
+        .{ .id = has_next, .function = function_id, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = transition_instruction, .index = 0 } } },
+        .{ .id = normalized_limit, .function = function_id, .type = .dynamic, .origin = .{ .instruction_result = .{ .instruction = transition_instruction, .index = 1 } } },
+        .{ .id = normalized_step, .function = function_id, .type = .dynamic, .origin = .{ .instruction_result = .{ .instruction = transition_instruction, .index = 2 } } },
+        .{ .id = next_control, .function = function_id, .type = .dynamic, .origin = .{ .instruction_result = .{ .instruction = transition_instruction, .index = 3 } } },
+        .{ .id = target_value, .function = function_id, .type = .dynamic, .origin = .{ .instruction_result = .{ .instruction = target_value_instruction, .index = 0 } } },
+        .{ .id = suffix_value, .function = function_id, .type = .dynamic, .origin = .{ .instruction_result = .{ .instruction = suffix_read, .index = 0 } } },
+    };
+    const instructions = [_]ir.Instruction{
+        .{ .id = false_instruction, .block = entry, .operation = .{ .constant = .{ .boolean = false } }, .results = &.{false_value}, .effects = .pure },
+        .{ .id = transition_instruction, .block = header, .operation = .{ .numeric_for_next = .{
+            .control = header_control,
+            .limit = header_limit,
+            .step = header_step,
+            .initial = header_initial,
+            .mode = .semantic_normalized,
+        } }, .results = &.{ has_next, normalized_limit, normalized_step, next_control }, .effects = .numeric_for_next },
+        .{ .id = target_value_instruction, .block = target, .operation = .{ .constant = .{ .integer = "17" } }, .results = &.{target_value}, .effects = .pure },
+        .{ .id = target_write, .block = target, .operation = .{ .place_write = .{ .place = target_place, .value = target_value } }, .results = &.{}, .effects = .place_write },
+        .{ .id = suffix_read, .block = suffix, .operation = .{ .place_read = target_place }, .results = &.{suffix_value}, .effects = .place_read },
+        .{ .id = suffix_write, .block = suffix, .operation = .{ .place_write = .{ .place = output_place, .value = target_value } }, .results = &.{}, .effects = .place_write },
+    };
+    const places = [_]ir.Place{
+        .{ .id = target_place, .function = function_id, .type = .dynamic, .origin = .{ .local = 0 } },
+        .{ .id = output_place, .function = function_id, .type = .dynamic, .origin = .{ .local = 1 } },
+    };
+    const program = ir.Program{
+        .program_id = "internal-loop-effectful-suffix",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+        .places = &places,
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, function);
+    defer analysis.deinit();
+    var replay = try ReplayProjectionContext.initForFunction(
+        std.testing.allocator,
+        &program,
+        function_id,
+    );
+    defer replay.deinit();
+    const incoming = [_]ir.CfgEdgeRef{.{
+        .source = source,
+        .kind = .jump,
+        .target = target,
+    }};
+    var split = (try findCollisionSplitAllocWithAnalysisAndReplayContext(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        0,
+        target,
+        &incoming,
+        &replay,
+    )) orelse return error.TestUnexpectedResult;
+    defer split.deinit();
+    try std.testing.expectEqual(target, split.entry);
+    try std.testing.expectEqual(target, split.join);
+    try std.testing.expectEqualSlices(ir.BlockId, &.{ target, suffix }, split.closure);
+
+    const loop_headers = try natural_loop.headerCandidatesAlloc(
+        std.testing.allocator,
+        &analysis,
+    );
+    defer std.testing.allocator.free(loop_headers);
+    try std.testing.expect(try internalLoopEffectfulSuffixCanBeCloned(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        loop_headers,
+        target,
+        &.{target},
+        &incoming,
+    ));
+
+    var cyclic_blocks = blocks;
+    cyclic_blocks[suffix.index()].terminator = .{ .jump = .{ .target = target } };
+    var cyclic_program = program;
+    cyclic_program.blocks = &cyclic_blocks;
+    var cyclic_analysis = try cfg.Analysis.init(
+        std.testing.allocator,
+        &cyclic_program,
+        function,
+    );
+    defer cyclic_analysis.deinit();
+    const cyclic_loop_headers = try natural_loop.headerCandidatesAlloc(
+        std.testing.allocator,
+        &cyclic_analysis,
+    );
+    defer std.testing.allocator.free(cyclic_loop_headers);
+    try std.testing.expect(!try internalLoopEffectfulSuffixCanBeCloned(
+        std.testing.allocator,
+        &cyclic_program,
+        &cyclic_analysis,
+        cyclic_loop_headers,
+        target,
+        &.{ target, suffix },
+        &incoming,
+    ));
+
+    var no_effect_blocks = blocks;
+    no_effect_blocks[target.index()].instructions = &.{target_value_instruction};
+    no_effect_blocks[suffix.index()].instructions = &.{};
+    var no_effect_program = program;
+    no_effect_program.blocks = &no_effect_blocks;
+    var no_effect_analysis = try cfg.Analysis.init(
+        std.testing.allocator,
+        &no_effect_program,
+        function,
+    );
+    defer no_effect_analysis.deinit();
+    const no_effect_loop_headers = try natural_loop.headerCandidatesAlloc(
+        std.testing.allocator,
+        &no_effect_analysis,
+    );
+    defer std.testing.allocator.free(no_effect_loop_headers);
+    try std.testing.expect(!try internalLoopEffectfulSuffixCanBeCloned(
+        std.testing.allocator,
+        &no_effect_program,
+        &no_effect_analysis,
+        no_effect_loop_headers,
+        target,
+        &.{ target, suffix },
+        &incoming,
+    ));
+}
+
 test "authenticated zero-parameter group SCC boundary requires complete replay ownership" {
     const function_id = ir.FunctionId.fromIndex(0);
     const entry = ir.BlockId.fromIndex(0);
@@ -12363,6 +12764,115 @@ test "contextual closure treats an incoming source as an external cycle boundary
         trimmed,
         &incoming,
     ));
+}
+
+pub fn findCollisionClosureSplitAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    function_index: usize,
+    block: ir.BlockId,
+    incoming: []const ir.CfgEdgeRef,
+    closure_source: []const ir.BlockId,
+) std.mem.Allocator.Error!?Split {
+    if (function_index >= program.functions.len or incoming.len == 0 or closure_source.len == 0) return null;
+    var analysis = cfg.Analysis.init(allocator, program, program.functions[function_index]) catch |err| switch (err) {
+        error.InvalidCfg => return null,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    defer analysis.deinit();
+    for (incoming) |reference| {
+        if (reference.target != block) return null;
+        const live = directEdgeRef(program, reference.source, block) orelse return null;
+        if (!analysis.isReachable(reference.source) or !std.meta.eql(live, reference)) return null;
+    }
+    if (!containsBlock(closure_source, block)) return null;
+    const closure = try allocator.dupe(ir.BlockId, closure_source);
+    errdefer allocator.free(closure);
+    const extended = try extendContinuationClosureAlloc(
+        allocator,
+        program,
+        &analysis,
+        block,
+        closure,
+        incoming,
+    );
+    const owned_closure = (try trimIncomingSourceClosureAlloc(
+        allocator,
+        &analysis,
+        block,
+        extended,
+        incoming,
+    )) orelse return null;
+    if (!prepareClosure(allocator, program, &analysis, owned_closure, incoming)) {
+        allocator.free(owned_closure);
+        return null;
+    }
+    const owned_incoming = try allocator.dupe(ir.CfgEdgeRef, incoming);
+    return .{
+        .allocator = allocator,
+        .function_index = function_index,
+        .branch = incoming[0].source,
+        .entry = block,
+        .join = block,
+        .incoming = owned_incoming,
+        .closure = owned_closure,
+    };
+}
+
+test "collision closure split retains the complete dominance-ordered component" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const frontier = ir.BlockId.fromIndex(1);
+    const tail = ir.BlockId.fromIndex(2);
+    const alternate = ir.BlockId.fromIndex(3);
+    const condition = ir.ValueId.fromIndex(0);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = condition,
+            .then_edge = .{ .target = frontier },
+            .else_edge = .{ .target = alternate },
+        } } },
+        .{ .id = frontier, .function = function_id, .terminator = .{ .jump = .{ .target = tail } } },
+        .{ .id = tail, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = alternate, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .parameters = &.{condition},
+        .blocks = &.{ entry, frontier, tail, alternate },
+        .entry_block = entry,
+    }};
+    const values = [_]ir.Value{.{
+        .id = condition,
+        .function = function_id,
+        .type = .boolean,
+        .origin = .{ .parameter = 0 },
+    }};
+    const program: ir.Program = .{
+        .program_id = "collision-closure-split",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+    };
+    const incoming = [_]ir.CfgEdgeRef{.{
+        .source = entry,
+        .kind = .branch_then,
+        .target = frontier,
+    }};
+
+    var split = (try findCollisionClosureSplitAlloc(
+        std.testing.allocator,
+        &program,
+        0,
+        frontier,
+        &incoming,
+        &.{ tail, frontier },
+    )).?;
+    defer split.deinit();
+    try std.testing.expectEqualSlices(ir.BlockId, &.{ frontier, tail }, split.closure);
+    try std.testing.expectEqualSlices(ir.CfgEdgeRef, &incoming, split.incoming);
 }
 
 test "continuation extension retains only the context-dependent sibling path" {
@@ -13375,6 +13885,222 @@ test "contextual boundary rejects an unprojected shared predecessor" {
         &analysis,
         &closure,
         &incoming,
+    ));
+}
+
+test "authenticated group carrier path projects a shared predecessor and ingress" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const incoming_source = ir.BlockId.fromIndex(1);
+    const target = ir.BlockId.fromIndex(2);
+    const carrier = ir.BlockId.fromIndex(3);
+    const shared_predecessor = ir.BlockId.fromIndex(4);
+    const consumer = ir.BlockId.fromIndex(5);
+    const alternate = ir.BlockId.fromIndex(6);
+    const original_target = ir.BlockId.fromIndex(7);
+    const original_carrier = ir.BlockId.fromIndex(8);
+    const original_shared = ir.BlockId.fromIndex(9);
+    const cross_group_carrier = ir.BlockId.fromIndex(10);
+    const original_cross_group = ir.BlockId.fromIndex(11);
+    const external_ingress = ir.BlockId.fromIndex(12);
+    const original_external = ir.BlockId.fromIndex(13);
+    const arm_source = ir.BlockId.fromIndex(14);
+    const arm_clone = ir.BlockId.fromIndex(15);
+    const group = ir.NodeSplitGroupId.fromIndex(0);
+    const cross_group = ir.NodeSplitGroupId.fromIndex(1);
+    const external_group = ir.NodeSplitGroupId.fromIndex(2);
+    const selector = ir.ValueId.fromIndex(0);
+    const seed = ir.ValueId.fromIndex(1);
+    const target_value = ir.ValueId.fromIndex(2);
+
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = selector,
+            .then_edge = .{ .target = incoming_source },
+            .else_edge = .{ .target = alternate },
+        } } },
+        .{ .id = incoming_source, .function = function_id, .terminator = .{ .jump = .{
+            .target = target,
+            .arguments = &.{seed},
+        } } },
+        .{ .id = target, .function = function_id, .parameters = &.{target_value}, .terminator = .{ .jump = .{
+            .target = carrier,
+        } } },
+        .{ .id = carrier, .function = function_id, .terminator = .{ .jump = .{
+            .target = shared_predecessor,
+        } } },
+        .{ .id = shared_predecessor, .function = function_id, .terminator = .{ .branch = .{
+            .condition = selector,
+            .then_edge = .{ .target = cross_group_carrier },
+            .else_edge = .{ .target = consumer },
+        } } },
+        .{ .id = consumer, .function = function_id, .terminator = .{ .return_values = &.{target_value} } },
+        .{ .id = alternate, .function = function_id, .terminator = .{ .jump = .{
+            .target = shared_predecessor,
+        } } },
+        .{ .id = original_target, .function = function_id, .terminator = .{ .unreachable_block = {} } },
+        .{ .id = original_carrier, .function = function_id, .terminator = .{ .unreachable_block = {} } },
+        .{ .id = original_shared, .function = function_id, .terminator = .{ .unreachable_block = {} } },
+        .{ .id = cross_group_carrier, .function = function_id, .terminator = .{ .jump = .{
+            .target = external_ingress,
+        } } },
+        .{ .id = original_cross_group, .function = function_id, .terminator = .{ .unreachable_block = {} } },
+        .{ .id = external_ingress, .function = function_id, .terminator = .{ .jump = .{
+            .target = carrier,
+        } } },
+        .{ .id = original_external, .function = function_id, .terminator = .{ .unreachable_block = {} } },
+        .{ .id = arm_source, .function = function_id, .terminator = .{ .unreachable_block = {} } },
+        .{ .id = arm_clone, .function = function_id, .terminator = .{ .unreachable_block = {} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &.{ selector, seed },
+        .blocks = &.{
+            entry,
+            incoming_source,
+            target,
+            carrier,
+            shared_predecessor,
+            consumer,
+            alternate,
+            original_target,
+            original_carrier,
+            original_shared,
+            cross_group_carrier,
+            original_cross_group,
+            external_ingress,
+            original_external,
+            arm_source,
+            arm_clone,
+        },
+        .entry_block = entry,
+    };
+    const values = [_]ir.Value{
+        .{ .id = selector, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = seed, .function = function_id, .type = .dynamic, .origin = .{ .parameter = 1 } },
+        .{ .id = target_value, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{
+            .block = target,
+            .index = 0,
+        } } },
+    };
+    const rewrites = [_]ir.CfgEdgeRewrite{
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(0),
+            .source = target,
+            .kind = .jump,
+            .from = .{ .target = original_target },
+            .to = .{ .target = target },
+            .rule = .node_split,
+            .node_split_group = group,
+        },
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(1),
+            .source = carrier,
+            .kind = .jump,
+            .from = .{ .target = original_carrier },
+            .to = .{ .target = carrier },
+            .rule = .node_split,
+            .node_split_group = group,
+        },
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(2),
+            .source = shared_predecessor,
+            .kind = .jump,
+            .from = .{ .target = original_shared },
+            .to = .{ .target = shared_predecessor },
+            .rule = .node_split,
+            .node_split_group = group,
+        },
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(3),
+            .source = external_ingress,
+            .kind = .jump,
+            .from = .{ .target = original_external },
+            .to = .{ .target = external_ingress },
+            .rule = .node_split,
+            .node_split_group = external_group,
+        },
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(4),
+            .source = cross_group_carrier,
+            .kind = .jump,
+            .from = .{ .target = original_cross_group },
+            .to = .{ .target = cross_group_carrier },
+            .rule = .node_split,
+            .node_split_group = cross_group,
+        },
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(5),
+            .source = target,
+            .kind = .jump,
+            .from = .{ .target = arm_source },
+            .to = .{ .target = arm_clone },
+            .rule = .node_split,
+            .node_split_group = group,
+        },
+    };
+    const program = ir.Program{
+        .program_id = "authenticated-group-carrier-projection",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+        .edge_rewrites = &rewrites,
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, function);
+    defer analysis.deinit();
+    var lineage_index = try CloneLineageIndex.initForFunction(
+        std.testing.allocator,
+        &program,
+        function_id,
+    );
+    defer lineage_index.deinit();
+    var replay_index = try node_split.ReplayIndex.initForFunction(
+        std.testing.allocator,
+        &program,
+        function_id,
+    );
+    defer replay_index.deinit();
+    const incoming = [_]ir.CfgEdgeRef{.{
+        .source = incoming_source,
+        .kind = .jump,
+        .target = target,
+    }};
+    const initial = try std.testing.allocator.dupe(ir.BlockId, &.{ target, consumer });
+    const expanded = try extendAuthenticatedGroupBoundaryContextAlloc(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        initial,
+        &incoming,
+        &lineage_index,
+        &replay_index,
+    );
+    defer std.testing.allocator.free(expanded);
+    try std.testing.expectEqual(@as(usize, 6), expanded.len);
+    try std.testing.expect(containsBlock(expanded, carrier));
+    try std.testing.expect(containsBlock(expanded, shared_predecessor));
+    try std.testing.expect(containsBlock(expanded, cross_group_carrier));
+    try std.testing.expect(containsBlock(expanded, external_ingress));
+    try std.testing.expect(closureLocalUsesHaveProjectedBoundary(
+        &program,
+        &analysis,
+        expanded,
+        &incoming,
+    ));
+    const arm_membership = [_]ir.BlockId{ target, arm_clone };
+    try std.testing.expect(hasAuthenticatedCloneArmIntoClosure(
+        &program,
+        &replay_index,
+        arm_source,
+        &arm_membership,
+    ));
+    try std.testing.expect(!hasAuthenticatedCloneArmIntoClosure(
+        &program,
+        &replay_index,
+        arm_source,
+        &.{target},
     ));
 }
 
