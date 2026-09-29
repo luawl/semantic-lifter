@@ -8680,6 +8680,158 @@ pub fn findSplitAllocForFunction(
     return null;
 }
 
+pub fn findContextualValueSplitAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    only_function: ?usize,
+) std.mem.Allocator.Error!?Split {
+    // Build the immutable rewrite indexes once for this scan. Each function
+    // receives a scoped value view below, so ownership checks remain local
+    // without repeating the complete block/rewrite history preprocessing.
+    var global_lineage_index = try CloneLineageIndex.init(allocator, program);
+    defer global_lineage_index.deinit();
+    var global_replay_index = try node_split.ReplayIndex.init(allocator, program);
+    defer global_replay_index.deinit();
+
+    for (program.functions, 0..) |function, function_index| {
+        if (only_function) |selected| if (function_index != selected) continue;
+        var lineage_index = global_lineage_index;
+        lineage_index.function_id = function.id;
+        var replay_index = global_replay_index;
+        replay_index.function_id = function.id;
+        var replay_cache = ReplayCache.init(allocator, program, &replay_index);
+        defer replay_cache.deinit();
+        var analysis = cfg.Analysis.init(allocator, program, function) catch |err| switch (err) {
+            error.InvalidCfg => continue,
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        defer analysis.deinit();
+
+        for (function.blocks) |source_id| {
+            if (!analysis.isReachable(source_id) or source_id.index() >= program.blocks.len) continue;
+            const source = program.blocks[source_id.index()];
+            switch (source.terminator) {
+                .jump => |edge| {
+                    if (try findContextualValueEdgeSplitAlloc(
+                        allocator,
+                        program,
+                        &analysis,
+                        function_index,
+                        source_id,
+                        .jump,
+                        edge.target,
+                        &lineage_index,
+                        &replay_index,
+                        &replay_cache,
+                        null,
+                        null,
+                    )) |split| return split;
+                },
+                .branch => |branch| {
+                    if (try findContextualValueEdgeSplitAlloc(
+                        allocator,
+                        program,
+                        &analysis,
+                        function_index,
+                        source_id,
+                        .branch_then,
+                        branch.then_edge.target,
+                        &lineage_index,
+                        &replay_index,
+                        &replay_cache,
+                        null,
+                        null,
+                    )) |split| return split;
+                    if (try findContextualValueEdgeSplitAlloc(
+                        allocator,
+                        program,
+                        &analysis,
+                        function_index,
+                        source_id,
+                        .branch_else,
+                        branch.else_edge.target,
+                        &lineage_index,
+                        &replay_index,
+                        &replay_cache,
+                        null,
+                        null,
+                    )) |split| return split;
+                },
+                .return_values, .return_pack, .return_expanded, .throw_error, .unreachable_block => {},
+            }
+        }
+    }
+    return null;
+}
+
+pub fn findContextualValueSplitForIncomingAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    function_index: usize,
+    target: ir.BlockId,
+    incoming: []const ir.CfgEdgeRef,
+    expected_parameters: ?[]const ir.ValueId,
+) std.mem.Allocator.Error!?Split {
+    if (function_index >= program.functions.len or incoming.len == 0) return null;
+    var analysis = cfg.Analysis.init(allocator, program, program.functions[function_index]) catch |err| switch (err) {
+        error.InvalidCfg => return null,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    defer analysis.deinit();
+    var replay_context = try ReplayProjectionContext.initForFunction(
+        allocator,
+        program,
+        program.functions[function_index].id,
+    );
+    defer replay_context.deinit();
+    return findContextualValueSplitForIncomingAllocWithReplayContext(
+        allocator,
+        program,
+        &analysis,
+        function_index,
+        target,
+        incoming,
+        expected_parameters,
+        &replay_context,
+    );
+}
+
+/// Finds an incoming-context split while reusing the caller's immutable
+/// function-scoped lineage and replay indexes.  Feedback normalization already
+/// owns these indexes for the current function; rebuilding them here turns
+/// repeated collision handling into a full history scan per candidate.
+pub fn findContextualValueSplitForIncomingAllocWithReplayContext(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    function_index: usize,
+    target: ir.BlockId,
+    incoming: []const ir.CfgEdgeRef,
+    expected_parameters: ?[]const ir.ValueId,
+    replay_context: *ReplayProjectionContext,
+) std.mem.Allocator.Error!?Split {
+    if (function_index >= program.functions.len or incoming.len == 0) return null;
+
+    for (incoming) |reference| {
+        if (reference.target != target) continue;
+        if (try findContextualValueEdgeSplitAlloc(
+            allocator,
+            program,
+            analysis,
+            function_index,
+            reference.source,
+            reference.kind,
+            reference.target,
+            &replay_context.lineage_index,
+            &replay_context.replay_index,
+            &replay_context.replay_cache,
+            expected_parameters,
+            replay_context,
+        )) |split| return split;
+    }
+    return null;
+}
+
 const ContextualValueUseDetector = struct {
     program: *const ir.Program,
     analysis: *const cfg.Analysis,
@@ -9636,6 +9788,315 @@ fn findGroupContextPackMappingAlloc(
     return result;
 }
 
+fn findContextualValueEdgeSplitAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    function_index: usize,
+    source: ir.BlockId,
+    kind: ir.CfgEdgeKind,
+    target: ir.BlockId,
+    lineage_index: *const CloneLineageIndex,
+    replay_index: *const node_split.ReplayIndex,
+    replay_cache: *ReplayCache,
+    expected_parameters: ?[]const ir.ValueId,
+    replay_context: ?*ReplayProjectionContext,
+) std.mem.Allocator.Error!?Split {
+    if (function_index >= program.functions.len or target.index() >= program.blocks.len or
+        program.blocks[target.index()].function != analysis.function.id or !analysis.isReachable(target)) return null;
+    const incoming: ir.CfgEdgeRef = .{ .source = source, .kind = kind, .target = target };
+    const edge = cfg_edge: {
+        const source_block = program.blocks[source.index()];
+        break :cfg_edge switch (kind) {
+            .jump => switch (source_block.terminator) {
+                .jump => |edge| if (edge.target == target) edge else return null,
+                else => return null,
+            },
+            .branch_then => switch (source_block.terminator) {
+                .branch => |branch| if (branch.then_edge.target == target) branch.then_edge else return null,
+                else => return null,
+            },
+            .branch_else => switch (source_block.terminator) {
+                .branch => |branch| if (branch.else_edge.target == target) branch.else_edge else return null,
+                else => return null,
+            },
+        };
+    };
+    if (!analysis.isReachable(source)) return null;
+
+    const incoming_edges = [_]ir.CfgEdgeRef{incoming};
+    var authenticated_parameters = false;
+    if (expected_parameters) |expected| {
+        switch (try authenticatedComposedParameterProjectionAlloc(
+            allocator,
+            program,
+            target,
+            expected,
+            edge.arguments,
+            lineage_index,
+            replay_index,
+            replay_cache,
+        )) {
+            .matched => authenticated_parameters = true,
+            .rejected, .not_applicable => {},
+        }
+        if (!authenticated_parameters) {
+            authenticated_parameters = try hasAuthenticatedIterationContextualProjectionAlloc(
+                allocator,
+                program,
+                analysis,
+                target,
+                incoming,
+                expected,
+                lineage_index,
+                replay_index,
+                replay_cache,
+            );
+        }
+        if (!authenticated_parameters and expected.len == 1) {
+            if (replay_context) |context| {
+                authenticated_parameters = try context.hasAuthenticatedOneParameterContinuationForEdge(
+                    analysis,
+                    incoming,
+                    expected,
+                );
+            }
+        }
+    }
+    // Internal members of an authenticated clone group intentionally have no
+    // independent visit context.  When one of those members is reached by a
+    // direct split edge, use the edge's complete one-parameter tuple as the
+    // proof subject.  The helper still requires replayed lineage, identical
+    // effects and operation semantics, and an authenticated successor, so an
+    // absent owner context cannot be replaced by value equality alone.
+    if (!authenticated_parameters and expected_parameters == null and edge.arguments.len == 1) {
+        if (replay_context) |context| {
+            authenticated_parameters = try context.hasAuthenticatedOneParameterContinuationForEdge(
+                analysis,
+                incoming,
+                edge.arguments,
+            );
+        }
+    }
+
+    // A parameterized contextual entry may be fully self-contained: its
+    // formal tuple is consumed by the entry's own effect before a shared
+    // successor.  Keep that authenticated boundary local instead of
+    // expanding through a surrounding SCC and importing unrelated producers.
+    if (authenticated_parameters and program.blocks[target.index()].parameters.len != 0) {
+        const minimal = try allocator.dupe(ir.BlockId, &.{target});
+        const prepared = if (replay_context) |context|
+            prepareClosureWithReplayContext(
+                allocator,
+                program,
+                analysis,
+                minimal,
+                &incoming_edges,
+                context,
+            )
+        else
+            prepareClosure(allocator, program, analysis, minimal, &incoming_edges);
+        if (prepared) {
+            traceStructural("contextual_candidate_parameterized_minimal_boundary target={} source={}\n", .{
+                target.index(),
+                source.index(),
+            });
+            return .{
+                .allocator = allocator,
+                .function_index = function_index,
+                .branch = source,
+                .entry = target,
+                .join = target,
+                .incoming = try allocator.dupe(ir.CfgEdgeRef, &incoming_edges),
+                .closure = minimal,
+            };
+        }
+        allocator.free(minimal);
+    }
+
+    var closure = try allocator.dupe(ir.BlockId, &.{target});
+    var retain_closure = false;
+    defer if (!retain_closure) allocator.free(closure);
+
+    // A shared target can be a forwarding block with no local use.  Let the
+    // existing authenticated continuation analysis discover a contextual use
+    // downstream before rejecting the split for lack of a distinct mapping.
+    // The extension remains constrained by canonical edge arguments, replay
+    // lineage, and the same cloneability checks used by collision splitting.
+    closure = try extendContinuationClosureAlloc(
+        allocator,
+        program,
+        analysis,
+        target,
+        closure,
+        &incoming_edges,
+    );
+    const boundary_closure = try trimIncomingSourceClosureAlloc(
+        allocator,
+        analysis,
+        target,
+        closure,
+        &incoming_edges,
+    ) orelse return null;
+    if (boundary_closure.ptr != closure.ptr or boundary_closure.len != closure.len) {
+        traceStructural("contextual_candidate_source_boundary target={} closure_before={} closure_after={}\n", .{
+            target.index(),
+            closure.len,
+            boundary_closure.len,
+        });
+    }
+    closure = boundary_closure;
+
+    closure = try extendAuthenticatedGroupBoundaryContextAlloc(
+        allocator,
+        program,
+        analysis,
+        closure,
+        &incoming_edges,
+        lineage_index,
+        replay_index,
+    );
+
+    if (!closureLocalUsesHaveProjectedBoundary(program, analysis, closure, &incoming_edges)) {
+        traceStructural("contextual_candidate_boundary_projection_rejected target={} closure={}\n", .{
+            target.index(),
+            closure.len,
+        });
+        return null;
+    }
+
+    var detector = ContextualValueUseDetector{
+        .program = program,
+        .analysis = analysis,
+        .incoming = incoming,
+        .target = target,
+        .owned = closure,
+    };
+    for (closure) |block_id| {
+        if (block_id.index() >= program.blocks.len) return null;
+        const block = program.blocks[block_id.index()];
+        if (block.id != block_id or block.function != analysis.function.id) return null;
+        for (block.instructions) |instruction_id| {
+            if (instruction_id.index() >= program.instructions.len) return null;
+            runtime_uses.visitOperationUses(program.instructions[instruction_id.index()].operation, &detector);
+            if (detector.found) break;
+        }
+        if (!detector.found) runtime_uses.visitTerminatorUses(block.terminator, &detector);
+        if (detector.found) break;
+    }
+    if (!detector.found and !authenticated_parameters) return null;
+
+    traceStructural("contextual_candidate source={} target={} kind={s} closure={} value={?d} pack={?d}\n", .{
+        source.index(),
+        target.index(),
+        @tagName(kind),
+        closure.len,
+        if (detector.value_id) |value_id| value_id.index() else null,
+        if (detector.pack_id) |pack_id| pack_id.index() else null,
+    });
+
+    if (detector.value_id) |value_id| {
+        const producer = switch (program.values[value_id.index()].origin) {
+            .block_parameter => |origin| origin.block,
+            .instruction_result => |origin| if (origin.instruction.index() < program.instructions.len)
+                program.instructions[origin.instruction.index()].block
+            else
+                return null,
+            .parameter, .capture => return null,
+        };
+        const authenticated = try findExistingValueCloneAlloc(
+            allocator,
+            program,
+            analysis,
+            producer,
+            value_id,
+            &incoming_edges,
+            closure[0..],
+            lineage_index,
+            replay_index,
+            replay_cache,
+        );
+        if (authenticated == null and !definitionDominatesIncoming(analysis, producer, &incoming_edges)) {
+            traceStructural("contextual_candidate_no_authenticated_clone producer={} value={} target={}\n", .{ producer.index(), value_id.index(), target.index() });
+            return null;
+        }
+    } else if (detector.pack_id) |pack_id| {
+        const producer = switch (program.value_packs[pack_id.index()].origin) {
+            .instruction_result => |instruction_id| if (instruction_id.index() < program.instructions.len)
+                program.instructions[instruction_id.index()].block
+            else
+                return null,
+            .varargs => return null,
+        };
+        const authenticated = try findExistingPackCloneAlloc(
+            allocator,
+            program,
+            analysis,
+            producer,
+            pack_id,
+            &incoming_edges,
+            closure[0..],
+            lineage_index,
+            replay_index,
+            replay_cache,
+        );
+        if (authenticated == null and !definitionDominatesIncoming(analysis, producer, &incoming_edges)) {
+            traceStructural("contextual_candidate_no_authenticated_pack producer={} pack={} target={}\n", .{ producer.index(), pack_id.index(), target.index() });
+            return null;
+        }
+    } else if (!authenticated_parameters) return null;
+    const external_result = collectExternalCloneMappingsAllocWithReplayState(
+        allocator,
+        program,
+        analysis,
+        closure,
+        &incoming_edges,
+        lineage_index,
+        replay_index,
+        replay_cache,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    var external = external_result orelse {
+        traceStructural("contextual_candidate_external_failure target={}\n", .{target.index()});
+        return null;
+    };
+    defer external.deinit();
+    const distinct_external_mapping = hasDistinctExternalCloneMapping(external);
+    if (!distinct_external_mapping) {
+        // A contextual value can be semantically available without a clone
+        // mapping when its producer dominates the live incoming edge.  The
+        // collision itself still supplies the ownership reason for this
+        // bounded split, and prepareClosure below proves that every use can
+        // be replayed.  Do not confuse identity mapping with an unresolved
+        // value: only a detected value/pack witness may use this path.
+        if (!authenticated_parameters and detector.value_id == null and detector.pack_id == null) {
+            traceStructural("contextual_candidate_no_distinct_mapping target={}\n", .{target.index()});
+            return null;
+        }
+        if (authenticated_parameters) {
+            traceStructural("contextual_candidate_authenticated_parameter_projection target={}\n", .{target.index()});
+        } else {
+            traceStructural("contextual_candidate_available_external target={}\n", .{target.index()});
+        }
+    }
+    if (!prepareClosure(allocator, program, analysis, closure, &incoming_edges)) {
+        traceStructural("contextual_candidate_prepare_failure target={}\n", .{target.index()});
+        return null;
+    }
+
+    retain_closure = true;
+    return .{
+        .allocator = allocator,
+        .function_index = function_index,
+        .branch = source,
+        .entry = target,
+        .join = target,
+        .incoming = try allocator.dupe(ir.CfgEdgeRef, &incoming_edges),
+        .closure = closure,
+    };
+}
+
 // An identity-only external mapping can still represent a distinct incoming
 // context when the collision proof has already supplied the owner tuple and
 // the live edge carries the complete result tuple of an authenticated numeric
@@ -10083,6 +10544,12 @@ fn hasAuthenticatedEffectfulParameterizedCompoundProjectionAlloc(
     return true;
 }
 
+fn hasDistinctExternalCloneMapping(mappings: ExternalCloneMappings) bool {
+    for (mappings.values, mappings.clone_values) |source, clone| if (source != clone) return true;
+    for (mappings.packs, mappings.clone_packs) |source, clone| if (source != clone) return true;
+    return false;
+}
+
 fn packProducerBlock(program: *const ir.Program, pack_id: ir.ValuePackId) ?ir.BlockId {
     if (pack_id.index() >= program.value_packs.len) return null;
     return switch (program.value_packs[pack_id.index()].origin) {
@@ -10092,6 +10559,111 @@ fn packProducerBlock(program: *const ir.Program, pack_id: ir.ValuePackId) ?ir.Bl
             null,
         .varargs => null,
     };
+}
+
+pub fn conditionalLoopEntryCountAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    function_index: usize,
+    header: ir.BlockId,
+) std.mem.Allocator.Error!usize {
+    if (function_index >= program.functions.len) return 0;
+    var analysis = cfg.Analysis.init(allocator, program, program.functions[function_index]) catch |err| switch (err) {
+        error.InvalidCfg => return 0,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    defer analysis.deinit();
+    var membership = natural_loop.collect(allocator, &analysis, header) catch |err| switch (err) {
+        error.UnsupportedShape => return 0,
+        error.OutOfMemory => return error.OutOfMemory,
+    } orelse return 0;
+    defer membership.deinit();
+    return countConditionalLoopEntries(&analysis, header, membership.bits);
+}
+
+pub fn interiorLoopEntryCountAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    function_index: usize,
+    header: ir.BlockId,
+) std.mem.Allocator.Error!usize {
+    if (function_index >= program.functions.len) return 0;
+    var analysis = cfg.Analysis.init(allocator, program, program.functions[function_index]) catch |err| switch (err) {
+        error.InvalidCfg => return 0,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    defer analysis.deinit();
+    var membership = natural_loop.collect(allocator, &analysis, header) catch |err| switch (err) {
+        error.UnsupportedShape => return 0,
+        error.OutOfMemory => return error.OutOfMemory,
+    } orelse return 0;
+    defer membership.deinit();
+    return countInteriorLoopEntries(&analysis, header, membership.bits);
+}
+
+test "contextual closure treats an incoming source as an external cycle boundary" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const source = ir.BlockId.fromIndex(1);
+    const target = ir.BlockId.fromIndex(2);
+    const middle = ir.BlockId.fromIndex(3);
+    const exit = ir.BlockId.fromIndex(4);
+    const selector = ir.ValueId.fromIndex(0);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = selector,
+            .then_edge = .{ .target = source },
+            .else_edge = .{ .target = target },
+        } } },
+        .{ .id = source, .function = function_id, .terminator = .{ .jump = .{ .target = target } } },
+        .{ .id = target, .function = function_id, .terminator = .{ .jump = .{ .target = middle } } },
+        .{ .id = middle, .function = function_id, .terminator = .{ .jump = .{ .target = source } } },
+        .{ .id = exit, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &.{selector},
+        .blocks = &.{ entry, source, target, middle, exit },
+        .entry_block = entry,
+    };
+    const values = [_]ir.Value{.{
+        .id = selector,
+        .function = function_id,
+        .type = .boolean,
+        .origin = .{ .parameter = 0 },
+    }};
+    const program = ir.Program{
+        .program_id = "contextual-incoming-source-boundary",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, function);
+    defer analysis.deinit();
+    const incoming = [_]ir.CfgEdgeRef{.{
+        .source = source,
+        .kind = .jump,
+        .target = target,
+    }};
+    const closure = try std.testing.allocator.dupe(ir.BlockId, &.{ target, middle, source });
+    const trimmed = (try trimIncomingSourceClosureAlloc(
+        std.testing.allocator,
+        &analysis,
+        target,
+        closure,
+        &incoming,
+    )).?;
+    defer std.testing.allocator.free(trimmed);
+    try std.testing.expectEqualSlices(ir.BlockId, &.{ target, middle }, trimmed);
+    try std.testing.expect(prepareClosure(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        trimmed,
+        &incoming,
+    ));
 }
 
 test "continuation extension retains only the context-dependent sibling path" {
@@ -13323,6 +13895,40 @@ fn countExternalLoopEntries(
     return count;
 }
 
+fn countInteriorLoopEntries(
+    analysis: *const cfg.Analysis,
+    header: ir.BlockId,
+    membership: []const bool,
+) usize {
+    var count: usize = 0;
+    for (analysis.function.blocks, 0..) |source, source_index| {
+        if (!analysis.isReachable(source) or membership[source_index]) continue;
+        const terminator = analysis.program.blocks[source.index()].terminator;
+        switch (terminator) {
+            .jump => |edge| {
+                if (isInteriorLoopTarget(analysis, header, membership, edge.target)) count += 1;
+            },
+            .branch => |branch| {
+                if (isInteriorLoopTarget(analysis, header, membership, branch.then_edge.target)) count += 1;
+                if (isInteriorLoopTarget(analysis, header, membership, branch.else_edge.target)) count += 1;
+            },
+            else => {},
+        }
+    }
+    return count;
+}
+
+fn isInteriorLoopTarget(
+    analysis: *const cfg.Analysis,
+    header: ir.BlockId,
+    membership: []const bool,
+    target: ir.BlockId,
+) bool {
+    if (target == header) return false;
+    const target_index = analysis.blockIndex(target) orelse return false;
+    return membership[target_index];
+}
+
 fn edgeHasNodeSplitHistory(program: *const ir.Program, reference: ir.CfgEdgeRef) bool {
     var current = reference.target;
     var remaining = program.edge_rewrites.len;
@@ -15775,6 +16381,94 @@ fn trimShadowedUnreachableCloneBlocksAlloc(
     return owned;
 }
 
+// A contextual split may discover a continuation path that loops back to the
+// source of the edge being redirected.  Cloning that source would also clone
+// the edge itself and make the new entry self-owned.  Treat incoming sources
+// as external cycle boundaries, retaining only the part of the candidate that
+// remains reachable from its entry without crossing one of those sources.
+fn trimIncomingSourceClosureAlloc(
+    allocator: std.mem.Allocator,
+    analysis: *const cfg.Analysis,
+    entry: ir.BlockId,
+    closure: []ir.BlockId,
+    incoming: []const ir.CfgEdgeRef,
+) std.mem.Allocator.Error!?[]ir.BlockId {
+    if (closure.len == 0 or incoming.len == 0) return closure;
+
+    const block_count = analysis.function.blocks.len;
+    const membership = try allocator.alloc(bool, block_count);
+    defer allocator.free(membership);
+    @memset(membership, false);
+
+    var has_internal_source = false;
+    for (closure) |block_id| {
+        const local_index = analysis.blockIndex(block_id) orelse return null;
+        if (local_index >= membership.len or membership[local_index]) return null;
+        membership[local_index] = true;
+        for (incoming) |reference| {
+            if (reference.source == block_id) {
+                has_internal_source = true;
+                break;
+            }
+        }
+    }
+    if (!has_internal_source) return closure;
+
+    const entry_index = analysis.blockIndex(entry) orelse return null;
+    if (!membership[entry_index]) return null;
+    for (incoming) |reference| if (reference.source == entry) return null;
+
+    const reachable = try allocator.alloc(bool, block_count);
+    defer allocator.free(reachable);
+    @memset(reachable, false);
+    const pending = try allocator.alloc(ir.BlockId, closure.len);
+    defer allocator.free(pending);
+
+    reachable[entry_index] = true;
+    pending[0] = entry;
+    var cursor: usize = 0;
+    var pending_len: usize = 1;
+    while (cursor < pending_len) : (cursor += 1) {
+        const current = pending[cursor];
+        for (0..analysis.successorCount(current)) |successor_index| {
+            const successor = analysis.successorAt(current, successor_index) orelse return null;
+            const successor_index_local = analysis.blockIndex(successor) orelse return null;
+            if (!membership[successor_index_local] or reachable[successor_index_local]) continue;
+            var is_incoming_source = false;
+            for (incoming) |reference| {
+                if (reference.source == successor) {
+                    is_incoming_source = true;
+                    break;
+                }
+            }
+            if (is_incoming_source) continue;
+            reachable[successor_index_local] = true;
+            if (pending_len >= pending.len) return null;
+            pending[pending_len] = successor;
+            pending_len += 1;
+        }
+    }
+
+    var retained_count: usize = 0;
+    for (closure) |block_id| {
+        const local_index = analysis.blockIndex(block_id) orelse return null;
+        if (reachable[local_index]) retained_count += 1;
+    }
+    if (retained_count == 0) return null;
+    if (retained_count == closure.len) return closure;
+
+    var retained: std.ArrayList(ir.BlockId) = .empty;
+    errdefer retained.deinit(allocator);
+    try retained.ensureTotalCapacity(allocator, retained_count);
+    for (closure) |block_id| {
+        const local_index = analysis.blockIndex(block_id) orelse return null;
+        if (reachable[local_index]) try retained.append(allocator, block_id);
+    }
+    const owned = try retained.toOwnedSlice(allocator);
+    allocator.free(closure);
+    return owned;
+}
+
 fn appendDelayedUseContinuationAlloc(
     allocator: std.mem.Allocator,
     program: *const ir.Program,
@@ -16527,6 +17221,20 @@ pub fn prepareClosure(
     incoming: []const ir.CfgEdgeRef,
 ) bool {
     return prepareClosureImpl(allocator, program, analysis, closure, incoming, null, false);
+}
+
+/// Prepare a clone closure using replay indexes owned by the caller.  Large
+/// normalization transactions already authenticate one immutable function
+/// snapshot; rebuilding those indexes for each collision is unnecessary.
+pub fn prepareClosureWithReplayContext(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    closure: []ir.BlockId,
+    incoming: []const ir.CfgEdgeRef,
+    replay_context: *ReplayProjectionContext,
+) bool {
+    return prepareClosureImpl(allocator, program, analysis, closure, incoming, replay_context, false);
 }
 
 fn tracePrepareClosureReject(reason: []const u8, closure_len: usize, incoming_len: usize) void {
