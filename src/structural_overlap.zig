@@ -15,6 +15,16 @@ const build_options = @import("build_options");
 const trace_structural_phases = build_options.trace_normalize_phases;
 const trace_conditional_batch = false;
 
+pub fn structuralPhaseNow() i96 {
+    if (!trace_structural_phases) return 0;
+    return Io.Clock.awake.now(Io.Threaded.global_single_threaded.io()).nanoseconds;
+}
+
+pub fn structuralPhaseMillis(start: i96) i64 {
+    if (!trace_structural_phases) return 0;
+    return @intCast(@divTrunc(structuralPhaseNow() - start, std.time.ns_per_ms));
+}
+
 pub fn traceStructural(comptime format: []const u8, args: anytype) void {
     if (trace_structural_phases) std.debug.print(format, args);
 }
@@ -7103,6 +7113,38 @@ fn sameIterationTransitionKind(
     };
 }
 
+fn isParameterlessForwardingBlock(
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    block_id: ir.BlockId,
+) bool {
+    if (block_id.index() >= program.blocks.len or analysis.blockIndex(block_id) == null or
+        !analysis.isReachable(block_id))
+    {
+        return false;
+    }
+    const block = program.blocks[block_id.index()];
+    return block.id == block_id and block.function == analysis.function.id and
+        block.parameters.len == 0 and block.instructions.len == 0 and
+        switch (block.terminator) {
+            .jump => |edge| edge.target.index() < program.blocks.len and
+                analysis.blockIndex(edge.target) != null and
+                program.blocks[edge.target.index()].function == block.function,
+            .branch, .return_values, .return_pack, .return_expanded, .throw_error, .unreachable_block => false,
+        };
+}
+
+fn isAuthenticatedParameterlessForwardingBlock(
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    block_id: ir.BlockId,
+    closure: []const ir.BlockId,
+    lineage_index: *const CloneLineageIndex,
+) bool {
+    if (closure.len != 1 or cloneStepForTargetCached(program, closure[0], lineage_index) == null) return false;
+    return isParameterlessForwardingBlock(program, analysis, block_id);
+}
+
 fn iterationStateTupleTransition(
     program: *const ir.Program,
     arguments: []const ir.ValueId,
@@ -9407,6 +9449,66 @@ fn packProducerBlock(program: *const ir.Program, pack_id: ir.ValuePackId) ?ir.Bl
     };
 }
 
+test "continuation extension trims a shared context-independent suffix" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const frontier = ir.BlockId.fromIndex(1);
+    const shared = ir.BlockId.fromIndex(2);
+    const tail = ir.BlockId.fromIndex(3);
+    const alternate = ir.BlockId.fromIndex(4);
+    const condition = ir.ValueId.fromIndex(0);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = condition,
+            .then_edge = .{ .target = frontier },
+            .else_edge = .{ .target = alternate },
+        } } },
+        .{ .id = frontier, .function = function_id, .terminator = .{ .jump = .{ .target = shared } } },
+        .{ .id = shared, .function = function_id, .terminator = .{ .jump = .{ .target = tail } } },
+        .{ .id = tail, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = alternate, .function = function_id, .terminator = .{ .jump = .{ .target = shared } } },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .parameters = &.{condition},
+        .blocks = &.{ entry, frontier, shared, tail, alternate },
+        .entry_block = entry,
+    }};
+    const values = [_]ir.Value{.{
+        .id = condition,
+        .function = function_id,
+        .type = .boolean,
+        .origin = .{ .parameter = 0 },
+    }};
+    const program: ir.Program = .{
+        .program_id = "shared-context-independent-continuation-suffix",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+    };
+    const incoming = [_]ir.CfgEdgeRef{.{
+        .source = entry,
+        .kind = .branch_then,
+        .target = frontier,
+    }};
+
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, functions[0]);
+    defer analysis.deinit();
+    const initial = try std.testing.allocator.dupe(ir.BlockId, &.{ shared, frontier, tail });
+    const trimmed = try trimContextIndependentSharedSuffixAlloc(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        entry,
+        initial,
+        &incoming,
+    );
+    defer std.testing.allocator.free(trimmed);
+    try std.testing.expectEqualSlices(ir.BlockId, &.{frontier}, trimmed);
+}
+
 test "non-dominating exact constants remain rematerializable continuation values" {
     const function_id = ir.FunctionId.fromIndex(0);
     const entry = ir.BlockId.fromIndex(0);
@@ -11202,6 +11304,476 @@ fn authenticatedParameterProjectionForEdge(
     return true;
 }
 
+const ContinuationContextUseDetector = struct {
+    const Witness = union(enum) {
+        value: ir.ValueId,
+        pack: ir.ValuePackId,
+        place: ir.PlaceId,
+    };
+
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    current: ir.BlockId,
+    incoming: []const ir.CfgEdgeRef,
+    closure: []const ir.BlockId,
+    continuation: []const ir.BlockId,
+    lineage_index: *const CloneLineageIndex,
+    replay_index: *const node_split.ReplayIndex,
+    replay_cache: *ReplayCache,
+    closure_only: bool = false,
+    found: bool = false,
+    witness: ?Witness = null,
+
+    fn mark(self: *ContinuationContextUseDetector, witness: Witness) void {
+        if (self.found) return;
+        self.found = true;
+        self.witness = witness;
+    }
+
+    fn authenticatedParameterProjection(
+        self: *ContinuationContextUseDetector,
+        source: ir.BlockId,
+        kind: ir.CfgEdgeKind,
+        target: ir.BlockId,
+        arguments: []const ir.ValueId,
+    ) std.mem.Allocator.Error!bool {
+        return authenticatedParameterProjectionForEdge(
+            self.allocator,
+            self.program,
+            self.analysis,
+            source,
+            kind,
+            target,
+            arguments,
+            self.closure,
+            self.continuation,
+            self.incoming,
+            self.lineage_index,
+            self.replay_index,
+            self.replay_cache,
+        );
+    }
+
+    pub fn value(self: *ContinuationContextUseDetector, value_id: ir.ValueId) void {
+        if (self.found) return;
+        if (value_id.index() >= self.program.values.len) {
+            self.found = true;
+            return;
+        }
+        const candidate_value = self.program.values[value_id.index()];
+        if (candidate_value.id != value_id or candidate_value.function != self.analysis.function.id) {
+            self.mark(.{ .value = value_id });
+            return;
+        }
+        const producer = blk: switch (candidate_value.origin) {
+            .parameter, .capture => return,
+            .block_parameter => |origin| origin.block,
+            .instruction_result => |origin| {
+                if (origin.instruction.index() >= self.program.instructions.len) {
+                    self.mark(.{ .value = value_id });
+                    return;
+                }
+                const instruction = self.program.instructions[origin.instruction.index()];
+                if (instruction.id != origin.instruction) {
+                    self.mark(.{ .value = value_id });
+                    return;
+                }
+                break :blk instruction.block;
+            },
+        };
+        if (producer == self.current) return;
+        if (containsBlock(self.closure, producer)) {
+            self.mark(.{ .value = value_id });
+            return;
+        }
+        if (self.closure_only) return;
+        if (containsBlock(self.continuation, producer)) {
+            // A dominating definition inside the candidate continuation is
+            // local to the shared suffix, not an incoming context value. It
+            // remains available when the suffix is reused. A non-dominating
+            // definition still requires the authenticated contextual path.
+            if (self.analysis.dominates(producer, self.current)) return;
+            self.mark(.{ .value = value_id });
+            return;
+        }
+        if (!hasCloneLineageCandidateForSource(self.replay_index, self.program, producer)) {
+            if (self.incoming.len == 0 or definitionDominatesIncoming(self.analysis, producer, self.incoming)) return;
+            self.mark(.{ .value = value_id });
+            return;
+        }
+        switch (valueCarriesContinuationContext(
+            self.allocator,
+            self.program,
+            self.analysis,
+            value_id,
+            self.current,
+            self.closure,
+            self.continuation,
+            self.incoming,
+            self.lineage_index,
+            self.replay_index,
+            self.replay_cache,
+        ) catch {
+            self.mark(.{ .value = value_id });
+            return;
+        }) {
+            .available => {},
+            .contextual, .unavailable => self.mark(.{ .value = value_id }),
+        }
+    }
+
+    pub fn pack(self: *ContinuationContextUseDetector, pack_id: ir.ValuePackId) void {
+        if (self.found) return;
+        const producer = packProducerBlock(self.program, pack_id) orelse {
+            self.mark(.{ .pack = pack_id });
+            return;
+        };
+        if (containsBlock(self.closure, producer)) {
+            self.mark(.{ .pack = pack_id });
+            return;
+        }
+        if (self.closure_only) return;
+        if (containsBlock(self.continuation, producer)) {
+            // Open packs follow the same ownership rule as scalar values:
+            // only a non-dominating local producer is contextual.
+            if (self.analysis.dominates(producer, self.current)) return;
+            self.mark(.{ .pack = pack_id });
+            return;
+        }
+        switch (packCarriesContinuationContext(
+            self.allocator,
+            self.program,
+            self.analysis,
+            pack_id,
+            self.current,
+            self.closure,
+            self.continuation,
+            self.incoming,
+            self.lineage_index,
+            self.replay_index,
+            self.replay_cache,
+        ) catch {
+            self.mark(.{ .pack = pack_id });
+            return;
+        }) {
+            .available => {},
+            .contextual, .unavailable => self.mark(.{ .pack = pack_id }),
+        }
+    }
+
+    pub fn place(self: *ContinuationContextUseDetector, place_id: ir.PlaceId) void {
+        if (self.found) return;
+        if (place_id.index() >= self.program.places.len) {
+            self.mark(.{ .place = place_id });
+            return;
+        }
+        const candidate_place = self.program.places[place_id.index()];
+        if (candidate_place.id != place_id or candidate_place.function != self.analysis.function.id) {
+            self.mark(.{ .place = place_id });
+            return;
+        }
+        const producer = blk: switch (candidate_place.origin) {
+            .local, .capture => return,
+            .instruction => |instruction_id| {
+                if (instruction_id.index() >= self.program.instructions.len) {
+                    self.mark(.{ .place = place_id });
+                    return;
+                }
+                const instruction = self.program.instructions[instruction_id.index()];
+                if (instruction.id != instruction_id) {
+                    self.mark(.{ .place = place_id });
+                    return;
+                }
+                break :blk instruction.block;
+            },
+        };
+        if (producer == self.current) return;
+        if (containsBlock(self.closure, producer)) {
+            self.mark(.{ .place = place_id });
+            return;
+        }
+        if (self.closure_only) return;
+        if (containsBlock(self.continuation, producer)) {
+            self.mark(.{ .place = place_id });
+            return;
+        }
+        if (self.incoming.len == 0 or definitionDominatesIncoming(self.analysis, producer, self.incoming)) return;
+        self.mark(.{ .place = place_id });
+    }
+};
+
+fn visitContinuationEdgeUses(
+    detector: *ContinuationContextUseDetector,
+    source: ir.BlockId,
+    kind: ir.CfgEdgeKind,
+    edge: ir.Edge,
+) void {
+    const projected = detector.authenticatedParameterProjection(
+        source,
+        kind,
+        edge.target,
+        edge.arguments,
+    ) catch false;
+    if (projected) return;
+    for (edge.arguments) |argument| detector.value(argument);
+}
+
+fn visitContinuationTerminatorUses(
+    detector: *ContinuationContextUseDetector,
+    source: ir.BlockId,
+    terminator: ir.Terminator,
+) void {
+    switch (terminator) {
+        .jump => |edge| visitContinuationEdgeUses(detector, source, .jump, edge),
+        .branch => |branch| {
+            detector.value(branch.condition);
+            visitContinuationEdgeUses(detector, source, .branch_then, branch.then_edge);
+            visitContinuationEdgeUses(detector, source, .branch_else, branch.else_edge);
+        },
+        .return_values => |values| for (values) |value_id| detector.value(value_id),
+        .return_pack => |pack_id| detector.pack(pack_id),
+        .return_expanded => |expanded| {
+            for (expanded.values) |value_id| detector.value(value_id);
+            detector.pack(expanded.pack);
+        },
+        .throw_error => |value| {
+            detector.value(value.value);
+            if (value.dynamic_level) |level| detector.value(level);
+        },
+        .unreachable_block => {},
+    }
+}
+
+fn hasReachableConditionalPredecessor(
+    analysis: *const cfg.Analysis,
+    block: ir.BlockId,
+) bool {
+    for (0..analysis.predecessorCount(block)) |predecessor_index| {
+        const predecessor = analysis.predecessorAt(block, predecessor_index) orelse return true;
+        if (!analysis.isReachable(predecessor)) continue;
+        if (predecessor.index() >= analysis.program.blocks.len) return true;
+        const predecessor_block = analysis.program.blocks[predecessor.index()];
+        if (predecessor_block.id != predecessor) return true;
+        switch (predecessor_block.terminator) {
+            .branch => return true,
+            else => {},
+        }
+    }
+    return false;
+}
+
+fn hasReachableExternalContinuationPredecessor(
+    analysis: *const cfg.Analysis,
+    block: ir.BlockId,
+    closure: []const ir.BlockId,
+    continuation: []const ir.BlockId,
+) bool {
+    for (0..analysis.predecessorCount(block)) |predecessor_index| {
+        const predecessor = analysis.predecessorAt(block, predecessor_index) orelse return true;
+        if (!analysis.isReachable(predecessor)) continue;
+        if (!containsBlock(closure, predecessor) and !containsBlock(continuation, predecessor)) return true;
+    }
+    return false;
+}
+
+fn uniqueReachableContinuationPredecessor(
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    block: ir.BlockId,
+    closure: []const ir.BlockId,
+    continuation: []const ir.BlockId,
+) ?ir.CfgEdgeRef {
+    var selected: ?ir.CfgEdgeRef = null;
+    for (0..analysis.predecessorCount(block)) |predecessor_index| {
+        const predecessor = analysis.predecessorAt(block, predecessor_index) orelse return null;
+        if (!analysis.isReachable(predecessor)) continue;
+        if (!containsBlock(closure, predecessor) and !containsBlock(continuation, predecessor)) return null;
+        for (0..analysis.successorCount(predecessor)) |successor_index| {
+            const successor = analysis.successorAt(predecessor, successor_index) orelse return null;
+            if (successor != block) continue;
+            const reference = successorEdgeRef(program, predecessor, successor_index) orelse return null;
+            if (selected != null) return null;
+            selected = reference;
+        }
+    }
+    return selected;
+}
+
+fn blockUsesContinuationContext(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    block: ir.Block,
+    current: ir.BlockId,
+    closure: []const ir.BlockId,
+    continuation: []const ir.BlockId,
+    incoming: []const ir.CfgEdgeRef,
+    lineage_index: *const CloneLineageIndex,
+    replay_index: *const node_split.ReplayIndex,
+    replay_cache: *ReplayCache,
+    stop: ir.BlockId,
+) std.mem.Allocator.Error!bool {
+    var detector = ContinuationContextUseDetector{
+        .allocator = allocator,
+        .program = program,
+        .analysis = analysis,
+        .current = current,
+        .incoming = incoming,
+        .closure = closure,
+        .continuation = continuation,
+        .lineage_index = lineage_index,
+        .replay_index = replay_index,
+        .replay_cache = replay_cache,
+    };
+    var has_observable_effect = false;
+    for (block.instructions) |instruction_id| {
+        if (instruction_id.index() >= program.instructions.len) return true;
+        const instruction = program.instructions[instruction_id.index()];
+        if (instruction.id != instruction_id or instruction.block != block.id) return true;
+        has_observable_effect = has_observable_effect or
+            proof_effect_closure.hasObservableEffects(instruction.effects);
+        runtime_uses.visitOperationUses(instruction.operation, &detector);
+        if (detector.found) {
+            traceStructural("structural_extension_witness block={} current={} witness={any}\n", .{
+                block.id.index(),
+                current.index(),
+                detector.witness,
+            });
+            return true;
+        }
+    }
+    visitContinuationTerminatorUses(&detector, block.id, block.terminator);
+    if (detector.found) {
+        traceStructural("structural_extension_witness block={} current={} witness={any} terminator=true\n", .{
+            block.id.index(),
+            current.index(),
+            detector.witness,
+        });
+    }
+    // Observable work cannot be shared across an ownership split merely
+    // because its operands are context-independent.  The alternate incoming
+    // edge selects a distinct execution path, so a zero-parameter effectful
+    // continuation block must be cloned with that path.  A shared block may
+    // have only jump predecessors: in that shape there is no immediate
+    // conditional predecessor to expose the ownership boundary, but a
+    // reachable predecessor outside this path proves that the block is a
+    // shared suffix.  Otherwise the split leaves the path entering an
+    // already-owned effectful block and the next structural pass is forced
+    // into one-block-at-a-time collision replay.
+    if (!detector.found and block.parameters.len == 0 and has_observable_effect) {
+        if (hasReachableConditionalPredecessor(analysis, current) or
+            hasReachableExternalContinuationPredecessor(
+                analysis,
+                current,
+                closure,
+                continuation,
+            )) return true;
+
+        // A uniquely owned effectful suffix still has to be cloned when it
+        // completes an authenticated iteration handoff.  Without this
+        // criterion, repeated node splits copy only the preceding block and
+        // rediscover the same suffix on every feedback iteration.
+        if (closure.len != 0 and incoming.len != 0) {
+            if (uniqueReachableContinuationPredecessor(
+                program,
+                analysis,
+                current,
+                closure,
+                continuation,
+            )) |boundary| {
+                if (try authenticatedIterationHandoffBoundaryAtIncoming(
+                    program,
+                    analysis,
+                    closure[0],
+                    closure,
+                    boundary,
+                    incoming,
+                    stop,
+                )) {
+                    traceStructural("structural_extension_authenticated_unique_handoff block={} predecessor={} stop={}\n", .{
+                        current.index(),
+                        boundary.source.index(),
+                        stop.index(),
+                    });
+                    return true;
+                }
+            }
+        }
+    }
+    return detector.found;
+}
+
+// A rejected parameterized bridge can still lead to a later block that uses a
+// value produced by the clone closure.  The ordinary continuation walk stops
+// at that bridge because it cannot yet authenticate the intermediate formal
+// tuple.  Find only the delayed paths that directly consume closure-local
+// values; prepareClosure remains responsible for authenticating every block
+// and edge added by this fallback.
+fn blockUsesDelayedClosureValue(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    block: ir.Block,
+    closure: []const ir.BlockId,
+    lineage_index: *const CloneLineageIndex,
+    replay_index: *const node_split.ReplayIndex,
+    replay_cache: *ReplayCache,
+) bool {
+    var detector = ContinuationContextUseDetector{
+        .allocator = allocator,
+        .program = program,
+        .analysis = analysis,
+        .current = block.id,
+        .incoming = &.{},
+        .closure = closure,
+        .continuation = &.{},
+        .lineage_index = lineage_index,
+        .replay_index = replay_index,
+        .replay_cache = replay_cache,
+        .closure_only = true,
+    };
+    for (block.instructions) |instruction_id| {
+        if (instruction_id.index() >= program.instructions.len) return true;
+        const instruction = program.instructions[instruction_id.index()];
+        if (instruction.id != instruction_id or instruction.block != block.id) return true;
+        runtime_uses.visitOperationUses(instruction.operation, &detector);
+        if (detector.found) return true;
+    }
+    runtime_uses.visitTerminatorUses(block.terminator, &detector);
+    return detector.found;
+}
+
+fn hasReachableExternalClosureUseAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    closure: []const ir.BlockId,
+) std.mem.Allocator.Error!bool {
+    var lineage_index = try CloneLineageIndex.initForFunction(allocator, program, analysis.function.id);
+    defer lineage_index.deinit();
+    var replay_index = try node_split.ReplayIndex.initForFunction(allocator, program, analysis.function.id);
+    defer replay_index.deinit();
+    var replay_cache = ReplayCache.init(allocator, program, &replay_index);
+    defer replay_cache.deinit();
+
+    for (analysis.function.blocks) |block_id| {
+        if (!analysis.isReachable(block_id) or containsBlock(closure, block_id)) continue;
+        if (block_id.index() >= program.blocks.len) return true;
+        if (blockUsesDelayedClosureValue(
+            allocator,
+            program,
+            analysis,
+            program.blocks[block_id.index()],
+            closure,
+            &lineage_index,
+            &replay_index,
+            &replay_cache,
+        )) return true;
+    }
+    return false;
+}
+
 fn successorEdgeRef(
     program: *const ir.Program,
     source: ir.BlockId,
@@ -11234,6 +11806,11 @@ const ContinuationValuePolicy = enum {
     ordinary,
     authenticated_parameter,
     incoming_parameter_bridge,
+};
+
+const ContinuationExtensionMode = enum {
+    contextual,
+    closure_only,
 };
 
 fn hasCloneLineageCandidateForSource(
@@ -11777,6 +12354,51 @@ fn loopCarriedValueIsInContinuationScc(
         try analysis.canReach(producer, source);
 }
 
+// A multi-entry, parameterless forwarding join can be the shared boundary of
+// a loop-carried tuple.  Its successor owns the tuple contract; cloning the
+// join would root the clone before the tuple's producer and manufacture a
+// non-dominating value.  Keep this boundary shared when every forwarded value
+// is authenticated by the same loop SCC.
+fn isSharedLoopForwardingBoundary(
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    block_id: ir.BlockId,
+) std.mem.Allocator.Error!bool {
+    if (!isParameterlessForwardingBlock(program, analysis, block_id)) return false;
+
+    var reachable_predecessors: usize = 0;
+    var predecessor_index: usize = 0;
+    while (analysis.predecessorAt(block_id, predecessor_index)) |predecessor| : (predecessor_index += 1) {
+        if (analysis.isReachable(predecessor)) reachable_predecessors += 1;
+    }
+    if (reachable_predecessors < 2) return false;
+
+    const block = program.blocks[block_id.index()];
+    const edge = switch (block.terminator) {
+        .jump => |value| value,
+        .branch, .return_values, .return_pack, .return_expanded, .throw_error, .unreachable_block => return false,
+    };
+    if (edge.target.index() >= program.blocks.len) return false;
+    const target = program.blocks[edge.target.index()];
+    if (target.id != edge.target or target.function != analysis.function.id or
+        target.parameters.len == 0 or edge.arguments.len != target.parameters.len or
+        !node_split.parametersAreCanonical(program.values, target) or
+        !try analysis.canReach(edge.target, block_id))
+    {
+        return false;
+    }
+    for (edge.arguments) |argument| {
+        if (!try loopCarriedValueIsInContinuationScc(
+            program,
+            analysis,
+            block_id,
+            edge.target,
+            argument,
+        )) return false;
+    }
+    return true;
+}
+
 // A block-parameter projection may cross a loop-carried source clone rather
 // than a direct node-split bridge. Require the value producer to be reachable
 // after the incoming context and to dominate the replay-stable source edge.
@@ -12057,6 +12679,47 @@ fn edgeCarriesContinuationContext(
     return true;
 }
 
+fn edgeArgumentsCarryClosureValue(
+    program: *const ir.Program,
+    source: ir.BlockId,
+    target: ir.BlockId,
+    closure: []const ir.BlockId,
+) bool {
+    const source_block = if (source.index() < program.blocks.len) program.blocks[source.index()] else return true;
+    if (source_block.id != source) return true;
+    switch (source_block.terminator) {
+        .jump => |edge| if (edge.target == target) for (edge.arguments) |argument| {
+            const producer = projectionValueProducer(program, argument) orelse continue;
+            if (containsBlock(closure, producer)) return true;
+        },
+        .branch => |branch| for (&[_]ir.Edge{ branch.then_edge, branch.else_edge }) |edge| {
+            if (edge.target != target) continue;
+            for (edge.arguments) |argument| {
+                const producer = projectionValueProducer(program, argument) orelse continue;
+                if (containsBlock(closure, producer)) return true;
+            }
+        },
+        else => {},
+    }
+    return false;
+}
+
+fn terminatorCarriesClosureValue(
+    program: *const ir.Program,
+    source: ir.BlockId,
+    closure: []const ir.BlockId,
+) bool {
+    if (source.index() >= program.blocks.len) return true;
+    const block = program.blocks[source.index()];
+    if (block.id != source) return true;
+    return switch (block.terminator) {
+        .jump => |edge| edgeArgumentsCarryClosureValue(program, source, edge.target, closure),
+        .branch => |branch| edgeArgumentsCarryClosureValue(program, source, branch.then_edge.target, closure) or
+            edgeArgumentsCarryClosureValue(program, source, branch.else_edge.target, closure),
+        .return_values, .return_pack, .return_expanded, .throw_error, .unreachable_block => false,
+    };
+}
+
 fn parameterizedContinuationBridge(
     allocator: std.mem.Allocator,
     program: *const ir.Program,
@@ -12129,6 +12792,78 @@ fn sharedIterationHeaderBoundaryAtIncoming(
         }
     }
     return true;
+}
+
+// A collision suffix may end at a shared zero-parameter forwarding chain
+// before it hands the complete iteration state back to its header.  The
+// forwarding blocks are not part of the clone, so authenticate this boundary
+// separately from ordinary continuation-context uses.  Keep the chain
+// straight-line and bounded: a branch, parameterized carrier, incoming-source
+// hop, or non-terminating cycle is not an iteration handoff proof.
+fn authenticatedIterationHandoffBoundaryAtIncoming(
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    entry: ir.BlockId,
+    closure: []const ir.BlockId,
+    boundary: ir.CfgEdgeRef,
+    incoming: []const ir.CfgEdgeRef,
+    expected_header: ?ir.BlockId,
+) std.mem.Allocator.Error!bool {
+    if (incoming.len == 0 or boundary.source != entry and !containsBlock(closure, boundary.source)) return false;
+
+    var handoff = boundary;
+    var hops: usize = 0;
+    while (hops <= analysis.function.blocks.len) : (hops += 1) {
+        if (handoff.target.index() >= program.blocks.len or
+            !analysis.isReachable(handoff.target) or
+            handoff.target == entry or
+            containsBlock(closure, handoff.target) or
+            !incomingEdgeIsCanonical(program, analysis, handoff))
+        {
+            return false;
+        }
+        for (incoming) |reference| {
+            if (handoff.target == reference.source) return false;
+        }
+
+        const edge = cfg_edge.value(program, handoff) orelse return false;
+        const block = program.blocks[handoff.target.index()];
+        if (block.id != handoff.target or block.function != analysis.function.id or
+            edge.arguments.len != block.parameters.len)
+        {
+            return false;
+        }
+
+        if (isIterationTransitionHeader(program, handoff.target)) {
+            // `stop` is usually the collision block that bounds the
+            // continuation, not an iteration header.  Constrain the handoff
+            // only when the caller supplied an actual iteration-header stop;
+            // otherwise a valid handoff to the loop's own header would be
+            // rejected merely because the collision block has a different id.
+            if (expected_header) |expected| {
+                if (isIterationTransitionHeader(program, expected) and handoff.target != expected) return false;
+            }
+            if (!try analysis.canReach(handoff.target, entry)) return false;
+            return sharedIterationHeaderBoundaryAtIncoming(
+                program,
+                analysis,
+                handoff.target,
+                edge.arguments,
+                incoming,
+            );
+        }
+
+        if (block.parameters.len != 0) return false;
+        switch (block.terminator) {
+            .jump => |next| {
+                if (next.target.index() >= program.blocks.len or
+                    (!isIterationTransitionHeader(program, next.target) and next.arguments.len != 0)) return false;
+                handoff = .{ .source = handoff.target, .kind = .jump, .target = next.target };
+            },
+            .branch, .return_values, .return_pack, .return_expanded, .throw_error, .unreachable_block => return false,
+        }
+    }
+    return false;
 }
 
 test "contextual continuation stops before a shared iteration header" {
@@ -12241,6 +12976,335 @@ test "contextual continuation stops before a shared iteration header" {
         null,
         null,
     ));
+}
+
+const SharedSuffixContextDetector = struct {
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    region: []const bool,
+    incoming: []const ir.CfgEdgeRef,
+    found: bool = false,
+
+    fn mark(self: *SharedSuffixContextDetector) void {
+        self.found = true;
+    }
+
+    fn blockIsShared(self: *const SharedSuffixContextDetector, block_id: ir.BlockId) bool {
+        const local_index = self.analysis.blockIndex(block_id) orelse return false;
+        return local_index < self.region.len and self.region[local_index];
+    }
+
+    fn externalDefinitionIsAvailable(
+        self: *const SharedSuffixContextDetector,
+        producer: ir.BlockId,
+    ) bool {
+        return self.blockIsShared(producer) or
+            definitionDominatesIncoming(self.analysis, producer, self.incoming);
+    }
+
+    pub fn value(self: *SharedSuffixContextDetector, value_id: ir.ValueId) void {
+        if (self.found) return;
+        if (value_id.index() >= self.program.values.len) {
+            self.mark();
+            return;
+        }
+        const item = self.program.values[value_id.index()];
+        if (item.id != value_id or item.function != self.analysis.function.id) {
+            self.mark();
+            return;
+        }
+        switch (item.origin) {
+            .parameter, .capture => {},
+            .block_parameter => |origin| {
+                if (!self.externalDefinitionIsAvailable(origin.block)) self.mark();
+            },
+            .instruction_result => |origin| {
+                if (origin.instruction.index() >= self.program.instructions.len) {
+                    self.mark();
+                    return;
+                }
+                const instruction = self.program.instructions[origin.instruction.index()];
+                if (instruction.id != origin.instruction or
+                    !self.externalDefinitionIsAvailable(instruction.block))
+                {
+                    self.mark();
+                }
+            },
+        }
+    }
+
+    pub fn pack(self: *SharedSuffixContextDetector, pack_id: ir.ValuePackId) void {
+        if (self.found) return;
+        if (pack_id.index() >= self.program.value_packs.len) {
+            self.mark();
+            return;
+        }
+        const item = self.program.value_packs[pack_id.index()];
+        if (item.id != pack_id or item.function != self.analysis.function.id) {
+            self.mark();
+            return;
+        }
+        switch (item.origin) {
+            .varargs => {},
+            .instruction_result => |instruction_id| {
+                if (instruction_id.index() >= self.program.instructions.len) {
+                    self.mark();
+                    return;
+                }
+                const instruction = self.program.instructions[instruction_id.index()];
+                if (instruction.id != instruction_id or
+                    !self.externalDefinitionIsAvailable(instruction.block))
+                {
+                    self.mark();
+                }
+            },
+        }
+    }
+
+    pub fn place(self: *SharedSuffixContextDetector, place_id: ir.PlaceId) void {
+        if (self.found) return;
+        if (place_id.index() >= self.program.places.len) {
+            self.mark();
+            return;
+        }
+        const item = self.program.places[place_id.index()];
+        if (item.id != place_id or item.function != self.analysis.function.id) {
+            self.mark();
+            return;
+        }
+        switch (item.origin) {
+            .local, .capture => {},
+            .instruction => |instruction_id| {
+                if (instruction_id.index() >= self.program.instructions.len) {
+                    self.mark();
+                    return;
+                }
+                const instruction = self.program.instructions[instruction_id.index()];
+                if (instruction.id != instruction_id or
+                    !self.externalDefinitionIsAvailable(instruction.block))
+                {
+                    self.mark();
+                }
+            },
+        }
+    }
+};
+
+fn blockUsesSharedSuffixContext(
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    block: ir.Block,
+    region: []const bool,
+    incoming: []const ir.CfgEdgeRef,
+) bool {
+    var detector = SharedSuffixContextDetector{
+        .program = program,
+        .analysis = analysis,
+        .region = region,
+        .incoming = incoming,
+    };
+    for (block.instructions) |instruction_id| {
+        if (instruction_id.index() >= program.instructions.len) return true;
+        const instruction = program.instructions[instruction_id.index()];
+        if (instruction.id != instruction_id or instruction.block != block.id) return true;
+        if (proof_effect_closure.hasObservableEffects(instruction.effects)) return true;
+        runtime_uses.visitOperationUses(instruction.operation, &detector);
+        if (detector.found) return true;
+    }
+    switch (block.terminator) {
+        .throw_error => return true,
+        else => {},
+    }
+    runtime_uses.visitTerminatorUses(block.terminator, &detector);
+    return detector.found;
+}
+
+fn isSharedSuffixBoundary(
+    block: ir.BlockId,
+    stop: ir.BlockId,
+    incoming: []const ir.CfgEdgeRef,
+) bool {
+    if (block == stop) return true;
+    for (incoming) |reference| if (reference.target == block) return true;
+    return false;
+}
+
+fn regionHasRetainedInClosurePredecessor(
+    analysis: *const cfg.Analysis,
+    membership: []const bool,
+    removed: []const bool,
+    region: []const bool,
+    stop: ir.BlockId,
+    incoming: []const ir.CfgEdgeRef,
+    block: ir.BlockId,
+) bool {
+    var predecessor_index: usize = 0;
+    while (analysis.predecessorAt(block, predecessor_index)) |predecessor| : (predecessor_index += 1) {
+        const predecessor_local = analysis.blockIndex(predecessor) orelse return true;
+        if (!membership[predecessor_local] or
+            region[predecessor_local] or
+            removed[predecessor_local] or
+            isSharedSuffixBoundary(predecessor, stop, incoming))
+        {
+            continue;
+        }
+        return true;
+    }
+    return false;
+}
+
+fn trimContextIndependentSharedSuffixAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    stop: ir.BlockId,
+    closure: []ir.BlockId,
+    incoming: []const ir.CfgEdgeRef,
+) std.mem.Allocator.Error![]ir.BlockId {
+    if (closure.len < 2 or incoming.len == 0) return closure;
+
+    if (trace_structural_phases and closure.len >= 100) {
+        traceStructural("shared_suffix_trim_begin stop={} closure={} incoming={}\n", .{
+            stop.index(),
+            closure.len,
+            incoming.len,
+        });
+    }
+
+    const function_block_count = analysis.function.blocks.len;
+    const membership = try allocator.alloc(bool, function_block_count);
+    defer allocator.free(membership);
+    @memset(membership, false);
+    for (closure) |block_id| {
+        const local_index = analysis.blockIndex(block_id) orelse return closure;
+        membership[local_index] = true;
+    }
+
+    const removed = try allocator.alloc(bool, function_block_count);
+    defer allocator.free(removed);
+    @memset(removed, false);
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (closure) |start| {
+            const start_index = analysis.blockIndex(start) orelse return closure;
+            if (removed[start_index] or isSharedSuffixBoundary(start, stop, incoming)) {
+                continue;
+            }
+            const start_block = program.blocks[start.index()];
+            if (start_block.id != start) continue;
+            if (start_block.parameters.len != 0) {
+                if (!node_split.parametersAreCanonical(program.values, start_block)) continue;
+            }
+
+            const region = try allocator.alloc(bool, function_block_count);
+            @memset(region, false);
+            defer allocator.free(region);
+            var pending: std.ArrayList(ir.BlockId) = .empty;
+            defer pending.deinit(allocator);
+            try pending.append(allocator, start);
+            var valid = true;
+            while (pending.pop()) |current| {
+                const current_index = analysis.blockIndex(current) orelse {
+                    valid = false;
+                    break;
+                };
+                if (region[current_index]) continue;
+                if (!membership[current_index] or removed[current_index]) {
+                    valid = false;
+                    break;
+                }
+                // The preserved stop/incoming boundary is shared by the
+                // original graph.  A pure region may hand control back to it;
+                // it must not become part of the clone closure itself.
+                if (isSharedSuffixBoundary(current, stop, incoming)) continue;
+                const current_block = program.blocks[current.index()];
+                if (current_block.id != current or
+                    !node_split.parametersAreCanonical(program.values, current_block))
+                {
+                    valid = false;
+                    break;
+                }
+                region[current_index] = true;
+                if (blockUsesSharedSuffixContext(program, analysis, current_block, region, incoming)) {
+                    if (trace_structural_phases and closure.len >= 100) {
+                        traceStructural("shared_suffix_trim_context_reject start={} current={}\n", .{
+                            start.index(),
+                            current.index(),
+                        });
+                    }
+                    valid = false;
+                    break;
+                }
+                for (0..analysis.successorCount(current)) |successor_index| {
+                    const successor = analysis.successorAt(current, successor_index) orelse {
+                        valid = false;
+                        break;
+                    };
+                    const successor_local = analysis.blockIndex(successor) orelse continue;
+                    if (membership[successor_local]) try pending.append(allocator, successor);
+                }
+                if (!valid) break;
+            }
+            if (!valid) continue;
+
+            // Do not remove a pure tail independently when a retained
+            // in-closure predecessor still transfers into it.  A complete
+            // pure suffix can be removed, but an effectful predecessor keeps
+            // its downstream control-flow tail in the clone closure.
+            for (closure) |candidate| {
+                const candidate_index = analysis.blockIndex(candidate) orelse {
+                    valid = false;
+                    break;
+                };
+                if (region[candidate_index] and regionHasRetainedInClosurePredecessor(
+                    analysis,
+                    membership,
+                    removed,
+                    region,
+                    stop,
+                    incoming,
+                    candidate,
+                )) {
+                    valid = false;
+                    break;
+                }
+            }
+            if (!valid) continue;
+
+            if (trace_structural_phases and closure.len >= 100) {
+                traceStructural("shared_suffix_trim_region start={} size={}\n", .{
+                    start.index(),
+                    std.mem.countScalar(bool, region, true),
+                });
+            }
+
+            for (analysis.function.blocks, 0..) |_, local_index| {
+                if (region[local_index] and !removed[local_index]) {
+                    removed[local_index] = true;
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    var removed_count: usize = 0;
+    for (closure) |block_id| {
+        const local_index = analysis.blockIndex(block_id) orelse return closure;
+        if (removed[local_index]) removed_count += 1;
+    }
+    if (removed_count == 0) return closure;
+
+    var retained: std.ArrayList(ir.BlockId) = .empty;
+    errdefer retained.deinit(allocator);
+    try retained.ensureTotalCapacity(allocator, closure.len - removed_count);
+    for (closure) |block_id| {
+        const local_index = analysis.blockIndex(block_id) orelse return closure;
+        if (!removed[local_index]) try retained.append(allocator, block_id);
+    }
+    const owned = try retained.toOwnedSlice(allocator);
+    allocator.free(closure);
+    return owned;
 }
 
 fn containsBlock(blocks: []const ir.BlockId, target: ir.BlockId) bool {
