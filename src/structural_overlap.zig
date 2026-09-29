@@ -9449,6 +9449,231 @@ fn packProducerBlock(program: *const ir.Program, pack_id: ir.ValuePackId) ?ir.Bl
     };
 }
 
+test "continuation extension retains only the context-dependent sibling path" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const closure_entry = ir.BlockId.fromIndex(1);
+    const dependent = ir.BlockId.fromIndex(2);
+    const sibling = ir.BlockId.fromIndex(3);
+    const exit = ir.BlockId.fromIndex(4);
+    const source_value = ir.ValueId.fromIndex(0);
+    const closure_value = ir.ValueId.fromIndex(1);
+    const exit_value = ir.ValueId.fromIndex(2);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .jump = .{
+            .target = closure_entry,
+            .arguments = &.{source_value},
+        } } },
+        .{ .id = closure_entry, .function = function_id, .parameters = &.{closure_value}, .terminator = .{ .branch = .{
+            .condition = closure_value,
+            .then_edge = .{ .target = dependent },
+            .else_edge = .{ .target = sibling },
+        } } },
+        .{ .id = dependent, .function = function_id, .terminator = .{ .jump = .{
+            .target = exit,
+            .arguments = &.{closure_value},
+        } } },
+        .{ .id = sibling, .function = function_id, .terminator = .{ .jump = .{
+            .target = exit,
+            .arguments = &.{source_value},
+        } } },
+        .{ .id = exit, .function = function_id, .parameters = &.{exit_value}, .terminator = .{ .return_values = &.{exit_value} } },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .parameters = &.{source_value},
+        .blocks = &.{ entry, closure_entry, dependent, sibling, exit },
+        .entry_block = entry,
+    }};
+    const values = [_]ir.Value{
+        .{ .id = source_value, .function = function_id, .type = .integer, .origin = .{ .parameter = 0 } },
+        .{ .id = closure_value, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = closure_entry, .index = 0 } } },
+        .{ .id = exit_value, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = exit, .index = 0 } } },
+    };
+    const program: ir.Program = .{
+        .program_id = "minimal-continuation-extension",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+    };
+
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, functions[0]);
+    defer analysis.deinit();
+    const closure = try std.testing.allocator.dupe(ir.BlockId, &.{closure_entry});
+    const extended = try extendContinuationClosureAlloc(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        exit,
+        closure,
+        null,
+    );
+    defer std.testing.allocator.free(extended);
+    try std.testing.expectEqualSlices(ir.BlockId, &.{ closure_entry, dependent }, extended);
+
+    var contextual_blocks = blocks;
+    contextual_blocks[sibling.index()].terminator = .{ .jump = .{
+        .target = exit,
+        .arguments = &.{closure_value},
+    } };
+    var contextual_program = program;
+    contextual_program.blocks = &contextual_blocks;
+    var contextual_analysis = try cfg.Analysis.init(
+        std.testing.allocator,
+        &contextual_program,
+        functions[0],
+    );
+    defer contextual_analysis.deinit();
+    const contextual_closure = try std.testing.allocator.dupe(ir.BlockId, &.{closure_entry});
+    const contextual_extended = try extendContinuationClosureAlloc(
+        std.testing.allocator,
+        &contextual_program,
+        &contextual_analysis,
+        exit,
+        contextual_closure,
+        null,
+    );
+    defer std.testing.allocator.free(contextual_extended);
+    try std.testing.expectEqual(3, contextual_extended.len);
+    try std.testing.expect(containsBlock(contextual_extended, dependent));
+    try std.testing.expect(containsBlock(contextual_extended, sibling));
+}
+
+test "continuation extension retains an effectful zero-parameter suffix" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const closure_entry = ir.BlockId.fromIndex(1);
+    const effectful = ir.BlockId.fromIndex(2);
+    const exit = ir.BlockId.fromIndex(3);
+    const condition = ir.ValueId.fromIndex(0);
+    const table = ir.ValueId.fromIndex(1);
+    const make_table = ir.InstructionId.fromIndex(0);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .jump = .{ .target = closure_entry } } },
+        .{ .id = closure_entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = condition,
+            .then_edge = .{ .target = effectful },
+            .else_edge = .{ .target = exit },
+        } } },
+        .{ .id = effectful, .function = function_id, .instructions = &.{make_table}, .terminator = .{ .jump = .{ .target = exit } } },
+        .{ .id = exit, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .parameters = &.{condition},
+        .blocks = &.{ entry, closure_entry, effectful, exit },
+        .entry_block = entry,
+    }};
+    const values = [_]ir.Value{
+        .{
+            .id = condition,
+            .function = function_id,
+            .type = .boolean,
+            .origin = .{ .parameter = 0 },
+        },
+        .{
+            .id = table,
+            .function = function_id,
+            .origin = .{ .instruction_result = .{ .instruction = make_table, .index = 0 } },
+        },
+    };
+    const instructions = [_]ir.Instruction{.{
+        .id = make_table,
+        .block = effectful,
+        .operation = .{ .make_table = {} },
+        .results = &.{table},
+        .effects = .table_constructor,
+    }};
+    const program: ir.Program = .{
+        .program_id = "effectful-zero-parameter-continuation",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+    };
+
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, functions[0]);
+    defer analysis.deinit();
+    const closure = try std.testing.allocator.dupe(ir.BlockId, &.{closure_entry});
+    const extended = try extendContinuationClosureAlloc(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        exit,
+        closure,
+        null,
+    );
+    defer std.testing.allocator.free(extended);
+    try std.testing.expectEqualSlices(ir.BlockId, &.{ closure_entry, effectful }, extended);
+}
+
+test "continuation extension retains a delayed mapped use after a parameterized boundary" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const closure_entry = ir.BlockId.fromIndex(1);
+    const parameterized_bridge = ir.BlockId.fromIndex(2);
+    const delayed_use = ir.BlockId.fromIndex(3);
+    const stop = ir.BlockId.fromIndex(4);
+    const source_value = ir.ValueId.fromIndex(0);
+    const closure_value = ir.ValueId.fromIndex(1);
+    const bridge_value = ir.ValueId.fromIndex(2);
+
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .jump = .{ .target = closure_entry, .arguments = &.{source_value} } } },
+        .{ .id = closure_entry, .function = function_id, .parameters = &.{closure_value}, .terminator = .{ .jump = .{ .target = parameterized_bridge, .arguments = &.{closure_value} } } },
+        .{ .id = parameterized_bridge, .function = function_id, .parameters = &.{bridge_value}, .terminator = .{ .jump = .{ .target = delayed_use } } },
+        .{ .id = delayed_use, .function = function_id, .terminator = .{ .jump = .{ .target = stop, .arguments = &.{closure_value} } } },
+        .{ .id = stop, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .parameters = &.{source_value},
+        .blocks = &.{ entry, closure_entry, parameterized_bridge, delayed_use, stop },
+        .entry_block = entry,
+    }};
+    const values = [_]ir.Value{
+        .{ .id = source_value, .function = function_id, .type = .integer, .origin = .{ .parameter = 0 } },
+        .{ .id = closure_value, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = closure_entry, .index = 0 } } },
+        .{ .id = bridge_value, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = parameterized_bridge, .index = 0 } } },
+    };
+    const program: ir.Program = .{
+        .program_id = "delayed-mapped-use-after-parameterized-boundary",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, functions[0]);
+    defer analysis.deinit();
+    const incoming = [_]ir.CfgEdgeRef{.{ .source = entry, .kind = .jump, .target = closure_entry }};
+    const closure = try std.testing.allocator.dupe(ir.BlockId, &.{closure_entry});
+    const extended = try extendContinuationClosureAlloc(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        stop,
+        closure,
+        &incoming,
+    );
+    defer std.testing.allocator.free(extended);
+    try std.testing.expectEqualSlices(
+        ir.BlockId,
+        &.{ closure_entry, parameterized_bridge, delayed_use },
+        extended,
+    );
+    try std.testing.expect(prepareClosure(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        extended,
+        &incoming,
+    ));
+}
+
 test "external-use projection rescans definitions added by the first pass" {
     const function_id = ir.FunctionId.fromIndex(0);
     const entry = ir.BlockId.fromIndex(0);
@@ -9509,6 +9734,155 @@ test "external-use projection rescans definitions added by the first pass" {
         ir.BlockId,
         &.{ closure_entry, first_consumer, downstream_consumer },
         projected,
+    );
+}
+
+test "continuation extension retains a shared effectful jump suffix before iteration handoff" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const header = ir.BlockId.fromIndex(1);
+    const source = ir.BlockId.fromIndex(2);
+    const closure_entry = ir.BlockId.fromIndex(3);
+    const forwarder = ir.BlockId.fromIndex(4);
+    const alternate = ir.BlockId.fromIndex(5);
+    const exit = ir.BlockId.fromIndex(6);
+
+    const selector = ir.ValueId.fromIndex(0);
+    const control = ir.ValueId.fromIndex(1);
+    const limit = ir.ValueId.fromIndex(2);
+    const step = ir.ValueId.fromIndex(3);
+    const header_control = ir.ValueId.fromIndex(4);
+    const header_limit = ir.ValueId.fromIndex(5);
+    const header_step = ir.ValueId.fromIndex(6);
+    const header_initial = ir.ValueId.fromIndex(7);
+    const false_value = ir.ValueId.fromIndex(8);
+    const has_next = ir.ValueId.fromIndex(9);
+    const normalized_limit = ir.ValueId.fromIndex(10);
+    const normalized_step = ir.ValueId.fromIndex(11);
+    const next_control = ir.ValueId.fromIndex(12);
+    const table = ir.ValueId.fromIndex(13);
+    const false_instruction = ir.InstructionId.fromIndex(0);
+    const transition_instruction = ir.InstructionId.fromIndex(1);
+    const make_table = ir.InstructionId.fromIndex(2);
+
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .instructions = &.{false_instruction}, .terminator = .{ .jump = .{
+            .target = header,
+            .arguments = &.{ control, limit, step, false_value },
+        } } },
+        .{ .id = header, .function = function_id, .parameters = &.{
+            header_control, header_limit, header_step, header_initial,
+        }, .instructions = &.{transition_instruction}, .terminator = .{ .branch = .{
+            .condition = has_next,
+            .then_edge = .{ .target = source },
+            .else_edge = .{ .target = exit },
+        } } },
+        .{ .id = source, .function = function_id, .terminator = .{ .branch = .{
+            .condition = selector,
+            .then_edge = .{ .target = closure_entry },
+            .else_edge = .{ .target = alternate },
+        } } },
+        .{ .id = closure_entry, .function = function_id, .terminator = .{ .jump = .{ .target = forwarder } } },
+        .{ .id = forwarder, .function = function_id, .instructions = &.{make_table}, .terminator = .{ .jump = .{
+            .target = header,
+            .arguments = &.{ next_control, normalized_limit, normalized_step, false_value },
+        } } },
+        .{ .id = alternate, .function = function_id, .terminator = .{ .jump = .{ .target = forwarder } } },
+        .{ .id = exit, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &.{ selector, control, limit, step },
+        .blocks = &.{ entry, header, source, closure_entry, forwarder, alternate, exit },
+        .entry_block = entry,
+    };
+    const values = [_]ir.Value{
+        .{ .id = selector, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = control, .function = function_id, .type = .dynamic, .origin = .{ .parameter = 1 } },
+        .{ .id = limit, .function = function_id, .type = .dynamic, .origin = .{ .parameter = 2 } },
+        .{ .id = step, .function = function_id, .type = .dynamic, .origin = .{ .parameter = 3 } },
+        .{ .id = header_control, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = header, .index = 0 } } },
+        .{ .id = header_limit, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = header, .index = 1 } } },
+        .{ .id = header_step, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = header, .index = 2 } } },
+        .{ .id = header_initial, .function = function_id, .type = .boolean, .origin = .{ .block_parameter = .{ .block = header, .index = 3 } } },
+        .{ .id = false_value, .function = function_id, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = false_instruction, .index = 0 } } },
+        .{ .id = has_next, .function = function_id, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = transition_instruction, .index = 0 } } },
+        .{ .id = normalized_limit, .function = function_id, .type = .dynamic, .origin = .{ .instruction_result = .{ .instruction = transition_instruction, .index = 1 } } },
+        .{ .id = normalized_step, .function = function_id, .type = .dynamic, .origin = .{ .instruction_result = .{ .instruction = transition_instruction, .index = 2 } } },
+        .{ .id = next_control, .function = function_id, .type = .dynamic, .origin = .{ .instruction_result = .{ .instruction = transition_instruction, .index = 3 } } },
+        .{ .id = table, .function = function_id, .type = .dynamic, .origin = .{ .instruction_result = .{ .instruction = make_table, .index = 0 } } },
+    };
+    const instructions = [_]ir.Instruction{
+        .{ .id = false_instruction, .block = entry, .operation = .{ .constant = .{ .boolean = false } }, .results = &.{false_value}, .effects = .pure },
+        .{ .id = transition_instruction, .block = header, .operation = .{ .numeric_for_next = .{
+            .control = header_control,
+            .limit = header_limit,
+            .step = header_step,
+            .initial = header_initial,
+            .mode = .semantic_normalized,
+        } }, .results = &.{ has_next, normalized_limit, normalized_step, next_control }, .effects = .numeric_for_next },
+        .{ .id = make_table, .block = forwarder, .operation = .{ .make_table = {} }, .results = &.{table}, .effects = .table_constructor },
+    };
+    const program: ir.Program = .{
+        .program_id = "shared-effectful-jump-suffix-iteration-handoff",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+    };
+
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, function);
+    defer analysis.deinit();
+    const incoming = [_]ir.CfgEdgeRef{.{
+        .source = source,
+        .kind = .branch_then,
+        .target = closure_entry,
+    }};
+    const closure = try std.testing.allocator.dupe(ir.BlockId, &.{closure_entry});
+    const extended = try extendContinuationClosureAlloc(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        exit,
+        closure,
+        &incoming,
+    );
+    defer std.testing.allocator.free(extended);
+    try std.testing.expectEqualSlices(ir.BlockId, &.{ closure_entry, forwarder }, extended);
+
+    // The same suffix is also valid when its only reachable predecessor is
+    // the admitted closure entry.  The iteration handoff proof must retain
+    // the effectful suffix instead of rediscovering it on the next split.
+    var uniquely_owned_blocks = blocks;
+    uniquely_owned_blocks[source.index()].terminator = .{ .branch = .{
+        .condition = selector,
+        .then_edge = .{ .target = closure_entry },
+        .else_edge = .{ .target = exit },
+    } };
+    uniquely_owned_blocks[alternate.index()].terminator = .{ .unreachable_block = {} };
+    var uniquely_owned_program = program;
+    uniquely_owned_program.blocks = &uniquely_owned_blocks;
+    var uniquely_owned_analysis = try cfg.Analysis.init(
+        std.testing.allocator,
+        &uniquely_owned_program,
+        function,
+    );
+    defer uniquely_owned_analysis.deinit();
+    const uniquely_owned_closure = try std.testing.allocator.dupe(ir.BlockId, &.{closure_entry});
+    const uniquely_owned_extended = try extendContinuationClosureAlloc(
+        std.testing.allocator,
+        &uniquely_owned_program,
+        &uniquely_owned_analysis,
+        header,
+        uniquely_owned_closure,
+        &incoming,
+    );
+    defer std.testing.allocator.free(uniquely_owned_extended);
+    try std.testing.expectEqualSlices(
+        ir.BlockId,
+        &.{ closure_entry, forwarder },
+        uniquely_owned_extended,
     );
 }
 
@@ -10122,6 +10496,265 @@ test "parameterized continuation admits an authenticated loop-carried SCC" {
         null,
         null,
         null,
+    ));
+}
+
+test "parameterized continuation retains a bridge that forwards closure state" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const source = ir.BlockId.fromIndex(1);
+    const bridge = ir.BlockId.fromIndex(2);
+    const sink = ir.BlockId.fromIndex(3);
+    const source_argument = ir.ValueId.fromIndex(0);
+    const forwarded_value = ir.ValueId.fromIndex(1);
+    const bridge_parameter = ir.ValueId.fromIndex(2);
+    const sink_parameter = ir.ValueId.fromIndex(3);
+    const source_instruction = ir.InstructionId.fromIndex(0);
+    const forwarded_instruction = ir.InstructionId.fromIndex(1);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .jump = .{ .target = source } } },
+        .{ .id = source, .function = function_id, .instructions = &.{ source_instruction, forwarded_instruction }, .terminator = .{ .jump = .{
+            .target = bridge,
+            .arguments = &.{source_argument},
+        } } },
+        .{ .id = bridge, .function = function_id, .parameters = &.{bridge_parameter}, .terminator = .{ .jump = .{
+            .target = sink,
+            .arguments = &.{forwarded_value},
+        } } },
+        .{ .id = sink, .function = function_id, .parameters = &.{sink_parameter}, .terminator = .{ .return_values = &.{sink_parameter} } },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .blocks = &.{ entry, source, bridge, sink },
+        .entry_block = entry,
+    }};
+    const values = [_]ir.Value{
+        .{ .id = source_argument, .function = function_id, .type = .dynamic, .origin = .{ .instruction_result = .{ .instruction = source_instruction, .index = 0 } } },
+        .{ .id = forwarded_value, .function = function_id, .type = .dynamic, .origin = .{ .instruction_result = .{ .instruction = forwarded_instruction, .index = 0 } } },
+        .{ .id = bridge_parameter, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = bridge, .index = 0 } } },
+        .{ .id = sink_parameter, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = sink, .index = 0 } } },
+    };
+    const instructions = [_]ir.Instruction{
+        .{ .id = source_instruction, .block = source, .operation = .{ .constant = .{ .number = 1 } }, .results = &.{source_argument}, .effects = .pure },
+        .{ .id = forwarded_instruction, .block = source, .operation = .{ .constant = .{ .number = 2 } }, .results = &.{forwarded_value}, .effects = .pure },
+    };
+    const program: ir.Program = .{
+        .program_id = "parameterized-bridge-forwards-closure-state",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, functions[0]);
+    defer analysis.deinit();
+    const incoming = [_]ir.CfgEdgeRef{.{ .source = entry, .kind = .jump, .target = source }};
+    const initial = try std.testing.allocator.dupe(ir.BlockId, &.{source});
+    const extended = try extendContinuationClosureAlloc(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        entry,
+        initial,
+        &incoming,
+    );
+    defer std.testing.allocator.free(extended);
+    try std.testing.expect(containsBlock(extended, bridge));
+}
+
+test "effectful tuple prefix reuses an authenticated parameterized suffix" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const prefix = ir.BlockId.fromIndex(1);
+    const forwarder = ir.BlockId.fromIndex(2);
+    const suffix = ir.BlockId.fromIndex(3);
+    const exit = ir.BlockId.fromIndex(4);
+    const alternate = ir.BlockId.fromIndex(5);
+
+    const selector = ir.ValueId.fromIndex(0);
+    const input_first = ir.ValueId.fromIndex(1);
+    const input_second = ir.ValueId.fromIndex(2);
+    const input_third = ir.ValueId.fromIndex(3);
+    const input_fourth = ir.ValueId.fromIndex(4);
+    const prefix_first = ir.ValueId.fromIndex(5);
+    const prefix_second = ir.ValueId.fromIndex(6);
+    const prefix_third = ir.ValueId.fromIndex(7);
+    const prefix_fourth = ir.ValueId.fromIndex(8);
+    const suffix_first = ir.ValueId.fromIndex(9);
+    const suffix_second = ir.ValueId.fromIndex(10);
+    const suffix_third = ir.ValueId.fromIndex(11);
+    const suffix_fourth = ir.ValueId.fromIndex(12);
+    const prefix_read = ir.ValueId.fromIndex(13);
+    const prefix_constant = ir.ValueId.fromIndex(14);
+    const prefix_condition = ir.ValueId.fromIndex(15);
+    const forward_read = ir.ValueId.fromIndex(16);
+    const tampered_value = ir.ValueId.fromIndex(17);
+
+    const prefix_read_id = ir.InstructionId.fromIndex(0);
+    const prefix_constant_id = ir.InstructionId.fromIndex(1);
+    const prefix_compare_id = ir.InstructionId.fromIndex(2);
+    const forward_read_id = ir.InstructionId.fromIndex(3);
+    const forward_write_id = ir.InstructionId.fromIndex(4);
+    const tampered_instruction_id = ir.InstructionId.fromIndex(5);
+
+    const prefix_place = ir.PlaceId.fromIndex(0);
+    const forward_read_place = ir.PlaceId.fromIndex(1);
+    const forward_write_place = ir.PlaceId.fromIndex(2);
+    const alternate_place = ir.PlaceId.fromIndex(3);
+    const prefix_arguments = [_]ir.ValueId{ input_first, input_second, input_third, input_fourth };
+    const prefix_tuple = [_]ir.ValueId{ prefix_first, prefix_second, prefix_third, prefix_fourth };
+    const suffix_tuple = [_]ir.ValueId{ suffix_first, suffix_second, suffix_third, suffix_fourth };
+    var tampered_tuple = prefix_tuple;
+    tampered_tuple[0] = tampered_value;
+
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = selector,
+            .then_edge = .{ .target = prefix, .arguments = prefix_arguments[0..] },
+            .else_edge = .{ .target = alternate },
+        } } },
+        .{ .id = prefix, .function = function_id, .parameters = prefix_tuple[0..], .instructions = &.{
+            prefix_read_id,
+            prefix_constant_id,
+            prefix_compare_id,
+        }, .terminator = .{ .branch = .{
+            .condition = prefix_condition,
+            .then_edge = .{ .target = exit },
+            .else_edge = .{ .target = forwarder },
+        } } },
+        .{ .id = forwarder, .function = function_id, .instructions = &.{
+            forward_read_id,
+            forward_write_id,
+        }, .terminator = .{ .jump = .{
+            .target = suffix,
+            .arguments = prefix_tuple[0..],
+        } } },
+        .{ .id = suffix, .function = function_id, .parameters = suffix_tuple[0..], .terminator = .{ .jump = .{ .target = exit } } },
+        .{ .id = exit, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = alternate, .function = function_id, .instructions = &.{tampered_instruction_id}, .terminator = .{ .jump = .{ .target = exit } } },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .parameters = &.{ selector, input_first, input_second, input_third, input_fourth },
+        .local_places = &.{ prefix_place, forward_read_place, forward_write_place, alternate_place },
+        .blocks = &.{ entry, prefix, forwarder, suffix, exit, alternate },
+        .entry_block = entry,
+    }};
+    const values = [_]ir.Value{
+        .{ .id = selector, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = input_first, .function = function_id, .type = .dynamic, .origin = .{ .parameter = 1 } },
+        .{ .id = input_second, .function = function_id, .type = .dynamic, .origin = .{ .parameter = 2 } },
+        .{ .id = input_third, .function = function_id, .type = .dynamic, .origin = .{ .parameter = 3 } },
+        .{ .id = input_fourth, .function = function_id, .type = .boolean, .origin = .{ .parameter = 4 } },
+        .{ .id = prefix_first, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = prefix, .index = 0 } } },
+        .{ .id = prefix_second, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = prefix, .index = 1 } } },
+        .{ .id = prefix_third, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = prefix, .index = 2 } } },
+        .{ .id = prefix_fourth, .function = function_id, .type = .boolean, .origin = .{ .block_parameter = .{ .block = prefix, .index = 3 } } },
+        .{ .id = suffix_first, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = suffix, .index = 0 } } },
+        .{ .id = suffix_second, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = suffix, .index = 1 } } },
+        .{ .id = suffix_third, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = suffix, .index = 2 } } },
+        .{ .id = suffix_fourth, .function = function_id, .type = .boolean, .origin = .{ .block_parameter = .{ .block = suffix, .index = 3 } } },
+        .{ .id = prefix_read, .function = function_id, .type = .dynamic, .origin = .{ .instruction_result = .{ .instruction = prefix_read_id, .index = 0 } } },
+        .{ .id = prefix_constant, .function = function_id, .type = .number, .origin = .{ .instruction_result = .{ .instruction = prefix_constant_id, .index = 0 } } },
+        .{ .id = prefix_condition, .function = function_id, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = prefix_compare_id, .index = 0 } } },
+        .{ .id = forward_read, .function = function_id, .type = .dynamic, .origin = .{ .instruction_result = .{ .instruction = forward_read_id, .index = 0 } } },
+        .{ .id = tampered_value, .function = function_id, .type = .dynamic, .origin = .{ .instruction_result = .{ .instruction = tampered_instruction_id, .index = 0 } } },
+    };
+    const places = [_]ir.Place{
+        .{ .id = prefix_place, .function = function_id, .origin = .{ .local = 0 } },
+        .{ .id = forward_read_place, .function = function_id, .origin = .{ .local = 1 } },
+        .{ .id = forward_write_place, .function = function_id, .origin = .{ .local = 2 } },
+        .{ .id = alternate_place, .function = function_id, .origin = .{ .local = 3 } },
+    };
+    const instructions = [_]ir.Instruction{
+        .{ .id = prefix_read_id, .block = prefix, .operation = .{ .place_read = prefix_place }, .results = &.{prefix_read}, .effects = .place_read },
+        .{ .id = prefix_constant_id, .block = prefix, .operation = .{ .constant = .{ .number = 186 } }, .results = &.{prefix_constant}, .effects = .pure },
+        .{ .id = prefix_compare_id, .block = prefix, .operation = .{ .binary = .{
+            .operator = .not_equal,
+            .left = prefix_read,
+            .right = prefix_constant,
+            .mode = .semantic,
+        } }, .results = &.{prefix_condition}, .effects = .semantic_table_read },
+        .{ .id = forward_read_id, .block = forwarder, .operation = .{ .place_read = forward_read_place }, .results = &.{forward_read}, .effects = .place_read },
+        .{ .id = forward_write_id, .block = forwarder, .operation = .{ .place_write = .{ .place = forward_write_place, .value = forward_read } }, .results = &.{}, .effects = .place_write },
+        .{ .id = tampered_instruction_id, .block = alternate, .operation = .{ .place_read = alternate_place }, .results = &.{tampered_value}, .effects = .place_read },
+    };
+    const program = ir.Program{
+        .program_id = "effectful-parameterized-prefix",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+        .places = &places,
+    };
+    const incoming = [_]ir.CfgEdgeRef{.{ .source = entry, .kind = .branch_then, .target = prefix }};
+
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, functions[0]);
+    defer analysis.deinit();
+    try std.testing.expect(try parameterizedContinuationBridge(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        forwarder,
+        0,
+        suffix,
+        exit,
+        &.{prefix},
+        &.{ forwarder, suffix },
+        &incoming,
+        null,
+        null,
+        null,
+    ));
+
+    const initial = try std.testing.allocator.dupe(ir.BlockId, &.{prefix});
+    const extended = try extendContinuationClosureAlloc(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        exit,
+        initial,
+        &incoming,
+    );
+    defer std.testing.allocator.free(extended);
+    try std.testing.expect(containsBlock(extended, prefix));
+    try std.testing.expect(containsBlock(extended, forwarder));
+    try std.testing.expect(!containsBlock(extended, suffix));
+    try std.testing.expect(prepareClosure(std.testing.allocator, &program, &analysis, extended, &incoming));
+
+    var tampered_blocks = blocks;
+    tampered_blocks[forwarder.index()].terminator = .{ .jump = .{
+        .target = suffix,
+        .arguments = tampered_tuple[0..],
+    } };
+    var tampered_program = program;
+    tampered_program.blocks = &tampered_blocks;
+    var tampered_analysis = try cfg.Analysis.init(std.testing.allocator, &tampered_program, functions[0]);
+    defer tampered_analysis.deinit();
+    try std.testing.expect(!try parameterizedContinuationBridge(
+        std.testing.allocator,
+        &tampered_program,
+        &tampered_analysis,
+        forwarder,
+        0,
+        suffix,
+        exit,
+        &.{prefix},
+        &.{ forwarder, suffix },
+        &incoming,
+        null,
+        null,
+        null,
+    ));
+    const tampered_closure = try std.testing.allocator.dupe(ir.BlockId, &.{ prefix, forwarder });
+    defer std.testing.allocator.free(tampered_closure);
+    try std.testing.expect(!prepareClosure(
+        std.testing.allocator,
+        &tampered_program,
+        &tampered_analysis,
+        tampered_closure,
+        &incoming,
     ));
 }
 
@@ -11251,6 +11884,108 @@ test "same-root iteration clones compare fresh results across split groups" {
     ));
 }
 
+fn findConditionalLoopEntrySplitAlloc(
+    allocator: std.mem.Allocator,
+    analysis: *const cfg.Analysis,
+    function_index: usize,
+) std.mem.Allocator.Error!?Split {
+    for (analysis.function.blocks) |header| {
+        var membership = natural_loop.collect(allocator, analysis, header) catch |err| switch (err) {
+            error.UnsupportedShape => continue,
+            error.OutOfMemory => return error.OutOfMemory,
+        } orelse continue;
+        defer membership.deinit();
+
+        const entry_count = try countConditionalLoopEntries(analysis, header, membership.bits);
+        if (entry_count == 0 or countExternalLoopEntries(analysis, header, membership.bits) < 2) continue;
+        const selected = try selectConditionalLoopEntry(analysis, header, membership.bits) orelse continue;
+
+        var owned_closure = try collectConditionalLoopClosureAlloc(allocator, analysis, membership.bits);
+        errdefer allocator.free(owned_closure);
+        var incoming = std.ArrayList(ir.CfgEdgeRef).empty;
+        defer incoming.deinit(allocator);
+        try incoming.append(allocator, selected);
+        const has_external_use = try hasReachableExternalClosureUseAlloc(
+            allocator,
+            analysis.program,
+            analysis,
+            owned_closure,
+        );
+        var prepared = prepareClosure(allocator, analysis.program, analysis, owned_closure, incoming.items);
+        if (!prepared or has_external_use) {
+            owned_closure = try extendClosureForExternalUsesAlloc(
+                allocator,
+                analysis.program,
+                analysis,
+                header,
+                owned_closure,
+                incoming.items,
+            );
+            prepared = prepareClosure(allocator, analysis.program, analysis, owned_closure, incoming.items);
+        }
+        if (!prepared) {
+            allocator.free(owned_closure);
+            continue;
+        }
+
+        // Redirect every external edge that the same authenticated closure
+        // can own in this pass.  A sibling path may stop reaching the header
+        // after one edge is redirected, turning a previously non-conditional
+        // predecessor into the next scalar entry.  Batch compatible entries
+        // before mutating the graph so the progress measure is stable.
+        const external_entries = try collectExternalLoopEntryEdgesAlloc(
+            allocator,
+            analysis,
+            header,
+            membership.bits,
+        );
+        defer allocator.free(external_entries);
+        if (trace_conditional_batch) std.debug.print("conditional_batch header={} entries={} selected={} external={any} closure={}\n", .{
+            header.index(),
+            entry_count,
+            selected,
+            external_entries,
+            owned_closure.len,
+        });
+        for (external_entries) |candidate| {
+            if (candidate.source == selected.source and
+                candidate.kind == selected.kind and
+                candidate.target == selected.target)
+            {
+                continue;
+            }
+            try incoming.append(allocator, candidate);
+            if (!prepareClosure(allocator, analysis.program, analysis, owned_closure, incoming.items)) {
+                if (trace_conditional_batch) std.debug.print("conditional_batch rejected header={} candidate={} incoming={any}\n", .{
+                    header.index(),
+                    candidate,
+                    incoming.items,
+                });
+                _ = incoming.pop();
+            } else if (trace_conditional_batch) {
+                std.debug.print("conditional_batch accepted header={} candidate={} incoming={any}\n", .{
+                    header.index(),
+                    candidate,
+                    incoming.items,
+                });
+            }
+        }
+        const owned_incoming = try incoming.toOwnedSlice(allocator);
+        errdefer allocator.free(owned_incoming);
+        return .{
+            .allocator = allocator,
+            .function_index = function_index,
+            .branch = selected.source,
+            .entry = header,
+            .join = header,
+            .incoming = owned_incoming,
+            .closure = owned_closure,
+            .entry_measure = entry_count,
+        };
+    }
+    return null;
+}
+
 fn collectConditionalLoopClosureAlloc(
     allocator: std.mem.Allocator,
     analysis: *const cfg.Analysis,
@@ -11552,6 +12287,41 @@ fn convergenceIsBypassed(
         }
     }
     return false;
+}
+
+fn collectArmClosureAlloc(
+    allocator: std.mem.Allocator,
+    analysis: *const cfg.Analysis,
+    start: ir.BlockId,
+    join: ir.BlockId,
+) std.mem.Allocator.Error!?[]ir.BlockId {
+    if (start == join) return try allocator.alloc(ir.BlockId, 0);
+    if (!try analysis.canReach(start, join)) return null;
+    const block_count = analysis.function.blocks.len;
+    const found = try allocator.alloc(bool, block_count);
+    defer allocator.free(found);
+    @memset(found, false);
+    const pending = try allocator.alloc(ir.BlockId, block_count);
+    defer allocator.free(pending);
+    const start_index = analysis.blockIndex(start) orelse return null;
+    found[start_index] = true;
+    pending[0] = start;
+    var cursor: usize = 0;
+    var pending_len: usize = 1;
+    while (cursor < pending_len) : (cursor += 1) {
+        const current = pending[cursor];
+        for (0..analysis.successorCount(current)) |successor_index| {
+            const successor = analysis.successorAt(current, successor_index) orelse return null;
+            if (successor == join) continue;
+            if (!try analysis.canReach(successor, join)) continue;
+            const local_index = analysis.blockIndex(successor) orelse return null;
+            if (found[local_index]) continue;
+            found[local_index] = true;
+            pending[pending_len] = successor;
+            pending_len += 1;
+        }
+    }
+    return try allocator.dupe(ir.BlockId, pending[0..pending_len]);
 }
 
 fn isEffectfulZeroParameterBlock(
@@ -13970,6 +14740,25 @@ fn appendDelayedUseContinuationAlloc(
     if (trace_structural_phases and closure.len >= 20) {
         traceStructural("structural_delayed_retained continuation={}\n", .{continuation.items.len});
     }
+}
+
+fn extendContinuationClosureAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    stop: ir.BlockId,
+    closure: []ir.BlockId,
+    incoming: ?[]const ir.CfgEdgeRef,
+) std.mem.Allocator.Error![]ir.BlockId {
+    return extendContinuationClosureWithModeAlloc(
+        allocator,
+        program,
+        analysis,
+        stop,
+        closure,
+        incoming,
+        .contextual,
+    );
 }
 
 fn extendClosureForExternalUsesAlloc(
