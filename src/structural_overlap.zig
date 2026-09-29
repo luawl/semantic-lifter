@@ -10601,6 +10601,937 @@ pub fn interiorLoopEntryCountAlloc(
     return countInteriorLoopEntries(&analysis, header, membership.bits);
 }
 
+// An incoming edge may originate inside an enclosing loop without making a
+// collision closure unsafe.  A linear effectful suffix can be cloned when it
+// has no parameters, no internal cycle, and one outgoing boundary.  If that
+// boundary returns to the suffix entry, it must be the complete authenticated
+// state handoff into an iteration header; otherwise cloning would duplicate a
+// loop body and recreate the same ownership collision.
+fn internalLoopEffectfulSuffixCanBeCloned(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    loop_headers: []const bool,
+    entry: ir.BlockId,
+    closure: []const ir.BlockId,
+    incoming: []const ir.CfgEdgeRef,
+) std.mem.Allocator.Error!bool {
+    if (closure.len == 0 or incoming.len == 0 or
+        loop_headers.len != analysis.function.blocks.len)
+    {
+        return false;
+    }
+    for (incoming) |reference| {
+        if (reference.target != entry or
+            !incomingEdgeIsCanonical(program, analysis, reference) or
+            containsBlock(closure, reference.source))
+        {
+            return false;
+        }
+    }
+
+    const membership = try allocator.alloc(bool, analysis.function.blocks.len);
+    defer allocator.free(membership);
+    @memset(membership, false);
+    for (closure) |block_id| {
+        const local_index = analysis.blockIndex(block_id) orelse return false;
+        if (local_index >= membership.len or membership[local_index] or
+            block_id.index() >= program.blocks.len)
+        {
+            return false;
+        }
+        membership[local_index] = true;
+        const block = program.blocks[block_id.index()];
+        if (block.id != block_id or block.function != analysis.function.id or
+            block.parameters.len != 0 or loop_headers[local_index])
+        {
+            return false;
+        }
+    }
+
+    const entry_index = analysis.blockIndex(entry) orelse return false;
+    if (!membership[entry_index]) return false;
+    const visited = try allocator.alloc(bool, membership.len);
+    defer allocator.free(visited);
+    @memset(visited, false);
+
+    var cursor = entry;
+    var visited_count: usize = 0;
+    var boundary: ?ir.CfgEdgeRef = null;
+    var has_effect = false;
+    while (true) {
+        const local_index = analysis.blockIndex(cursor) orelse return false;
+        if (!membership[local_index] or visited[local_index] or
+            cursor.index() >= program.blocks.len)
+        {
+            return false;
+        }
+        visited[local_index] = true;
+        visited_count += 1;
+        const block = program.blocks[cursor.index()];
+        for (block.instructions) |instruction_id| {
+            if (instruction_id.index() >= program.instructions.len) return false;
+            const instruction = program.instructions[instruction_id.index()];
+            if (instruction.id != instruction_id or instruction.block != cursor) return false;
+            has_effect = has_effect or proof_effect_closure.hasObservableEffects(instruction.effects);
+        }
+
+        const edge = switch (block.terminator) {
+            .jump => |value| value,
+            .branch, .return_values, .return_pack, .return_expanded, .throw_error, .unreachable_block => return false,
+        };
+        if (edge.target.index() >= program.blocks.len or
+            !analysis.isReachable(edge.target))
+        {
+            return false;
+        }
+        const target_index = analysis.blockIndex(edge.target) orelse return false;
+        if (membership[target_index]) {
+            if (edge.target == cursor or visited[target_index]) return false;
+            cursor = edge.target;
+            continue;
+        }
+        if (boundary != null) return false;
+        const target = program.blocks[edge.target.index()];
+        if (target.id != edge.target or target.function != analysis.function.id or
+            edge.arguments.len != target.parameters.len)
+        {
+            return false;
+        }
+        boundary = .{ .source = cursor, .kind = .jump, .target = edge.target };
+        break;
+    }
+
+    if (!has_effect or visited_count != closure.len or boundary == null) return false;
+    const handoff = boundary.?;
+    if (try analysis.canReach(handoff.target, entry)) {
+        return try authenticatedIterationHandoffBoundaryAtIncoming(
+            program,
+            analysis,
+            entry,
+            closure,
+            handoff,
+            incoming,
+            null,
+        );
+    }
+    return true;
+}
+
+// A zero-parameter internal SCC edge can still be a valid clone boundary when
+// the edge is one authenticated member of a single node-split group.  The
+// ordinary internal-predecessor count cannot distinguish that case from an
+// unowned loop edge, so keep the exception behind the complete group proof:
+// every relevant edge must have one active replayable rewrite, one lineage
+// parent, and one group-owned clone endpoint.
+fn authenticatedGroupCloneEdgeForReference(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    reference: ir.CfgEdgeRef,
+    replay_context: *ReplayProjectionContext,
+) std.mem.Allocator.Error!?ir.NodeSplitGroupId {
+    if (!incomingEdgeIsCanonical(program, analysis, reference)) return null;
+
+    var selected_group: ?ir.NodeSplitGroupId = null;
+    var found = false;
+    for (replay_context.replay_index.nodeSplitRewriteIndices()) |rewrite_index| {
+        if (rewrite_index >= program.edge_rewrites.len) return null;
+        const rewrite = program.edge_rewrites[rewrite_index];
+        if (rewrite.rule != .node_split or rewrite.node_split_group == null or
+            rewrite.source != reference.source or rewrite.kind != reference.kind or
+            rewrite.to.target != reference.target or rewrite.from.target == rewrite.to.target)
+        {
+            continue;
+        }
+        if (found or !nodeSplitRewriteArgumentsAreStable(program, rewrite) or
+            !activeNodeSplitRewrite(program, rewrite)) return null;
+        const group = rewrite.node_split_group.?;
+        if (!replay_context.replay_index.groupOwnsBlock(program, group, reference.source) or
+            !replay_context.replay_index.groupOwnsBlock(program, group, reference.target))
+        {
+            return null;
+        }
+        const lineage_parent = replay_context.cloneLineageParent(rewrite.to.target) orelse return null;
+        if (lineage_parent.block != rewrite.from.target or lineage_parent.group != group) return null;
+        const replay = (try replay_context.replay_cache.get(
+            rewrite.from.target,
+            rewrite.to.target,
+            group,
+        )) orelse return null;
+        if (!nodeSplitRewriteArgumentsMatchReplay(program, rewrite, replay.*) or
+            !try cloneLineageArgumentsMatchReplayCached(
+                allocator,
+                program,
+                rewrite.from.target,
+                rewrite.to.target,
+                &replay_context.lineage_index,
+                &replay_context.replay_index,
+                &replay_context.replay_cache,
+            )) return null;
+        found = true;
+        selected_group = group;
+    }
+    return selected_group;
+}
+
+fn authenticatedGroupOwnedInternalSccClosure(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    closure: []const ir.BlockId,
+    incoming: []const ir.CfgEdgeRef,
+    replay_context: *ReplayProjectionContext,
+) std.mem.Allocator.Error!bool {
+    if (closure.len <= 1 or incoming.len == 0) return false;
+
+    var selected_group: ?ir.NodeSplitGroupId = null;
+    for (incoming) |reference| {
+        const group = (try authenticatedGroupCloneEdgeForReference(
+            allocator,
+            program,
+            analysis,
+            reference,
+            replay_context,
+        )) orelse return false;
+        if (!try replay_context.hasAuthenticatedContinuationBridgeForEdge(analysis, reference)) return false;
+        if (selected_group) |existing| {
+            if (existing != group) return false;
+        } else {
+            selected_group = group;
+        }
+    }
+    const group = selected_group orelse return false;
+
+    for (closure) |block_id| {
+        if (block_id.index() >= program.blocks.len) return false;
+        const block = program.blocks[block_id.index()];
+        if (block.id != block_id or block.function != analysis.function.id or
+            !node_split.parametersAreCanonical(program.values, block) or
+            !replay_context.replay_index.isAuthenticatedCloneBlock(program, block_id) or
+            !replay_context.replay_index.groupOwnsBlock(program, group, block_id))
+        {
+            return false;
+        }
+
+        switch (block.terminator) {
+            .jump => |edge| if (containsBlock(closure, edge.target)) {
+                const edge_group = (try authenticatedGroupCloneEdgeForReference(
+                    allocator,
+                    program,
+                    analysis,
+                    .{ .source = block_id, .kind = .jump, .target = edge.target },
+                    replay_context,
+                )) orelse return false;
+                if (edge_group != group) return false;
+            },
+            .branch => |branch| {
+                for ([_]struct { kind: ir.CfgEdgeKind, edge: ir.Edge }{
+                    .{ .kind = .branch_then, .edge = branch.then_edge },
+                    .{ .kind = .branch_else, .edge = branch.else_edge },
+                }) |candidate| {
+                    if (!containsBlock(closure, candidate.edge.target)) continue;
+                    const edge_group = (try authenticatedGroupCloneEdgeForReference(
+                        allocator,
+                        program,
+                        analysis,
+                        .{ .source = block_id, .kind = candidate.kind, .target = candidate.edge.target },
+                        replay_context,
+                    )) orelse return false;
+                    if (edge_group != group) return false;
+                }
+            },
+            .return_values, .return_pack, .return_expanded, .throw_error, .unreachable_block => return false,
+        }
+    }
+    return true;
+}
+
+// A selected collision edge can be the only external entry into an already
+// authenticated clone-group cycle.  In that shape, cutting the incoming
+// source out of the SCC leaves a cloned producer reachable from the original
+// source and cannot project its carried tuple.  Clone the complete SCC only
+// when the source and its ingress are themselves replay-authenticated members
+// of one group.  The ordinary closure, boundary, and availability proofs
+// still decide whether the resulting component is cloneable.
+fn authenticatedIncomingSourceComponentProjection(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    entry: ir.BlockId,
+    component: []const bool,
+    incoming: []const ir.CfgEdgeRef,
+    replay_context: *ReplayProjectionContext,
+) std.mem.Allocator.Error!bool {
+    if (incoming.len != 1 or component.len != analysis.function.blocks.len) {
+        traceStructural("structural_phase complete_component_reject reason=shape incoming={} component={} blocks={}\n", .{
+            incoming.len,
+            component.len,
+            analysis.function.blocks.len,
+        });
+        return false;
+    }
+    const reference = incoming[0];
+    const canonical = incomingEdgeIsCanonical(program, analysis, reference);
+    if (reference.target != entry or reference.source == entry or !canonical) {
+        traceStructural("structural_phase complete_component_reject reason=edge_shape source={} target={} entry={} source_is_entry={} canonical={}\n", .{
+            reference.source.index(),
+            reference.target.index(),
+            entry.index(),
+            reference.source == entry,
+            canonical,
+        });
+        return false;
+    }
+    const source_index = analysis.blockIndex(reference.source) orelse {
+        traceStructural("structural_phase complete_component_reject reason=source_index source={}\n", .{reference.source.index()});
+        return false;
+    };
+    const entry_index = analysis.blockIndex(entry) orelse {
+        traceStructural("structural_phase complete_component_reject reason=entry_index entry={}\n", .{entry.index()});
+        return false;
+    };
+    if (!component[source_index] or !component[entry_index] or
+        !replay_context.replay_index.isAuthenticatedCloneBlock(program, reference.source))
+    {
+        traceStructural("structural_phase complete_component_reject reason=membership source={} source_scc={} entry={} entry_scc={} source_clone={}\n", .{
+            reference.source.index(),
+            component[source_index],
+            entry.index(),
+            component[entry_index],
+            replay_context.replay_index.isAuthenticatedCloneBlock(program, reference.source),
+        });
+        return false;
+    }
+
+    const lineage_parent = replay_context.cloneLineageParent(reference.source) orelse {
+        traceStructural("structural_phase complete_component_reject reason=lineage source={}\n", .{reference.source.index()});
+        return false;
+    };
+    if (!replay_context.replay_index.groupOwnsBlock(
+        program,
+        lineage_parent.group,
+        reference.source,
+    )) {
+        traceStructural("structural_phase complete_component_reject reason=group_ownership source={} parent={} group={}\n", .{
+            reference.source.index(),
+            lineage_parent.block.index(),
+            lineage_parent.group.index(),
+        });
+        return false;
+    }
+    const stable_arguments = cloneLineageArgumentsAreStableCached(
+        program,
+        reference.source,
+        &replay_context.lineage_index,
+    );
+    const replay_arguments = try cloneLineageArgumentsMatchReplayCached(
+        allocator,
+        program,
+        lineage_parent.block,
+        reference.source,
+        &replay_context.lineage_index,
+        &replay_context.replay_index,
+        &replay_context.replay_cache,
+    );
+    if (!stable_arguments or !replay_arguments) {
+        traceStructural("structural_phase complete_component_reject reason=lineage_replay source={} parent={} stable={} replay={}\n", .{
+            reference.source.index(),
+            lineage_parent.block.index(),
+            stable_arguments,
+            replay_arguments,
+        });
+        return false;
+    }
+    const reaches_source = try analysis.canReach(entry, reference.source);
+    const returns_to_entry = try analysis.canReach(reference.source, entry);
+    if (!reaches_source or !returns_to_entry) {
+        traceStructural("structural_phase complete_component_reject reason=scc_reach source={} entry_to_source={} source_to_entry={}\n", .{
+            reference.source.index(),
+            reaches_source,
+            returns_to_entry,
+        });
+        return false;
+    }
+    const live_reference = directEdgeRef(program, reference.source, entry) orelse {
+        traceStructural("structural_phase complete_component_reject reason=live_edge source={} entry={}\n", .{
+            reference.source.index(),
+            entry.index(),
+        });
+        return false;
+    };
+    if (!std.meta.eql(live_reference, reference)) {
+        traceStructural("structural_phase complete_component_reject reason=edge_mismatch source={} entry={} kind={s}\n", .{
+            reference.source.index(),
+            entry.index(),
+            @tagName(reference.kind),
+        });
+        return false;
+    }
+
+    var predecessor_count: usize = 0;
+    var predecessor_index: usize = 0;
+    while (analysis.predecessorAt(reference.source, predecessor_index)) |predecessor| : (predecessor_index += 1) {
+        const predecessor_local_index = analysis.blockIndex(predecessor) orelse {
+            traceStructural("structural_phase complete_component_reject reason=predecessor_index source={} predecessor={}\n", .{
+                reference.source.index(),
+                predecessor.index(),
+            });
+            return false;
+        };
+        if (!component[predecessor_local_index] or
+            !replay_context.replay_index.isAuthenticatedCloneBlock(program, predecessor) or
+            !replay_context.replay_index.groupOwnsBlock(program, lineage_parent.group, predecessor))
+        {
+            traceStructural("structural_phase complete_component_reject reason=predecessor_ownership source={} predecessor={} predecessor_scc={} predecessor_clone={} predecessor_group={}\n", .{
+                reference.source.index(),
+                predecessor.index(),
+                component[predecessor_local_index],
+                replay_context.replay_index.isAuthenticatedCloneBlock(program, predecessor),
+                replay_context.replay_index.groupOwnsBlock(program, lineage_parent.group, predecessor),
+            });
+            return false;
+        }
+        const predecessor_reference = directEdgeRef(program, predecessor, reference.source) orelse {
+            traceStructural("structural_phase complete_component_reject reason=predecessor_edge source={} predecessor={}\n", .{
+                reference.source.index(),
+                predecessor.index(),
+            });
+            return false;
+        };
+        if (!replay_context.hasNodeSplitEntryEdge(
+            predecessor_reference.source,
+            predecessor_reference.kind,
+            reference.source,
+            lineage_parent.group,
+        )) {
+            traceStructural("structural_phase complete_component_reject reason=predecessor_replay source={} predecessor={} kind={s} group={}\n", .{
+                reference.source.index(),
+                predecessor.index(),
+                @tagName(predecessor_reference.kind),
+                lineage_parent.group.index(),
+            });
+            return false;
+        }
+        predecessor_count += 1;
+    }
+    return predecessor_count != 0;
+}
+
+// An internal SCC edge with more than one same-component predecessor is a
+// join collision, not a linear suffix.  Cloning one block at a time merely
+// walks the collision around the component.  Build the authenticated forward
+// projection from the collided block while cutting every direct component
+// predecessor of that block; the resulting closure can contain the whole
+// cyclic route and still leaves the incoming sources outside the clone.
+fn internalSccBoundaryClosureAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    block: ir.BlockId,
+    incoming: []const ir.CfgEdgeRef,
+    replay_context: *ReplayProjectionContext,
+) std.mem.Allocator.Error!?[]ir.BlockId {
+    if (incoming.len == 0 or block.index() >= program.blocks.len) return null;
+    const block_index = analysis.blockIndex(block) orelse return null;
+    const block_count = analysis.function.blocks.len;
+    const forward = try allocator.alloc(bool, block_count);
+    defer allocator.free(forward);
+    const backward = try allocator.alloc(bool, block_count);
+    defer allocator.free(backward);
+    const queued = try allocator.alloc(ir.BlockId, block_count);
+    defer allocator.free(queued);
+    @memset(forward, false);
+    @memset(backward, false);
+
+    var head: usize = 0;
+    var tail: usize = 1;
+    queued[0] = block;
+    forward[block_index] = true;
+    while (head < tail) : (head += 1) {
+        const current = queued[head];
+        var successor_index: usize = 0;
+        while (successor_index < analysis.successorCount(current)) : (successor_index += 1) {
+            const successor = analysis.successorAt(current, successor_index) orelse return null;
+            const local_index = analysis.blockIndex(successor) orelse return null;
+            if (!analysis.isReachable(successor) or forward[local_index]) continue;
+            forward[local_index] = true;
+            if (tail >= queued.len) return null;
+            queued[tail] = successor;
+            tail += 1;
+        }
+    }
+
+    head = 0;
+    tail = 1;
+    queued[0] = block;
+    backward[block_index] = true;
+    while (head < tail) : (head += 1) {
+        const current = queued[head];
+        var predecessor_index: usize = 0;
+        while (predecessor_index < analysis.predecessorCount(current)) : (predecessor_index += 1) {
+            const predecessor = analysis.predecessorAt(current, predecessor_index) orelse return null;
+            const local_index = analysis.blockIndex(predecessor) orelse return null;
+            if (!analysis.isReachable(predecessor) or backward[local_index]) continue;
+            backward[local_index] = true;
+            if (tail >= queued.len) return null;
+            queued[tail] = predecessor;
+            tail += 1;
+        }
+    }
+
+    const component = try allocator.alloc(bool, block_count);
+    defer allocator.free(component);
+    @memset(component, false);
+    var component_size: usize = 0;
+    for (analysis.function.blocks, 0..) |_, candidate_index| {
+        if (forward[candidate_index] and backward[candidate_index]) {
+            component[candidate_index] = true;
+            component_size += 1;
+        }
+    }
+    if (component_size < 2) return null;
+
+    const complete_component_projection = try authenticatedIncomingSourceComponentProjection(
+        allocator,
+        program,
+        analysis,
+        block,
+        component,
+        incoming,
+        replay_context,
+    );
+
+    const forbidden = try allocator.alloc(bool, block_count);
+    defer allocator.free(forbidden);
+    @memset(forbidden, false);
+    if (!complete_component_projection) {
+        for (incoming) |reference| {
+            if (reference.target != block) return null;
+            const source_index = analysis.blockIndex(reference.source) orelse return null;
+            if (!component[source_index] or source_index == block_index) return null;
+            forbidden[source_index] = true;
+        }
+    }
+
+    // A second internal predecessor is what makes the scalar boundary clone
+    // non-convergent.  A parameterized branching entry has a stronger
+    // alternative: its complete incoming tuple can authenticate a rooted SCC
+    // projection even when only one internal predecessor reaches the entry.
+    // Cut all such predecessors, including ones not selected by this feedback
+    // arm, so the projection owns one complete entry.
+    var internal_predecessor_count: usize = 0;
+    var predecessor_index: usize = 0;
+    while (predecessor_index < analysis.predecessorCount(block)) : (predecessor_index += 1) {
+        const predecessor = analysis.predecessorAt(block, predecessor_index) orelse return null;
+        const local_index = analysis.blockIndex(predecessor) orelse return null;
+        if (!component[local_index] or local_index == block_index) continue;
+        if (!complete_component_projection) forbidden[local_index] = true;
+        internal_predecessor_count += 1;
+    }
+    traceStructural("structural_phase internal_scc_candidate block={} component={} internal_predecessors={} complete_component={}\n", .{
+        block.index(),
+        component_size,
+        internal_predecessor_count,
+        complete_component_projection,
+    });
+    const parameterized_branch_boundary = program.blocks[block.index()].parameters.len != 0 and switch (program.blocks[block.index()].terminator) {
+        .branch => true,
+        else => false,
+    };
+
+    var closure = std.ArrayList(ir.BlockId).empty;
+    var retain_closure = false;
+    defer if (!retain_closure) closure.deinit(allocator);
+    const seen = try allocator.alloc(bool, block_count);
+    defer allocator.free(seen);
+    @memset(seen, false);
+    head = 0;
+    tail = 1;
+    queued[0] = block;
+    seen[block_index] = true;
+    while (head < tail) : (head += 1) {
+        const current = queued[head];
+        try closure.append(allocator, current);
+        var successor_index: usize = 0;
+        while (successor_index < analysis.successorCount(current)) : (successor_index += 1) {
+            const successor = analysis.successorAt(current, successor_index) orelse return null;
+            const local_index = analysis.blockIndex(successor) orelse return null;
+            if (!component[local_index] or
+                (!complete_component_projection and forbidden[local_index]) or
+                seen[local_index]) continue;
+            seen[local_index] = true;
+            if (tail >= queued.len) return null;
+            queued[tail] = successor;
+            tail += 1;
+        }
+    }
+    if (closure.items.len <= 1) {
+        traceStructural("structural_phase internal_scc_reject block={} reason=boundary_cut closure={}\n", .{
+            block.index(),
+            closure.items.len,
+        });
+        return null;
+    }
+    if (complete_component_projection and closure.items.len != component_size) {
+        traceStructural("structural_phase internal_scc_reject block={} reason=incomplete_component_projection closure={} component={}\n", .{
+            block.index(),
+            closure.items.len,
+            component_size,
+        });
+        return null;
+    }
+    if (!complete_component_projection and internal_predecessor_count < 2 and !parameterized_branch_boundary and
+        !try authenticatedGroupOwnedInternalSccClosure(
+            allocator,
+            program,
+            analysis,
+            closure.items,
+            incoming,
+            replay_context,
+        ))
+    {
+        traceStructural("structural_phase internal_scc_reject block={} reason=single_internal_predecessor closure={} component={}\n", .{
+            block.index(),
+            closure.items.len,
+            component_size,
+        });
+        return null;
+    }
+    // A complete authenticated SCC may have consumers immediately outside the
+    // component.  Defer its first preparation check until the bounded
+    // external-use and authenticated-group projections have had a chance to
+    // bring those consumers into the clone.  The final preparation below
+    // remains mandatory and still owns all boundary, availability, and clone
+    // ordering proofs.  Incomplete projections retain the prefix fallback.
+    if (!complete_component_projection) {
+        if (!prepareClosureWithReplayContext(
+            allocator,
+            program,
+            analysis,
+            closure.items,
+            incoming,
+            replay_context,
+        )) {
+            if (try rootedSccPrefixClosureAlloc(
+                allocator,
+                program,
+                analysis,
+                block,
+                incoming,
+                component,
+                forbidden,
+                replay_context,
+            )) |prefix| {
+                traceStructural("structural_phase internal_scc_prefix_accept block={} closure={} component={} incoming={}\n", .{
+                    block.index(),
+                    prefix.len,
+                    component_size,
+                    incoming.len,
+                });
+                const owned = prefix;
+                retain_closure = true;
+                closure.deinit(allocator);
+                return owned;
+            }
+            traceStructural("structural_phase internal_scc_reject block={} reason=prepare closure={} component={}\n", .{
+                block.index(),
+                closure.items.len,
+                component_size,
+            });
+            return null;
+        }
+    }
+    traceStructural("structural_phase internal_scc_accept block={} closure={} component={} incoming={} deferred_prepare={}\n", .{
+        block.index(),
+        closure.items.len,
+        component_size,
+        incoming.len,
+        complete_component_projection,
+    });
+
+    var expanded = try closure.toOwnedSlice(allocator);
+    retain_closure = true;
+    var retain_expanded = false;
+    defer if (!retain_expanded) allocator.free(expanded);
+    // A complete SCC projection can still feed a shared continuation outside
+    // the SCC. Expand only the authenticated consumers of its mapped values
+    // before publication, using the same closure-only ownership pass as the
+    // bounded boundary fallback.
+    expanded = try extendClosureForExternalUsesAlloc(
+        allocator,
+        program,
+        analysis,
+        block,
+        expanded,
+        incoming,
+    );
+    expanded = try extendAuthenticatedGroupBoundaryContextAlloc(
+        allocator,
+        program,
+        analysis,
+        expanded,
+        incoming,
+        &replay_context.lineage_index,
+        &replay_context.replay_index,
+    );
+    if (!complete_component_projection) {
+        expanded = (try trimIncomingSourceClosureAlloc(
+            allocator,
+            analysis,
+            block,
+            expanded,
+            incoming,
+        )) orelse return null;
+    }
+    const prepared = if (complete_component_projection)
+        prepareClosureWithReplayContextFromTargets(
+            allocator,
+            program,
+            analysis,
+            expanded,
+            incoming,
+            replay_context,
+        )
+    else
+        prepareClosureWithReplayContext(
+            allocator,
+            program,
+            analysis,
+            expanded,
+            incoming,
+            replay_context,
+        );
+    if (!prepared) return null;
+    retain_expanded = true;
+    return expanded;
+}
+
+// A complete SCC projection may contain a producer that is globally
+// dominant but not dominant from the proposed clone entry.  Cloning through
+// that producer would remap a live value to a definition that is not executed
+// on every cloned path.  Search the SCC in deterministic successor order and
+// retain only the largest rooted prefix whose complete value/effect proof
+// remains valid.  The first rejected successor stays outside the clone as a
+// shared continuation; no value is synthesized or aliased.
+fn rootedSccPrefixClosureAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    block: ir.BlockId,
+    incoming: []const ir.CfgEdgeRef,
+    component: []const bool,
+    forbidden: []const bool,
+    replay_context: *ReplayProjectionContext,
+) std.mem.Allocator.Error!?[]ir.BlockId {
+    const block_count = analysis.function.blocks.len;
+    if (block.index() >= program.blocks.len or
+        component.len != block_count or
+        forbidden.len != block_count or
+        incoming.len == 0)
+    {
+        return null;
+    }
+    const block_index = analysis.blockIndex(block) orelse return null;
+    if (!component[block_index]) return null;
+
+    const seen = try allocator.alloc(bool, block_count);
+    defer allocator.free(seen);
+    const queue = try allocator.alloc(ir.BlockId, block_count);
+    defer allocator.free(queue);
+    @memset(seen, false);
+
+    var closure: std.ArrayList(ir.BlockId) = .empty;
+    errdefer closure.deinit(allocator);
+    try closure.append(allocator, block);
+    seen[block_index] = true;
+    if (!prepareClosureWithReplayContext(
+        allocator,
+        program,
+        analysis,
+        closure.items,
+        incoming,
+        replay_context,
+    )) {
+        return null;
+    }
+
+    var head: usize = 0;
+    var tail: usize = 1;
+    queue[0] = block;
+    var grew = false;
+    while (head < tail) : (head += 1) {
+        const current = queue[head];
+        var successor_index: usize = 0;
+        while (successor_index < analysis.successorCount(current)) : (successor_index += 1) {
+            const successor = analysis.successorAt(current, successor_index) orelse return null;
+            const local_index = analysis.blockIndex(successor) orelse return null;
+            if (!component[local_index] or forbidden[local_index] or seen[local_index]) continue;
+
+            const previous_len = closure.items.len;
+            try closure.append(allocator, successor);
+            if (!prepareClosureWithReplayContext(
+                allocator,
+                program,
+                analysis,
+                closure.items,
+                incoming,
+                replay_context,
+            )) {
+                closure.items.len = previous_len;
+                continue;
+            }
+
+            seen[local_index] = true;
+            if (tail >= queue.len) return null;
+            queue[tail] = successor;
+            tail += 1;
+            grew = true;
+        }
+    }
+
+    if (!grew or closure.items.len <= 1) return null;
+    const owned = try closure.toOwnedSlice(allocator);
+    var expanded = try extendClosureForExternalUsesAlloc(
+        allocator,
+        program,
+        analysis,
+        block,
+        owned,
+        incoming,
+    );
+    expanded = (try trimIncomingSourceClosureAlloc(
+        allocator,
+        analysis,
+        block,
+        expanded,
+        incoming,
+    )) orelse {
+        allocator.free(expanded);
+        return null;
+    };
+    if (!prepareClosureWithReplayContext(
+        allocator,
+        program,
+        analysis,
+        expanded,
+        incoming,
+        replay_context,
+    )) {
+        allocator.free(expanded);
+        return null;
+    }
+    return expanded;
+}
+
+test "authenticated zero-parameter group SCC boundary requires complete replay ownership" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const root = ir.BlockId.fromIndex(1);
+    const source = ir.BlockId.fromIndex(2);
+    const target = ir.BlockId.fromIndex(3);
+    const next = ir.BlockId.fromIndex(4);
+    const root_clone = ir.BlockId.fromIndex(5);
+    const source_clone = ir.BlockId.fromIndex(6);
+    const target_clone = ir.BlockId.fromIndex(7);
+    const next_clone = ir.BlockId.fromIndex(8);
+    const exit = ir.BlockId.fromIndex(9);
+
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .jump = .{ .target = root_clone } } },
+        .{ .id = root, .function = function_id, .terminator = .{ .jump = .{ .target = source } } },
+        .{ .id = source, .function = function_id, .terminator = .{ .jump = .{ .target = target } } },
+        .{ .id = target, .function = function_id, .terminator = .{ .jump = .{ .target = next } } },
+        .{ .id = next, .function = function_id, .terminator = .{ .branch = .{
+            .condition = ir.ValueId.fromIndex(0),
+            .then_edge = .{ .target = root },
+            .else_edge = .{ .target = exit },
+        } } },
+        .{ .id = root_clone, .function = function_id, .terminator = .{ .jump = .{ .target = source_clone } } },
+        .{ .id = source_clone, .function = function_id, .terminator = .{ .jump = .{ .target = target_clone } } },
+        .{ .id = target_clone, .function = function_id, .terminator = .{ .jump = .{ .target = next_clone } } },
+        .{ .id = next_clone, .function = function_id, .terminator = .{ .branch = .{
+            .condition = ir.ValueId.fromIndex(0),
+            .then_edge = .{ .target = root_clone },
+            .else_edge = .{ .target = exit },
+        } } },
+        .{ .id = exit, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &.{ir.ValueId.fromIndex(0)},
+        .blocks = &.{ entry, root, source, target, next, root_clone, source_clone, target_clone, next_clone, exit },
+        .entry_block = entry,
+    };
+    const values = [_]ir.Value{.{
+        .id = ir.ValueId.fromIndex(0),
+        .function = function_id,
+        .type = .boolean,
+        .origin = .{ .parameter = 0 },
+    }};
+    const group = ir.NodeSplitGroupId.fromIndex(0);
+    const rewrites = [_]ir.CfgEdgeRewrite{
+        .{ .id = ir.EdgeRewriteId.fromIndex(0), .source = entry, .kind = .jump, .from = .{ .target = root }, .to = .{ .target = root_clone }, .rule = .node_split, .node_split_group = group },
+        .{ .id = ir.EdgeRewriteId.fromIndex(1), .source = root_clone, .kind = .jump, .from = .{ .target = source }, .to = .{ .target = source_clone }, .rule = .node_split, .node_split_group = group },
+        .{ .id = ir.EdgeRewriteId.fromIndex(2), .source = source_clone, .kind = .jump, .from = .{ .target = target }, .to = .{ .target = target_clone }, .rule = .node_split, .node_split_group = group },
+        .{ .id = ir.EdgeRewriteId.fromIndex(3), .source = target_clone, .kind = .jump, .from = .{ .target = next }, .to = .{ .target = next_clone }, .rule = .node_split, .node_split_group = group },
+        .{ .id = ir.EdgeRewriteId.fromIndex(4), .source = next_clone, .kind = .branch_then, .from = .{ .target = root }, .to = .{ .target = root_clone }, .rule = .node_split, .node_split_group = group },
+    };
+    var program = ir.Program{
+        .program_id = "authenticated-zero-parameter-group-scc-boundary",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+        .edge_rewrites = &rewrites,
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, function);
+    defer analysis.deinit();
+    var replay = try ReplayProjectionContext.initForFunction(
+        std.testing.allocator,
+        &program,
+        function_id,
+    );
+    defer replay.deinit();
+    const incoming = [_]ir.CfgEdgeRef{.{
+        .source = root_clone,
+        .kind = .jump,
+        .target = source_clone,
+    }};
+    const closure = (try internalSccBoundaryClosureAlloc(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        source_clone,
+        &incoming,
+        &replay,
+    )) orelse return error.TestUnexpectedResult;
+    defer std.testing.allocator.free(closure);
+    try std.testing.expectEqualSlices(ir.BlockId, &.{ source_clone, target_clone, next_clone }, closure);
+
+    var tampered_rewrites = rewrites;
+    tampered_rewrites[1].node_split_group = null;
+    var tampered_program = program;
+    tampered_program.edge_rewrites = &tampered_rewrites;
+    var tampered_analysis = try cfg.Analysis.init(std.testing.allocator, &tampered_program, function);
+    defer tampered_analysis.deinit();
+    var tampered_replay = try ReplayProjectionContext.initForFunction(
+        std.testing.allocator,
+        &tampered_program,
+        function_id,
+    );
+    defer tampered_replay.deinit();
+    try std.testing.expect((try internalSccBoundaryClosureAlloc(
+        std.testing.allocator,
+        &tampered_program,
+        &tampered_analysis,
+        source_clone,
+        &incoming,
+        &tampered_replay,
+    )) == null);
+}
+
 test "contextual closure treats an incoming source as an external cycle boundary" {
     const function_id = ir.FunctionId.fromIndex(0);
     const entry = ir.BlockId.fromIndex(0);
@@ -13929,6 +14860,23 @@ fn isInteriorLoopTarget(
     return membership[target_index];
 }
 
+fn directEdgeRef(program: *const ir.Program, source: ir.BlockId, target: ir.BlockId) ?ir.CfgEdgeRef {
+    if (source.index() >= program.blocks.len) return null;
+    return switch (program.blocks[source.index()].terminator) {
+        .jump => |edge| if (edge.target == target)
+            .{ .source = source, .kind = .jump, .target = target }
+        else
+            null,
+        .branch => |branch| if (branch.then_edge.target == target and branch.else_edge.target != target)
+            .{ .source = source, .kind = .branch_then, .target = target }
+        else if (branch.else_edge.target == target and branch.then_edge.target != target)
+            .{ .source = source, .kind = .branch_else, .target = target }
+        else
+            null,
+        else => null,
+    };
+}
+
 fn edgeHasNodeSplitHistory(program: *const ir.Program, reference: ir.CfgEdgeRef) bool {
     var current = reference.target;
     var remaining = program.edge_rewrites.len;
@@ -17235,6 +18183,20 @@ pub fn prepareClosureWithReplayContext(
     replay_context: *ReplayProjectionContext,
 ) bool {
     return prepareClosureImpl(allocator, program, analysis, closure, incoming, replay_context, false);
+}
+
+/// Prepare a complete authenticated SCC from the actual cloned entry target.
+/// The selected incoming source may remain in the SCC as an internal cycle
+/// member, but it is not the entry at which the new clone is reached.
+pub fn prepareClosureWithReplayContextFromTargets(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    closure: []ir.BlockId,
+    incoming: []const ir.CfgEdgeRef,
+    replay_context: *ReplayProjectionContext,
+) bool {
+    return prepareClosureImpl(allocator, program, analysis, closure, incoming, replay_context, true);
 }
 
 fn tracePrepareClosureReject(reason: []const u8, closure_len: usize, incoming_len: usize) void {
