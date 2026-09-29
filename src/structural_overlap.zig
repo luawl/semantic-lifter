@@ -8608,6 +8608,128 @@ fn selectOverlapConvergence(
     return selected;
 }
 
+pub fn findSplitAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+) std.mem.Allocator.Error!?Split {
+    return findSplitAllocForFunction(allocator, program, null);
+}
+
+pub fn findSplitAllocForFunction(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    only_function: ?usize,
+) std.mem.Allocator.Error!?Split {
+    for (program.functions, 0..) |function, function_index| {
+        if (only_function) |selected| if (function_index != selected) continue;
+        var analysis = cfg.Analysis.init(allocator, program, function) catch |err| switch (err) {
+            error.InvalidCfg => continue,
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        defer analysis.deinit();
+        if (try findConditionalLoopEntrySplitAlloc(allocator, &analysis, function_index)) |split| return split;
+        for (function.blocks) |block_id| {
+            if (isIterationTransitionHeader(program, block_id)) continue;
+            const branch = switch (program.blocks[block_id.index()].terminator) {
+                .branch => |value| value,
+                else => continue,
+            };
+            if (try analysis.canReach(branch.then_edge.target, block_id) or
+                try analysis.canReach(branch.else_edge.target, block_id)) continue;
+            if (try analysis.immediateConvergence(allocator, block_id, null) != null) continue;
+            const selection = try selectOverlapConvergence(allocator, &analysis, block_id) orelse continue;
+            const then_closure = try collectArmClosureAlloc(
+                allocator,
+                &analysis,
+                branch.then_edge.target,
+                selection.join,
+            ) orelse continue;
+            defer allocator.free(then_closure);
+            const else_closure = try collectArmClosureAlloc(
+                allocator,
+                &analysis,
+                branch.else_edge.target,
+                selection.join,
+            ) orelse continue;
+            defer allocator.free(else_closure);
+            const common = try commonClosureAlloc(allocator, program, &analysis, selection.join, then_closure, else_closure);
+            var owns_common = true;
+            defer if (owns_common) allocator.free(common);
+            if (common.len == 0) continue;
+
+            const use_then = then_closure.len < else_closure.len;
+            const context = if (use_then) then_closure else else_closure;
+            var boundary = (try collectBoundaryAlloc(allocator, program, context, common)) orelse continue;
+            var owns_boundary = true;
+            defer if (owns_boundary) boundary.deinit(allocator);
+
+            if (!prepareClosure(allocator, program, &analysis, common, boundary.incoming)) continue;
+            owns_common = false;
+            owns_boundary = false;
+            return .{
+                .allocator = allocator,
+                .function_index = function_index,
+                .branch = block_id,
+                .entry = boundary.entry,
+                .join = selection.join,
+                .incoming = boundary.incoming,
+                .closure = common,
+            };
+        }
+    }
+    return null;
+}
+
+const ContextualValueUseDetector = struct {
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    incoming: ir.CfgEdgeRef,
+    target: ir.BlockId,
+    owned: []const ir.BlockId = &.{},
+    found: bool = false,
+    value_id: ?ir.ValueId = null,
+    pack_id: ?ir.ValuePackId = null,
+
+    pub fn value(self: *ContextualValueUseDetector, value_id: ir.ValueId) void {
+        if (self.found) return;
+        if (value_id.index() >= self.program.values.len) {
+            self.found = true;
+            return;
+        }
+        const producer = switch (self.program.values[value_id.index()].origin) {
+            .parameter, .capture => return,
+            .block_parameter => |origin| origin.block,
+            .instruction_result => |origin| if (origin.instruction.index() < self.program.instructions.len)
+                self.program.instructions[origin.instruction.index()].block
+            else
+                null,
+        } orelse {
+            self.found = true;
+            return;
+        };
+        // A pure literal has no producer identity to preserve across a
+        // contextual split.  Ignore it here so a rematerializable seed (for
+        // example the initial nil/false tuple of an iteration) cannot mask a
+        // later value that genuinely needs clone ownership proof.
+        if (isRematerializableConstant(self.program, value_id, self.analysis.function.id)) return;
+        if (producer == self.target or containsBlock(self.owned, producer) or
+            !definitionDominatesIncoming(self.analysis, producer, &.{self.incoming})) return;
+        self.found = true;
+        self.value_id = value_id;
+    }
+
+    pub fn pack(self: *ContextualValueUseDetector, pack_id: ir.ValuePackId) void {
+        if (self.found) return;
+        const producer = packProducerBlock(self.program, pack_id) orelse return;
+        if (producer == self.target or containsBlock(self.owned, producer) or
+            !definitionDominatesIncoming(self.analysis, producer, &.{self.incoming})) return;
+        self.found = true;
+        self.pack_id = pack_id;
+    }
+
+    pub fn place(_: *ContextualValueUseDetector, _: ir.PlaceId) void {}
+};
+
 const DirectValueUseDetector = struct {
     target: ir.ValueId,
     found: bool = false,
@@ -8736,6 +8858,240 @@ fn closureLocalUsesHaveProjectedBoundary(
             if (visitor.predecessor) |predecessor| predecessor.index() else null,
         });
         return false;
+    }
+    return true;
+}
+
+// A node-split group can contain a pure carrier path that is not selected by
+// the ordinary delayed-use walk.  If that path rejoins a closure-local value
+// consumer, leaving it outside the clone would make the original consumer
+// observe a definition owned by the new clone.  Expand only authenticated
+// node-split carriers, including nested groups, and only when a bounded
+// reverse search connects them to the existing closure.  This keeps replay
+// evidence as the authority and does not turn arbitrary reachability into
+// clone ownership.
+fn appendAuthenticatedGroupCarrierPathAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    closure_entry: ir.BlockId,
+    target: ir.BlockId,
+    group: ir.NodeSplitGroupId,
+    incoming: []const ir.CfgEdgeRef,
+    membership: []bool,
+    replay_index: *const node_split.ReplayIndex,
+    expanded: *std.ArrayList(ir.BlockId),
+) std.mem.Allocator.Error!bool {
+    const target_index = analysis.blockIndex(target) orelse {
+        std.debug.print("group_carrier_path_abort target={} reason=target_not_in_analysis\n", .{target.index()});
+        return false;
+    };
+    if (membership[target_index]) return true;
+    if (trace_structural_phases and replay_index.isAuthenticatedCloneBlock(program, target)) {
+        traceStructural("group_carrier_candidate entry={} target={} group={} reachable={} canonical={}\n", .{
+            closure_entry.index(),
+            target.index(),
+            group.index(),
+            try analysis.canReach(closure_entry, target),
+            node_split.parametersAreCanonical(program.values, program.blocks[target.index()]),
+        });
+    }
+    if (target.index() >= program.blocks.len or
+        program.blocks[target.index()].id != target or
+        !node_split.parametersAreCanonical(program.values, program.blocks[target.index()]) or
+        !replay_index.isAuthenticatedCloneBlock(program, target) or
+        !try analysis.canReach(closure_entry, target))
+    {
+        return false;
+    }
+
+    const block_count = analysis.function.blocks.len;
+    const seen = try allocator.alloc(bool, block_count);
+    defer allocator.free(seen);
+    const candidates = try allocator.alloc(bool, block_count);
+    defer allocator.free(candidates);
+    const connected = try allocator.alloc(bool, block_count);
+    defer allocator.free(connected);
+    const queue = try allocator.alloc(ir.BlockId, block_count);
+    defer allocator.free(queue);
+    @memset(seen, false);
+    @memset(candidates, false);
+    @memset(connected, false);
+
+    var head: usize = 0;
+    var tail: usize = 1;
+    queue[0] = target;
+    seen[target_index] = true;
+    candidates[target_index] = true;
+    var incoming_skips: usize = 0;
+    var membership_joins: usize = 0;
+    var seen_skips: usize = 0;
+    var invalid_skips: usize = 0;
+    var ownership_skips: usize = 0;
+    while (head < tail) : (head += 1) {
+        const current = queue[head];
+        if (analysis.blockIndex(current) == null) {
+            std.debug.print("group_carrier_path_abort target={} current={} reason=current_not_in_analysis\n", .{ target.index(), current.index() });
+            return false;
+        }
+        var predecessor_index: usize = 0;
+        while (analysis.predecessorAt(current, predecessor_index)) |predecessor| : (predecessor_index += 1) {
+            var incoming_source = false;
+            for (incoming) |reference| {
+                if (reference.source == predecessor and reference.target == current) {
+                    incoming_source = true;
+                    break;
+                }
+            }
+            if (incoming_source) {
+                incoming_skips += 1;
+                continue;
+            }
+
+            const predecessor_local_index = analysis.blockIndex(predecessor) orelse {
+                std.debug.print("group_carrier_path_abort target={} current={} predecessor={} reason=predecessor_not_in_analysis\n", .{ target.index(), current.index(), predecessor.index() });
+                return false;
+            };
+            if (membership[predecessor_local_index]) {
+                membership_joins += 1;
+                continue;
+            }
+            if (seen[predecessor_local_index]) {
+                seen_skips += 1;
+                continue;
+            }
+            if (predecessor.index() >= program.blocks.len or
+                program.blocks[predecessor.index()].id != predecessor or
+                !node_split.parametersAreCanonical(program.values, program.blocks[predecessor.index()]))
+            {
+                invalid_skips += 1;
+                continue;
+            }
+            if (!replay_index.isAuthenticatedCloneBlock(program, predecessor)) {
+                ownership_skips += 1;
+                continue;
+            }
+            seen[predecessor_local_index] = true;
+            candidates[predecessor_local_index] = true;
+            if (tail >= queue.len) {
+                std.debug.print("group_carrier_path_abort target={} current={} predecessor={} reason=queue_exhausted explored={} capacity={}\n", .{ target.index(), current.index(), predecessor.index(), tail, queue.len });
+                return false;
+            }
+            queue[tail] = predecessor;
+            tail += 1;
+        }
+    }
+
+    // A target can have both a direct closure predecessor and an authenticated
+    // carrier predecessor.  The old single-path search stopped at the first
+    // closure predecessor and left the carrier outside the projected clone.
+    // Mark candidate blocks that have at least one complete authenticated path
+    // back to the selected boundary, then retain every connected candidate.
+    var connected_changed = true;
+    while (connected_changed) {
+        connected_changed = false;
+        var candidate_index: usize = 0;
+        while (candidate_index < tail) : (candidate_index += 1) {
+            const current = queue[candidate_index];
+            const current_index = analysis.blockIndex(current) orelse return false;
+            if (connected[current_index]) continue;
+            var predecessor_index: usize = 0;
+            while (analysis.predecessorAt(current, predecessor_index)) |predecessor| : (predecessor_index += 1) {
+                var selected_incoming = false;
+                for (incoming) |reference| {
+                    if (reference.source == predecessor and reference.target == current) {
+                        selected_incoming = true;
+                        break;
+                    }
+                }
+                if (selected_incoming) {
+                    connected[current_index] = true;
+                    connected_changed = true;
+                    break;
+                }
+                const predecessor_local_index = analysis.blockIndex(predecessor) orelse return false;
+                if (membership[predecessor_local_index] or
+                    (candidates[predecessor_local_index] and connected[predecessor_local_index]))
+                {
+                    connected[current_index] = true;
+                    connected_changed = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    const connected_target_index = analysis.blockIndex(target) orelse return false;
+    if (!connected[connected_target_index]) {
+        traceStructural("group_carrier_path_not_found target={} group={} explored={} incoming_skips={} membership_joins={} seen_skips={} invalid_skips={} ownership_skips={}\n", .{
+            target.index(),
+            group.index(),
+            tail,
+            incoming_skips,
+            membership_joins,
+            seen_skips,
+            invalid_skips,
+            ownership_skips,
+        });
+        return false;
+    }
+
+    // A connected carrier path is still unsafe when one of its blocks has a
+    // reachable predecessor outside the path.  That predecessor would keep
+    // the original block reachable after the selected edge is redirected,
+    // so accepting only the authenticated reverse path would manufacture a
+    // clone-local value boundary.  Treat the whole candidate as a transaction
+    // and leave membership untouched; a later candidate may still use the
+    // existing closure without importing this incomplete path.
+    var candidate_index: usize = 0;
+    while (candidate_index < tail) : (candidate_index += 1) {
+        const current = queue[candidate_index];
+        const current_index = analysis.blockIndex(current) orelse return false;
+        if (!connected[current_index] or membership[current_index]) continue;
+        var predecessor_index: usize = 0;
+        while (analysis.predecessorAt(current, predecessor_index)) |predecessor| : (predecessor_index += 1) {
+            const predecessor_local_index = analysis.blockIndex(predecessor) orelse return false;
+            if (membership[predecessor_local_index] or connected[predecessor_local_index]) continue;
+            var selected_incoming = false;
+            for (incoming) |reference| {
+                if (reference.source == predecessor and reference.target == current) {
+                    selected_incoming = true;
+                    break;
+                }
+            }
+            if (selected_incoming or !try analysis.canReach(closure_entry, predecessor)) continue;
+            if (trace_structural_phases) {
+                traceStructural("group_carrier_path_boundary_reject entry={} target={} block={} predecessor={} group={}\n", .{
+                    closure_entry.index(),
+                    target.index(),
+                    current.index(),
+                    predecessor.index(),
+                    group.index(),
+                });
+            }
+            return false;
+        }
+    }
+
+    var path: std.ArrayList(ir.BlockId) = .empty;
+    defer path.deinit(allocator);
+    var queue_index = tail;
+    while (queue_index != 0) {
+        queue_index -= 1;
+        const block_id = queue[queue_index];
+        const block_index = analysis.blockIndex(block_id) orelse return false;
+        if (!connected[block_index] or membership[block_index]) continue;
+        membership[block_index] = true;
+        try expanded.append(allocator, block_id);
+        try path.append(allocator, block_id);
+    }
+    if (trace_structural_phases) {
+        traceStructural("group_carrier_path entry={} target={} group={} added={any}\n", .{
+            closure_entry.index(),
+            target.index(),
+            group.index(),
+            path.items,
+        });
     }
     return true;
 }
@@ -10339,6 +10695,66 @@ test "non-dominating exact constants remain rematerializable continuation values
     );
 }
 
+test "contextual-use detection ignores rematerializable constants" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const producer = ir.BlockId.fromIndex(1);
+    const incoming_source = ir.BlockId.fromIndex(2);
+    const target = ir.BlockId.fromIndex(3);
+    const selector = ir.ValueId.fromIndex(0);
+    const constant_value = ir.ValueId.fromIndex(1);
+    const copied_value = ir.ValueId.fromIndex(2);
+    const constant_instruction = ir.InstructionId.fromIndex(0);
+    const copy_instruction = ir.InstructionId.fromIndex(1);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .instructions = &.{copy_instruction}, .terminator = .{ .branch = .{
+            .condition = selector,
+            .then_edge = .{ .target = producer },
+            .else_edge = .{ .target = incoming_source },
+        } } },
+        .{ .id = producer, .function = function_id, .instructions = &.{constant_instruction}, .terminator = .{ .jump = .{ .target = target } } },
+        .{ .id = incoming_source, .function = function_id, .terminator = .{ .jump = .{ .target = target } } },
+        .{ .id = target, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .parameters = &.{selector},
+        .blocks = &.{ entry, producer, incoming_source, target },
+        .entry_block = entry,
+    }};
+    const values = [_]ir.Value{
+        .{ .id = selector, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = constant_value, .function = function_id, .type = .dynamic, .origin = .{ .instruction_result = .{ .instruction = constant_instruction, .index = 0 } } },
+        .{ .id = copied_value, .function = function_id, .type = .dynamic, .origin = .{ .instruction_result = .{ .instruction = copy_instruction, .index = 0 } } },
+    };
+    const instructions = [_]ir.Instruction{
+        .{ .id = constant_instruction, .block = producer, .operation = .{ .constant = .{ .nil_value = {} } }, .results = &.{constant_value}, .effects = .pure },
+        .{ .id = copy_instruction, .block = entry, .operation = .{ .copy = selector }, .results = &.{copied_value}, .effects = .pure },
+    };
+    const program = ir.Program{
+        .program_id = "contextual-use-constant-filter",
+        .entry_function = function_id,
+        .functions = &.{functions[0]},
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, functions[0]);
+    defer analysis.deinit();
+    const incoming = ir.CfgEdgeRef{ .source = incoming_source, .kind = .jump, .target = target };
+    var detector = ContextualValueUseDetector{
+        .program = &program,
+        .analysis = &analysis,
+        .incoming = incoming,
+        .target = target,
+    };
+    detector.value(constant_value);
+    try std.testing.expect(!detector.found);
+    detector.value(copied_value);
+    try std.testing.expect(detector.found);
+    try std.testing.expectEqual(copied_value, detector.value_id.?);
+}
+
 test "contextual boundary rejects an unprojected shared predecessor" {
     const function_id = ir.FunctionId.fromIndex(0);
     const entry = ir.BlockId.fromIndex(0);
@@ -10400,6 +10816,101 @@ test "contextual boundary rejects an unprojected shared predecessor" {
         &closure,
         &incoming,
     ));
+}
+
+test "authenticated group carrier path rejects an unowned ingress before nested clones" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const root = ir.BlockId.fromIndex(0);
+    const closure_entry = ir.BlockId.fromIndex(1);
+    const unowned_ingress = ir.BlockId.fromIndex(2);
+    const nested_carrier = ir.BlockId.fromIndex(3);
+    const carrier = ir.BlockId.fromIndex(4);
+    const target = ir.BlockId.fromIndex(5);
+    const original_entry = ir.BlockId.fromIndex(6);
+    const original_nested = ir.BlockId.fromIndex(7);
+    const original_carrier = ir.BlockId.fromIndex(8);
+    const original_target = ir.BlockId.fromIndex(9);
+    const group = ir.NodeSplitGroupId.fromIndex(0);
+    const nested_group = ir.NodeSplitGroupId.fromIndex(1);
+    const carrier_group = ir.NodeSplitGroupId.fromIndex(2);
+    const target_group = ir.NodeSplitGroupId.fromIndex(3);
+    const blocks = [_]ir.Block{
+        .{ .id = root, .function = function_id, .terminator = .{ .jump = .{ .target = closure_entry } } },
+        .{ .id = closure_entry, .function = function_id, .terminator = .{ .jump = .{ .target = unowned_ingress } } },
+        .{ .id = unowned_ingress, .function = function_id, .terminator = .{ .jump = .{ .target = nested_carrier } } },
+        .{ .id = nested_carrier, .function = function_id, .terminator = .{ .jump = .{ .target = carrier } } },
+        .{ .id = carrier, .function = function_id, .terminator = .{ .jump = .{ .target = target } } },
+        .{ .id = target, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = original_entry, .function = function_id, .terminator = .{ .unreachable_block = {} } },
+        .{ .id = original_nested, .function = function_id, .terminator = .{ .unreachable_block = {} } },
+        .{ .id = original_carrier, .function = function_id, .terminator = .{ .unreachable_block = {} } },
+        .{ .id = original_target, .function = function_id, .terminator = .{ .unreachable_block = {} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .blocks = &.{
+            root,
+            closure_entry,
+            unowned_ingress,
+            nested_carrier,
+            carrier,
+            target,
+            original_entry,
+            original_nested,
+            original_carrier,
+            original_target,
+        },
+        .entry_block = root,
+    };
+    const rewrites = [_]ir.CfgEdgeRewrite{
+        .{ .id = ir.EdgeRewriteId.fromIndex(0), .source = closure_entry, .kind = .jump, .from = .{ .target = original_entry }, .to = .{ .target = closure_entry }, .rule = .node_split, .node_split_group = group },
+        .{ .id = ir.EdgeRewriteId.fromIndex(1), .source = nested_carrier, .kind = .jump, .from = .{ .target = original_nested }, .to = .{ .target = nested_carrier }, .rule = .node_split, .node_split_group = nested_group },
+        .{ .id = ir.EdgeRewriteId.fromIndex(2), .source = carrier, .kind = .jump, .from = .{ .target = original_carrier }, .to = .{ .target = carrier }, .rule = .node_split, .node_split_group = carrier_group },
+        .{ .id = ir.EdgeRewriteId.fromIndex(3), .source = target, .kind = .jump, .from = .{ .target = original_target }, .to = .{ .target = target }, .rule = .node_split, .node_split_group = target_group },
+    };
+    const program = ir.Program{
+        .program_id = "nested-carrier-unowned-ingress",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &.{},
+        .edge_rewrites = &rewrites,
+    };
+    var analysis_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer analysis_arena.deinit();
+    var analysis = try cfg.Analysis.init(analysis_arena.allocator(), &program, function);
+    defer analysis.deinit();
+    var replay_index = try node_split.ReplayIndex.initForFunction(
+        std.testing.allocator,
+        &program,
+        function_id,
+    );
+    defer replay_index.deinit();
+    var membership = [_]bool{ false, true, false, false, false, false, false, false, false, false };
+    var expanded: std.ArrayList(ir.BlockId) = .empty;
+    defer expanded.deinit(std.testing.allocator);
+    try expanded.append(std.testing.allocator, closure_entry);
+    const incoming = [_]ir.CfgEdgeRef{.{
+        .source = root,
+        .kind = .jump,
+        .target = closure_entry,
+    }};
+
+    try std.testing.expect(!try appendAuthenticatedGroupCarrierPathAlloc(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        closure_entry,
+        target,
+        group,
+        &incoming,
+        &membership,
+        &replay_index,
+        &expanded,
+    ));
+    try std.testing.expectEqual(@as(usize, 1), expanded.items.len);
+    try std.testing.expectEqual(closure_entry, expanded.items[0]);
 }
 
 test "parameterized continuation admits an authenticated loop-carried SCC" {
@@ -11385,6 +11896,177 @@ test "parameterized continuation rejects unavailable arguments despite stop reac
     ));
 }
 
+test "authenticated pack continuation projection avoids repeated extension" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const producer = ir.BlockId.fromIndex(1);
+    const clone = ir.BlockId.fromIndex(2);
+    const closure = ir.BlockId.fromIndex(3);
+    const consumer = ir.BlockId.fromIndex(4);
+    const stop = ir.BlockId.fromIndex(5);
+    const selector = ir.ValueId.fromIndex(0);
+    const callee = ir.ValueId.fromIndex(1);
+    const source_call = ir.InstructionId.fromIndex(0);
+    const clone_call = ir.InstructionId.fromIndex(1);
+    const consumer_call = ir.InstructionId.fromIndex(2);
+    const source_pack = ir.ValuePackId.fromIndex(0);
+    const clone_pack = ir.ValuePackId.fromIndex(1);
+
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = selector,
+            .then_edge = .{ .target = producer },
+            .else_edge = .{ .target = clone },
+        } } },
+        .{ .id = producer, .function = function_id, .instructions = &.{source_call}, .terminator = .{ .jump = .{ .target = closure } } },
+        .{ .id = clone, .function = function_id, .instructions = &.{clone_call}, .terminator = .{ .jump = .{ .target = closure } } },
+        .{ .id = closure, .function = function_id, .terminator = .{ .jump = .{ .target = consumer } } },
+        .{ .id = consumer, .function = function_id, .instructions = &.{consumer_call}, .terminator = .{ .jump = .{ .target = stop } } },
+        .{ .id = stop, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .parameters = &.{ selector, callee },
+        .blocks = &.{ entry, producer, clone, closure, consumer, stop },
+        .entry_block = entry,
+    }};
+    const values = [_]ir.Value{
+        .{ .id = selector, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = callee, .function = function_id, .type = .dynamic, .origin = .{ .parameter = 1 } },
+    };
+    const instructions = [_]ir.Instruction{
+        .{
+            .id = source_call,
+            .block = producer,
+            .operation = .{ .call = .{ .callee = callee, .arguments = &.{}, .result_arity = .{ .variadic = {} } } },
+            .results = &.{},
+            .pack_result = source_pack,
+            .effects = ir.EffectSummary.dynamic_call,
+        },
+        .{
+            .id = clone_call,
+            .block = clone,
+            .operation = .{ .call = .{ .callee = callee, .arguments = &.{}, .result_arity = .{ .variadic = {} } } },
+            .results = &.{},
+            .pack_result = clone_pack,
+            .effects = ir.EffectSummary.dynamic_call,
+        },
+        .{
+            .id = consumer_call,
+            .block = consumer,
+            .operation = .{ .call = .{ .callee = callee, .arguments = &.{}, .argument_pack = source_pack, .result_arity = .{ .fixed = 0 } } },
+            .results = &.{},
+            .effects = ir.EffectSummary.dynamic_call,
+        },
+    };
+    var packs = [_]ir.ValuePack{
+        .{ .id = source_pack, .function = function_id, .origin = .{ .instruction_result = source_call } },
+        .{ .id = clone_pack, .function = function_id, .origin = .{ .instruction_result = clone_call } },
+    };
+    const rewrites = [_]ir.CfgEdgeRewrite{.{
+        .id = ir.EdgeRewriteId.fromIndex(0),
+        .source = entry,
+        .kind = .branch_else,
+        .from = .{ .target = producer },
+        .to = .{ .target = clone },
+        .rule = .node_split,
+        .node_split_group = ir.NodeSplitGroupId.fromIndex(0),
+    }};
+    var program: ir.Program = .{
+        .program_id = "authenticated-pack-continuation-projection",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+        .value_packs = &packs,
+        .edge_rewrites = &rewrites,
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, functions[0]);
+    defer analysis.deinit();
+    const incoming = [_]ir.CfgEdgeRef{.{ .source = clone, .kind = .jump, .target = closure }};
+
+    var lineage_index = try CloneLineageIndex.init(std.testing.allocator, &program);
+    defer lineage_index.deinit();
+    var replay_index = try node_split.ReplayIndex.init(std.testing.allocator, &program);
+    defer replay_index.deinit();
+    var replay_cache = ReplayCache.init(std.testing.allocator, &program, &replay_index);
+    defer replay_cache.deinit();
+
+    const normalized = try normalizeIncomingThroughForwardingAlloc(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        &incoming,
+    );
+    defer std.testing.allocator.free(normalized);
+    try std.testing.expectEqual(clone, normalized[0].source);
+    try std.testing.expectEqual(@as(u8, 2), try cloneContextRankCached(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        clone,
+        &incoming,
+        &lineage_index,
+        &replay_index,
+        &replay_cache,
+    ));
+
+    try std.testing.expectEqual(
+        ContinuationValueContext.contextual,
+        try packCarriesContinuationContext(
+            std.testing.allocator,
+            &program,
+            &analysis,
+            source_pack,
+            consumer,
+            &.{closure},
+            &.{consumer},
+            &incoming,
+            &lineage_index,
+            &replay_index,
+            &replay_cache,
+        ),
+    );
+
+    const invalid_prefix = [_]ir.ValueType{.integer};
+    packs[clone_pack.index()].shape = .{ .prefix = &invalid_prefix, .tail = .closed };
+    var invalid_lineage_index = try CloneLineageIndex.init(std.testing.allocator, &program);
+    defer invalid_lineage_index.deinit();
+    var invalid_replay_index = try node_split.ReplayIndex.init(std.testing.allocator, &program);
+    defer invalid_replay_index.deinit();
+    var invalid_replay_cache = ReplayCache.init(std.testing.allocator, &program, &invalid_replay_index);
+    defer invalid_replay_cache.deinit();
+    try std.testing.expectEqual(
+        ContinuationValueContext.unavailable,
+        try packCarriesContinuationContext(
+            std.testing.allocator,
+            &program,
+            &analysis,
+            source_pack,
+            consumer,
+            &.{closure},
+            &.{consumer},
+            &incoming,
+            &invalid_lineage_index,
+            &invalid_replay_index,
+            &invalid_replay_cache,
+        ),
+    );
+
+    const tampered_initial = try std.testing.allocator.dupe(ir.BlockId, &.{closure});
+    const tampered = try extendContinuationClosureAlloc(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        stop,
+        tampered_initial,
+        &incoming,
+    );
+    defer std.testing.allocator.free(tampered);
+    try std.testing.expectEqualSlices(ir.BlockId, &.{ closure, consumer }, tampered);
+}
+
 test "authenticated pack continuation follows transparent forwarding provenance" {
     const function_id = ir.FunctionId.fromIndex(0);
     const entry = ir.BlockId.fromIndex(0);
@@ -12322,6 +13004,29 @@ fn collectArmClosureAlloc(
         }
     }
     return try allocator.dupe(ir.BlockId, pending[0..pending_len]);
+}
+
+fn commonClosureAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    join: ir.BlockId,
+    left: []const ir.BlockId,
+    right: []const ir.BlockId,
+) std.mem.Allocator.Error![]ir.BlockId {
+    var common: std.ArrayList(ir.BlockId) = .empty;
+    defer common.deinit(allocator);
+    for (left) |left_id| {
+        const left_index = analysis.blockIndex(left_id) orelse continue;
+        for (right) |right_id| {
+            if (analysis.blockIndex(right_id) == left_index) {
+                try common.append(allocator, left_id);
+                break;
+            }
+        }
+    }
+    const owned = try common.toOwnedSlice(allocator);
+    return try extendContinuationClosureAlloc(allocator, program, analysis, join, owned, null);
 }
 
 fn isEffectfulZeroParameterBlock(
@@ -15195,6 +15900,76 @@ fn extendContinuationClosureWithModeAlloc(
         );
     }
     return owned;
+}
+
+const Boundary = struct {
+    entry: ir.BlockId,
+    incoming: []ir.CfgEdgeRef,
+
+    fn deinit(self: *Boundary, allocator: std.mem.Allocator) void {
+        allocator.free(self.incoming);
+        self.* = undefined;
+    }
+};
+
+fn collectBoundaryAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    context: []const ir.BlockId,
+    common: []const ir.BlockId,
+) std.mem.Allocator.Error!?Boundary {
+    var entry: ?ir.BlockId = null;
+    var incoming: std.ArrayList(ir.CfgEdgeRef) = .empty;
+    defer incoming.deinit(allocator);
+    for (context) |source| {
+        if (containsBlock(common, source) or source.index() >= program.blocks.len) continue;
+        switch (program.blocks[source.index()].terminator) {
+            .jump => |edge| if (!try appendBoundaryEntry(allocator, &incoming, &entry, source, .jump, edge.target, common)) return null,
+            .branch => |branch| {
+                if (!try appendBoundaryEntry(
+                    allocator,
+                    &incoming,
+                    &entry,
+                    source,
+                    .branch_then,
+                    branch.then_edge.target,
+                    common,
+                )) return null;
+                if (!try appendBoundaryEntry(
+                    allocator,
+                    &incoming,
+                    &entry,
+                    source,
+                    .branch_else,
+                    branch.else_edge.target,
+                    common,
+                )) return null;
+            },
+            .return_values, .return_pack, .return_expanded, .throw_error, .unreachable_block => {},
+        }
+    }
+    const selected = entry orelse return null;
+    if (incoming.items.len == 0) return null;
+    return .{ .entry = selected, .incoming = try incoming.toOwnedSlice(allocator) };
+}
+
+fn appendBoundaryEntry(
+    allocator: std.mem.Allocator,
+    incoming: *std.ArrayList(ir.CfgEdgeRef),
+    entry: *?ir.BlockId,
+    source: ir.BlockId,
+    kind: ir.CfgEdgeKind,
+    target: ir.BlockId,
+    common: []const ir.BlockId,
+) std.mem.Allocator.Error!bool {
+    if (!containsBlock(common, target)) return true;
+    if (entry.*) |existing| {
+        if (existing != target) return false;
+    } else {
+        entry.* = target;
+    }
+    try incoming.append(allocator, .{ .source = source, .kind = kind, .target = target });
+    return true;
 }
 
 fn containsBlock(blocks: []const ir.BlockId, target: ir.BlockId) bool {
