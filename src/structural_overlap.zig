@@ -9449,6 +9449,69 @@ fn packProducerBlock(program: *const ir.Program, pack_id: ir.ValuePackId) ?ir.Bl
     };
 }
 
+test "external-use projection rescans definitions added by the first pass" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const closure_entry = ir.BlockId.fromIndex(1);
+    const first_consumer = ir.BlockId.fromIndex(2);
+    const downstream_consumer = ir.BlockId.fromIndex(3);
+    const stop = ir.BlockId.fromIndex(4);
+    const source_value = ir.ValueId.fromIndex(0);
+    const closure_value = ir.ValueId.fromIndex(1);
+    const downstream_value = ir.ValueId.fromIndex(2);
+    const first_copy = ir.InstructionId.fromIndex(0);
+    const downstream_copy = ir.InstructionId.fromIndex(1);
+
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .jump = .{ .target = closure_entry } } },
+        .{ .id = closure_entry, .function = function_id, .instructions = &.{first_copy}, .terminator = .{ .jump = .{ .target = first_consumer } } },
+        .{ .id = first_consumer, .function = function_id, .instructions = &.{downstream_copy}, .terminator = .{ .jump = .{ .target = downstream_consumer } } },
+        .{ .id = downstream_consumer, .function = function_id, .terminator = .{ .return_values = &.{downstream_value} } },
+        .{ .id = stop, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &.{source_value},
+        .blocks = &.{ entry, closure_entry, first_consumer, downstream_consumer, stop },
+        .entry_block = entry,
+    };
+    const values = [_]ir.Value{
+        .{ .id = source_value, .function = function_id, .type = .dynamic, .origin = .{ .parameter = 0 } },
+        .{ .id = closure_value, .function = function_id, .type = .dynamic, .origin = .{ .instruction_result = .{ .instruction = first_copy, .index = 0 } } },
+        .{ .id = downstream_value, .function = function_id, .type = .dynamic, .origin = .{ .instruction_result = .{ .instruction = downstream_copy, .index = 0 } } },
+    };
+    const instructions = [_]ir.Instruction{
+        .{ .id = first_copy, .block = closure_entry, .operation = .{ .copy = source_value }, .results = &.{closure_value}, .effects = .pure },
+        .{ .id = downstream_copy, .block = first_consumer, .operation = .{ .copy = closure_value }, .results = &.{downstream_value}, .effects = .pure },
+    };
+    const program = ir.Program{
+        .program_id = "bounded-external-use-rescan",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+    };
+
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, function);
+    defer analysis.deinit();
+    const closure = try std.testing.allocator.dupe(ir.BlockId, &.{closure_entry});
+    const projected = try extendClosureForExternalUsesAlloc(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        stop,
+        closure,
+        null,
+    );
+    defer std.testing.allocator.free(projected);
+    try std.testing.expectEqualSlices(
+        ir.BlockId,
+        &.{ closure_entry, first_consumer, downstream_consumer },
+        projected,
+    );
+}
+
 test "continuation extension trims a shared context-independent suffix" {
     const function_id = ir.FunctionId.fromIndex(0);
     const entry = ir.BlockId.fromIndex(0);
@@ -9507,6 +9570,310 @@ test "continuation extension trims a shared context-independent suffix" {
     );
     defer std.testing.allocator.free(trimmed);
     try std.testing.expectEqualSlices(ir.BlockId, &.{frontier}, trimmed);
+}
+
+test "continuation extension retains an effectful shared suffix" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const frontier = ir.BlockId.fromIndex(1);
+    const shared = ir.BlockId.fromIndex(2);
+    const tail = ir.BlockId.fromIndex(3);
+    const alternate = ir.BlockId.fromIndex(4);
+    const condition = ir.ValueId.fromIndex(0);
+    const table = ir.ValueId.fromIndex(1);
+    const make_table = ir.InstructionId.fromIndex(0);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = condition,
+            .then_edge = .{ .target = frontier },
+            .else_edge = .{ .target = alternate },
+        } } },
+        .{ .id = frontier, .function = function_id, .terminator = .{ .jump = .{ .target = shared } } },
+        .{ .id = shared, .function = function_id, .instructions = &.{make_table}, .terminator = .{ .jump = .{ .target = tail } } },
+        .{ .id = tail, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = alternate, .function = function_id, .terminator = .{ .jump = .{ .target = shared } } },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .parameters = &.{condition},
+        .blocks = &.{ entry, frontier, shared, tail, alternate },
+        .entry_block = entry,
+    }};
+    const values = [_]ir.Value{
+        .{
+            .id = condition,
+            .function = function_id,
+            .type = .boolean,
+            .origin = .{ .parameter = 0 },
+        },
+        .{
+            .id = table,
+            .function = function_id,
+            .origin = .{ .instruction_result = .{ .instruction = make_table, .index = 0 } },
+        },
+    };
+    const instructions = [_]ir.Instruction{.{
+        .id = make_table,
+        .block = shared,
+        .operation = .{ .make_table = {} },
+        .results = &.{table},
+        .effects = .table_constructor,
+    }};
+    const program: ir.Program = .{
+        .program_id = "effectful-shared-context-independent-suffix",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+    };
+    const incoming = [_]ir.CfgEdgeRef{.{
+        .source = entry,
+        .kind = .branch_then,
+        .target = frontier,
+    }};
+
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, functions[0]);
+    defer analysis.deinit();
+    const initial = try std.testing.allocator.dupe(ir.BlockId, &.{ shared, frontier, tail });
+    const retained = try trimContextIndependentSharedSuffixAlloc(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        entry,
+        initial,
+        &incoming,
+    );
+    defer std.testing.allocator.free(retained);
+    try std.testing.expectEqualSlices(ir.BlockId, &.{ shared, frontier, tail }, retained);
+}
+
+test "shared suffix trimming retains every effectful operation category" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const frontier = ir.BlockId.fromIndex(1);
+    const shared = ir.BlockId.fromIndex(2);
+    const tail = ir.BlockId.fromIndex(3);
+    const alternate = ir.BlockId.fromIndex(4);
+    const condition = ir.ValueId.fromIndex(0);
+    const callee = ir.ValueId.fromIndex(1);
+    const table = ir.ValueId.fromIndex(2);
+    const key = ir.ValueId.fromIndex(3);
+    const value = ir.ValueId.fromIndex(4);
+    const place_id = ir.PlaceId.fromIndex(0);
+    const instruction_id = ir.InstructionId.fromIndex(0);
+    const local_places = [_]ir.PlaceId{place_id};
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = condition,
+            .then_edge = .{ .target = frontier },
+            .else_edge = .{ .target = alternate },
+        } } },
+        .{ .id = frontier, .function = function_id, .terminator = .{ .jump = .{ .target = shared } } },
+        .{ .id = shared, .function = function_id, .instructions = &.{instruction_id}, .terminator = .{ .jump = .{ .target = tail } } },
+        .{ .id = tail, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = alternate, .function = function_id, .terminator = .{ .jump = .{ .target = shared } } },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .parameters = &.{ condition, callee, table, key, value },
+        .local_places = &local_places,
+        .blocks = &.{ entry, frontier, shared, tail, alternate },
+        .entry_block = entry,
+    }};
+    const values = [_]ir.Value{
+        .{ .id = condition, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = callee, .function = function_id, .origin = .{ .parameter = 1 } },
+        .{ .id = table, .function = function_id, .origin = .{ .parameter = 2 } },
+        .{ .id = key, .function = function_id, .origin = .{ .parameter = 3 } },
+        .{ .id = value, .function = function_id, .origin = .{ .parameter = 4 } },
+    };
+    const places = [_]ir.Place{.{
+        .id = place_id,
+        .function = function_id,
+        .origin = .{ .local = 0 },
+    }};
+    var instructions = [_]ir.Instruction{.{
+        .id = instruction_id,
+        .block = shared,
+        .operation = .{ .place_write = .{ .place = place_id, .value = value } },
+        .results = &.{},
+        .effects = .place_write,
+    }};
+    const program: ir.Program = .{
+        .program_id = "effectful-shared-suffix-operation-matrix",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+        .places = &places,
+    };
+    const incoming = [_]ir.CfgEdgeRef{.{
+        .source = entry,
+        .kind = .branch_then,
+        .target = frontier,
+    }};
+    const cases = [_]struct {
+        operation: ir.Operation,
+        effects: ir.EffectSummary,
+    }{
+        .{ .operation = .{ .place_write = .{ .place = place_id, .value = value } }, .effects = .place_write },
+        .{ .operation = .{ .table_get = .{ .table = table, .key = key } }, .effects = .semantic_table_read },
+        .{ .operation = .{ .table_set = .{ .table = table, .key = key, .value = value } }, .effects = .semantic_table_write },
+        .{ .operation = .{ .environment_get = .{ .target = .{ .ambient = {} }, .name = "shared" } }, .effects = .semantic_environment_read },
+        .{ .operation = .{ .environment_set = .{ .target = .{ .ambient = {} }, .name = "shared", .value = value } }, .effects = .semantic_environment_write },
+        .{ .operation = .{ .call = .{ .callee = callee, .arguments = &.{value}, .result_arity = .{ .fixed = 0 } } }, .effects = .dynamic_call },
+        .{ .operation = .{ .coroutine_yield = .{ .arguments = &.{value}, .result_arity = .{ .fixed = 0 } } }, .effects = .coroutine_yield },
+    };
+
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, functions[0]);
+    defer analysis.deinit();
+    for (cases) |case| {
+        instructions[0].operation = case.operation;
+        instructions[0].effects = case.effects;
+        const initial = try std.testing.allocator.dupe(ir.BlockId, &.{ shared, frontier, tail });
+        const retained = try trimContextIndependentSharedSuffixAlloc(
+            std.testing.allocator,
+            &program,
+            &analysis,
+            tail,
+            initial,
+            &incoming,
+        );
+        defer std.testing.allocator.free(retained);
+        try std.testing.expectEqualSlices(ir.BlockId, &.{ shared, frontier, tail }, retained);
+    }
+}
+
+test "shared suffix trimming retains a throw terminator" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const frontier = ir.BlockId.fromIndex(1);
+    const shared = ir.BlockId.fromIndex(2);
+    const tail = ir.BlockId.fromIndex(3);
+    const alternate = ir.BlockId.fromIndex(4);
+    const condition = ir.ValueId.fromIndex(0);
+    const error_value = ir.ValueId.fromIndex(1);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = condition,
+            .then_edge = .{ .target = frontier },
+            .else_edge = .{ .target = alternate },
+        } } },
+        .{ .id = frontier, .function = function_id, .terminator = .{ .jump = .{ .target = shared } } },
+        .{ .id = shared, .function = function_id, .terminator = .{ .throw_error = .{ .value = error_value, .level = 0 } } },
+        .{ .id = tail, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = alternate, .function = function_id, .terminator = .{ .jump = .{ .target = shared } } },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .parameters = &.{ condition, error_value },
+        .blocks = &.{ entry, frontier, shared, tail, alternate },
+        .entry_block = entry,
+    }};
+    const values = [_]ir.Value{
+        .{ .id = condition, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = error_value, .function = function_id, .origin = .{ .parameter = 1 } },
+    };
+    const program: ir.Program = .{
+        .program_id = "throwing-shared-suffix",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+    };
+    const incoming = [_]ir.CfgEdgeRef{.{
+        .source = entry,
+        .kind = .branch_then,
+        .target = frontier,
+    }};
+
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, functions[0]);
+    defer analysis.deinit();
+    const initial = try std.testing.allocator.dupe(ir.BlockId, &.{ shared, frontier, tail });
+    const retained = try trimContextIndependentSharedSuffixAlloc(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        tail,
+        initial,
+        &incoming,
+    );
+    defer std.testing.allocator.free(retained);
+    try std.testing.expectEqualSlices(ir.BlockId, &.{ shared, frontier, tail }, retained);
+}
+
+test "shared suffix trimming retains aliases sourced from incoming edge arguments" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const frontier = ir.BlockId.fromIndex(1);
+    const shared = ir.BlockId.fromIndex(2);
+    const tail = ir.BlockId.fromIndex(3);
+    const alternate = ir.BlockId.fromIndex(4);
+    const selector = ir.ValueId.fromIndex(0);
+    const seed = ir.ValueId.fromIndex(1);
+    const frontier_value = ir.ValueId.fromIndex(2);
+    const alias_value = ir.ValueId.fromIndex(3);
+    const alias_instruction = ir.InstructionId.fromIndex(0);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = selector,
+            .then_edge = .{ .target = frontier, .arguments = &.{seed} },
+            .else_edge = .{ .target = alternate },
+        } } },
+        .{ .id = frontier, .function = function_id, .parameters = &.{frontier_value}, .terminator = .{ .jump = .{ .target = shared } } },
+        .{ .id = shared, .function = function_id, .instructions = &.{alias_instruction}, .terminator = .{ .jump = .{ .target = tail } } },
+        .{ .id = tail, .function = function_id, .terminator = .{ .return_values = &.{alias_value} } },
+        .{ .id = alternate, .function = function_id, .terminator = .{ .jump = .{ .target = shared } } },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .parameters = &.{ selector, seed },
+        .blocks = &.{ entry, frontier, shared, tail, alternate },
+        .entry_block = entry,
+    }};
+    const values = [_]ir.Value{
+        .{ .id = selector, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = seed, .function = function_id, .origin = .{ .parameter = 1 } },
+        .{ .id = frontier_value, .function = function_id, .origin = .{ .block_parameter = .{ .block = frontier, .index = 0 } } },
+        .{ .id = alias_value, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = alias_instruction, .index = 0 } } },
+    };
+    const instructions = [_]ir.Instruction{.{
+        .id = alias_instruction,
+        .block = shared,
+        .operation = .{ .copy = frontier_value },
+        .results = &.{alias_value},
+        .effects = .pure,
+    }};
+    const program: ir.Program = .{
+        .program_id = "incoming-edge-argument-alias-shared-suffix",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+    };
+    const incoming = [_]ir.CfgEdgeRef{.{
+        .source = entry,
+        .kind = .branch_then,
+        .target = frontier,
+    }};
+
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, functions[0]);
+    defer analysis.deinit();
+    const initial = try std.testing.allocator.dupe(ir.BlockId, &.{ shared, frontier, tail });
+    const retained = try trimContextIndependentSharedSuffixAlloc(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        tail,
+        initial,
+        &incoming,
+    );
+    defer std.testing.allocator.free(retained);
+    try std.testing.expectEqualSlices(ir.BlockId, &.{ shared, frontier, tail }, retained);
 }
 
 test "non-dominating exact constants remain rematerializable continuation values" {
@@ -13304,6 +13671,740 @@ fn trimContextIndependentSharedSuffixAlloc(
     }
     const owned = try retained.toOwnedSlice(allocator);
     allocator.free(closure);
+    return owned;
+}
+
+fn trimShadowedUnreachableCloneBlocksAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    entry: ir.BlockId,
+    closure: []ir.BlockId,
+    lineage_index: *const CloneLineageIndex,
+) std.mem.Allocator.Error![]ir.BlockId {
+    if (closure.len < 2) return closure;
+
+    const block_count = analysis.function.blocks.len;
+    const membership = try allocator.alloc(bool, block_count);
+    defer allocator.free(membership);
+    @memset(membership, false);
+    for (closure) |block_id| {
+        const local_index = analysis.blockIndex(block_id) orelse return closure;
+        if (membership[local_index]) return closure;
+        membership[local_index] = true;
+    }
+
+    const entry_index = analysis.blockIndex(entry) orelse return closure;
+    if (!membership[entry_index]) return closure;
+
+    const reachable = try allocator.alloc(bool, block_count);
+    defer allocator.free(reachable);
+    @memset(reachable, false);
+    const pending = try allocator.alloc(ir.BlockId, closure.len);
+    defer allocator.free(pending);
+    reachable[entry_index] = true;
+    pending[0] = entry;
+    var cursor: usize = 0;
+    var pending_len: usize = 1;
+    while (cursor < pending_len) : (cursor += 1) {
+        const current = pending[cursor];
+        for (0..analysis.successorCount(current)) |successor_index| {
+            const successor = analysis.successorAt(current, successor_index) orelse return closure;
+            const successor_index_local = analysis.blockIndex(successor) orelse return closure;
+            if (!membership[successor_index_local] or reachable[successor_index_local]) continue;
+            reachable[successor_index_local] = true;
+            if (pending_len >= pending.len) return closure;
+            pending[pending_len] = successor;
+            pending_len += 1;
+        }
+    }
+
+    const shadowed = try allocator.alloc(bool, block_count);
+    defer allocator.free(shadowed);
+    @memset(shadowed, false);
+    var removed_count: usize = 0;
+    for (closure) |block_id| {
+        const block_index = analysis.blockIndex(block_id) orelse return closure;
+        if (reachable[block_index]) continue;
+        if (cloneStepForTargetCached(program, block_id, lineage_index)) |step| {
+            const source_index = analysis.blockIndex(step.source) orelse continue;
+            if (!membership[source_index]) {
+                shadowed[block_index] = true;
+                removed_count += 1;
+                continue;
+            }
+        }
+        for (closure) |candidate| {
+            const candidate_index = analysis.blockIndex(candidate) orelse return closure;
+            if (!reachable[candidate_index]) continue;
+            const step = cloneStepForTargetCached(program, candidate, lineage_index) orelse continue;
+            if (step.source != block_id) continue;
+            shadowed[block_index] = true;
+            removed_count += 1;
+            break;
+        }
+    }
+    if (removed_count == 0) return closure;
+
+    var retained: std.ArrayList(ir.BlockId) = .empty;
+    errdefer retained.deinit(allocator);
+    try retained.ensureTotalCapacity(allocator, closure.len - removed_count);
+    for (closure) |block_id| {
+        const local_index = analysis.blockIndex(block_id) orelse return closure;
+        if (!shadowed[local_index]) try retained.append(allocator, block_id);
+    }
+    const owned = try retained.toOwnedSlice(allocator);
+    allocator.free(closure);
+    return owned;
+}
+
+fn appendDelayedUseContinuationAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    stop: ir.BlockId,
+    closure: []const ir.BlockId,
+    seeds: []const ir.BlockId,
+    incoming: ?[]const ir.CfgEdgeRef,
+    continuation: *std.ArrayList(ir.BlockId),
+    lineage_index: *const CloneLineageIndex,
+    replay_index: *const node_split.ReplayIndex,
+    replay_cache: *ReplayCache,
+) std.mem.Allocator.Error!void {
+    if (seeds.len == 0) return;
+
+    const block_count = analysis.function.blocks.len;
+    const candidate = try allocator.alloc(bool, block_count);
+    defer allocator.free(candidate);
+    @memset(candidate, false);
+
+    var pending: std.ArrayList(ir.BlockId) = .empty;
+    defer pending.deinit(allocator);
+    var candidates: std.ArrayList(ir.BlockId) = .empty;
+    defer candidates.deinit(allocator);
+
+    for (seeds) |seed| {
+        if (seed == stop or containsBlock(closure, seed) or seed.index() >= program.blocks.len) continue;
+        try pending.append(allocator, seed);
+    }
+    while (pending.pop()) |block_id| {
+        if (block_id == stop or containsBlock(closure, block_id) or block_id.index() >= program.blocks.len) continue;
+        const local_index = analysis.blockIndex(block_id) orelse continue;
+        if (candidate[local_index]) continue;
+        const block = program.blocks[block_id.index()];
+        if (block.id != block_id or block.function != analysis.function.id or
+            !node_split.parametersAreCanonical(program.values, block)) continue;
+        candidate[local_index] = true;
+        try candidates.append(allocator, block_id);
+
+        for (0..analysis.successorCount(block_id)) |successor_index| {
+            const successor = analysis.successorAt(block_id, successor_index) orelse continue;
+            if (successor == stop or containsBlock(closure, successor) or
+                successor.index() >= program.blocks.len)
+            {
+                continue;
+            }
+            try pending.append(allocator, successor);
+        }
+    }
+    if (trace_structural_phases and closure.len >= 20) {
+        traceStructural("structural_delayed_frontier closure={} seeds={} candidates={}\n", .{
+            closure.len,
+            seeds.len,
+            candidates.items.len,
+        });
+    }
+    if (candidates.items.len == 0) return;
+
+    const needed = try allocator.alloc(bool, block_count);
+    defer allocator.free(needed);
+    @memset(needed, false);
+    const direct_needed = try allocator.alloc(bool, block_count);
+    defer allocator.free(direct_needed);
+    @memset(direct_needed, false);
+
+    var needed_blocks: std.ArrayList(ir.BlockId) = .empty;
+    defer needed_blocks.deinit(allocator);
+    for (candidates.items) |block_id| {
+        if (blockUsesDelayedClosureValue(
+            allocator,
+            program,
+            analysis,
+            program.blocks[block_id.index()],
+            closure,
+            lineage_index,
+            replay_index,
+            replay_cache,
+        )) {
+            const local_index = analysis.blockIndex(block_id) orelse continue;
+            needed[local_index] = true;
+            direct_needed[local_index] = true;
+            try needed_blocks.append(allocator, block_id);
+        }
+    }
+    if (trace_structural_phases and closure.len == 1 and incoming != null) {
+        traceStructural("structural_delayed_candidates closure_entry={} seeds={} candidates={} direct={any}\n", .{
+            closure[0].index(),
+            seeds.len,
+            candidates.items.len,
+            needed_blocks.items,
+        });
+    }
+    if (trace_structural_phases and closure.len >= 20) {
+        traceStructural("structural_delayed_direct_uses closure={} direct={}\n", .{
+            closure.len,
+            needed_blocks.items.len,
+        });
+    }
+
+    // Any predecessor on a candidate path to a delayed use must be cloned as
+    // well.  This deliberately does not cross the existing stop boundary or
+    // the original closure; prepareClosure will reject an unauthenticated
+    // path instead of letting this discovery pass invent one.
+    var needed_index: usize = 0;
+    while (needed_index < needed_blocks.items.len) : (needed_index += 1) {
+        const block_id = needed_blocks.items[needed_index];
+        const target_local_index = analysis.blockIndex(block_id) orelse continue;
+        var predecessor_index: usize = 0;
+        while (analysis.predecessorAt(block_id, predecessor_index)) |predecessor| : (predecessor_index += 1) {
+            const local_index = analysis.blockIndex(predecessor) orelse continue;
+            if ((!candidate[local_index] and !containsBlock(continuation.items, predecessor)) or
+                needed[local_index]) continue;
+            var carries_closure_value = false;
+
+            // An authenticated parameterized handoff is a semantic boundary:
+            // the target owns the continuation context and the predecessor is
+            // not required merely to keep reverse propagation connected.
+            // Crossing it would pull an unrelated producer path into the
+            // clone and turn an available incoming value into a non-dominating
+            // internal definition.
+            if (incoming) |references| {
+                if (references.len != 0) {
+                    var bridge = false;
+                    for (0..analysis.successorCount(predecessor)) |successor_index| {
+                        const successor = analysis.successorAt(predecessor, successor_index) orelse continue;
+                        if (successor != block_id) continue;
+                        bridge = try parameterizedContinuationBridge(
+                            allocator,
+                            program,
+                            analysis,
+                            predecessor,
+                            successor_index,
+                            successor,
+                            stop,
+                            closure,
+                            continuation.items,
+                            references,
+                            lineage_index,
+                            replay_index,
+                            replay_cache,
+                        );
+                        if (trace_structural_phases and closure.len == 1) {
+                            traceStructural("delayed_bridge_check source={} target={} result={}\n", .{
+                                predecessor.index(),
+                                successor.index(),
+                                bridge,
+                            });
+                        }
+                        break;
+                    }
+                    carries_closure_value = edgeArgumentsCarryClosureValue(
+                        program,
+                        predecessor,
+                        block_id,
+                        closure,
+                    );
+                    const direct_use = if (analysis.blockIndex(block_id)) |index|
+                        direct_needed[index]
+                    else
+                        false;
+                    if (!carries_closure_value and
+                        isAuthenticatedParameterlessForwardingBlock(
+                            program,
+                            analysis,
+                            block_id,
+                            closure,
+                            lineage_index,
+                        ) and
+                        (!direct_use or analysis.predecessorCount(block_id) != 1)) continue;
+                    if (trace_structural_phases and closure.len == 1) {
+                        traceStructural("delayed_reverse source={} target={} bridge={} carries_closure={} direct_target={} source_forwarding={}\n", .{
+                            predecessor.index(),
+                            block_id.index(),
+                            bridge,
+                            carries_closure_value,
+                            direct_use,
+                            isAuthenticatedParameterlessForwardingBlock(
+                                program,
+                                analysis,
+                                predecessor,
+                                closure,
+                                lineage_index,
+                            ),
+                        });
+                    }
+                    if (bridge and !carries_closure_value and
+                        !isAuthenticatedParameterlessForwardingBlock(
+                            program,
+                            analysis,
+                            predecessor,
+                            closure,
+                            lineage_index,
+                        ) and !direct_use) continue;
+                }
+            }
+            needed[local_index] = true;
+            direct_needed[local_index] = direct_needed[local_index] or
+                direct_needed[target_local_index] or
+                carries_closure_value;
+            try needed_blocks.append(allocator, predecessor);
+        }
+    }
+
+    for (candidates.items) |block_id| {
+        const local_index = analysis.blockIndex(block_id) orelse continue;
+        if (needed[local_index] and !containsBlock(continuation.items, block_id)) {
+            try continuation.append(allocator, block_id);
+        }
+    }
+    if (trace_structural_phases and closure.len >= 20) {
+        traceStructural("structural_delayed_retained continuation={}\n", .{continuation.items.len});
+    }
+}
+
+fn extendClosureForExternalUsesAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    stop: ir.BlockId,
+    closure: []ir.BlockId,
+    incoming: ?[]const ir.CfgEdgeRef,
+) std.mem.Allocator.Error![]ir.BlockId {
+    var projected = try extendContinuationClosureWithModeAlloc(
+        allocator,
+        program,
+        analysis,
+        stop,
+        closure,
+        incoming,
+        .closure_only,
+    );
+
+    // A closure-only pass can add a continuation block whose definitions are
+    // then consumed farther downstream.  Re-scan once so ownership discovery
+    // reaches that next consumer, but keep the pass bounded; the final
+    // projected-boundary and clone-availability checks remain authoritative.
+    const rescanned = try extendContinuationClosureWithModeAlloc(
+        allocator,
+        program,
+        analysis,
+        stop,
+        projected,
+        incoming,
+        .closure_only,
+    );
+    if (trace_structural_phases and
+        (rescanned.ptr != projected.ptr or rescanned.len != projected.len))
+    {
+        traceStructural("structural_external_rescan before={} after={} stop={}\n", .{
+            projected.len,
+            rescanned.len,
+            stop.index(),
+        });
+    }
+    projected = rescanned;
+    return projected;
+}
+
+fn extendContinuationClosureWithModeAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    stop: ir.BlockId,
+    closure: []ir.BlockId,
+    incoming: ?[]const ir.CfgEdgeRef,
+    mode: ContinuationExtensionMode,
+) std.mem.Allocator.Error![]ir.BlockId {
+    if (closure.len == 0) return closure;
+    const function_id = analysis.function.id;
+
+    const index_start = structuralPhaseNow();
+    var lineage_index = try CloneLineageIndex.initForFunction(allocator, program, function_id);
+    defer lineage_index.deinit();
+    var replay_index = try node_split.ReplayIndex.initForFunction(allocator, program, function_id);
+    defer replay_index.deinit();
+    var replay_cache = ReplayCache.init(allocator, program, &replay_index);
+    defer replay_cache.deinit();
+    const index_ms = structuralPhaseMillis(index_start);
+
+    var visited = try allocator.alloc(bool, analysis.function.blocks.len);
+    defer allocator.free(visited);
+    @memset(visited, false);
+    var parameterized_admitted = try allocator.alloc(bool, analysis.function.blocks.len);
+    defer allocator.free(parameterized_admitted);
+    @memset(parameterized_admitted, false);
+    var pending: std.ArrayList(ir.BlockId) = .empty;
+    defer pending.deinit(allocator);
+    var continuation: std.ArrayList(ir.BlockId) = .empty;
+    defer continuation.deinit(allocator);
+    var delayed_seeds: std.ArrayList(ir.BlockId) = .empty;
+    defer delayed_seeds.deinit(allocator);
+
+    const discovery_start = structuralPhaseNow();
+    for (closure) |source_id| {
+        if (source_id.index() >= program.blocks.len) continue;
+        for (0..analysis.successorCount(source_id)) |successor_index| {
+            const target = analysis.successorAt(source_id, successor_index) orelse continue;
+            if (target == stop or containsBlock(closure, target) or target.index() >= program.blocks.len) continue;
+            const target_block = program.blocks[target.index()];
+            const parameterized_bridge = try parameterizedContinuationBridge(
+                allocator,
+                program,
+                analysis,
+                source_id,
+                successor_index,
+                target,
+                stop,
+                closure,
+                continuation.items,
+                incoming,
+                &lineage_index,
+                &replay_index,
+                &replay_cache,
+            );
+            if (target_block.function == function_id) {
+                if (try isSharedLoopForwardingBoundary(program, analysis, target) and
+                    !terminatorCarriesClosureValue(program, target, closure)) continue;
+                const closure_owned_bridge = parameterized_bridge and
+                    edgeArgumentsCarryClosureValue(program, source_id, target, closure);
+                if (target_block.parameters.len == 0 or (parameterized_bridge and !closure_owned_bridge)) {
+                    if (parameterized_bridge) {
+                        const target_index = analysis.blockIndex(target) orelse continue;
+                        parameterized_admitted[target_index] = true;
+                    }
+                    try pending.append(allocator, target);
+                } else {
+                    try delayed_seeds.append(allocator, target);
+                }
+            }
+        }
+    }
+
+    while (pending.pop()) |block_id| {
+        const local_index = analysis.blockIndex(block_id) orelse continue;
+        if (visited[local_index] or containsBlock(closure, block_id)) continue;
+        if (block_id.index() >= program.blocks.len) continue;
+        const block = program.blocks[block_id.index()];
+        if (block.function != function_id or
+            (block.parameters.len != 0 and
+                !(try analysis.canReach(block_id, stop)) and !parameterized_admitted[local_index])) continue;
+        visited[local_index] = true;
+        try continuation.append(allocator, block_id);
+        for (block.instructions) |instruction_id| {
+            if (instruction_id.index() >= program.instructions.len) return closure;
+            const instruction = program.instructions[instruction_id.index()];
+            if (instruction.id != instruction_id or instruction.block != block.id) return closure;
+        }
+        for (0..analysis.successorCount(block_id)) |successor_index| {
+            const target = analysis.successorAt(block_id, successor_index) orelse continue;
+            if (target == stop or containsBlock(closure, target) or target.index() >= program.blocks.len) continue;
+            const target_block = program.blocks[target.index()];
+            const parameterized_bridge = try parameterizedContinuationBridge(
+                allocator,
+                program,
+                analysis,
+                block_id,
+                successor_index,
+                target,
+                stop,
+                closure,
+                continuation.items,
+                incoming,
+                &lineage_index,
+                &replay_index,
+                &replay_cache,
+            );
+            if (target_block.function == function_id) {
+                if (try isSharedLoopForwardingBoundary(program, analysis, target) and
+                    !terminatorCarriesClosureValue(program, target, closure)) continue;
+                const closure_owned_bridge = parameterized_bridge and
+                    edgeArgumentsCarryClosureValue(program, block_id, target, closure);
+                if (target_block.parameters.len == 0 or (parameterized_bridge and !closure_owned_bridge)) {
+                    if (parameterized_bridge) {
+                        const target_index = analysis.blockIndex(target) orelse continue;
+                        parameterized_admitted[target_index] = true;
+                    }
+                    try pending.append(allocator, target);
+                } else {
+                    try delayed_seeds.append(allocator, target);
+                }
+            }
+        }
+    }
+
+    if (trace_structural_phases and closure.len >= 20) {
+        traceStructural("structural_delayed_seed_state closure={} seeds={} continuation={}\n", .{
+            closure.len,
+            delayed_seeds.items.len,
+            continuation.items.len,
+        });
+    }
+
+    try appendDelayedUseContinuationAlloc(
+        allocator,
+        program,
+        analysis,
+        stop,
+        closure,
+        delayed_seeds.items,
+        incoming,
+        &continuation,
+        &lineage_index,
+        &replay_index,
+        &replay_cache,
+    );
+
+    if (trace_structural_phases and closure.len == 1 and incoming != null) {
+        traceStructural("structural_continuation_membership stop={} has_4057={} has_4036={} count={}\n", .{
+            stop.index(),
+            containsBlock(continuation.items, ir.BlockId.fromIndex(4057)),
+            containsBlock(continuation.items, ir.BlockId.fromIndex(4036)),
+            continuation.items.len,
+        });
+        traceStructural("structural_continuation_ids {any}\n", .{continuation.items});
+        traceStructural("structural_continuation_boundary closure_entry={} incoming={any}\n", .{
+            closure[0].index(),
+            incoming.?,
+        });
+    }
+
+    const discovery_ms = structuralPhaseMillis(discovery_start);
+    if (continuation.items.len == 0) return closure;
+
+    const needed = try allocator.alloc(bool, analysis.function.blocks.len);
+    defer allocator.free(needed);
+    @memset(needed, false);
+    const direct_needed = try allocator.alloc(bool, analysis.function.blocks.len);
+    defer allocator.free(direct_needed);
+    @memset(direct_needed, false);
+    const references = incoming orelse &.{};
+    const context_scan_start = structuralPhaseNow();
+    for (continuation.items) |block_id| {
+        const local_index = analysis.blockIndex(block_id) orelse return closure;
+        const block = program.blocks[block_id.index()];
+        const uses_context = if (mode == .closure_only)
+            blockUsesDelayedClosureValue(
+                allocator,
+                program,
+                analysis,
+                block,
+                closure,
+                &lineage_index,
+                &replay_index,
+                &replay_cache,
+            )
+        else
+            try blockUsesContinuationContext(
+                allocator,
+                program,
+                analysis,
+                block,
+                block_id,
+                closure,
+                continuation.items,
+                references,
+                &lineage_index,
+                &replay_index,
+                &replay_cache,
+                stop,
+            );
+        if (uses_context) {
+            needed[local_index] = true;
+            direct_needed[local_index] = true;
+            if (trace_structural_phases and closure.len == 1 and incoming != null) {
+                traceStructural("structural_continuation_context block={} direct=true witness=continuation\n", .{
+                    block_id.index(),
+                });
+            }
+        }
+    }
+    const context_scan_ms = structuralPhaseMillis(context_scan_start);
+
+    // Retain only paths that carry closure-local or otherwise unauthenticated
+    // context. Unrelated siblings must not be cloned just because one path
+    // below the same continuation needs a mapping.
+    const propagation_start = structuralPhaseNow();
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (continuation.items) |block_id| {
+            const local_index = analysis.blockIndex(block_id) orelse return closure;
+            if (needed[local_index]) continue;
+            for (0..analysis.successorCount(block_id)) |successor_index| {
+                const successor = analysis.successorAt(block_id, successor_index) orelse return closure;
+                const successor_local_index = analysis.blockIndex(successor) orelse continue;
+                if (containsBlock(continuation.items, successor) and needed[successor_local_index]) {
+                    const carries_closure_value = edgeArgumentsCarryClosureValue(
+                        program,
+                        block_id,
+                        successor,
+                        closure,
+                    );
+                    const successor_forwarding = isAuthenticatedParameterlessForwardingBlock(
+                        program,
+                        analysis,
+                        successor,
+                        closure,
+                        &lineage_index,
+                    );
+                    if (!carries_closure_value and
+                        successor_forwarding and
+                        (!direct_needed[successor_local_index] or
+                            analysis.predecessorCount(successor) != 1)) continue;
+                    const bridge = if (references.len != 0)
+                        try parameterizedContinuationBridge(
+                            allocator,
+                            program,
+                            analysis,
+                            block_id,
+                            successor_index,
+                            successor,
+                            stop,
+                            closure,
+                            continuation.items,
+                            references,
+                            &lineage_index,
+                            &replay_index,
+                            &replay_cache,
+                        )
+                    else
+                        false;
+                    const predecessor_forwarding = isAuthenticatedParameterlessForwardingBlock(
+                        program,
+                        analysis,
+                        block_id,
+                        closure,
+                        &lineage_index,
+                    );
+                    if (trace_structural_phases and closure.len == 1 and incoming != null) {
+                        traceStructural("structural_continuation_reverse source={} target={} bridge={} carries_closure={} successor_forwarding={} predecessor_forwarding={} direct_target={}\n", .{
+                            block_id.index(),
+                            successor.index(),
+                            bridge,
+                            carries_closure_value,
+                            successor_forwarding,
+                            predecessor_forwarding,
+                            direct_needed[successor_local_index],
+                        });
+                    }
+                    if (bridge and
+                        !carries_closure_value and
+                        !predecessor_forwarding and
+                        !direct_needed[successor_local_index]) continue;
+                    needed[local_index] = true;
+                    direct_needed[local_index] = direct_needed[local_index] or
+                        direct_needed[successor_local_index] or
+                        carries_closure_value;
+                    changed = true;
+                    break;
+                }
+            }
+        }
+    }
+    const propagation_ms = structuralPhaseMillis(propagation_start);
+
+    if (trace_structural_phases and closure.len == 1 and incoming != null) {
+        for (continuation.items) |block_id| {
+            const local_index = analysis.blockIndex(block_id) orelse continue;
+            if (needed[local_index]) traceStructural("structural_extension_needed block={}\n", .{block_id.index()});
+        }
+    }
+
+    var needs_extension = false;
+    for (continuation.items) |block_id| {
+        const local_index = analysis.blockIndex(block_id) orelse return closure;
+        if (needed[local_index]) {
+            needs_extension = true;
+            break;
+        }
+    }
+    if (!needs_extension) return closure;
+    if (trace_structural_phases and continuation.items.len >= 128) {
+        traceStructural("structural_phase continuation function={} stop={} closure={} continuation={} index_ms={} discovery_ms={} context_ms={} propagation_ms={} needed={}\\n", .{
+            function_id.index(),
+            stop.index(),
+            closure.len,
+            continuation.items.len,
+            index_ms,
+            discovery_ms,
+            context_scan_ms,
+            propagation_ms,
+            std.mem.countScalar(bool, needed, true),
+        });
+    }
+    traceStructural("structural_extension stop={d} closure_len={} continuation_len={}\n", .{
+        stop.index(),
+        closure.len,
+        continuation.items.len,
+    });
+    var expanded: std.ArrayList(ir.BlockId) = .empty;
+    errdefer expanded.deinit(allocator);
+    try expanded.appendSlice(allocator, closure);
+    for (continuation.items) |block_id| {
+        const local_index = analysis.blockIndex(block_id) orelse return closure;
+        if (needed[local_index]) try expanded.append(allocator, block_id);
+    }
+    if (trace_structural_phases and closure.len == 1 and incoming != null) {
+        const forwarding_index = analysis.blockIndex(ir.BlockId.fromIndex(4057));
+        traceStructural("structural_continuation_post_propagation stop={} has_4057={} has_4036={} count={} needed_4057={}\n", .{
+            stop.index(),
+            containsBlock(continuation.items, ir.BlockId.fromIndex(4057)),
+            containsBlock(continuation.items, ir.BlockId.fromIndex(4036)),
+            continuation.items.len,
+            if (forwarding_index) |index| needed[index] else false,
+        });
+    }
+    var owned = try expanded.toOwnedSlice(allocator);
+    allocator.free(closure);
+    if (incoming) |incoming_references| {
+        if (incoming_references.len != 0) {
+            owned = try trimContextIndependentSharedSuffixAlloc(
+                allocator,
+                program,
+                analysis,
+                stop,
+                owned,
+                incoming_references,
+            );
+        }
+    }
+    if (owned.len != 0 and cloneStepForTargetCached(program, owned[0], &lineage_index) != null) {
+        owned = try trimShadowedUnreachableCloneBlocksAlloc(
+            allocator,
+            program,
+            analysis,
+            owned[0],
+            owned,
+            &lineage_index,
+        );
+    }
+
+    // Contextual discovery can admit a parameterized producer after the first
+    // delayed-use scan.  Re-scan the resulting closure for values that are
+    // now clone-local before publishing it; otherwise a shared suffix may
+    // retain a terminator or operation that consumes the new clone value.
+    // The closure-only mode does not recurse here, so this remains one
+    // bounded ownership pass per contextual discovery.
+    if (mode == .contextual) {
+        return extendClosureForExternalUsesAlloc(
+            allocator,
+            program,
+            analysis,
+            stop,
+            owned,
+            incoming,
+        );
+    }
     return owned;
 }
 
