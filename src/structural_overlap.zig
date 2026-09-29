@@ -11424,6 +11424,774 @@ fn rootedSccPrefixClosureAlloc(
     return expanded;
 }
 
+const DeadPureForwardingUses = struct {
+    values: []bool,
+    packs: []bool,
+
+    pub fn value(self: DeadPureForwardingUses, value_id: ir.ValueId) void {
+        if (value_id.index() < self.values.len) self.values[value_id.index()] = true;
+    }
+
+    pub fn pack(self: DeadPureForwardingUses, pack_id: ir.ValuePackId) void {
+        if (pack_id.index() < self.packs.len) self.packs[pack_id.index()] = true;
+    }
+
+    pub fn place(_: DeadPureForwardingUses, _: ir.PlaceId) void {}
+};
+
+// A forwarding block may contain exact-pure instructions whose results are
+// dead.  Such instructions do not carry observable state or a value boundary,
+// so the block is semantically equivalent to its argument-free jump.  Keep
+// this proof separate from the empty-block forwarding predicate: the latter
+// is a historical shape, while this predicate proves the live semantics.
+fn isDeadPureForwardingBlock(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    block_id: ir.BlockId,
+) std.mem.Allocator.Error!bool {
+    if (block_id.index() >= program.blocks.len or
+        analysis.blockIndex(block_id) == null or
+        !analysis.isReachable(block_id) or
+        analysis.function.entry_block == block_id)
+    {
+        return false;
+    }
+    const block = program.blocks[block_id.index()];
+    if (block.id != block_id or block.function != analysis.function.id or
+        block.parameters.len != 0)
+    {
+        return false;
+    }
+    const outgoing = switch (block.terminator) {
+        .jump => |edge| edge,
+        .branch, .return_values, .return_pack, .return_expanded, .throw_error, .unreachable_block => return false,
+    };
+    if (outgoing.arguments.len != 0 or outgoing.target == block_id or
+        outgoing.target.index() >= program.blocks.len or
+        analysis.blockIndex(outgoing.target) == null or
+        !analysis.isReachable(outgoing.target))
+    {
+        return false;
+    }
+    const successor = program.blocks[outgoing.target.index()];
+    if (successor.id != outgoing.target or successor.function != block.function or
+        successor.parameters.len != 0)
+    {
+        return false;
+    }
+
+    for (block.instructions) |instruction_id| {
+        if (instruction_id.index() >= program.instructions.len) return false;
+        const instruction = program.instructions[instruction_id.index()];
+        if (instruction.id != instruction_id or instruction.block != block_id or
+            proof_effect_closure.hasObservableEffects(instruction.effects))
+        {
+            return false;
+        }
+    }
+
+    const used_values = try allocator.alloc(bool, program.values.len);
+    defer allocator.free(used_values);
+    @memset(used_values, false);
+    const used_packs = try allocator.alloc(bool, program.value_packs.len);
+    defer allocator.free(used_packs);
+    @memset(used_packs, false);
+    const visitor = DeadPureForwardingUses{
+        .values = used_values,
+        .packs = used_packs,
+    };
+    for (analysis.function.blocks) |reachable_block_id| {
+        if (!analysis.isReachable(reachable_block_id) or
+            reachable_block_id.index() >= program.blocks.len)
+        {
+            continue;
+        }
+        const reachable_block = program.blocks[reachable_block_id.index()];
+        if (reachable_block.id != reachable_block_id or
+            reachable_block.function != analysis.function.id)
+        {
+            return false;
+        }
+        for (reachable_block.instructions) |instruction_id| {
+            if (instruction_id.index() >= program.instructions.len) return false;
+            const instruction = program.instructions[instruction_id.index()];
+            if (instruction.id != instruction_id or instruction.block != reachable_block_id) return false;
+            runtime_uses.visitOperationUses(instruction.operation, visitor);
+        }
+        runtime_uses.visitTerminatorUses(reachable_block.terminator, visitor);
+    }
+    for (block.instructions) |instruction_id| {
+        const instruction = program.instructions[instruction_id.index()];
+        for (instruction.results) |result_id| {
+            if (result_id.index() >= used_values.len or used_values[result_id.index()]) return false;
+        }
+        if (instruction.pack_result) |pack_id| {
+            if (pack_id.index() >= used_packs.len or used_packs[pack_id.index()]) return false;
+        }
+    }
+    return true;
+}
+
+// An authenticated SCC projection can be duplicated at an internal SCC edge
+// without duplicating the SCC's continuation.  Parameterized and branching
+// entries are admitted only through the complete SCC/replay proof below.  The
+// A one-block fallback may also carry parameters, but only when the live
+// incoming edge and the complete cloneability/availability proof authenticate
+// that formal tuple.  It does not infer or synthesize any parameter value.
+fn boundaryCloneSplitAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    block: ir.BlockId,
+    incoming: []const ir.CfgEdgeRef,
+    replay_context: *ReplayProjectionContext,
+) std.mem.Allocator.Error!?Split {
+    if (block.index() >= program.blocks.len or incoming.len == 0) return null;
+    const target = program.blocks[block.index()];
+    if (target.id != block or target.function != analysis.function.id) return null;
+
+    // A parameterized entry has a complete local boundary when its formal
+    // tuple is consumed locally before the successor. Try that authenticated
+    // one-block projection first; the larger SCC projection remains a
+    // fallback when the local tuple is insufficient or the successor has a
+    // context-dependent use.
+    if (target.parameters.len != 0) {
+        const closure = try allocator.alloc(ir.BlockId, 1);
+        closure[0] = block;
+        if (prepareClosureWithReplayContext(
+            allocator,
+            program,
+            analysis,
+            closure,
+            incoming,
+            replay_context,
+        )) {
+            const owned_incoming = try allocator.dupe(ir.CfgEdgeRef, incoming);
+            return .{
+                .allocator = allocator,
+                .function_index = analysis.function.id.index(),
+                .branch = incoming[0].source,
+                .entry = block,
+                .join = block,
+                .incoming = owned_incoming,
+                .closure = closure,
+            };
+        }
+        allocator.free(closure);
+    }
+
+    if (try internalSccBoundaryClosureAlloc(
+        allocator,
+        program,
+        analysis,
+        block,
+        incoming,
+        replay_context,
+    )) |scc_closure| {
+        const owned_incoming = try allocator.dupe(ir.CfgEdgeRef, incoming);
+        return .{
+            .allocator = allocator,
+            .function_index = analysis.function.id.index(),
+            .branch = incoming[0].source,
+            .entry = block,
+            .join = block,
+            .incoming = owned_incoming,
+            .closure = scc_closure,
+        };
+    }
+
+    if (target.parameters.len != 0) {
+        var closure = try allocator.alloc(ir.BlockId, 1);
+        var retain_closure = false;
+        defer if (!retain_closure) allocator.free(closure);
+        closure[0] = block;
+        // A parameterized entry can feed a shared forwarding suffix even when
+        // the entry itself is the only collided block. Retain only the
+        // suffix blocks that consume its mapped values before validating the
+        // clone; otherwise the availability audit sees the original producer
+        // as unreachable after the incoming edge is redirected.
+        closure = try extendClosureForExternalUsesAlloc(
+            allocator,
+            program,
+            analysis,
+            block,
+            closure,
+            incoming,
+        );
+        closure = try extendAuthenticatedGroupBoundaryContextAlloc(
+            allocator,
+            program,
+            analysis,
+            closure,
+            incoming,
+            &replay_context.lineage_index,
+            &replay_context.replay_index,
+        );
+        closure = (try trimIncomingSourceClosureAlloc(
+            allocator,
+            analysis,
+            block,
+            closure,
+            incoming,
+        )) orelse return null;
+        if (!prepareClosureWithReplayContext(
+            allocator,
+            program,
+            analysis,
+            closure,
+            incoming,
+            replay_context,
+        )) {
+            return null;
+        }
+        traceStructural("structural_phase collision_parameterized_boundary_split function={} block={} incoming={}\n", .{
+            analysis.function.id.index(),
+            block.index(),
+            incoming.len,
+        });
+        const owned_incoming = try allocator.dupe(ir.CfgEdgeRef, incoming);
+        retain_closure = true;
+        return .{
+            .allocator = allocator,
+            .function_index = analysis.function.id.index(),
+            .branch = incoming[0].source,
+            .entry = block,
+            .join = block,
+            .incoming = owned_incoming,
+            .closure = closure,
+        };
+    }
+    switch (target.terminator) {
+        .jump, .branch => {},
+        .return_values, .return_pack, .return_expanded, .throw_error, .unreachable_block => return null,
+    }
+
+    // Cloning an empty pure forwarding jump inside an SCC does not project any
+    // observable state and can simply move the ownership collision around the
+    // cycle.  A non-empty block is eligible only when its exact-pure results
+    // are proven dead, which gives the same semantic boundary without
+    // treating a live value-producing block as transparent.
+    var has_observable_boundary = switch (target.terminator) {
+        .branch => true,
+        else => false,
+    };
+    for (target.instructions) |instruction_id| {
+        if (instruction_id.index() >= program.instructions.len) return null;
+        const instruction = program.instructions[instruction_id.index()];
+        if (instruction.id != instruction_id or instruction.block != block) return null;
+        has_observable_boundary = has_observable_boundary or
+            proof_effect_closure.hasObservableEffects(instruction.effects);
+    }
+    const dead_pure_forwarding = if (has_observable_boundary)
+        false
+    else
+        try isDeadPureForwardingBlock(allocator, program, analysis, block);
+    if (!has_observable_boundary and !dead_pure_forwarding) return null;
+    if (dead_pure_forwarding) {
+        traceStructural("structural_phase collision_dead_pure_forwarding_boundary function={} block={} incoming={}\n", .{
+            analysis.function.id.index(),
+            block.index(),
+            incoming.len,
+        });
+    }
+
+    const closure = try allocator.alloc(ir.BlockId, 1);
+    closure[0] = block;
+    if (!prepareClosureWithReplayContext(
+        allocator,
+        program,
+        analysis,
+        closure,
+        incoming,
+        replay_context,
+    )) {
+        allocator.free(closure);
+        return null;
+    }
+
+    const owned_incoming = try allocator.dupe(ir.CfgEdgeRef, incoming);
+    return .{
+        .allocator = allocator,
+        .function_index = analysis.function.id.index(),
+        .branch = incoming[0].source,
+        .entry = block,
+        .join = block,
+        .incoming = owned_incoming,
+        .closure = closure,
+    };
+}
+
+pub fn findCollisionSplitAllocWithAnalysisAndReplayContext(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    function_index: usize,
+    block: ir.BlockId,
+    incoming: []const ir.CfgEdgeRef,
+    replay_context: *ReplayProjectionContext,
+) std.mem.Allocator.Error!?Split {
+    if (function_index >= program.functions.len or incoming.len == 0 or
+        analysis.function.id != program.functions[function_index].id)
+    {
+        return null;
+    }
+    for (incoming) |reference| {
+        if (reference.target != block) return null;
+        const live = directEdgeRef(program, reference.source, block) orelse return null;
+        if (!analysis.isReachable(reference.source) or !std.meta.eql(live, reference)) return null;
+    }
+
+    const candidate_scan_start = structuralPhaseNow();
+    const block_index = analysis.blockIndex(block) orelse return null;
+    const loop_headers = try natural_loop.headerCandidatesAlloc(allocator, analysis);
+    defer allocator.free(loop_headers);
+    var selected_header: ?ir.BlockId = null;
+    var selected_size: usize = std.math.maxInt(usize);
+    var has_internal_loop_source = false;
+    for (analysis.function.blocks, 0..) |candidate, candidate_index| {
+        if (!loop_headers[candidate_index] or !analysis.dominates(candidate, block)) continue;
+        var candidate_membership = natural_loop.collect(allocator, analysis, candidate) catch |err| switch (err) {
+            error.UnsupportedShape => continue,
+            error.OutOfMemory => return error.OutOfMemory,
+        } orelse continue;
+        defer candidate_membership.deinit();
+        if (!candidate_membership.bits[block_index]) continue;
+        var contains_source = false;
+        for (incoming) |reference| {
+            const source_index = analysis.blockIndex(reference.source) orelse return null;
+            if (candidate_membership.bits[source_index]) {
+                contains_source = true;
+                break;
+            }
+        }
+        if (contains_source) {
+            has_internal_loop_source = true;
+            continue;
+        }
+        const size = std.mem.countScalar(bool, candidate_membership.bits, true);
+        if (size < selected_size or
+            (size == selected_size and (selected_header == null or candidate.index() < selected_header.?.index())))
+        {
+            selected_header = candidate;
+            selected_size = size;
+        }
+    }
+    traceStructural("structural_phase collision_scan function={} block={} incoming={} selected={?d} selected_size={} ms={}\n", .{
+        function_index,
+        block.index(),
+        incoming.len,
+        if (selected_header) |header_id| header_id.index() else null,
+        if (selected_header != null) selected_size else 0,
+        structuralPhaseMillis(candidate_scan_start),
+    });
+    const header = selected_header orelse block;
+    var closure = if (selected_header) |owner| closure: {
+        var membership = natural_loop.collect(allocator, analysis, owner) catch |err| switch (err) {
+            error.UnsupportedShape => return null,
+            error.OutOfMemory => return error.OutOfMemory,
+        } orelse return null;
+        defer membership.deinit();
+        break :closure try collectConditionalLoopClosureAlloc(allocator, analysis, membership.bits);
+    } else try collectAcyclicCollisionClosureAlloc(allocator, analysis, block);
+    errdefer allocator.free(closure);
+    const extension_start = structuralPhaseNow();
+    closure = try extendContinuationClosureAlloc(allocator, program, analysis, header, closure, incoming);
+    traceStructural("structural_phase collision_extension function={} block={} header={} closure={} ms={}\n", .{
+        function_index,
+        block.index(),
+        header.index(),
+        closure.len,
+        structuralPhaseMillis(extension_start),
+    });
+    if (selected_header == null and has_internal_loop_source and
+        !(try internalLoopEffectfulSuffixCanBeCloned(
+            allocator,
+            program,
+            analysis,
+            loop_headers,
+            block,
+            closure,
+            incoming,
+        )))
+    {
+        const target = program.blocks[block.index()];
+        const has_branch_boundary = switch (target.terminator) {
+            .branch => true,
+            else => false,
+        };
+        const has_effect_boundary = blk: {
+            for (target.instructions) |instruction_id| {
+                if (instruction_id.index() >= program.instructions.len) break :blk false;
+                if (proof_effect_closure.hasObservableEffects(
+                    program.instructions[instruction_id.index()].effects,
+                )) break :blk true;
+            }
+            break :blk false;
+        };
+        // A non-empty exact-pure block can also be a valid boundary when its
+        // results are dead; boundaryCloneSplitAlloc performs that liveness
+        // proof. An empty forwarding jump remains unsafe inside this loop.
+        if (has_branch_boundary or has_effect_boundary or target.instructions.len != 0) {
+            if (try boundaryCloneSplitAlloc(
+                allocator,
+                program,
+                analysis,
+                block,
+                incoming,
+                replay_context,
+            )) |boundary_split| {
+                traceStructural("structural_phase collision_boundary_branch_split function={} block={} incoming={}\n", .{
+                    function_index,
+                    block.index(),
+                    incoming.len,
+                });
+                allocator.free(closure);
+                return boundary_split;
+            }
+        }
+        traceStructural("structural_phase collision_reject_internal_loop_suffix function={} block={} closure={} incoming={any}\n", .{
+            function_index,
+            block.index(),
+            closure.len,
+            incoming,
+        });
+        allocator.free(closure);
+        return null;
+    }
+    // Redirecting an edge whose source is inside the clone would copy the
+    // edge's own loop body and leave the same collision at the cloned entry.
+    // Loop-header selection already avoids this shape; continuation extension
+    // must preserve that boundary instead of reintroducing it downstream.
+    for (incoming) |reference| {
+        if (containsBlock(closure, reference.source)) {
+            traceStructural("structural_phase collision_reject_internal_source function={} block={} source={} closure={}\n", .{
+                function_index,
+                block.index(),
+                reference.source.index(),
+                closure.len,
+            });
+            traceStructural("structural_phase collision_internal_source_closure function={} block={} source={} closure_ids={any} incoming={any}\n", .{
+                function_index,
+                block.index(),
+                reference.source.index(),
+                closure,
+                incoming,
+            });
+            // Loop continuation extension can pull an incoming source into a
+            // selected loop closure even when the collided entry itself was
+            // not the selected loop header. Reuse the authenticated boundary
+            // proof before rejecting that shape; the helper still rejects
+            // pure forwarding blocks and unprepared value boundaries.
+            const target = program.blocks[block.index()];
+            const has_branch_boundary = switch (target.terminator) {
+                .branch => true,
+                else => false,
+            };
+            const has_effect_boundary = blk: {
+                for (target.instructions) |instruction_id| {
+                    if (instruction_id.index() >= program.instructions.len) break :blk false;
+                    if (proof_effect_closure.hasObservableEffects(
+                        program.instructions[instruction_id.index()].effects,
+                    )) break :blk true;
+                }
+                break :blk false;
+            };
+            if (has_branch_boundary or has_effect_boundary) {
+                if (try boundaryCloneSplitAlloc(
+                    allocator,
+                    program,
+                    analysis,
+                    block,
+                    incoming,
+                    replay_context,
+                )) |boundary_split| {
+                    traceStructural("structural_phase collision_internal_source_boundary_split function={} block={} incoming={}\n", .{
+                        function_index,
+                        block.index(),
+                        incoming.len,
+                    });
+                    allocator.free(closure);
+                    return boundary_split;
+                }
+            }
+            allocator.free(closure);
+            return null;
+        }
+    }
+    const prepare_start = structuralPhaseNow();
+    const prepared = prepareClosureWithReplayContext(
+        allocator,
+        program,
+        analysis,
+        closure,
+        incoming,
+        replay_context,
+    );
+    traceStructural("structural_phase collision_prepare function={} block={} header={} closure={} prepared={} ms={}\n", .{
+        function_index,
+        block.index(),
+        header.index(),
+        closure.len,
+        prepared,
+        structuralPhaseMillis(prepare_start),
+    });
+    if (!prepared) {
+        std.debug.print("structural_collision_prepare_failure block={} header={} closure={any} incoming={any}\n", .{
+            block.index(),
+            header.index(),
+            closure,
+            incoming,
+        });
+        allocator.free(closure);
+
+        // A boundary-only clone is not a valid substitute for an
+        // unauthenticated continuation.  It leaves downstream uses in the
+        // wrong context and can make feedback repeatedly clone the same
+        // boundary.  Let the caller choose an authenticated contextual split
+        // instead.
+        return null;
+    }
+    const owned_incoming = try allocator.dupe(ir.CfgEdgeRef, incoming);
+    return .{
+        .allocator = allocator,
+        .function_index = function_index,
+        .branch = incoming[0].source,
+        .entry = block,
+        .join = header,
+        .incoming = owned_incoming,
+        .closure = closure,
+    };
+}
+
+test "collision closure rejects an incoming source inside its loop" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const source = ir.BlockId.fromIndex(1);
+    const target = ir.BlockId.fromIndex(2);
+    const body = ir.BlockId.fromIndex(3);
+    const exit = ir.BlockId.fromIndex(4);
+    const condition = ir.ValueId.fromIndex(0);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .jump = .{ .target = source } } },
+        .{ .id = source, .function = function_id, .terminator = .{ .jump = .{ .target = target } } },
+        .{ .id = target, .function = function_id, .terminator = .{ .jump = .{ .target = body } } },
+        .{ .id = body, .function = function_id, .terminator = .{ .branch = .{
+            .condition = condition,
+            .then_edge = .{ .target = source },
+            .else_edge = .{ .target = exit },
+        } } },
+        .{ .id = exit, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &.{condition},
+        .blocks = &.{ entry, source, target, body, exit },
+        .entry_block = entry,
+    };
+    const values = [_]ir.Value{.{
+        .id = condition,
+        .function = function_id,
+        .type = .boolean,
+        .origin = .{ .parameter = 0 },
+    }};
+    const program = ir.Program{
+        .program_id = "collision-internal-incoming-source",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, function);
+    defer analysis.deinit();
+    var replay = try ReplayProjectionContext.initForFunction(
+        std.testing.allocator,
+        &program,
+        function_id,
+    );
+    defer replay.deinit();
+    const incoming = [_]ir.CfgEdgeRef{.{
+        .source = source,
+        .kind = .jump,
+        .target = target,
+    }};
+    const collision_split = try findCollisionSplitAllocWithAnalysisAndReplayContext(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        0,
+        target,
+        &incoming,
+        &replay,
+    );
+    if (collision_split) |split_value| {
+        var split = split_value;
+        split.deinit();
+    }
+    try std.testing.expect(collision_split == null);
+}
+
+test "dead pure forwarding boundary clones its one-block projection" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const source = ir.BlockId.fromIndex(1);
+    const target = ir.BlockId.fromIndex(2);
+    const body = ir.BlockId.fromIndex(3);
+    const exit = ir.BlockId.fromIndex(4);
+    const condition = ir.ValueId.fromIndex(0);
+    const dead_value = ir.ValueId.fromIndex(1);
+    const constant = ir.InstructionId.fromIndex(0);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .jump = .{ .target = source } } },
+        .{ .id = source, .function = function_id, .terminator = .{ .jump = .{ .target = target } } },
+        .{ .id = target, .function = function_id, .instructions = &.{constant}, .terminator = .{ .jump = .{ .target = body } } },
+        .{ .id = body, .function = function_id, .terminator = .{ .branch = .{
+            .condition = condition,
+            .then_edge = .{ .target = source },
+            .else_edge = .{ .target = exit },
+        } } },
+        .{ .id = exit, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &.{condition},
+        .blocks = &.{ entry, source, target, body, exit },
+        .entry_block = entry,
+    };
+    const values = [_]ir.Value{
+        .{
+            .id = condition,
+            .function = function_id,
+            .type = .boolean,
+            .origin = .{ .parameter = 0 },
+        },
+        .{
+            .id = dead_value,
+            .function = function_id,
+            .type = .boolean,
+            .origin = .{ .instruction_result = .{ .instruction = constant, .index = 0 } },
+        },
+    };
+    const instructions = [_]ir.Instruction{.{
+        .id = constant,
+        .block = target,
+        .operation = .{ .constant = .{ .boolean = true } },
+        .results = &.{dead_value},
+        .effects = ir.EffectSummary.pure,
+    }};
+    const program = ir.Program{
+        .program_id = "dead-pure-forwarding-boundary",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, function);
+    defer analysis.deinit();
+    var replay = try ReplayProjectionContext.initForFunction(
+        std.testing.allocator,
+        &program,
+        function_id,
+    );
+    defer replay.deinit();
+    const incoming = [_]ir.CfgEdgeRef{.{
+        .source = source,
+        .kind = .jump,
+        .target = target,
+    }};
+
+    var split = (try findCollisionSplitAllocWithAnalysisAndReplayContext(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        0,
+        target,
+        &incoming,
+        &replay,
+    )) orelse return error.TestUnexpectedResult;
+    defer split.deinit();
+    try std.testing.expectEqual(target, split.entry);
+    try std.testing.expectEqual(target, split.join);
+    try std.testing.expectEqualSlices(ir.BlockId, &.{target}, split.closure);
+}
+
+test "branching internal SCC boundary clones only its authenticated block" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const source = ir.BlockId.fromIndex(1);
+    const target = ir.BlockId.fromIndex(2);
+    const body = ir.BlockId.fromIndex(3);
+    const exit = ir.BlockId.fromIndex(4);
+    const observed = ir.ValueId.fromIndex(0);
+    const read = ir.InstructionId.fromIndex(0);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .jump = .{ .target = source } } },
+        .{ .id = source, .function = function_id, .terminator = .{ .jump = .{ .target = target } } },
+        .{ .id = target, .function = function_id, .instructions = &.{read}, .terminator = .{ .branch = .{
+            .condition = observed,
+            .then_edge = .{ .target = body },
+            .else_edge = .{ .target = exit },
+        } } },
+        .{ .id = body, .function = function_id, .terminator = .{ .jump = .{ .target = source } } },
+        .{ .id = exit, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .blocks = &.{ entry, source, target, body, exit },
+        .entry_block = entry,
+    };
+    const values = [_]ir.Value{.{
+        .id = observed,
+        .function = function_id,
+        .type = .dynamic,
+        .origin = .{ .instruction_result = .{ .instruction = read, .index = 0 } },
+    }};
+    const instructions = [_]ir.Instruction{.{
+        .id = read,
+        .block = target,
+        .operation = .{ .environment_get = .{ .target = .{ .ambient = {} }, .name = "shared" } },
+        .results = &.{observed},
+        .effects = ir.EffectSummary.semantic_environment_read,
+    }};
+    const program = ir.Program{
+        .program_id = "branching-internal-scc-boundary",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, function);
+    defer analysis.deinit();
+    var replay = try ReplayProjectionContext.initForFunction(
+        std.testing.allocator,
+        &program,
+        function_id,
+    );
+    defer replay.deinit();
+    const incoming = [_]ir.CfgEdgeRef{.{
+        .source = source,
+        .kind = .jump,
+        .target = target,
+    }};
+
+    var split = (try findCollisionSplitAllocWithAnalysisAndReplayContext(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        0,
+        target,
+        &incoming,
+        &replay,
+    )) orelse return error.TestUnexpectedResult;
+    defer split.deinit();
+    try std.testing.expectEqual(target, split.entry);
+    try std.testing.expectEqual(target, split.join);
+    try std.testing.expectEqualSlices(ir.BlockId, &.{target}, split.closure);
+}
+
 test "authenticated zero-parameter group SCC boundary requires complete replay ownership" {
     const function_id = ir.FunctionId.fromIndex(0);
     const entry = ir.BlockId.fromIndex(0);
@@ -14609,6 +15377,19 @@ test "same-root iteration clones compare fresh results across split groups" {
         &tampered_replay,
         &tampered_cache,
     ));
+}
+
+fn collectAcyclicCollisionClosureAlloc(
+    allocator: std.mem.Allocator,
+    analysis: *const cfg.Analysis,
+    block: ir.BlockId,
+) std.mem.Allocator.Error![]ir.BlockId {
+    _ = analysis;
+    // Seed at the collided entry.  The authenticated continuation pass below
+    // owns the decision about which arm blocks carry this incoming context;
+    // eagerly cloning both terminal arms turns unrelated siblings into part of
+    // the semantic split and can multiply a large acyclic dispatcher.
+    return allocator.dupe(ir.BlockId, &.{block});
 }
 
 fn findConditionalLoopEntrySplitAlloc(
