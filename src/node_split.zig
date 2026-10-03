@@ -317,6 +317,23 @@ pub fn instructionStructureIsCloneableWithMappedFlags(
     return node_split_instruction.sequenceIsCloneableWithMappedFlags(program, source, mapped_values, mapped_packs);
 }
 
+pub fn replayAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    incoming: ir.Edge,
+    clone_id: ir.BlockId,
+) std.mem.Allocator.Error!?ir.Edge {
+    var selected_group: ?ir.NodeSplitGroupId = null;
+    var found_mapping = false;
+    for (program.edge_rewrites) |rewrite| {
+        if (rewrite.rule != .node_split or rewrite.from.target != incoming.target or rewrite.to.target != clone_id) continue;
+        if (found_mapping and rewrite.node_split_group != selected_group) return null;
+        selected_group = rewrite.node_split_group;
+        found_mapping = true;
+    }
+    return replayAllocWithGroup(allocator, program, incoming, clone_id, selected_group, null);
+}
+
 /// Replay an ungrouped or implicitly grouped split using precomputed rewrite
 /// metadata.  This preserves replayAlloc's group-selection semantics while
 /// avoiding a full history scan for every candidate rewrite.
@@ -337,6 +354,117 @@ pub fn replayAllocWithIndex(
         found_mapping = true;
     }
     return replayAllocWithGroup(allocator, program, incoming, clone_id, selected_group, index);
+}
+
+pub fn replayAllocForGroup(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    incoming: ir.Edge,
+    clone_id: ir.BlockId,
+    group: ir.NodeSplitGroupId,
+) std.mem.Allocator.Error!?ir.Edge {
+    return replayAllocWithGroup(allocator, program, incoming, clone_id, group, null);
+}
+
+pub fn replayAllocForGroupWithIndex(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    incoming: ir.Edge,
+    clone_id: ir.BlockId,
+    group: ir.NodeSplitGroupId,
+    index: *const ReplayIndex,
+) std.mem.Allocator.Error!?ir.Edge {
+    return replayAllocWithGroup(allocator, program, incoming, clone_id, group, index);
+}
+
+pub fn replayMappingsForCloneAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    source: ir.BlockId,
+    clone: ir.BlockId,
+    group: ir.NodeSplitGroupId,
+) std.mem.Allocator.Error!?ReplayMappings {
+    return replayMappingsAlloc(allocator, program, source, clone, group, null);
+}
+
+/// Replay an authenticated edge fold from a node-split clone back to its
+/// source block.  Unlike a forwarding jump, the clone may contain real
+/// instructions; the node-split mapping proves that executing the source
+/// block preserves the clone's operations, effects, and terminator.
+pub fn replayCloneFold(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    incoming: ir.Edge,
+    source_id: ir.BlockId,
+    group: ir.NodeSplitGroupId,
+) std.mem.Allocator.Error!?ir.Edge {
+    if (incoming.target.index() >= program.blocks.len or source_id.index() >= program.blocks.len or
+        incoming.target == source_id)
+    {
+        return null;
+    }
+    const source = program.blocks[source_id.index()];
+    const clone = program.blocks[incoming.target.index()];
+    if (source.id != source_id or clone.id != incoming.target or
+        source.function != clone.function or incoming.arguments.len != clone.parameters.len)
+    {
+        return null;
+    }
+
+    var mappings = (try replayMappingsForCloneAlloc(
+        allocator,
+        program,
+        source_id,
+        incoming.target,
+        group,
+    )) orelse return null;
+    defer mappings.deinit();
+    if (!try sameMappedBlockAlloc(allocator, program, source, clone, mappings)) return null;
+
+    const arguments = try allocator.alloc(ir.ValueId, incoming.arguments.len);
+    errdefer allocator.free(arguments);
+    for (incoming.arguments, 0..) |argument, argument_index| {
+        switch (reverseReplayValue(mappings, argument)) {
+            .mapped => |source_value| {
+                arguments[argument_index] = source_value;
+                continue;
+            },
+            .ambiguous => return null,
+            .missing => {},
+        }
+        if (!foldArgumentIsExternal(program, argument, incoming.target)) return null;
+        arguments[argument_index] = argument;
+    }
+    return .{ .target = source_id, .arguments = arguments };
+}
+
+fn foldArgumentIsExternal(
+    program: *const ir.Program,
+    argument: ir.ValueId,
+    clone_id: ir.BlockId,
+) bool {
+    if (argument.index() >= program.values.len) return false;
+    const value = program.values[argument.index()];
+    if (value.id != argument) return false;
+    return switch (value.origin) {
+        .parameter, .capture => true,
+        .block_parameter => |origin| origin.block != clone_id,
+        .instruction_result => |origin| blk: {
+            if (origin.instruction.index() >= program.instructions.len) break :blk false;
+            break :blk program.instructions[origin.instruction.index()].block != clone_id;
+        },
+    };
+}
+
+pub fn replayMappingsForCloneAllocWithIndex(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    index: *const ReplayIndex,
+    source: ir.BlockId,
+    clone: ir.BlockId,
+    group: ir.NodeSplitGroupId,
+) std.mem.Allocator.Error!?ReplayMappings {
+    return replayMappingsAlloc(allocator, program, source, clone, group, index);
 }
 
 fn replayAllocWithGroup(
@@ -381,6 +509,29 @@ pub const ReplayMappings = struct {
         self.* = undefined;
     }
 };
+
+/// Reverse projection is only a function when every clone identity denotes
+/// one source identity.  External terminator aliases intentionally relax the
+/// forward map, so callers must reject an ambiguous inverse instead of
+/// choosing the first source by storage order.
+pub const ReverseReplayValue = union(enum) {
+    missing,
+    mapped: ir.ValueId,
+    ambiguous,
+};
+
+pub fn reverseReplayValue(mappings: ReplayMappings, clone_value: ir.ValueId) ReverseReplayValue {
+    var selected: ?ir.ValueId = null;
+    for (mappings.clone_values, mappings.source_values) |candidate_clone, candidate_source| {
+        if (candidate_clone != clone_value) continue;
+        if (selected) |existing| {
+            if (existing != candidate_source) return .ambiguous;
+        } else {
+            selected = candidate_source;
+        }
+    }
+    return if (selected) |source| .{ .mapped = source } else .missing;
+}
 
 const ReplayGroupRange = struct {
     group: ir.NodeSplitGroupId,
@@ -887,6 +1038,261 @@ test "function-scoped replay index excludes foreign rewrite history" {
     try std.testing.expect(index.clone_sources[second_clone.index()] == null);
 }
 
+test "replay use mapping keeps stable identity operands implicit" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const source = ir.BlockId.fromIndex(0);
+    const clone = ir.BlockId.fromIndex(1);
+    const target = ir.BlockId.fromIndex(2);
+    const source_value = ir.ValueId.fromIndex(0);
+    const mapped_value = ir.ValueId.fromIndex(1);
+    const shared_value = ir.ValueId.fromIndex(2);
+    const alternate_value = ir.ValueId.fromIndex(3);
+    const values = [_]ir.Value{
+        .{ .id = source_value, .function = function_id, .type = .dynamic, .origin = .{ .parameter = 0 } },
+        .{ .id = mapped_value, .function = function_id, .type = .dynamic, .origin = .{ .parameter = 1 } },
+        .{ .id = shared_value, .function = function_id, .type = .dynamic, .origin = .{ .parameter = 2 } },
+        .{ .id = alternate_value, .function = function_id, .type = .dynamic, .origin = .{ .parameter = 3 } },
+    };
+    const blocks = [_]ir.Block{
+        .{ .id = source, .function = function_id, .terminator = .{ .jump = .{
+            .target = target,
+            .arguments = &.{ source_value, shared_value },
+        } } },
+        .{ .id = clone, .function = function_id, .terminator = .{ .jump = .{
+            .target = target,
+            .arguments = &.{ mapped_value, shared_value },
+        } } },
+        .{ .id = target, .function = function_id, .terminator = .{ .unreachable_block = {} } },
+    };
+    const program = ir.Program{
+        .program_id = "replay-identity-operand",
+        .entry_function = function_id,
+        .functions = &.{},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+    };
+
+    var source_values: std.ArrayList(ir.ValueId) = .empty;
+    defer source_values.deinit(std.testing.allocator);
+    var clone_values: std.ArrayList(ir.ValueId) = .empty;
+    defer clone_values.deinit(std.testing.allocator);
+    var source_packs: std.ArrayList(ir.ValuePackId) = .empty;
+    defer source_packs.deinit(std.testing.allocator);
+    var clone_packs: std.ArrayList(ir.ValuePackId) = .empty;
+    defer clone_packs.deinit(std.testing.allocator);
+
+    try std.testing.expect(try appendReplayUseMappings(
+        std.testing.allocator,
+        &program,
+        source,
+        clone,
+        &source_values,
+        &clone_values,
+        &source_packs,
+        &clone_packs,
+    ));
+    // A fresh identity pair is still part of the replay witness.  It may not
+    // be silently omitted merely because the two IDs happen to match.
+    try std.testing.expectEqualSlices(ir.ValueId, &.{ source_value, shared_value }, source_values.items);
+    try std.testing.expectEqualSlices(ir.ValueId, &.{ mapped_value, shared_value }, clone_values.items);
+
+    source_values.clearRetainingCapacity();
+    clone_values.clearRetainingCapacity();
+    try source_values.append(std.testing.allocator, alternate_value);
+    try clone_values.append(std.testing.allocator, shared_value);
+    try std.testing.expect(try appendReplayUseMappings(
+        std.testing.allocator,
+        &program,
+        source,
+        clone,
+        &source_values,
+        &clone_values,
+        &source_packs,
+        &clone_packs,
+    ));
+    try std.testing.expectEqualSlices(ir.ValueId, &.{ alternate_value, source_value }, source_values.items);
+    try std.testing.expectEqualSlices(ir.ValueId, &.{ shared_value, mapped_value }, clone_values.items);
+
+    source_values.clearRetainingCapacity();
+    clone_values.clearRetainingCapacity();
+    try source_values.append(std.testing.allocator, shared_value);
+    try clone_values.append(std.testing.allocator, alternate_value);
+    try std.testing.expect(!try appendReplayUseMappings(
+        std.testing.allocator,
+        &program,
+        source,
+        clone,
+        &source_values,
+        &clone_values,
+        &source_packs,
+        &clone_packs,
+    ));
+}
+
+test "replay accepts external aliases in a cloned terminator tuple" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const incoming = ir.BlockId.fromIndex(0);
+    const source = ir.BlockId.fromIndex(1);
+    const clone = ir.BlockId.fromIndex(2);
+    const target = ir.BlockId.fromIndex(3);
+    const producer = ir.BlockId.fromIndex(4);
+    const first = ir.ValueId.fromIndex(0);
+    const second = ir.ValueId.fromIndex(1);
+    const flag = ir.ValueId.fromIndex(2);
+    const target_first = ir.ValueId.fromIndex(3);
+    const target_second = ir.ValueId.fromIndex(4);
+    const target_flag = ir.ValueId.fromIndex(5);
+    const group = ir.NodeSplitGroupId.fromIndex(0);
+    const blocks = [_]ir.Block{
+        .{ .id = incoming, .function = function_id, .terminator = .{ .jump = .{ .target = source } } },
+        .{ .id = source, .function = function_id, .terminator = .{ .jump = .{
+            .target = target,
+            .arguments = &.{ first, second, flag },
+        } } },
+        .{ .id = clone, .function = function_id, .terminator = .{ .jump = .{
+            .target = target,
+            .arguments = &.{ first, first, flag },
+        } } },
+        .{ .id = target, .function = function_id, .parameters = &.{ target_first, target_second, target_flag }, .terminator = .{ .unreachable_block = {} } },
+        .{ .id = producer, .function = function_id, .parameters = &.{ first, second, flag }, .terminator = .{ .unreachable_block = {} } },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .blocks = &.{ incoming, source, clone, target, producer },
+        .entry_block = incoming,
+    }};
+    var values = [_]ir.Value{
+        .{ .id = first, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = producer, .index = 0 } } },
+        .{ .id = second, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = producer, .index = 1 } } },
+        .{ .id = flag, .function = function_id, .type = .boolean, .origin = .{ .block_parameter = .{ .block = producer, .index = 2 } } },
+        .{ .id = target_first, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = target, .index = 0 } } },
+        .{ .id = target_second, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = target, .index = 1 } } },
+        .{ .id = target_flag, .function = function_id, .type = .boolean, .origin = .{ .block_parameter = .{ .block = target, .index = 2 } } },
+    };
+    const rewrites = [_]ir.CfgEdgeRewrite{.{
+        .id = ir.EdgeRewriteId.fromIndex(0),
+        .source = incoming,
+        .kind = .jump,
+        .from = .{ .target = source },
+        .to = .{ .target = clone },
+        .rule = .node_split,
+        .node_split_group = group,
+    }};
+    const program = ir.Program{
+        .program_id = "external-terminator-alias-replay",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+        .edge_rewrites = &rewrites,
+    };
+
+    var index = try ReplayIndex.initForFunction(std.testing.allocator, &program, function_id);
+    defer index.deinit();
+    const replayed = try replayAllocForGroupWithIndex(
+        std.testing.allocator,
+        &program,
+        .{ .target = source },
+        clone,
+        group,
+        &index,
+    );
+    try std.testing.expect(replayed != null);
+    if (replayed) |edge| if (edge.arguments.len != 0) std.testing.allocator.free(edge.arguments);
+
+    var mapped_sources: std.ArrayList(ir.ValueId) = .empty;
+    defer mapped_sources.deinit(std.testing.allocator);
+    var mapped_clones: std.ArrayList(ir.ValueId) = .empty;
+    defer mapped_clones.deinit(std.testing.allocator);
+    var mapped_packs: std.ArrayList(ir.ValuePackId) = .empty;
+    defer mapped_packs.deinit(std.testing.allocator);
+    var mapped_clone_packs: std.ArrayList(ir.ValuePackId) = .empty;
+    defer mapped_clone_packs.deinit(std.testing.allocator);
+
+    // Equal types are insufficient: external aliases must come from one
+    // authenticated producer, not merely look interchangeable.
+    try mapped_sources.append(std.testing.allocator, first);
+    try mapped_clones.append(std.testing.allocator, first);
+    const original_second_origin = values[second.index()].origin;
+    values[second.index()].origin = .{ .block_parameter = .{ .block = target, .index = 1 } };
+    try std.testing.expect(!try appendReplayTerminatorValueMapping(
+        std.testing.allocator,
+        &program,
+        source,
+        clone,
+        &mapped_sources,
+        &mapped_clones,
+        second,
+        first,
+    ));
+    values[second.index()].origin = original_second_origin;
+
+    // A local or instruction result in the cloned block cannot be treated as
+    // an external value just because the terminator tuple aliases it.
+    mapped_sources.clearRetainingCapacity();
+    mapped_clones.clearRetainingCapacity();
+    try mapped_sources.append(std.testing.allocator, first);
+    try mapped_clones.append(std.testing.allocator, flag);
+    const original_flag_type = values[flag.index()].type;
+    const original_flag_origin = values[flag.index()].origin;
+    values[flag.index()].type = .dynamic;
+    values[flag.index()].origin = .{ .block_parameter = .{ .block = clone, .index = 0 } };
+    try std.testing.expect(!try appendReplayTerminatorValueMapping(
+        std.testing.allocator,
+        &program,
+        source,
+        clone,
+        &mapped_sources,
+        &mapped_clones,
+        second,
+        flag,
+    ));
+    values[flag.index()].origin = .{ .instruction_result = .{
+        .instruction = ir.InstructionId.fromIndex(0),
+        .index = 0,
+    } };
+    try std.testing.expect(!try appendReplayTerminatorValueMapping(
+        std.testing.allocator,
+        &program,
+        source,
+        clone,
+        &mapped_sources,
+        &mapped_clones,
+        second,
+        flag,
+    ));
+    values[flag.index()].type = original_flag_type;
+    values[flag.index()].origin = original_flag_origin;
+}
+
+test "reverse replay mapping rejects an ambiguous clone identity" {
+    const source_first = ir.ValueId.fromIndex(10);
+    const source_second = ir.ValueId.fromIndex(11);
+    const clone_value = ir.ValueId.fromIndex(20);
+    var source_values = [_]ir.ValueId{ source_first, source_second };
+    var clone_values = [_]ir.ValueId{ clone_value, clone_value };
+    var source_packs: [0]ir.ValuePackId = .{};
+    var clone_packs: [0]ir.ValuePackId = .{};
+    const mappings = ReplayMappings{
+        .allocator = std.testing.allocator,
+        .source_values = source_values[0..],
+        .clone_values = clone_values[0..],
+        .source_packs = source_packs[0..],
+        .clone_packs = clone_packs[0..],
+        .history_start = null,
+    };
+    try std.testing.expectEqual(
+        ReverseReplayValue.ambiguous,
+        reverseReplayValue(mappings, clone_value),
+    );
+    try std.testing.expectEqual(
+        ReverseReplayValue.missing,
+        reverseReplayValue(mappings, ir.ValueId.fromIndex(21)),
+    );
+}
+
 fn replayMappingsAlloc(
     allocator: std.mem.Allocator,
     program: *const ir.Program,
@@ -1118,6 +1524,29 @@ const UseCollector = struct {
 
     pub fn place(_: *UseCollector, _: ir.PlaceId) void {}
 };
+
+fn appendReplayUseMappings(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    source_id: ir.BlockId,
+    clone_id: ir.BlockId,
+    source_values: *std.ArrayList(ir.ValueId),
+    clone_values: *std.ArrayList(ir.ValueId),
+    source_packs: *std.ArrayList(ir.ValuePackId),
+    clone_packs: *std.ArrayList(ir.ValuePackId),
+) std.mem.Allocator.Error!bool {
+    return appendReplayUseMappingsFrom(
+        allocator,
+        program,
+        source_id,
+        clone_id,
+        source_values,
+        clone_values,
+        source_packs,
+        clone_packs,
+        0,
+    );
+}
 
 fn appendReplayUseMappingsFrom(
     allocator: std.mem.Allocator,
@@ -1620,6 +2049,10 @@ fn sameMappedBlockAlloc(
     );
 }
 
+fn reverseStructuralTerminator(program: *const ir.Program, block: ir.BlockId, terminator: ir.Terminator) ir.Terminator {
+    return reverseStructuralTerminatorFrom(program, block, terminator, 0);
+}
+
 const StructuralTerminatorPair = struct {
     source: ir.Terminator,
     clone: ir.Terminator,
@@ -1666,6 +2099,15 @@ fn reverseStructuralTerminatorPair(
     };
 }
 
+fn reverseStructuralTerminatorFrom(
+    program: *const ir.Program,
+    block: ir.BlockId,
+    terminator: ir.Terminator,
+    history_start: usize,
+) ir.Terminator {
+    return reverseStructuralTerminatorFromWithMode(program, block, terminator, history_start, true);
+}
+
 fn reverseStructuralTerminatorFromWithMode(
     program: *const ir.Program,
     block: ir.BlockId,
@@ -1691,6 +2133,121 @@ fn reverseStructuralTerminatorFromWithMode(
         _ = replaceTerminatorEdge(&result, rewrite.kind, rewrite.to, rewrite.from);
     }
     return result;
+}
+
+test "node-split replay restores a consumed branch before reversing clone history" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const incoming = ir.BlockId.fromIndex(0);
+    const original = ir.BlockId.fromIndex(1);
+    const original_then = ir.BlockId.fromIndex(2);
+    const original_else = ir.BlockId.fromIndex(3);
+    const clone = ir.BlockId.fromIndex(4);
+    const clone_then = ir.BlockId.fromIndex(5);
+    const condition = ir.ValueId.fromIndex(0);
+    const blocks = [_]ir.Block{
+        .{ .id = incoming, .function = function_id, .terminator = .{ .jump = .{ .target = clone } } },
+        .{ .id = original, .function = function_id, .terminator = .{ .branch = .{
+            .condition = condition,
+            .then_edge = .{ .target = original_then },
+            .else_edge = .{ .target = original_else },
+        } } },
+        .{ .id = original_then, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = original_else, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = clone, .function = function_id, .terminator = .{ .jump = .{ .target = clone_then } } },
+        .{ .id = clone_then, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const branch = ir.Branch{
+        .condition = condition,
+        .then_edge = .{ .target = original_then },
+        .else_edge = .{ .target = original_else },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .blocks = &.{ incoming, original, original_then, original_else, clone, clone_then },
+        .entry_block = incoming,
+    }};
+    const values = [_]ir.Value{.{
+        .id = condition,
+        .function = function_id,
+        .type = .boolean,
+        .origin = .{ .parameter = 0 },
+    }};
+    const terms = [_]ir.SolverTerm{.{
+        .id = ir.SolverTermId.fromIndex(0),
+        .sort = .{ .kind = .boolean },
+        .operation = .{ .value = condition },
+    }};
+    const queries = [_]ir.SolverQuery{.{
+        .id = ir.QueryId.fromIndex(0),
+        .kind = .prove_true,
+        .goal = ir.SolverTermId.fromIndex(0),
+    }};
+    const certificates = [_]ir.SolverCertificate{.{
+        .id = ir.CertificateId.fromIndex(0),
+        .query = ir.QueryId.fromIndex(0),
+        .engine = .internal_facts,
+        .resolution = .proved,
+    }};
+    const rewrites = [_]ir.CfgEdgeRewrite{
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(0),
+            .source = incoming,
+            .kind = .jump,
+            .from = .{ .target = original },
+            .to = .{ .target = clone },
+            .rule = .node_split,
+        },
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(1),
+            .source = clone,
+            .kind = .branch_then,
+            .from = .{ .target = original_then },
+            .to = .{ .target = clone_then },
+            .rule = .node_split,
+        },
+    };
+    const obligations = [_]ir.Obligation{.{
+        .id = ir.ObligationId.fromIndex(0),
+        .kind = .control_structure,
+        .subject = .{ .control_branch = .{ .block = clone, .branch = branch } },
+        .status = .discharged,
+        .blocks_profile = .core,
+        .detail = "consumed branch replay fixture",
+        .query = ir.QueryId.fromIndex(0),
+        .certificate = ir.CertificateId.fromIndex(0),
+    }};
+    const program = ir.Program{
+        .program_id = "consumed-branch-replay",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+        .solver_terms = &terms,
+        .queries = &queries,
+        .certificates = &certificates,
+        .edge_rewrites = &rewrites,
+        .obligations = &obligations,
+    };
+
+    const restored = reverseStructuralTerminatorFrom(
+        &program,
+        clone,
+        blocks[clone.index()].terminator,
+        0,
+    );
+    try std.testing.expectEqual(std.meta.Tag(ir.Terminator).branch, std.meta.activeTag(restored));
+    try std.testing.expectEqual(original_then, restored.branch.then_edge.target);
+    try std.testing.expectEqual(original_else, restored.branch.else_edge.target);
+
+    const replayed = (try replayAlloc(
+        std.testing.allocator,
+        &program,
+        .{ .target = original },
+        clone,
+    )) orelse return error.TestUnexpectedResult;
+    defer if (replayed.arguments.len != 0) std.testing.allocator.free(replayed.arguments);
+    try std.testing.expectEqual(clone, replayed.target);
 }
 
 fn replaceTerminatorEdge(terminator: *ir.Terminator, kind: ir.CfgEdgeKind, expected: ir.Edge, replacement: ir.Edge) bool {
@@ -1871,6 +2428,40 @@ fn sameMappedTerminator(
             sameMappedOptionalValue(throw_error.dynamic_level, clone.throw_error.dynamic_level, source_parameters, clone_parameters),
         .unreachable_block => true,
     };
+}
+
+/// Authenticate the entry shape of a split pair without requiring the
+/// instruction bodies to be identical. Structure reconstruction uses this
+/// only for an already-owned effectful body that was extended after the
+/// split; ordinary clone validation must continue to use sameMappedBlockAlloc.
+pub fn entryShapeMatches(
+    program: *const ir.Program,
+    source: ir.Block,
+    clone: ir.Block,
+) bool {
+    if (source.id == clone.id or source.function != clone.function or
+        source.parameters.len != clone.parameters.len or
+        !parametersAreCanonical(program.values, source) or
+        !parametersAreCanonical(program.values, clone)) return false;
+
+    for (source.parameters, clone.parameters) |source_id, clone_id| {
+        if (source_id == clone_id or source_id.index() >= program.values.len or
+            clone_id.index() >= program.values.len) return false;
+        const source_value = program.values[source_id.index()];
+        const clone_value = program.values[clone_id.index()];
+        if (source_value.id != source_id or clone_value.id != clone_id or
+            !sameType(source_value.type, clone_value.type) or
+            !sameOptionalString(source_value.name_hint, clone_value.name_hint)) return false;
+    }
+
+    return sameMappedTerminator(
+        source.terminator,
+        clone.terminator,
+        source.id,
+        clone.id,
+        source.parameters,
+        clone.parameters,
+    );
 }
 
 fn sameMappedEdge(
