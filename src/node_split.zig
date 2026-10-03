@@ -317,6 +317,54 @@ pub fn instructionStructureIsCloneableWithMappedFlags(
     return node_split_instruction.sequenceIsCloneableWithMappedFlags(program, source, mapped_values, mapped_packs);
 }
 
+/// Replay an ungrouped or implicitly grouped split using precomputed rewrite
+/// metadata.  This preserves replayAlloc's group-selection semantics while
+/// avoiding a full history scan for every candidate rewrite.
+pub fn replayAllocWithIndex(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    incoming: ir.Edge,
+    clone_id: ir.BlockId,
+    index: *const ReplayIndex,
+) std.mem.Allocator.Error!?ir.Edge {
+    var selected_group: ?ir.NodeSplitGroupId = null;
+    var found_mapping = false;
+    for (index.nodeSplitRewriteIndices()) |rewrite_index| {
+        const rewrite = program.edge_rewrites[rewrite_index];
+        if (rewrite.from.target != incoming.target or rewrite.to.target != clone_id) continue;
+        if (found_mapping and rewrite.node_split_group != selected_group) return null;
+        selected_group = rewrite.node_split_group;
+        found_mapping = true;
+    }
+    return replayAllocWithGroup(allocator, program, incoming, clone_id, selected_group, index);
+}
+
+fn replayAllocWithGroup(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    incoming: ir.Edge,
+    clone_id: ir.BlockId,
+    group: ?ir.NodeSplitGroupId,
+    replay_index: ?*const ReplayIndex,
+) std.mem.Allocator.Error!?ir.Edge {
+    if (incoming.target.index() >= program.blocks.len or clone_id.index() >= program.blocks.len) return null;
+    const source = program.blocks[incoming.target.index()];
+    const clone = program.blocks[clone_id.index()];
+    var mappings = try replayMappingsAlloc(allocator, program, source.id, clone.id, group, replay_index) orelse return null;
+    defer mappings.deinit();
+    if (source.id != incoming.target or clone.id != clone_id or source.id == clone.id or
+        source.function != clone.function or incoming.arguments.len != source.parameters.len or
+        !std.mem.eql(ir.EvidenceId, source.evidence, clone.evidence) or
+        !sameOptionalString(source.name_hint, clone.name_hint))
+    {
+        return null;
+    }
+    if (!try sameMappedBlockAlloc(allocator, program, source, clone, mappings)) return null;
+
+    if (incoming.arguments.len == 0) return .{ .target = clone_id };
+    return .{ .target = clone_id, .arguments = try allocator.dupe(ir.ValueId, incoming.arguments) };
+}
+
 pub const ReplayMappings = struct {
     allocator: std.mem.Allocator,
     source_values: []ir.ValueId,
@@ -839,6 +887,369 @@ test "function-scoped replay index excludes foreign rewrite history" {
     try std.testing.expect(index.clone_sources[second_clone.index()] == null);
 }
 
+fn replayMappingsAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    current_source: ir.BlockId,
+    current_clone: ir.BlockId,
+    group: ?ir.NodeSplitGroupId,
+    replay_index: ?*const ReplayIndex,
+) std.mem.Allocator.Error!?ReplayMappings {
+    if (current_source.index() >= program.blocks.len or current_clone.index() >= program.blocks.len) return null;
+    const source_block = program.blocks[current_source.index()];
+    const clone_block = program.blocks[current_clone.index()];
+    if (source_block.id != current_source or clone_block.id != current_clone or
+        source_block.function != clone_block.function)
+    {
+        return null;
+    }
+    if (replay_index) |index| {
+        if (index.function_id) |function_id| {
+            if (source_block.function != function_id) return null;
+        }
+    }
+    var owned_clone_sources: ?[]?ir.BlockId = null;
+    const clone_sources: []?ir.BlockId = if (replay_index) |index| blk: {
+        if (!index.valid) return null;
+        break :blk index.clone_sources;
+    } else blk: {
+        const allocated = try allocator.alloc(?ir.BlockId, program.blocks.len);
+        owned_clone_sources = allocated;
+        @memset(allocated, null);
+        for (program.edge_rewrites) |rewrite| {
+            if (rewrite.rule != .node_split or rewrite.to.target.index() >= program.blocks.len or
+                rewrite.from.target.index() >= program.blocks.len or rewrite.to.target == rewrite.from.target) continue;
+            if (allocated[rewrite.to.target.index()]) |existing| {
+                if (existing != rewrite.from.target) return null;
+            } else {
+                allocated[rewrite.to.target.index()] = rewrite.from.target;
+            }
+        }
+        break :blk allocated;
+    };
+    defer if (owned_clone_sources) |allocated| allocator.free(allocated);
+    if (group) |requested_group| {
+        if (replay_index) |index| {
+            if (!index.ownsMapping(program, current_source, current_clone, requested_group)) return null;
+        } else {
+            var owns_mapping = false;
+            for (program.edge_rewrites) |rewrite| {
+                if (rewrite.rule == .node_split and rewrite.node_split_group == requested_group and
+                    rewrite.from.target == current_source and rewrite.to.target == current_clone)
+                {
+                    owns_mapping = true;
+                    break;
+                }
+            }
+            if (!owns_mapping) return null;
+        }
+    }
+    if (current_clone.index() >= clone_sources.len) return null;
+    if (clone_sources[current_clone.index()]) |recorded| {
+        if (recorded != current_source) return null;
+    } else {
+        if (replay_index != null) return null;
+        clone_sources[current_clone.index()] = current_source;
+    }
+    const source_depth = replayNodeSplitDepth(replay_index, clone_sources, current_source) orelse return null;
+    const clone_depth = replayNodeSplitDepth(replay_index, clone_sources, current_clone) orelse return null;
+    if (clone_depth != std.math.add(usize, source_depth, 1) catch return null) return null;
+
+    const active = try allocator.alloc(bool, program.blocks.len);
+    defer allocator.free(active);
+    @memset(active, false);
+    var group_owned: ?[]bool = null;
+    if (replay_index == null) {
+        const allocated = try allocator.alloc(bool, program.blocks.len);
+        group_owned = allocated;
+        @memset(allocated, false);
+        if (group) |requested_group| {
+            for (program.edge_rewrites) |rewrite| {
+                if (rewrite.rule == .node_split and rewrite.node_split_group == requested_group and
+                    rewrite.to.target.index() < allocated.len)
+                {
+                    allocated[rewrite.to.target.index()] = true;
+                }
+            }
+        }
+    }
+    defer if (group_owned) |allocated| allocator.free(allocated);
+    var pending: std.ArrayList(ir.BlockId) = .empty;
+    defer pending.deinit(allocator);
+    try pending.append(allocator, current_clone);
+    if (replay_index) |index| {
+        while (pending.pop()) |clone_id| {
+            if (clone_id.index() >= active.len or active[clone_id.index()]) continue;
+            active[clone_id.index()] = true;
+            const rewrite_indices = index.adjacentRewriteIndices(group, clone_id);
+            for (rewrite_indices) |rewrite_index| {
+                const rewrite = program.edge_rewrites[rewrite_index];
+                if (group == null and rewrite.node_split_group != null) continue;
+                if (rewrite.from.target.index() >= program.blocks.len or rewrite.to.target.index() >= program.blocks.len or
+                    program.blocks[rewrite.from.target.index()].function != source_block.function or
+                    program.blocks[rewrite.to.target.index()].function != source_block.function)
+                {
+                    continue;
+                }
+                const mapped_source_depth = replayNodeSplitDepth(replay_index, clone_sources, rewrite.from.target) orelse return null;
+                const mapped_clone_depth = replayNodeSplitDepth(replay_index, clone_sources, rewrite.to.target) orelse return null;
+                if (mapped_source_depth != source_depth or mapped_clone_depth != clone_depth) continue;
+                const source_is_owned = if (group) |requested_group|
+                    index.groupOwnsBlock(program, requested_group, rewrite.source)
+                else
+                    true;
+                if (source_is_owned and rewrite.source == clone_id and rewrite.to.target.index() < clone_sources.len and
+                    clone_sources[rewrite.to.target.index()] != null)
+                {
+                    try pending.append(allocator, rewrite.to.target);
+                }
+                if (source_is_owned and rewrite.to.target == clone_id and rewrite.source.index() < clone_sources.len and
+                    clone_sources[rewrite.source.index()] != null)
+                {
+                    try pending.append(allocator, rewrite.source);
+                }
+            }
+        }
+    } else while (pending.pop()) |clone_id| {
+        if (clone_id.index() >= active.len or active[clone_id.index()]) continue;
+        active[clone_id.index()] = true;
+        for (program.edge_rewrites) |rewrite| {
+            if (rewrite.rule != .node_split or rewrite.node_split_group != group) continue;
+            const mapped_source_depth = replayNodeSplitDepth(replay_index, clone_sources, rewrite.from.target) orelse return null;
+            const mapped_clone_depth = replayNodeSplitDepth(replay_index, clone_sources, rewrite.to.target) orelse return null;
+            if (mapped_source_depth != source_depth or mapped_clone_depth != clone_depth) continue;
+            const source_is_owned = group == null or
+                (rewrite.source.index() < group_owned.?.len and group_owned.?[rewrite.source.index()]);
+            if (source_is_owned and rewrite.source == clone_id and rewrite.to.target.index() < clone_sources.len and
+                clone_sources[rewrite.to.target.index()] != null)
+            {
+                try pending.append(allocator, rewrite.to.target);
+            }
+            if (source_is_owned and rewrite.to.target == clone_id and rewrite.source.index() < clone_sources.len and
+                clone_sources[rewrite.source.index()] != null)
+            {
+                try pending.append(allocator, rewrite.source);
+            }
+        }
+    }
+
+    var source_values: std.ArrayList(ir.ValueId) = .empty;
+    defer source_values.deinit(allocator);
+    var clone_values: std.ArrayList(ir.ValueId) = .empty;
+    defer clone_values.deinit(allocator);
+    var source_packs: std.ArrayList(ir.ValuePackId) = .empty;
+    defer source_packs.deinit(allocator);
+    var clone_packs: std.ArrayList(ir.ValuePackId) = .empty;
+    defer clone_packs.deinit(allocator);
+    for (active, 0..) |is_active, clone_index| {
+        if (!is_active or clone_index == current_clone.index()) continue;
+        const source_id = clone_sources[clone_index] orelse return null;
+        if (!try appendReplayBlockMappings(
+            allocator,
+            program,
+            source_id,
+            ir.BlockId.fromIndex(clone_index),
+            &source_values,
+            &clone_values,
+            &source_packs,
+            &clone_packs,
+        )) return null;
+    }
+    // Seed the current block's canonical parameter/result identities before
+    // inferring mappings from uses. Otherwise a tampered clone can mention a
+    // source value directly and manufacture an identity mapping that masks
+    // the required source-to-clone projection.
+    if (!try appendReplayBlockMappings(
+        allocator,
+        program,
+        current_source,
+        current_clone,
+        &source_values,
+        &clone_values,
+        &source_packs,
+        &clone_packs,
+    )) return null;
+    if (!try appendReplayUseMappingsFrom(
+        allocator,
+        program,
+        current_source,
+        current_clone,
+        &source_values,
+        &clone_values,
+        &source_packs,
+        &clone_packs,
+        if (group) |requested_group| requested_group.index() else 0,
+    )) return null;
+    const owned_source_values = try source_values.toOwnedSlice(allocator);
+    errdefer allocator.free(owned_source_values);
+    const owned_clone_values = try clone_values.toOwnedSlice(allocator);
+    errdefer allocator.free(owned_clone_values);
+    const owned_source_packs = try source_packs.toOwnedSlice(allocator);
+    errdefer allocator.free(owned_source_packs);
+    const owned_clone_packs = try clone_packs.toOwnedSlice(allocator);
+    errdefer allocator.free(owned_clone_packs);
+    return .{
+        .allocator = allocator,
+        .source_values = owned_source_values,
+        .clone_values = owned_clone_values,
+        .source_packs = owned_source_packs,
+        .clone_packs = owned_clone_packs,
+        .history_start = if (group) |requested_group| requested_group.index() else null,
+    };
+}
+
+const UseCollector = struct {
+    allocator: std.mem.Allocator,
+    values: *std.ArrayList(ir.ValueId),
+    packs: *std.ArrayList(ir.ValuePackId),
+    out_of_memory: *bool,
+
+    pub fn value(self: *UseCollector, value_id: ir.ValueId) void {
+        self.values.append(self.allocator, value_id) catch {
+            self.out_of_memory.* = true;
+        };
+    }
+
+    pub fn pack(self: *UseCollector, pack_id: ir.ValuePackId) void {
+        self.packs.append(self.allocator, pack_id) catch {
+            self.out_of_memory.* = true;
+        };
+    }
+
+    pub fn place(_: *UseCollector, _: ir.PlaceId) void {}
+};
+
+fn appendReplayUseMappingsFrom(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    source_id: ir.BlockId,
+    clone_id: ir.BlockId,
+    source_values: *std.ArrayList(ir.ValueId),
+    clone_values: *std.ArrayList(ir.ValueId),
+    source_packs: *std.ArrayList(ir.ValuePackId),
+    clone_packs: *std.ArrayList(ir.ValuePackId),
+    history_start: usize,
+) std.mem.Allocator.Error!bool {
+    if (source_id.index() >= program.blocks.len or clone_id.index() >= program.blocks.len) return false;
+    const source = program.blocks[source_id.index()];
+    const clone = program.blocks[clone_id.index()];
+    if (source.id != source_id or clone.id != clone_id or source.instructions.len != clone.instructions.len) return false;
+
+    var source_used_values: std.ArrayList(ir.ValueId) = .empty;
+    defer source_used_values.deinit(allocator);
+    var clone_used_values: std.ArrayList(ir.ValueId) = .empty;
+    defer clone_used_values.deinit(allocator);
+    var source_used_packs: std.ArrayList(ir.ValuePackId) = .empty;
+    defer source_used_packs.deinit(allocator);
+    var clone_used_packs: std.ArrayList(ir.ValuePackId) = .empty;
+    defer clone_used_packs.deinit(allocator);
+    var out_of_memory = false;
+
+    for (source.instructions, clone.instructions) |source_instruction_id, clone_instruction_id| {
+        if (source_instruction_id.index() >= program.instructions.len or clone_instruction_id.index() >= program.instructions.len) return false;
+        const source_instruction = program.instructions[source_instruction_id.index()];
+        const clone_instruction = program.instructions[clone_instruction_id.index()];
+        if (source_instruction.id != source_instruction_id or clone_instruction.id != clone_instruction_id) return false;
+        source_used_values.clearRetainingCapacity();
+        clone_used_values.clearRetainingCapacity();
+        source_used_packs.clearRetainingCapacity();
+        clone_used_packs.clearRetainingCapacity();
+        var source_collector = UseCollector{
+            .allocator = allocator,
+            .values = &source_used_values,
+            .packs = &source_used_packs,
+            .out_of_memory = &out_of_memory,
+        };
+        var clone_collector = UseCollector{
+            .allocator = allocator,
+            .values = &clone_used_values,
+            .packs = &clone_used_packs,
+            .out_of_memory = &out_of_memory,
+        };
+        runtime_uses.visitOperationUses(source_instruction.operation, &source_collector);
+        runtime_uses.visitOperationUses(clone_instruction.operation, &clone_collector);
+        if (out_of_memory) return error.OutOfMemory;
+        if (source_used_values.items.len != clone_used_values.items.len or
+            source_used_packs.items.len != clone_used_packs.items.len)
+            return false;
+        for (source_used_values.items, clone_used_values.items) |source_value, clone_value| {
+            if (!replayValuePairCompatible(program, source_value, clone_value) or
+                !try appendReplayValueMapping(allocator, source_values, clone_values, source_value, clone_value)) return false;
+        }
+        for (source_used_packs.items, clone_used_packs.items) |source_pack, clone_pack| {
+            if (!replayPackPairCompatible(program, source_pack, clone_pack) or
+                !try appendReplayPackMapping(allocator, source_packs, clone_packs, source_pack, clone_pack)) return false;
+        }
+    }
+
+    source_used_values.clearRetainingCapacity();
+    clone_used_values.clearRetainingCapacity();
+    source_used_packs.clearRetainingCapacity();
+    clone_used_packs.clearRetainingCapacity();
+    var source_collector = UseCollector{
+        .allocator = allocator,
+        .values = &source_used_values,
+        .packs = &source_used_packs,
+        .out_of_memory = &out_of_memory,
+    };
+    var clone_collector = UseCollector{
+        .allocator = allocator,
+        .values = &clone_used_values,
+        .packs = &clone_used_packs,
+        .out_of_memory = &out_of_memory,
+    };
+    const terminators = reverseStructuralTerminatorPair(
+        program,
+        source.id,
+        source.terminator,
+        clone.id,
+        clone.terminator,
+        history_start,
+    );
+    runtime_uses.visitTerminatorUses(terminators.source, &source_collector);
+    runtime_uses.visitTerminatorUses(terminators.clone, &clone_collector);
+    if (out_of_memory) return error.OutOfMemory;
+    if (source_used_values.items.len != clone_used_values.items.len or
+        source_used_packs.items.len != clone_used_packs.items.len)
+        return false;
+    for (source_used_values.items, clone_used_values.items) |source_value, clone_value| {
+        if (!replayValuePairCompatible(program, source_value, clone_value) or
+            !try appendReplayTerminatorValueMapping(
+                allocator,
+                program,
+                source.id,
+                clone.id,
+                source_values,
+                clone_values,
+                source_value,
+                clone_value,
+            )) return false;
+    }
+    for (source_used_packs.items, clone_used_packs.items) |source_pack, clone_pack| {
+        if (!replayPackPairCompatible(program, source_pack, clone_pack) or
+            !try appendReplayPackMapping(allocator, source_packs, clone_packs, source_pack, clone_pack)) return false;
+    }
+    return true;
+}
+
+fn replayValuePairCompatible(program: *const ir.Program, source_id: ir.ValueId, clone_id: ir.ValueId) bool {
+    if (source_id == clone_id) return true;
+    if (source_id.index() >= program.values.len or clone_id.index() >= program.values.len) return false;
+    const source = program.values[source_id.index()];
+    const clone = program.values[clone_id.index()];
+    return source.id == source_id and clone.id == clone_id and source.function == clone.function and
+        sameType(source.type, clone.type) and sameOptionalString(source.name_hint, clone.name_hint);
+}
+
+fn replayPackPairCompatible(program: *const ir.Program, source_id: ir.ValuePackId, clone_id: ir.ValuePackId) bool {
+    if (source_id == clone_id) return true;
+    if (source_id.index() >= program.value_packs.len or clone_id.index() >= program.value_packs.len) return false;
+    const source = program.value_packs[source_id.index()];
+    const clone = program.value_packs[clone_id.index()];
+    return source.id == source_id and clone.id == clone_id and source.function == clone.function and
+        samePackShape(source.shape, clone.shape) and std.mem.eql(ir.EvidenceId, source.evidence, clone.evidence);
+}
+
 fn populateNodeSplitDepths(
     allocator: std.mem.Allocator,
     clone_sources: []const ?ir.BlockId,
@@ -913,6 +1324,403 @@ fn populateNodeSplitDepths(
         }
     }
     return valid;
+}
+
+fn replayNodeSplitDepth(
+    replay_index: ?*const ReplayIndex,
+    clone_sources: []const ?ir.BlockId,
+    block: ir.BlockId,
+) ?usize {
+    if (replay_index) |index| return index.nodeSplitDepth(block);
+    return nodeSplitDepth(clone_sources, block);
+}
+
+fn nodeSplitDepth(clone_sources: []const ?ir.BlockId, block: ir.BlockId) ?usize {
+    var current = block;
+    var depth: usize = 0;
+    while (current.index() < clone_sources.len) {
+        const parent = clone_sources[current.index()] orelse return depth;
+        depth = std.math.add(usize, depth, 1) catch return null;
+        if (depth > clone_sources.len) return null;
+        current = parent;
+    }
+    return null;
+}
+
+fn appendReplayBlockMappings(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    source_id: ir.BlockId,
+    clone_id: ir.BlockId,
+    source_values: *std.ArrayList(ir.ValueId),
+    clone_values: *std.ArrayList(ir.ValueId),
+    source_packs: *std.ArrayList(ir.ValuePackId),
+    clone_packs: *std.ArrayList(ir.ValuePackId),
+) std.mem.Allocator.Error!bool {
+    if (source_id.index() >= program.blocks.len or clone_id.index() >= program.blocks.len) return false;
+    const source = program.blocks[source_id.index()];
+    const clone = program.blocks[clone_id.index()];
+    if (source.id != source_id or clone.id != clone_id or source.function != clone.function or
+        source.parameters.len != clone.parameters.len or source.instructions.len != clone.instructions.len) return false;
+    for (source.parameters, clone.parameters) |source_value, clone_value| {
+        if (!try appendReplayValueMapping(allocator, source_values, clone_values, source_value, clone_value)) return false;
+    }
+    for (source.instructions, clone.instructions) |source_instruction_id, clone_instruction_id| {
+        if (source_instruction_id.index() >= program.instructions.len or clone_instruction_id.index() >= program.instructions.len) return false;
+        const source_instruction = program.instructions[source_instruction_id.index()];
+        const clone_instruction = program.instructions[clone_instruction_id.index()];
+        if (source_instruction.id != source_instruction_id or clone_instruction.id != clone_instruction_id or
+            source_instruction.block != source.id or clone_instruction.block != clone.id or
+            source_instruction.results.len != clone_instruction.results.len or
+            (source_instruction.pack_result == null) != (clone_instruction.pack_result == null)) return false;
+        for (source_instruction.results, clone_instruction.results) |source_value, clone_value| {
+            if (!try appendReplayValueMapping(allocator, source_values, clone_values, source_value, clone_value)) return false;
+        }
+        if (source_instruction.pack_result) |source_pack| {
+            if (!try appendReplayPackMapping(
+                allocator,
+                source_packs,
+                clone_packs,
+                source_pack,
+                clone_instruction.pack_result.?,
+            )) return false;
+        }
+    }
+    return true;
+}
+
+fn appendReplayValueMapping(
+    allocator: std.mem.Allocator,
+    sources: *std.ArrayList(ir.ValueId),
+    clones: *std.ArrayList(ir.ValueId),
+    source: ir.ValueId,
+    clone: ir.ValueId,
+) std.mem.Allocator.Error!bool {
+    for (sources.items, clones.items) |existing_source, existing_clone| {
+        if (existing_source == source) return existing_clone == clone;
+        if (source == clone and existing_clone == clone) return true;
+        if (existing_clone == clone) return false;
+    }
+    try sources.append(allocator, source);
+    try clones.append(allocator, clone);
+    return true;
+}
+
+// A cloned terminator may project multiple external block parameters onto one
+// value when the selected incoming edge has already authenticated that alias.
+// Keep instruction results, local block parameters, and all pack mappings
+// injective; only the external edge tuple gets this narrower relation.
+fn appendReplayTerminatorValueMapping(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    source_block: ir.BlockId,
+    clone_block: ir.BlockId,
+    sources: *std.ArrayList(ir.ValueId),
+    clones: *std.ArrayList(ir.ValueId),
+    source: ir.ValueId,
+    clone: ir.ValueId,
+) std.mem.Allocator.Error!bool {
+    for (sources.items, clones.items) |existing_source, existing_clone| {
+        if (existing_source == source) return existing_clone == clone;
+        if (source == clone and existing_clone == clone) return true;
+        if (existing_clone != clone) continue;
+        if (!replayValuePairCompatible(program, existing_source, source) or
+            !replayExternalAliasSourcePair(program, source_block, existing_source, source) or
+            !replayExternalValue(program, clone_block, existing_clone)) return false;
+    }
+    try sources.append(allocator, source);
+    try clones.append(allocator, clone);
+    return true;
+}
+
+fn replayExternalAliasSourcePair(
+    program: *const ir.Program,
+    block_id: ir.BlockId,
+    left_id: ir.ValueId,
+    right_id: ir.ValueId,
+) bool {
+    if (left_id.index() >= program.values.len or right_id.index() >= program.values.len) return false;
+    const left = program.values[left_id.index()];
+    const right = program.values[right_id.index()];
+    if (left.id != left_id or right.id != right_id) return false;
+    const left_origin = switch (left.origin) {
+        .block_parameter => |origin| origin,
+        .parameter, .capture, .instruction_result => return false,
+    };
+    const right_origin = switch (right.origin) {
+        .block_parameter => |origin| origin,
+        .parameter, .capture, .instruction_result => return false,
+    };
+    return left_origin.block != block_id and left_origin.block == right_origin.block;
+}
+
+fn replayExternalValue(
+    program: *const ir.Program,
+    block_id: ir.BlockId,
+    value_id: ir.ValueId,
+) bool {
+    if (value_id.index() >= program.values.len) return false;
+    const value = program.values[value_id.index()];
+    if (value.id != value_id) return false;
+    return switch (value.origin) {
+        .parameter, .capture => true,
+        .block_parameter => |origin| origin.block != block_id,
+        .instruction_result => |origin| blk: {
+            if (origin.instruction.index() >= program.instructions.len) break :blk false;
+            break :blk program.instructions[origin.instruction.index()].block != block_id;
+        },
+    };
+}
+
+fn appendReplayPackMapping(
+    allocator: std.mem.Allocator,
+    sources: *std.ArrayList(ir.ValuePackId),
+    clones: *std.ArrayList(ir.ValuePackId),
+    source: ir.ValuePackId,
+    clone: ir.ValuePackId,
+) std.mem.Allocator.Error!bool {
+    for (sources.items, clones.items) |existing_source, existing_clone| {
+        if (existing_source == source or existing_clone == clone) {
+            return existing_source == source and existing_clone == clone;
+        }
+    }
+    try sources.append(allocator, source);
+    try clones.append(allocator, clone);
+    return true;
+}
+
+fn sameMappedBlockAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    source: ir.Block,
+    clone: ir.Block,
+    external: ReplayMappings,
+) std.mem.Allocator.Error!bool {
+    if (source.parameters.len != clone.parameters.len or
+        source.instructions.len != clone.instructions.len or
+        !parametersAreCanonical(program.values, source) or
+        !parametersAreCanonical(program.values, clone) or
+        !node_split_instruction.sequenceIsCloneableWithMappings(
+            program,
+            source,
+            external.source_values,
+            external.source_packs,
+        ) or
+        !node_split_instruction.sequenceIsCloneableWithMappings(
+            program,
+            clone,
+            external.clone_values,
+            external.clone_packs,
+        )) return false;
+
+    if (external.source_values.len != external.clone_values.len or external.source_packs.len != external.clone_packs.len) return false;
+    const local_value_capacity = mappedValueCapacity(program, source) orelse return false;
+    const mapped_capacity = std.math.add(usize, external.source_values.len, local_value_capacity) catch return false;
+    const source_values = try allocator.alloc(ir.ValueId, mapped_capacity);
+    defer allocator.free(source_values);
+    const clone_values = try allocator.alloc(ir.ValueId, mapped_capacity);
+    defer allocator.free(clone_values);
+    @memcpy(source_values[0..external.source_values.len], external.source_values);
+    @memcpy(clone_values[0..external.clone_values.len], external.clone_values);
+    const local_pack_capacity = mappedPackCapacity(program, source) orelse return false;
+    const mapped_pack_capacity = std.math.add(usize, external.source_packs.len, local_pack_capacity) catch return false;
+    const source_packs = try allocator.alloc(ir.ValuePackId, mapped_pack_capacity);
+    defer allocator.free(source_packs);
+    const clone_packs = try allocator.alloc(ir.ValuePackId, mapped_pack_capacity);
+    defer allocator.free(clone_packs);
+    @memcpy(source_packs[0..external.source_packs.len], external.source_packs);
+    @memcpy(clone_packs[0..external.clone_packs.len], external.clone_packs);
+    var mapped_count: usize = external.source_values.len;
+    var mapped_pack_count: usize = external.source_packs.len;
+
+    for (source.parameters, clone.parameters, 0..) |source_id, clone_id, parameter_index| {
+        if (source_id == clone_id) return false;
+        const source_value = program.values[source_id.index()];
+        const clone_value = program.values[clone_id.index()];
+        if (!sameType(source_value.type, clone_value.type) or
+            !sameOptionalString(source_value.name_hint, clone_value.name_hint)) return false;
+        const source_origin = source_value.origin.block_parameter;
+        const clone_origin = clone_value.origin.block_parameter;
+        if (source_origin.block != source.id or source_origin.index != parameter_index or
+            clone_origin.block != clone.id or clone_origin.index != parameter_index) return false;
+        source_values[mapped_count] = source_id;
+        clone_values[mapped_count] = clone_id;
+        mapped_count += 1;
+    }
+
+    for (source.instructions, clone.instructions, 0..) |source_id, clone_id, instruction_index| {
+        if (source_id == clone_id) return false;
+        for (source.instructions) |candidate| if (candidate == clone_id) return false;
+        for (clone.instructions[0..instruction_index]) |prior| if (prior == clone_id) return false;
+        const source_instruction = program.instructions[source_id.index()];
+        const clone_instruction = program.instructions[clone_id.index()];
+        if (source_instruction.results.len != clone_instruction.results.len or
+            !node_split_instruction.sameEffects(source_instruction.effects, clone_instruction.effects) or
+            !std.mem.eql(ir.EvidenceId, source_instruction.evidence, clone_instruction.evidence)) return false;
+        const mapped_operation = (try node_split_instruction.remapOperation(
+            allocator,
+            program,
+            program.values,
+            source.function,
+            source_instruction.operation,
+            source_values[0..mapped_count],
+            clone_values[0..mapped_count],
+            source_packs[0..mapped_pack_count],
+            clone_packs[0..mapped_pack_count],
+        )) orelse return false;
+        defer node_split_instruction.deinitRemappedOperation(allocator, mapped_operation);
+        if (!node_split_instruction.sameOperation(mapped_operation, clone_instruction.operation)) return false;
+
+        for (source_instruction.results, clone_instruction.results) |source_result_id, clone_result_id| {
+            if (source_result_id == clone_result_id) return false;
+            for (source_values[0..mapped_count]) |candidate| if (candidate == clone_result_id) return false;
+            for (clone_values[0..mapped_count]) |candidate| if (candidate == source_result_id) return false;
+            const source_result = program.values[source_result_id.index()];
+            const clone_result = program.values[clone_result_id.index()];
+            if (!sameType(source_result.type, clone_result.type) or
+                !sameOptionalString(source_result.name_hint, clone_result.name_hint)) return false;
+            source_values[mapped_count] = source_result_id;
+            clone_values[mapped_count] = clone_result_id;
+            mapped_count += 1;
+        }
+        if (!sameMappedPackResult(
+            program,
+            source.function,
+            source_id,
+            clone_id,
+            source_instruction.pack_result,
+            clone_instruction.pack_result,
+            source_packs[0..mapped_pack_count],
+            clone_packs[0..mapped_pack_count],
+        )) return false;
+        if (source_instruction.pack_result) |source_pack_id| {
+            source_packs[mapped_pack_count] = source_pack_id;
+            clone_packs[mapped_pack_count] = clone_instruction.pack_result.?;
+            mapped_pack_count += 1;
+        }
+    }
+
+    const history_start = external.history_start orelse 0;
+    if (history_start > program.edge_rewrites.len) return false;
+    const terminators = reverseStructuralTerminatorPair(
+        program,
+        source.id,
+        source.terminator,
+        clone.id,
+        clone.terminator,
+        history_start,
+    );
+    return sameMappedTerminator(
+        terminators.source,
+        terminators.clone,
+        source.id,
+        clone.id,
+        source_values[0..mapped_count],
+        clone_values[0..mapped_count],
+    );
+}
+
+const StructuralTerminatorPair = struct {
+    source: ir.Terminator,
+    clone: ir.Terminator,
+};
+
+fn reverseStructuralTerminatorPair(
+    program: *const ir.Program,
+    source_block: ir.BlockId,
+    source_terminator: ir.Terminator,
+    clone_block: ir.BlockId,
+    clone_terminator: ir.Terminator,
+    history_start: usize,
+) StructuralTerminatorPair {
+    // A consumed branch is proof metadata for the post-branch jump unless the
+    // other side is itself a branch or carries the same authenticated
+    // witness. Restoring it on only one side makes an exact clone of the
+    // selected arm look structurally different.
+    const source_consumed_branch = if (source_terminator == .jump)
+        edge_path.consumedBranchForReplay(program, source_block)
+    else
+        null;
+    const clone_consumed_branch = if (clone_terminator == .jump)
+        edge_path.consumedBranchForReplay(program, clone_block)
+    else
+        null;
+    const source_branch_compatible = source_terminator == .branch or source_consumed_branch != null;
+    const clone_branch_compatible = clone_terminator == .branch or clone_consumed_branch != null;
+    const restore_consumed_branch = source_branch_compatible and clone_branch_compatible;
+    return .{
+        .source = reverseStructuralTerminatorFromWithMode(
+            program,
+            source_block,
+            source_terminator,
+            history_start,
+            restore_consumed_branch,
+        ),
+        .clone = reverseStructuralTerminatorFromWithMode(
+            program,
+            clone_block,
+            clone_terminator,
+            history_start,
+            restore_consumed_branch,
+        ),
+    };
+}
+
+fn reverseStructuralTerminatorFromWithMode(
+    program: *const ir.Program,
+    block: ir.BlockId,
+    terminator: ir.Terminator,
+    history_start: usize,
+    restore_consumed_branch: bool,
+) ir.Terminator {
+    var result = terminator;
+    if (restore_consumed_branch and result == .jump) {
+        if (edge_path.consumedBranchForReplay(program, block)) |branch| {
+            const live = result.jump;
+            if (sameEdge(live, branch.then_edge) or sameEdge(live, branch.else_edge)) {
+                result = .{ .branch = branch };
+            }
+        }
+    }
+    var index = program.edge_rewrites.len;
+    while (index > history_start) {
+        index -= 1;
+        const rewrite = program.edge_rewrites[index];
+        if (rewrite.source != block or
+            (rewrite.rule != .node_split and rewrite.rule != .forwarding_jump and rewrite.rule != .clone_fold)) continue;
+        _ = replaceTerminatorEdge(&result, rewrite.kind, rewrite.to, rewrite.from);
+    }
+    return result;
+}
+
+fn replaceTerminatorEdge(terminator: *ir.Terminator, kind: ir.CfgEdgeKind, expected: ir.Edge, replacement: ir.Edge) bool {
+    switch (terminator.*) {
+        .jump => |edge| {
+            if (kind != .jump or !sameEdge(edge, expected)) return false;
+            terminator.* = .{ .jump = replacement };
+        },
+        .branch => |branch| {
+            var changed = branch;
+            switch (kind) {
+                .branch_then => {
+                    if (!sameEdge(branch.then_edge, expected)) return false;
+                    changed.then_edge = replacement;
+                },
+                .branch_else => {
+                    if (!sameEdge(branch.else_edge, expected)) return false;
+                    changed.else_edge = replacement;
+                },
+                .jump => return false,
+            }
+            terminator.* = .{ .branch = changed };
+        },
+        else => return false,
+    }
+    return true;
+}
+
+fn sameEdge(left: ir.Edge, right: ir.Edge) bool {
+    return left.target == right.target and std.mem.eql(ir.ValueId, left.arguments, right.arguments);
 }
 
 fn remapTerminatorAlloc(
@@ -1001,4 +1809,110 @@ fn mappedPackCapacity(program: *const ir.Program, block: ir.Block) ?usize {
         }
     }
     return capacity;
+}
+
+fn sameMappedPackResult(
+    program: *const ir.Program,
+    function: ir.FunctionId,
+    source_instruction: ir.InstructionId,
+    clone_instruction: ir.InstructionId,
+    source_maybe: ?ir.ValuePackId,
+    clone_maybe: ?ir.ValuePackId,
+    prior_source: []const ir.ValuePackId,
+    prior_clone: []const ir.ValuePackId,
+) bool {
+    const source_id = source_maybe orelse return clone_maybe == null;
+    const clone_id = clone_maybe orelse return false;
+    if (source_id == clone_id or source_id.index() >= program.value_packs.len or clone_id.index() >= program.value_packs.len) return false;
+    for (prior_source) |candidate| if (candidate == clone_id) return false;
+    for (prior_clone) |candidate| if (candidate == source_id) return false;
+    const source = program.value_packs[source_id.index()];
+    const clone = program.value_packs[clone_id.index()];
+    if (source.id != source_id or clone.id != clone_id or source.function != function or clone.function != function or
+        !samePackShape(source.shape, clone.shape) or
+        !std.mem.eql(ir.EvidenceId, source.evidence, clone.evidence)) return false;
+    const source_producer = switch (source.origin) {
+        .instruction_result => |instruction_id| instruction_id,
+        .varargs => return false,
+    };
+    const clone_producer = switch (clone.origin) {
+        .instruction_result => |instruction_id| instruction_id,
+        .varargs => return false,
+    };
+    return source_producer == source_instruction and clone_producer == clone_instruction;
+}
+
+fn samePackShape(left: ir.PackShape, right: ir.PackShape) bool {
+    if (left.tail != right.tail or left.prefix.len != right.prefix.len) return false;
+    for (left.prefix, right.prefix) |left_type, right_type| if (!sameType(left_type, right_type)) return false;
+    return true;
+}
+
+fn sameMappedTerminator(
+    source: ir.Terminator,
+    clone: ir.Terminator,
+    source_block: ir.BlockId,
+    clone_block: ir.BlockId,
+    source_parameters: []const ir.ValueId,
+    clone_parameters: []const ir.ValueId,
+) bool {
+    if (std.meta.activeTag(source) != std.meta.activeTag(clone)) return false;
+    return switch (source) {
+        .jump => |edge| sameMappedEdge(edge, clone.jump, source_block, clone_block, source_parameters, clone_parameters),
+        .branch => |branch| remapValue(branch.condition, source_parameters, clone_parameters) == clone.branch.condition and
+            sameMappedEdge(branch.then_edge, clone.branch.then_edge, source_block, clone_block, source_parameters, clone_parameters) and
+            sameMappedEdge(branch.else_edge, clone.branch.else_edge, source_block, clone_block, source_parameters, clone_parameters),
+        .return_values => |items| sameMappedValues(items, clone.return_values, source_parameters, clone_parameters),
+        .return_pack => |pack| pack == clone.return_pack,
+        .return_expanded => |expanded| expanded.pack == clone.return_expanded.pack and
+            sameMappedValues(expanded.values, clone.return_expanded.values, source_parameters, clone_parameters),
+        .throw_error => |throw_error| throw_error.level == clone.throw_error.level and
+            remapValue(throw_error.value, source_parameters, clone_parameters) == clone.throw_error.value and
+            sameMappedOptionalValue(throw_error.dynamic_level, clone.throw_error.dynamic_level, source_parameters, clone_parameters),
+        .unreachable_block => true,
+    };
+}
+
+fn sameMappedEdge(
+    source: ir.Edge,
+    clone: ir.Edge,
+    source_block: ir.BlockId,
+    clone_block: ir.BlockId,
+    source_parameters: []const ir.ValueId,
+    clone_parameters: []const ir.ValueId,
+) bool {
+    return remapBlockTarget(source.target, source_block, clone_block) == clone.target and
+        sameMappedValues(source.arguments, clone.arguments, source_parameters, clone_parameters);
+}
+
+fn sameMappedValues(
+    source: []const ir.ValueId,
+    clone: []const ir.ValueId,
+    source_parameters: []const ir.ValueId,
+    clone_parameters: []const ir.ValueId,
+) bool {
+    if (source.len != clone.len) return false;
+    for (source, clone) |source_value, clone_value| {
+        if (remapValue(source_value, source_parameters, clone_parameters) != clone_value) return false;
+    }
+    return true;
+}
+
+fn sameMappedOptionalValue(
+    source: ?ir.ValueId,
+    clone: ?ir.ValueId,
+    source_parameters: []const ir.ValueId,
+    clone_parameters: []const ir.ValueId,
+) bool {
+    if (source == null or clone == null) return source == null and clone == null;
+    return remapValue(source.?, source_parameters, clone_parameters) == clone.?;
+}
+
+fn sameOptionalString(left: ?[]const u8, right: ?[]const u8) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return std.mem.eql(u8, left.?, right.?);
+}
+
+fn sameType(left: ir.ValueType, right: ir.ValueType) bool {
+    return left.kind == right.kind and left.bit_width == right.bit_width and left.signed == right.signed;
 }
