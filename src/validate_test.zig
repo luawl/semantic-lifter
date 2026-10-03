@@ -3,6 +3,70 @@ const lifter = @import("semantic_lifter");
 const ir = lifter.ir;
 const validation = lifter.validate;
 
+const entry_binding_fixture = struct {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const block_id = ir.BlockId.fromIndex(0);
+    const captured_first = ir.ValueId.fromIndex(0);
+    const captured_second = ir.ValueId.fromIndex(1);
+    const place_first = ir.PlaceId.fromIndex(0);
+    const place_second = ir.PlaceId.fromIndex(1);
+    const capture_value_first = ir.CaptureId.fromIndex(0);
+    const capture_value_second = ir.CaptureId.fromIndex(1);
+    const capture_place_first = ir.CaptureId.fromIndex(2);
+    const capture_place_second = ir.CaptureId.fromIndex(3);
+    const external_value = ir.ExternalBindingId.fromIndex(0);
+    const external_place = ir.ExternalBindingId.fromIndex(1);
+    const proof = ir.EvidenceId.fromIndex(0);
+
+    const values = [_]ir.Value{
+        .{ .id = captured_first, .function = function_id, .type = .integer, .name_hint = "captured_first", .origin = .{ .capture = capture_value_first } },
+        .{ .id = captured_second, .function = function_id, .type = .integer, .name_hint = "captured_second", .origin = .{ .capture = capture_value_second } },
+    };
+    const places = [_]ir.Place{
+        .{ .id = place_first, .function = function_id, .type = .integer, .name_hint = "place_first", .origin = .{ .capture = capture_place_first }, .evidence = &.{proof} },
+        .{ .id = place_second, .function = function_id, .type = .integer, .name_hint = "place_second", .origin = .{ .capture = capture_place_second }, .evidence = &.{proof} },
+    };
+    const captures = [_]ir.Capture{
+        .{ .id = capture_value_first, .function = function_id, .kind = .{ .immutable_value = captured_first }, .evidence = &.{proof} },
+        .{ .id = capture_value_second, .function = function_id, .kind = .{ .immutable_value = captured_second }, .evidence = &.{proof} },
+        .{ .id = capture_place_first, .function = function_id, .kind = .{ .shared_place = place_first }, .evidence = &.{proof} },
+        .{ .id = capture_place_second, .function = function_id, .kind = .{ .shared_place = place_second }, .evidence = &.{proof} },
+    };
+    const external_bindings = [_]ir.ExternalBinding{
+        .{ .id = external_value, .kind = .immutable_value, .type = .integer, .evidence = &.{proof} },
+        .{ .id = external_place, .kind = .shared_place, .type = .integer, .evidence = &.{proof} },
+    };
+    const entry_bindings = [_]ir.ExternalBindingId{ external_value, external_value, external_place, external_place };
+    const blocks = [_]ir.Block{.{
+        .id = block_id,
+        .function = function_id,
+        .terminator = .{ .return_values = &.{ captured_first, captured_second } },
+        .evidence = &.{proof},
+    }};
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .name_hint = "entry",
+        .captures = &.{ capture_value_first, capture_value_second, capture_place_first, capture_place_second },
+        .blocks = &.{block_id},
+        .entry_block = block_id,
+        .evidence = &.{proof},
+    }};
+    const evidence = [_]ir.Evidence{.{ .id = proof, .kind = .source_span, .locator = "fixture:entry-external-bindings" }};
+    const program: ir.Program = .{
+        .program_id = "entry-external-bindings",
+        .entry_function = function_id,
+        .entry_bindings = &entry_bindings,
+        .external_bindings = &external_bindings,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+        .places = &places,
+        .captures = &captures,
+        .evidence = &evidence,
+    };
+};
+
 test "branch conditions admit every scalar Luau truthiness domain" {
     const function_id = ir.FunctionId.fromIndex(0);
     const entry_id = ir.BlockId.fromIndex(0);
@@ -744,4 +808,676 @@ test "solver division requires an exact nonzero guard in symbolic queries" {
     var wrong_remainder_mode_report = try validation.validate(std.testing.allocator, &program, .core);
     defer wrong_remainder_mode_report.deinit();
     try std.testing.expect(wrong_remainder_mode_report.contains(.solver_sort_mismatch));
+}
+
+test "fixed-width integer values map to matching solver bit-vectors" {
+    const fixture = lifter.fixtures.arithmetic_module;
+    const u32_type: ir.ValueType = .{ .kind = .integer, .bit_width = 32, .signed = false };
+    var values = fixture.values;
+    values[fixture.v_factor.index()].type = u32_type;
+    const bv32: ir.SolverSort = .{ .kind = .bit_vector, .bit_width = 32 };
+    var terms = [_]ir.SolverTerm{
+        .{ .id = ir.SolverTermId.fromIndex(0), .sort = bv32, .operation = .{ .value = fixture.v_factor } },
+        .{ .id = ir.SolverTermId.fromIndex(1), .sort = bv32, .operation = .{ .bit_vector_literal = .{ .value = "2", .bit_width = 32 } } },
+        .{ .id = ir.SolverTermId.fromIndex(2), .sort = .{ .kind = .boolean }, .operation = .{ .binary = .{
+            .operator = .equal,
+            .left = ir.SolverTermId.fromIndex(0),
+            .right = ir.SolverTermId.fromIndex(1),
+        } } },
+    };
+    const query: ir.SolverQuery = .{ .id = ir.QueryId.fromIndex(0), .kind = .prove_true, .goal = ir.SolverTermId.fromIndex(2) };
+    var program = fixture.program;
+    program.values = &values;
+    program.solver_terms = &terms;
+    program.queries = &.{query};
+
+    var report = try validation.validate(std.testing.allocator, &program, .core);
+    defer report.deinit();
+    try std.testing.expect(!report.contains(.solver_sort_mismatch));
+    try std.testing.expectEqual(ir.SolverResolution.proved, lifter.solver.solve(&program, query));
+
+    terms[0].sort.signed = true;
+    var mismatch_report = try validation.validate(std.testing.allocator, &program, .core);
+    defer mismatch_report.deinit();
+    try std.testing.expect(mismatch_report.contains(.solver_sort_mismatch));
+}
+
+test "wide bit-vector models remain typed solver-neutral artifacts" {
+    const fixture = lifter.fixtures.arithmetic_module;
+    var values = fixture.values;
+    values[fixture.v_left.index()].type = .dynamic;
+    const bv128: ir.SolverSort = .{ .kind = .bit_vector, .bit_width = 128 };
+    const terms = [_]ir.SolverTerm{
+        .{ .id = ir.SolverTermId.fromIndex(0), .sort = bv128, .operation = .{ .value = fixture.v_left } },
+        .{ .id = ir.SolverTermId.fromIndex(1), .sort = bv128, .operation = .{ .bit_vector_literal = .{
+            .value = "340282366920938463463374607431768211455",
+            .bit_width = 128,
+        } } },
+        .{ .id = ir.SolverTermId.fromIndex(2), .sort = .{ .kind = .boolean }, .operation = .{ .binary = .{
+            .operator = .equal,
+            .left = ir.SolverTermId.fromIndex(0),
+            .right = ir.SolverTermId.fromIndex(1),
+        } } },
+    };
+    const queries = [_]ir.SolverQuery{.{
+        .id = ir.QueryId.fromIndex(0),
+        .kind = .find_model,
+        .goal = ir.SolverTermId.fromIndex(2),
+    }};
+    var bindings = [_]ir.SolverModelBinding{.{
+        .term = ir.SolverTermId.fromIndex(0),
+        .value = .{ .bit_vector = .{
+            .value = "340282366920938463463374607431768211455",
+            .bit_width = 128,
+        } },
+    }};
+    const models = [_]ir.SolverModel{.{
+        .id = ir.SolverModelId.fromIndex(0),
+        .query = ir.QueryId.fromIndex(0),
+        .bindings = &bindings,
+    }};
+    var program = fixture.program;
+    program.values = &values;
+    program.solver_terms = &terms;
+    program.queries = &queries;
+    program.solver_models = &models;
+
+    var valid_report = try validation.validate(std.testing.allocator, &program, .core);
+    defer valid_report.deinit();
+    try std.testing.expect(!valid_report.contains(.invalid_solver_model_value));
+    try std.testing.expect(!valid_report.contains(.irrelevant_solver_model_term));
+    try std.testing.expect(!valid_report.contains(.contradictory_solver_model));
+    try std.testing.expect(!valid_report.contains(.incomplete_solver_model));
+
+    bindings[0].value.bit_vector.value = "340282366920938463463374607431768211456";
+    var overflow_report = try validation.validate(std.testing.allocator, &program, .core);
+    defer overflow_report.deinit();
+    try std.testing.expect(overflow_report.contains(.invalid_solver_model_value));
+}
+
+test "serialized solver models replay owning query semantics" {
+    const fixture = lifter.fixtures.arithmetic_module;
+    const terms = [_]ir.SolverTerm{
+        .{ .id = ir.SolverTermId.fromIndex(0), .sort = .{ .kind = .integer }, .operation = .{ .value = fixture.v_left } },
+        .{ .id = ir.SolverTermId.fromIndex(1), .sort = .{ .kind = .integer }, .operation = .{ .integer_literal = "7" } },
+        .{ .id = ir.SolverTermId.fromIndex(2), .sort = .{ .kind = .boolean }, .operation = .{ .binary = .{
+            .operator = .equal,
+            .left = ir.SolverTermId.fromIndex(0),
+            .right = ir.SolverTermId.fromIndex(1),
+        } } },
+    };
+    const queries = [_]ir.SolverQuery{.{
+        .id = ir.QueryId.fromIndex(0),
+        .kind = .find_model,
+        .goal = ir.SolverTermId.fromIndex(2),
+    }};
+    const bindings = [_]ir.SolverModelBinding{.{
+        .term = ir.SolverTermId.fromIndex(0),
+        .value = .{ .integer = "7" },
+    }};
+    const models = [_]ir.SolverModel{.{
+        .id = ir.SolverModelId.fromIndex(0),
+        .query = ir.QueryId.fromIndex(0),
+        .bindings = &bindings,
+    }};
+    var program = fixture.program;
+    program.solver_terms = &terms;
+    program.queries = &queries;
+    program.solver_models = &models;
+
+    const encoded = try lifter.codec.encodeAlloc(std.testing.allocator, &program);
+    defer std.testing.allocator.free(encoded);
+    var parsed = try lifter.codec.parse(std.testing.allocator, encoded);
+    defer parsed.deinit();
+    var valid_report = try validation.validate(std.testing.allocator, &parsed.value, .core);
+    defer valid_report.deinit();
+    try std.testing.expect(!valid_report.contains(.contradictory_solver_model));
+    try std.testing.expect(!valid_report.contains(.incomplete_solver_model));
+
+    const tampered_bindings = try std.testing.allocator.dupe(ir.SolverModelBinding, parsed.value.solver_models[0].bindings);
+    defer std.testing.allocator.free(tampered_bindings);
+    tampered_bindings[0].value = .{ .integer = "8" };
+    const tampered_models = try std.testing.allocator.dupe(ir.SolverModel, parsed.value.solver_models);
+    defer std.testing.allocator.free(tampered_models);
+    tampered_models[0].bindings = tampered_bindings;
+    var tampered = parsed.value;
+    tampered.solver_models = tampered_models;
+    var tampered_report = try validation.validate(std.testing.allocator, &tampered, .core);
+    defer tampered_report.deinit();
+    try std.testing.expect(tampered_report.contains(.contradictory_solver_model));
+    var found_model_index = false;
+    for (tampered_report.diagnostics.items) |diagnostic| {
+        if (diagnostic.code != .contradictory_solver_model) continue;
+        try std.testing.expectEqual(@as(?u32, 0), diagnostic.entity_index);
+        found_model_index = true;
+    }
+    try std.testing.expect(found_model_index);
+}
+
+test "direct vararg pack return satisfies readable admission" {
+    const fixtures = lifter.fixtures;
+    var report = try validation.validate(std.testing.allocator, &fixtures.variadic_identity_module.program, .readable_luau);
+    defer report.deinit();
+    try std.testing.expect(report.isClean());
+}
+
+test "value-pack producers form a canonical dominance-safe bijection" {
+    const fixtures = lifter.fixtures;
+
+    {
+        const reordered = [_]ir.InstructionId{
+            fixtures.open_pack_adjust_module.i_get,
+            fixtures.open_pack_adjust_module.i_adjust,
+            fixtures.open_pack_adjust_module.i_call,
+        };
+        var blocks = fixtures.open_pack_adjust_module.blocks;
+        blocks[0].instructions = &reordered;
+        var program = fixtures.open_pack_adjust_module.program;
+        program.blocks = &blocks;
+        var report = try validation.validate(std.testing.allocator, &program, .core);
+        defer report.deinit();
+        try std.testing.expect(report.contains(.value_pack_used_before_definition));
+    }
+
+    {
+        var instructions = fixtures.open_pack_adjust_module.instructions;
+        instructions[1].pack_result = null;
+        var program = fixtures.open_pack_adjust_module.program;
+        program.instructions = &instructions;
+        var report = try validation.validate(std.testing.allocator, &program, .core);
+        defer report.deinit();
+        try std.testing.expect(report.contains(.invalid_instruction_pack_result));
+        try std.testing.expect(report.contains(.missing_value_pack_definition));
+    }
+
+    {
+        var instructions = fixtures.open_pack_adjust_module.instructions;
+        instructions[0].pack_result = fixtures.open_pack_adjust_module.p_results;
+        var program = fixtures.open_pack_adjust_module.program;
+        program.instructions = &instructions;
+        var report = try validation.validate(std.testing.allocator, &program, .core);
+        defer report.deinit();
+        try std.testing.expect(report.contains(.duplicate_value_pack_definition));
+        try std.testing.expect(report.contains(.instruction_pack_result_origin_mismatch));
+    }
+
+    {
+        var instructions = fixtures.open_pack_adjust_module.instructions;
+        instructions[2].effects = .{ .precision = .unknown };
+        var program = fixtures.open_pack_adjust_module.program;
+        program.instructions = &instructions;
+        var report = try validation.validate(std.testing.allocator, &program, .core);
+        defer report.deinit();
+        try std.testing.expect(report.contains(.invalid_pack_adjustment_effects));
+    }
+
+    {
+        const gap_id = ir.InstructionId.fromIndex(3);
+        const unused_id = ir.ValueId.fromIndex(2);
+        var values = fixtures.open_pack_adjust_module.values ++ [_]ir.Value{.{
+            .id = unused_id,
+            .function = fixtures.open_pack_adjust_module.f_entry,
+            .origin = .{ .instruction_result = .{ .instruction = gap_id, .index = 0 } },
+        }};
+        var instructions = fixtures.open_pack_adjust_module.instructions ++ [_]ir.Instruction{.{
+            .id = gap_id,
+            .block = fixtures.open_pack_adjust_module.b_entry,
+            .operation = .{ .constant = .{ .nil_value = {} } },
+            .results = &.{unused_id},
+            .effects = .pure,
+            .evidence = &.{fixtures.open_pack_adjust_module.proof},
+        }};
+        const reordered = [_]ir.InstructionId{
+            fixtures.open_pack_adjust_module.i_get,
+            fixtures.open_pack_adjust_module.i_call,
+            gap_id,
+            fixtures.open_pack_adjust_module.i_adjust,
+        };
+        var blocks = fixtures.open_pack_adjust_module.blocks;
+        blocks[0].instructions = &reordered;
+        var program = fixtures.open_pack_adjust_module.program;
+        program.values = &values;
+        program.instructions = &instructions;
+        program.blocks = &blocks;
+        var core_report = try validation.validate(std.testing.allocator, &program, .core);
+        defer core_report.deinit();
+        try std.testing.expect(core_report.isClean());
+        var readable_report = try validation.validate(std.testing.allocator, &program, .readable_luau);
+        defer readable_report.deinit();
+        try std.testing.expect(readable_report.isClean());
+    }
+}
+
+test "readable capability decisions occur at admission" {
+    const fixtures = lifter.fixtures;
+
+    {
+        var functions = fixtures.arithmetic_module.functions;
+        functions[0].is_variadic = true;
+        var program = fixtures.arithmetic_module.program;
+        program.functions = &functions;
+        var core_report = try validation.validate(std.testing.allocator, &program, .core);
+        defer core_report.deinit();
+        try std.testing.expect(core_report.isClean());
+        var readable_report = try validation.validate(std.testing.allocator, &program, .readable_luau);
+        defer readable_report.deinit();
+        try std.testing.expect(readable_report.isClean());
+
+        const orphan_packs = [_]ir.ValuePack{.{
+            .id = ir.ValuePackId.fromIndex(0),
+            .function = functions[0].id,
+            .origin = .{ .varargs = functions[0].id },
+            .evidence = &.{fixtures.arithmetic_module.proof},
+        }};
+        var orphan_program = program;
+        orphan_program.value_packs = &orphan_packs;
+        var orphan_report = try validation.validate(std.testing.allocator, &orphan_program, .core);
+        defer orphan_report.deinit();
+        try std.testing.expect(orphan_report.contains(.missing_value_pack_definition));
+    }
+
+    {
+        var core_report = try validation.validate(std.testing.allocator, &fixtures.immutable_closure_module.program, .core);
+        defer core_report.deinit();
+        try std.testing.expect(core_report.isClean());
+        var readable_report = try validation.validate(std.testing.allocator, &fixtures.immutable_closure_module.program, .readable_luau);
+        defer readable_report.deinit();
+        try std.testing.expect(readable_report.isClean());
+    }
+
+    {
+        var core_report = try validation.validate(std.testing.allocator, &fixtures.shared_place_closure_module.program, .core);
+        defer core_report.deinit();
+        try std.testing.expect(core_report.isClean());
+        var readable_report = try validation.validate(std.testing.allocator, &fixtures.shared_place_closure_module.program, .readable_luau);
+        defer readable_report.deinit();
+        try std.testing.expect(readable_report.isClean());
+    }
+
+    {
+        var core_report = try validation.validate(std.testing.allocator, &fixtures.open_pack_adjust_module.program, .core);
+        defer core_report.deinit();
+        try std.testing.expect(core_report.isClean());
+        var readable_report = try validation.validate(std.testing.allocator, &fixtures.open_pack_adjust_module.program, .readable_luau);
+        defer readable_report.deinit();
+        try std.testing.expect(readable_report.isClean());
+    }
+
+    {
+        var blocks = fixtures.absolute_value_module.blocks;
+        blocks[2].terminator = .{ .jump = .{ .target = fixtures.absolute_value_module.b_nonnegative } };
+        blocks[3].terminator = .{ .branch = .{
+            .condition = fixtures.absolute_value_module.v_is_negative,
+            .then_edge = .{ .target = fixtures.absolute_value_module.b_nonnegative },
+            .else_edge = .{ .target = fixtures.absolute_value_module.b_negative },
+        } };
+        var program = fixtures.absolute_value_module.program;
+        program.blocks = &blocks;
+        var core_report = try validation.validate(std.testing.allocator, &program, .core);
+        defer core_report.deinit();
+        try std.testing.expect(core_report.isClean());
+        var readable_report = try validation.validate(std.testing.allocator, &program, .readable_luau);
+        defer readable_report.deinit();
+        // Readable-profile admission can preserve an unstructured CFG through
+        // the emitter's explicit dispatcher fallback. Failure to build a
+        // structured plan is therefore not itself an admission error.
+        try std.testing.expect(readable_report.isClean());
+
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const normalized = try lifter.irreducible_normalize.normalizeInArena(arena.allocator(), &program);
+        try std.testing.expectEqual(@as(usize, 1), normalized.cloned_blocks);
+        try std.testing.expectEqual(@as(usize, 0), normalized.cloned_instructions);
+        try std.testing.expectEqual(@as(usize, 0), normalized.cloned_values);
+        const clone_id = ir.BlockId.fromIndex(program.blocks.len);
+        try std.testing.expectEqual(clone_id, normalized.program.blocks[clone_id.index()].terminator.branch.then_edge.target);
+        var normalized_report = try validation.validate(std.testing.allocator, &normalized.program, .readable_luau);
+        defer normalized_report.deinit();
+        try std.testing.expect(normalized_report.isClean());
+    }
+}
+
+test "core ownership lists are complete bijections" {
+    const fixtures = lifter.fixtures;
+    const no_blocks = [_]ir.BlockId{};
+    const duplicate_blocks = [_]ir.BlockId{
+        fixtures.arithmetic_module.b_add,
+        fixtures.arithmetic_module.b_add,
+    };
+    var functions = fixtures.arithmetic_module.functions;
+    functions[0].blocks = &no_blocks;
+    functions[1].blocks = &duplicate_blocks;
+
+    const no_instructions = [_]ir.InstructionId{};
+    const duplicate_instructions = [_]ir.InstructionId{
+        fixtures.arithmetic_module.i_sum,
+        fixtures.arithmetic_module.i_sum,
+        fixtures.arithmetic_module.i_factor,
+        fixtures.arithmetic_module.i_result,
+    };
+    var blocks = fixtures.arithmetic_module.blocks;
+    blocks[0].instructions = &no_instructions;
+    blocks[1].instructions = &duplicate_instructions;
+
+    var program = fixtures.arithmetic_module.program;
+    program.functions = &functions;
+    program.blocks = &blocks;
+    var report = try validation.validate(std.testing.allocator, &program, .core);
+    defer report.deinit();
+    try std.testing.expect(report.contains(.unlisted_function_block));
+    try std.testing.expect(report.contains(.duplicate_function_block));
+    try std.testing.expect(report.contains(.unlisted_block_instruction));
+    try std.testing.expect(report.contains(.duplicate_block_instruction));
+}
+
+test "SSA uses must follow and be dominated by their definitions" {
+    const fixtures = lifter.fixtures;
+
+    {
+        const reordered = [_]ir.InstructionId{
+            fixtures.arithmetic_module.i_result,
+            fixtures.arithmetic_module.i_sum,
+            fixtures.arithmetic_module.i_factor,
+        };
+        var blocks = fixtures.arithmetic_module.blocks;
+        blocks[1].instructions = &reordered;
+        var program = fixtures.arithmetic_module.program;
+        program.blocks = &blocks;
+        var report = try validation.validate(std.testing.allocator, &program, .core);
+        defer report.deinit();
+        try std.testing.expect(report.contains(.value_used_before_definition));
+    }
+
+    {
+        const sibling_value = [_]ir.ValueId{fixtures.absolute_value_module.v_negated};
+        var blocks = fixtures.absolute_value_module.blocks;
+        blocks[3].terminator = .{ .jump = .{
+            .target = fixtures.absolute_value_module.b_join,
+            .arguments = &sibling_value,
+        } };
+        var program = fixtures.absolute_value_module.program;
+        program.blocks = &blocks;
+        var report = try validation.validate(std.testing.allocator, &program, .core);
+        defer report.deinit();
+        try std.testing.expect(report.contains(.non_dominating_value_use));
+    }
+
+    {
+        var blocks = fixtures.absolute_value_module.blocks;
+        blocks[fixtures.absolute_value_module.b_nonnegative.index()].terminator = .{ .throw_error = .{
+            .value = fixtures.absolute_value_module.v_input,
+            .level = 0,
+            .dynamic_level = fixtures.absolute_value_module.v_negated,
+        } };
+        var program = fixtures.absolute_value_module.program;
+        program.blocks = &blocks;
+        var report = try validation.validate(std.testing.allocator, &program, .core);
+        defer report.deinit();
+        try std.testing.expect(report.contains(.non_dominating_value_use));
+    }
+}
+
+test "unreachable valid blocks can be omitted from readable emission" {
+    const fixtures = lifter.fixtures;
+    var blocks = fixtures.absolute_value_module.blocks;
+    var branch = blocks[1].terminator.branch;
+    branch.else_edge.target = fixtures.absolute_value_module.b_negative;
+    blocks[1].terminator = .{ .branch = branch };
+    var program = fixtures.absolute_value_module.program;
+    program.blocks = &blocks;
+
+    var core_report = try validation.validate(std.testing.allocator, &program, .core);
+    defer core_report.deinit();
+    try std.testing.expect(core_report.isClean());
+
+    var readable_report = try validation.validate(std.testing.allocator, &program, .readable_luau);
+    defer readable_report.deinit();
+    try std.testing.expect(!readable_report.contains(.unreachable_readable_block));
+    try std.testing.expect(readable_report.isClean());
+}
+
+test "readable admission blocks unbound entry, error, and bit-operation semantics" {
+    const fixtures = lifter.fixtures;
+
+    {
+        const entry_parameters = [_]ir.ValueId{fixtures.arithmetic_module.v_export};
+        var blocks = fixtures.arithmetic_module.blocks;
+        blocks[0].parameters = &entry_parameters;
+        var program = fixtures.arithmetic_module.program;
+        program.blocks = &blocks;
+        var report = try validation.validate(std.testing.allocator, &program, .core);
+        defer report.deinit();
+        try std.testing.expect(report.contains(.entry_block_has_parameters));
+    }
+
+    {
+        var blocks = fixtures.absolute_value_module.blocks;
+        blocks[4].terminator = .{ .unreachable_block = {} };
+        var program = fixtures.absolute_value_module.program;
+        program.blocks = &blocks;
+        var core_report = try validation.validate(std.testing.allocator, &program, .core);
+        defer core_report.deinit();
+        try std.testing.expect(core_report.isClean());
+        var readable_report = try validation.validate(std.testing.allocator, &program, .readable_luau);
+        defer readable_report.deinit();
+        try std.testing.expect(readable_report.contains(.unsupported_readable_terminator));
+    }
+
+    {
+        var instructions = fixtures.arithmetic_module.instructions;
+        instructions[1].operation.binary.operator = .bit_and;
+        var program = fixtures.arithmetic_module.program;
+        program.instructions = &instructions;
+        var core_report = try validation.validate(std.testing.allocator, &program, .core);
+        defer core_report.deinit();
+        try std.testing.expect(core_report.isClean());
+        var readable_report = try validation.validate(std.testing.allocator, &program, .readable_luau);
+        defer readable_report.deinit();
+        try std.testing.expect(readable_report.contains(.unsupported_readable_bit_operation));
+    }
+
+    {
+        const u32_type: ir.ValueType = .{ .kind = .integer, .bit_width = 32, .signed = false };
+        var values = fixtures.arithmetic_module.values;
+        values[1].type = u32_type;
+        values[2].type = u32_type;
+        values[3].type = u32_type;
+        var instructions = fixtures.arithmetic_module.instructions;
+        instructions[1].operation = .{ .binary = .{
+            .operator = .bit_and,
+            .left = fixtures.arithmetic_module.v_left,
+            .right = fixtures.arithmetic_module.v_right,
+            .mode = .primitive,
+        } };
+        var program = fixtures.arithmetic_module.program;
+        program.values = &values;
+        program.instructions = &instructions;
+        var readable_report = try validation.validate(std.testing.allocator, &program, .readable_luau);
+        defer readable_report.deinit();
+        try std.testing.expect(readable_report.isClean());
+    }
+}
+
+test "shift behavior is required only on runtime shift operations" {
+    const fixture = lifter.fixtures.arithmetic_module;
+    const u32_type: ir.ValueType = .{ .kind = .integer, .bit_width = 32, .signed = false };
+    var values = fixture.values;
+    values[fixture.v_left.index()].type = u32_type;
+    values[fixture.v_right.index()].type = u32_type;
+    values[fixture.v_sum.index()].type = u32_type;
+    var instructions = fixture.instructions;
+    instructions[fixture.i_sum.index()].operation = .{ .binary = .{
+        .operator = .shift_left,
+        .left = fixture.v_left,
+        .right = fixture.v_right,
+        .mode = .primitive,
+    } };
+    var program = fixture.program;
+    program.values = &values;
+    program.instructions = &instructions;
+
+    var missing = try validation.validate(std.testing.allocator, &program, .core);
+    defer missing.deinit();
+    try std.testing.expect(missing.contains(.missing_shift_behavior));
+    try std.testing.expect(!missing.contains(.unexpected_shift_behavior));
+
+    instructions[fixture.i_sum.index()].operation.binary.shift_behavior = .zero_saturating;
+    var explicit = try validation.validate(std.testing.allocator, &program, .core);
+    defer explicit.deinit();
+    try std.testing.expect(explicit.isClean());
+
+    instructions[fixture.i_sum.index()].operation.binary.operator = .bit_and;
+    var unexpected = try validation.validate(std.testing.allocator, &program, .core);
+    defer unexpected.deinit();
+    try std.testing.expect(unexpected.contains(.unexpected_shift_behavior));
+    try std.testing.expect(!unexpected.contains(.missing_shift_behavior));
+}
+
+test "numeric type descriptors are canonical" {
+    const fixtures = lifter.fixtures;
+    var values = fixtures.arithmetic_module.values;
+    values[1].type = .{ .kind = .integer, .bit_width = 0, .signed = false };
+    var program = fixtures.arithmetic_module.program;
+    program.values = &values;
+    var report = try validation.validate(std.testing.allocator, &program, .core);
+    defer report.deinit();
+    try std.testing.expect(report.contains(.invalid_value_type));
+}
+
+test "operation results cannot claim contradictory semantic types" {
+    const fixtures = lifter.fixtures;
+    var values = fixtures.arithmetic_module.values;
+    values[fixtures.arithmetic_module.v_sum.index()].type = .{ .kind = .string };
+    var program = fixtures.arithmetic_module.program;
+    program.values = &values;
+    var report = try validation.validate(std.testing.allocator, &program, .core);
+    defer report.deinit();
+    try std.testing.expect(report.contains(.operation_result_type_mismatch));
+}
+
+test "fixed-width integer constants must fit their declared result type" {
+    const fixture = lifter.fixtures.arithmetic_module;
+    var values = fixture.values;
+    values[fixture.v_factor.index()].type = .{ .kind = .integer, .bit_width = 8, .signed = false };
+    var instructions = fixture.instructions;
+    var program = fixture.program;
+    program.values = &values;
+    program.instructions = &instructions;
+
+    instructions[fixture.i_factor.index()].operation = .{ .constant = .{ .integer = "-1" } };
+    var negative_report = try validation.validate(std.testing.allocator, &program, .core);
+    defer negative_report.deinit();
+    try std.testing.expect(negative_report.contains(.operation_result_type_mismatch));
+
+    instructions[fixture.i_factor.index()].operation = .{ .constant = .{ .integer = "256" } };
+    var overflow_report = try validation.validate(std.testing.allocator, &program, .core);
+    defer overflow_report.deinit();
+    try std.testing.expect(overflow_report.contains(.operation_result_type_mismatch));
+
+    instructions[fixture.i_factor.index()].operation = .{ .constant = .{ .integer = "255" } };
+    var boundary_report = try validation.validate(std.testing.allocator, &program, .core);
+    defer boundary_report.deinit();
+    try std.testing.expect(!boundary_report.contains(.operation_result_type_mismatch));
+}
+
+test "core integer constants support declared widths beyond host integers" {
+    const fixture = lifter.fixtures.arithmetic_module;
+    var values = fixture.values;
+    values[fixture.v_factor.index()].type = .{ .kind = .integer, .bit_width = 128, .signed = false };
+    var instructions = fixture.instructions;
+    instructions[fixture.i_factor.index()].operation = .{ .constant = .{
+        .integer = "340282366920938463463374607431768211455",
+    } };
+    var program = fixture.program;
+    program.values = &values;
+    program.instructions = &instructions;
+
+    var core_report = try validation.validate(std.testing.allocator, &program, .core);
+    defer core_report.deinit();
+    try std.testing.expect(!core_report.contains(.invalid_integer_literal));
+    try std.testing.expect(!core_report.contains(.operation_result_type_mismatch));
+
+    var readable_report = try validation.validate(std.testing.allocator, &program, .readable_luau);
+    defer readable_report.deinit();
+    try std.testing.expect(readable_report.contains(.inexact_luau_integer_literal));
+}
+
+test "place writes must preserve the place value type" {
+    const fixture = lifter.fixtures.shared_place_closure_module;
+    var values = fixture.values;
+    values[fixture.v_start.index()].type = .string;
+    var program = fixture.program;
+    program.values = &values;
+
+    var report = try validation.validate(std.testing.allocator, &program, .core);
+    defer report.deinit();
+    try std.testing.expect(report.contains(.place_value_type_mismatch));
+}
+
+test "obligation queries cover only referenced external bindings" {
+    const fixture = entry_binding_fixture;
+    const constant_terms = [_]ir.SolverTerm{.{
+        .id = ir.SolverTermId.fromIndex(0),
+        .sort = .{ .kind = .boolean },
+        .operation = .{ .boolean_literal = true },
+    }};
+    const constant_queries = [_]ir.SolverQuery{.{
+        .id = ir.QueryId.fromIndex(0),
+        .kind = .prove_true,
+        .goal = ir.SolverTermId.fromIndex(0),
+    }};
+    var obligations = [_]ir.Obligation{.{
+        .id = ir.ObligationId.fromIndex(0),
+        .kind = .unresolved_identity,
+        .subject = .{ .external_binding = fixture.external_value },
+        .status = .open,
+        .blocks_profile = .readable_luau,
+        .detail = "the query must depend on this entry binding",
+        .evidence = &.{fixture.proof},
+        .requirement = ir.ObligationRequirement.fromQuery(constant_queries[0]),
+        .query = ir.QueryId.fromIndex(0),
+    }};
+    var program = fixture.program;
+    program.solver_terms = &constant_terms;
+    program.queries = &constant_queries;
+    program.obligations = &obligations;
+
+    var unrelated = try validation.validate(std.testing.allocator, &program, .core);
+    defer unrelated.deinit();
+    try std.testing.expect(unrelated.contains(.obligation_query_subject_mismatch));
+
+    const dependent_terms = [_]ir.SolverTerm{
+        .{
+            .id = ir.SolverTermId.fromIndex(0),
+            .sort = .{ .kind = .integer },
+            .operation = .{ .value = fixture.captured_first },
+        },
+        .{
+            .id = ir.SolverTermId.fromIndex(1),
+            .sort = .{ .kind = .integer },
+            .operation = .{ .integer_literal = "0" },
+        },
+        .{
+            .id = ir.SolverTermId.fromIndex(2),
+            .sort = .{ .kind = .boolean },
+            .operation = .{ .binary = .{
+                .operator = .equal,
+                .left = ir.SolverTermId.fromIndex(0),
+                .right = ir.SolverTermId.fromIndex(1),
+            } },
+        },
+    };
+    const dependent_queries = [_]ir.SolverQuery{.{
+        .id = ir.QueryId.fromIndex(0),
+        .kind = .prove_true,
+        .goal = ir.SolverTermId.fromIndex(2),
+    }};
+    obligations[0].requirement = ir.ObligationRequirement.fromQuery(dependent_queries[0]);
+    program.solver_terms = &dependent_terms;
+    program.queries = &dependent_queries;
+
+    var related = try validation.validate(std.testing.allocator, &program, .core);
+    defer related.deinit();
+    try std.testing.expect(!related.contains(.obligation_query_subject_mismatch));
+    try std.testing.expect(related.isClean());
 }
