@@ -1481,3 +1481,689 @@ test "obligation queries cover only referenced external bindings" {
     try std.testing.expect(!related.contains(.obligation_query_subject_mismatch));
     try std.testing.expect(related.isClean());
 }
+
+test "entry external bindings admit explicit value and place aliases" {
+    const fixture = entry_binding_fixture;
+    var report = try validation.validate(std.testing.allocator, &fixture.program, .core);
+    defer report.deinit();
+    try std.testing.expect(report.isClean());
+    try std.testing.expectEqual(fixture.entry_bindings[0], fixture.entry_bindings[1]);
+    try std.testing.expectEqual(fixture.entry_bindings[2], fixture.entry_bindings[3]);
+}
+
+test "entry capture mappings report missing invalid and unused external slots" {
+    const fixture = entry_binding_fixture;
+
+    var missing_program = fixture.program;
+    missing_program.entry_bindings = &.{};
+    var missing = try validation.validate(std.testing.allocator, &missing_program, .core);
+    defer missing.deinit();
+    try std.testing.expect(missing.contains(.entry_capture_binding_arity_mismatch));
+    try std.testing.expect(missing.contains(.unlisted_external_binding));
+    try std.testing.expect(!missing.contains(.capture_without_lexical_parent));
+
+    const invalid_bindings = [_]ir.ExternalBindingId{
+        fixture.external_value,
+        fixture.external_value,
+        fixture.external_place,
+        ir.ExternalBindingId.fromIndex(9),
+    };
+    var invalid_program = fixture.program;
+    invalid_program.entry_bindings = &invalid_bindings;
+    var invalid = try validation.validate(std.testing.allocator, &invalid_program, .core);
+    defer invalid.deinit();
+    try std.testing.expect(invalid.contains(.invalid_entry_capture_binding));
+
+    const bindings_with_unused = fixture.external_bindings ++ [_]ir.ExternalBinding{.{
+        .id = ir.ExternalBindingId.fromIndex(2),
+        .kind = .immutable_value,
+        .type = .integer,
+        .evidence = &.{fixture.proof},
+    }};
+    var unused_program = fixture.program;
+    unused_program.external_bindings = &bindings_with_unused;
+    var unused = try validation.validate(std.testing.allocator, &unused_program, .core);
+    defer unused.deinit();
+    try std.testing.expect(unused.contains(.unlisted_external_binding));
+}
+
+test "entry capture mappings enforce kind and directional type contracts" {
+    const fixture = entry_binding_fixture;
+    const wrong_kind = [_]ir.ExternalBindingId{
+        fixture.external_place,
+        fixture.external_value,
+        fixture.external_place,
+        fixture.external_place,
+    };
+    var wrong_kind_program = fixture.program;
+    wrong_kind_program.entry_bindings = &wrong_kind;
+    var kind_report = try validation.validate(std.testing.allocator, &wrong_kind_program, .core);
+    defer kind_report.deinit();
+    try std.testing.expect(kind_report.contains(.entry_capture_binding_kind_mismatch));
+
+    var wrong_types = fixture.external_bindings;
+    wrong_types[fixture.external_value.index()].type = .dynamic;
+    wrong_types[fixture.external_place.index()].type = .number;
+    var wrong_type_program = fixture.program;
+    wrong_type_program.external_bindings = &wrong_types;
+    var type_report = try validation.validate(std.testing.allocator, &wrong_type_program, .core);
+    defer type_report.deinit();
+    try std.testing.expect(type_report.contains(.entry_capture_binding_type_mismatch));
+
+    var malformed = fixture.external_bindings;
+    malformed[0].id = ir.ExternalBindingId.fromIndex(1);
+    malformed[0].type = .{ .kind = .integer };
+    var malformed_program = fixture.program;
+    malformed_program.external_bindings = &malformed;
+    var malformed_report = try validation.validate(std.testing.allocator, &malformed_program, .core);
+    defer malformed_report.deinit();
+    try std.testing.expect(malformed_report.contains(.noncanonical_external_binding_id));
+    try std.testing.expect(malformed_report.contains(.invalid_external_binding_type));
+}
+
+test "nonentry root captures remain ownerless" {
+    const fixture = entry_binding_fixture;
+    const second_function = ir.FunctionId.fromIndex(1);
+    const second_block = ir.BlockId.fromIndex(1);
+    const blocks = fixture.blocks ++ [_]ir.Block{.{
+        .id = second_block,
+        .function = second_function,
+        .terminator = .{ .return_values = &.{} },
+        .evidence = &.{fixture.proof},
+    }};
+    const functions = fixture.functions ++ [_]ir.Function{.{
+        .id = second_function,
+        .blocks = &.{second_block},
+        .entry_block = second_block,
+        .evidence = &.{fixture.proof},
+    }};
+    var program = fixture.program;
+    program.entry_function = second_function;
+    program.entry_bindings = &.{};
+    program.external_bindings = &.{};
+    program.functions = &functions;
+    program.blocks = &blocks;
+
+    var report = try validation.validate(std.testing.allocator, &program, .core);
+    defer report.deinit();
+    try std.testing.expect(report.contains(.capture_without_lexical_parent));
+}
+
+test "immutable closure bindings must match captured slot types" {
+    const fixture = lifter.fixtures.immutable_closure_module;
+    var values = fixture.values;
+    values[fixture.v_base.index()].type = .string;
+    var program = fixture.program;
+    program.values = &values;
+
+    var report = try validation.validate(std.testing.allocator, &program, .core);
+    defer report.deinit();
+    try std.testing.expect(report.contains(.closure_binding_type_mismatch));
+}
+
+test "shared-place closure bindings must match captured place types" {
+    const fixture = lifter.fixtures.shared_place_closure_module;
+    var values = fixture.values;
+    values[fixture.v_start.index()].type = .number;
+    var places = fixture.places;
+    places[fixture.p_state.index()].type = .number;
+    var program = fixture.program;
+    program.values = &values;
+    program.places = &places;
+
+    var report = try validation.validate(std.testing.allocator, &program, .core);
+    defer report.deinit();
+    try std.testing.expect(!report.contains(.place_value_type_mismatch));
+    try std.testing.expect(report.contains(.closure_binding_type_mismatch));
+}
+
+test "shared-place closure bindings are invariant rather than covariant" {
+    const fixture = lifter.fixtures.shared_place_closure_module;
+    var places = fixture.places;
+    places[fixture.p_captured_state.index()].type = .number;
+    var values = fixture.values;
+    values[fixture.v_current.index()].type = .number;
+    values[fixture.v_next.index()].type = .number;
+    var program = fixture.program;
+    program.places = &places;
+    program.values = &values;
+
+    var report = try validation.validate(std.testing.allocator, &program, .core);
+    defer report.deinit();
+    try std.testing.expect(report.contains(.closure_binding_type_mismatch));
+}
+
+test "copy and place reads allow only directional type widening" {
+    const arithmetic = lifter.fixtures.arithmetic_module;
+    var arithmetic_values = arithmetic.values;
+    arithmetic_values[arithmetic.v_sum.index()].type = .number;
+    arithmetic_values[arithmetic.v_result.index()].type = .number;
+    var arithmetic_instructions = arithmetic.instructions;
+    arithmetic_instructions[arithmetic.i_sum.index()].operation = .{ .copy = arithmetic.v_left };
+    var arithmetic_program = arithmetic.program;
+    arithmetic_program.values = &arithmetic_values;
+    arithmetic_program.instructions = &arithmetic_instructions;
+    var copy_report = try validation.validate(std.testing.allocator, &arithmetic_program, .core);
+    defer copy_report.deinit();
+    try std.testing.expect(!copy_report.contains(.operation_result_type_mismatch));
+
+    const shared = lifter.fixtures.shared_place_closure_module;
+    var shared_values = shared.values;
+    shared_values[shared.v_current.index()].type = .number;
+    shared_values[shared.v_next.index()].type = .number;
+    var shared_program = shared.program;
+    shared_program.values = &shared_values;
+    var read_report = try validation.validate(std.testing.allocator, &shared_program, .core);
+    defer read_report.deinit();
+    try std.testing.expect(!read_report.contains(.operation_result_type_mismatch));
+}
+
+test "CFG edge values must match their block parameter types" {
+    const fixture = lifter.fixtures.absolute_value_module;
+    var values = fixture.values;
+    values[fixture.v_absolute.index()].type = .{ .kind = .string };
+    var program = fixture.program;
+    program.values = &values;
+    var report = try validation.validate(std.testing.allocator, &program, .core);
+    defer report.deinit();
+    try std.testing.expect(report.contains(.edge_argument_type_mismatch));
+}
+
+test "solver sorts and certificates are independently auditable" {
+    const fixtures = lifter.fixtures;
+    const terms = [_]ir.SolverTerm{
+        .{ .id = ir.SolverTermId.fromIndex(0), .sort = .{ .kind = .boolean }, .operation = .{ .boolean_literal = true } },
+        .{ .id = ir.SolverTermId.fromIndex(1), .sort = .{ .kind = .integer }, .operation = .{ .integer_literal = "1" } },
+        .{ .id = ir.SolverTermId.fromIndex(2), .sort = .{ .kind = .integer }, .operation = .{ .binary = .{
+            .operator = .add,
+            .left = ir.SolverTermId.fromIndex(0),
+            .right = ir.SolverTermId.fromIndex(1),
+        } } },
+    };
+    const queries = [_]ir.SolverQuery{.{
+        .id = ir.QueryId.fromIndex(0),
+        .kind = .prove_true,
+        .goal = ir.SolverTermId.fromIndex(0),
+    }};
+    const certificates = [_]ir.SolverCertificate{
+        .{
+            .id = ir.CertificateId.fromIndex(0),
+            .query = ir.QueryId.fromIndex(0),
+            .engine = .internal_facts,
+            .resolution = .disproved,
+        },
+        .{
+            .id = ir.CertificateId.fromIndex(1),
+            .query = ir.QueryId.fromIndex(0),
+            .engine = .z3,
+            .resolution = .proved,
+        },
+    };
+    var program = fixtures.arithmetic_module.program;
+    program.solver_terms = &terms;
+    program.queries = &queries;
+    program.certificates = &certificates;
+
+    var report = try validation.validate(std.testing.allocator, &program, .core);
+    defer report.deinit();
+    try std.testing.expect(report.contains(.solver_sort_mismatch));
+    try std.testing.expect(report.contains(.certificate_replay_mismatch));
+    try std.testing.expect(report.contains(.certificate_without_proof));
+}
+
+test "solver models and unsat cores are typed query-bound artifacts" {
+    const fixture = lifter.fixtures.arithmetic_module;
+    const terms = [_]ir.SolverTerm{
+        .{ .id = ir.SolverTermId.fromIndex(0), .sort = .{ .kind = .integer }, .operation = .{ .value = fixture.v_left } },
+        .{ .id = ir.SolverTermId.fromIndex(1), .sort = .{ .kind = .integer }, .operation = .{ .integer_literal = "0" } },
+        .{ .id = ir.SolverTermId.fromIndex(2), .sort = .{ .kind = .boolean }, .operation = .{ .binary = .{ .operator = .greater, .left = ir.SolverTermId.fromIndex(0), .right = ir.SolverTermId.fromIndex(1) } } },
+        .{ .id = ir.SolverTermId.fromIndex(3), .sort = .{ .kind = .integer }, .operation = .{ .integer_literal = "9" } },
+    };
+    var constraints = [_]ir.Constraint{.{
+        .id = ir.ConstraintId.fromIndex(0),
+        .predicate = ir.SolverTermId.fromIndex(2),
+        .evidence = &.{fixture.proof},
+    }};
+    var queries = [_]ir.SolverQuery{
+        .{
+            .id = ir.QueryId.fromIndex(0),
+            .kind = .prove_true,
+            .assumptions = &.{ir.ConstraintId.fromIndex(0)},
+            .goal = ir.SolverTermId.fromIndex(2),
+        },
+        .{
+            .id = ir.QueryId.fromIndex(1),
+            .kind = .prove_true,
+            .goal = ir.SolverTermId.fromIndex(2),
+        },
+    };
+    var model_bindings = [_]ir.SolverModelBinding{.{
+        .term = ir.SolverTermId.fromIndex(0),
+        .value = .{ .integer = "-1" },
+    }};
+    var models = [_]ir.SolverModel{.{
+        .id = ir.SolverModelId.fromIndex(0),
+        .query = ir.QueryId.fromIndex(1),
+        .bindings = &model_bindings,
+        .evidence = &.{fixture.proof},
+    }};
+    var core_constraints = [_]ir.ConstraintId{ir.ConstraintId.fromIndex(0)};
+    var cores = [_]ir.UnsatCore{.{
+        .id = ir.UnsatCoreId.fromIndex(0),
+        .query = ir.QueryId.fromIndex(0),
+        .constraints = &core_constraints,
+        .evidence = &.{fixture.proof},
+    }};
+    var certificates = [_]ir.SolverCertificate{
+        .{
+            .id = ir.CertificateId.fromIndex(0),
+            .query = ir.QueryId.fromIndex(0),
+            .engine = .z3,
+            .resolution = .proved,
+            .evidence = &.{fixture.proof},
+            .certificate_digest = "fixture:unsat-core",
+            .unsat_core = ir.UnsatCoreId.fromIndex(0),
+        },
+        .{
+            .id = ir.CertificateId.fromIndex(1),
+            .query = ir.QueryId.fromIndex(1),
+            .engine = .z3,
+            .resolution = .disproved,
+            .evidence = &.{fixture.proof},
+            .certificate_digest = "fixture:model",
+            .model = ir.SolverModelId.fromIndex(0),
+        },
+    };
+    var program = fixture.program;
+    program.solver_terms = &terms;
+    program.constraints = &constraints;
+    program.queries = &queries;
+    program.solver_models = &models;
+    program.unsat_cores = &cores;
+    program.certificates = &certificates;
+
+    var valid_report = try validation.validate(std.testing.allocator, &program, .core);
+    defer valid_report.deinit();
+    try std.testing.expect(!valid_report.contains(.invalid_solver_model_value));
+    try std.testing.expect(!valid_report.contains(.irrelevant_solver_model_term));
+    try std.testing.expect(!valid_report.contains(.contradictory_solver_model));
+    try std.testing.expect(!valid_report.contains(.incomplete_solver_model));
+    try std.testing.expect(!valid_report.contains(.invalid_unsat_core_constraint));
+    try std.testing.expect(!valid_report.contains(.certificate_artifact_mismatch));
+    try std.testing.expect(valid_report.contains(.certificate_without_proof));
+
+    certificates[0].engine = .internal_facts;
+    cores[0].constraints = &.{};
+    var incomplete_core_report = try validation.validate(std.testing.allocator, &program, .core);
+    defer incomplete_core_report.deinit();
+    try std.testing.expect(incomplete_core_report.contains(.incomplete_unsat_core));
+    var found_core_index = false;
+    for (incomplete_core_report.diagnostics.items) |diagnostic| {
+        if (diagnostic.code != .incomplete_unsat_core) continue;
+        try std.testing.expectEqual(@as(?u32, 0), diagnostic.entity_index);
+        found_core_index = true;
+    }
+    try std.testing.expect(found_core_index);
+    cores[0].constraints = &core_constraints;
+    certificates[0].engine = .z3;
+
+    models[0].evidence = &.{};
+    var model_evidence_report = try validation.validate(std.testing.allocator, &program, .core);
+    defer model_evidence_report.deinit();
+    try std.testing.expect(model_evidence_report.contains(.certificate_artifact_mismatch));
+    models[0].evidence = &.{fixture.proof};
+
+    model_bindings[0].value = .{ .integer = "-01" };
+    var numeral_report = try validation.validate(std.testing.allocator, &program, .core);
+    defer numeral_report.deinit();
+    try std.testing.expect(numeral_report.contains(.invalid_solver_model_value));
+    model_bindings[0].value = .{ .integer = "-1" };
+
+    model_bindings[0].value = .{ .integer = "7" };
+    var contradictory_model_report = try validation.validate(std.testing.allocator, &program, .core);
+    defer contradictory_model_report.deinit();
+    try std.testing.expect(contradictory_model_report.contains(.contradictory_solver_model));
+    model_bindings[0].value = .{ .integer = "-1" };
+
+    models[0].bindings = &.{};
+    var incomplete_model_report = try validation.validate(std.testing.allocator, &program, .core);
+    defer incomplete_model_report.deinit();
+    try std.testing.expect(incomplete_model_report.contains(.incomplete_solver_model));
+    models[0].bindings = &model_bindings;
+
+    const duplicate_bindings = [_]ir.SolverModelBinding{ model_bindings[0], model_bindings[0] };
+    models[0].bindings = &duplicate_bindings;
+    var duplicate_model_report = try validation.validate(std.testing.allocator, &program, .core);
+    defer duplicate_model_report.deinit();
+    try std.testing.expect(duplicate_model_report.contains(.duplicate_solver_model_term));
+    models[0].bindings = &model_bindings;
+
+    const irrelevant_bindings = [_]ir.SolverModelBinding{.{
+        .term = ir.SolverTermId.fromIndex(3),
+        .value = .{ .integer = "9" },
+    }};
+    models[0].bindings = &irrelevant_bindings;
+    var irrelevant_model_report = try validation.validate(std.testing.allocator, &program, .core);
+    defer irrelevant_model_report.deinit();
+    try std.testing.expect(irrelevant_model_report.contains(.irrelevant_solver_model_term));
+    try std.testing.expect(!irrelevant_model_report.contains(.invalid_solver_model_reference));
+    var found_model_index = false;
+    for (irrelevant_model_report.diagnostics.items) |diagnostic| {
+        if (diagnostic.code != .irrelevant_solver_model_term) continue;
+        try std.testing.expectEqual(@as(?u32, 0), diagnostic.entity_index);
+        found_model_index = true;
+    }
+    try std.testing.expect(found_model_index);
+    models[0].bindings = &model_bindings;
+
+    const duplicate_core = [_]ir.ConstraintId{ ir.ConstraintId.fromIndex(0), ir.ConstraintId.fromIndex(0) };
+    cores[0].constraints = &duplicate_core;
+    var duplicate_core_report = try validation.validate(std.testing.allocator, &program, .core);
+    defer duplicate_core_report.deinit();
+    try std.testing.expect(duplicate_core_report.contains(.duplicate_unsat_core_constraint));
+    cores[0].constraints = &core_constraints;
+
+    core_constraints[0] = ir.ConstraintId.fromIndex(99);
+    var foreign_core_report = try validation.validate(std.testing.allocator, &program, .core);
+    defer foreign_core_report.deinit();
+    try std.testing.expect(foreign_core_report.contains(.invalid_unsat_core_constraint));
+    core_constraints[0] = ir.ConstraintId.fromIndex(0);
+
+    const duplicate_assumptions = [_]ir.ConstraintId{ ir.ConstraintId.fromIndex(0), ir.ConstraintId.fromIndex(0) };
+    queries[0].assumptions = &duplicate_assumptions;
+    var duplicate_assumption_report = try validation.validate(std.testing.allocator, &program, .core);
+    defer duplicate_assumption_report.deinit();
+    try std.testing.expect(duplicate_assumption_report.contains(.duplicate_query_assumption));
+    queries[0].assumptions = &.{ir.ConstraintId.fromIndex(0)};
+
+    constraints[0].evidence = &.{};
+    var core_evidence_report = try validation.validate(std.testing.allocator, &program, .core);
+    defer core_evidence_report.deinit();
+    try std.testing.expect(core_evidence_report.contains(.unsat_core_constraint_without_evidence));
+    constraints[0].evidence = &.{fixture.proof};
+
+    certificates[0].model = ir.SolverModelId.fromIndex(0);
+    var artifact_report = try validation.validate(std.testing.allocator, &program, .core);
+    defer artifact_report.deinit();
+    try std.testing.expect(artifact_report.contains(.certificate_artifact_mismatch));
+}
+
+test "solver real literals use exact canonical rationals" {
+    const fixture = lifter.fixtures.arithmetic_module;
+    var terms = [_]ir.SolverTerm{.{
+        .id = ir.SolverTermId.fromIndex(0),
+        .sort = .{ .kind = .real },
+        .operation = .{ .real_literal = .{ .numerator = "1", .denominator = "0" } },
+    }};
+    var program = fixture.program;
+    program.solver_terms = &terms;
+
+    var zero_report = try validation.validate(std.testing.allocator, &program, .core);
+    defer zero_report.deinit();
+    try std.testing.expect(zero_report.contains(.invalid_solver_numeral));
+
+    terms[0].operation = .{ .real_literal = .{ .numerator = "-3", .denominator = "2" } };
+    var valid_report = try validation.validate(std.testing.allocator, &program, .core);
+    defer valid_report.deinit();
+    try std.testing.expect(!valid_report.contains(.invalid_solver_numeral));
+    try std.testing.expect(!valid_report.contains(.solver_sort_mismatch));
+}
+
+test "instruction-scoped places require a matching allocation write" {
+    const fixture = lifter.fixtures.shared_place_closure_module;
+    var places = fixture.places;
+    places[fixture.p_state.index()].origin = .{ .instruction = fixture.i_initialize };
+    var program = fixture.program;
+    program.places = &places;
+
+    var valid_report = try validation.validate(std.testing.allocator, &program, .readable_luau);
+    defer valid_report.deinit();
+    try std.testing.expect(valid_report.isClean());
+
+    places[fixture.p_state.index()].origin = .{ .instruction = fixture.i_make_counter };
+    var malformed_report = try validation.validate(std.testing.allocator, &program, .core);
+    defer malformed_report.deinit();
+    try std.testing.expect(malformed_report.contains(.invalid_place_allocation));
+}
+
+test "edge-scoped constraints reject unauthenticated stale targets" {
+    const fixture = lifter.fixtures.absolute_value_module;
+    const terms = [_]ir.SolverTerm{.{
+        .id = ir.SolverTermId.fromIndex(0),
+        .sort = .{ .kind = .boolean },
+        .operation = .{ .value = fixture.v_is_negative },
+    }};
+    const constraints = [_]ir.Constraint{.{
+        .id = ir.ConstraintId.fromIndex(0),
+        .predicate = ir.SolverTermId.fromIndex(0),
+        .evidence = &.{fixture.proof},
+        .scope = .{ .edge = .{
+            .source = fixture.b_entry,
+            .kind = .branch_then,
+            .target = fixture.b_nonnegative,
+        } },
+    }};
+    var program = fixture.program;
+    program.solver_terms = &terms;
+    program.constraints = &constraints;
+
+    var report = try validation.validate(std.testing.allocator, &program, .core);
+    defer report.deinit();
+    try std.testing.expect(report.contains(.invalid_constraint_scope));
+}
+
+test "instruction-scoped place use must follow its allocation" {
+    const fixture = lifter.fixtures.shared_place_closure_module;
+    var places = fixture.places;
+    places[fixture.p_state.index()].origin = .{ .instruction = fixture.i_initialize };
+    const reversed = [_]ir.InstructionId{ fixture.i_make_counter, fixture.i_initialize };
+    var blocks = fixture.blocks;
+    blocks[fixture.b_factory.index()].instructions = &reversed;
+    var program = fixture.program;
+    program.places = &places;
+    program.blocks = &blocks;
+
+    var report = try validation.validate(std.testing.allocator, &program, .core);
+    defer report.deinit();
+    try std.testing.expect(report.contains(.place_used_before_allocation));
+}
+
+test "instruction-scoped place allocation must dominate every use" {
+    const f = ir.FunctionId.fromIndex(0);
+    const b_entry = ir.BlockId.fromIndex(0);
+    const b_allocate = ir.BlockId.fromIndex(1);
+    const b_use = ir.BlockId.fromIndex(2);
+    const b_exit = ir.BlockId.fromIndex(3);
+    const i_condition = ir.InstructionId.fromIndex(0);
+    const i_initial = ir.InstructionId.fromIndex(1);
+    const i_allocate = ir.InstructionId.fromIndex(2);
+    const i_read = ir.InstructionId.fromIndex(3);
+    const v_condition = ir.ValueId.fromIndex(0);
+    const v_initial = ir.ValueId.fromIndex(1);
+    const v_read = ir.ValueId.fromIndex(2);
+    const p_state = ir.PlaceId.fromIndex(0);
+    const values = [_]ir.Value{
+        .{ .id = v_condition, .function = f, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = i_condition, .index = 0 } } },
+        .{ .id = v_initial, .function = f, .type = .integer, .origin = .{ .instruction_result = .{ .instruction = i_initial, .index = 0 } } },
+        .{ .id = v_read, .function = f, .type = .integer, .origin = .{ .instruction_result = .{ .instruction = i_read, .index = 0 } } },
+    };
+    const places = [_]ir.Place{.{
+        .id = p_state,
+        .function = f,
+        .type = .integer,
+        .origin = .{ .instruction = i_allocate },
+    }};
+    const instructions = [_]ir.Instruction{
+        .{ .id = i_condition, .block = b_entry, .operation = .{ .constant = .{ .boolean = true } }, .results = &.{v_condition}, .effects = .pure },
+        .{ .id = i_initial, .block = b_entry, .operation = .{ .constant = .{ .integer = "1" } }, .results = &.{v_initial}, .effects = .pure },
+        .{ .id = i_allocate, .block = b_allocate, .operation = .{ .place_write = .{ .place = p_state, .value = v_initial } }, .results = &.{}, .effects = .place_write },
+        .{ .id = i_read, .block = b_use, .operation = .{ .place_read = p_state }, .results = &.{v_read}, .effects = .place_read },
+    };
+    const blocks = [_]ir.Block{
+        .{
+            .id = b_entry,
+            .function = f,
+            .instructions = &.{ i_condition, i_initial },
+            .terminator = .{ .branch = .{
+                .condition = v_condition,
+                .then_edge = .{ .target = b_allocate },
+                .else_edge = .{ .target = b_use },
+            } },
+        },
+        .{ .id = b_allocate, .function = f, .instructions = &.{i_allocate}, .terminator = .{ .jump = .{ .target = b_exit } } },
+        .{ .id = b_use, .function = f, .instructions = &.{i_read}, .terminator = .{ .jump = .{ .target = b_exit } } },
+        .{ .id = b_exit, .function = f, .terminator = .{ .return_values = &.{} } },
+    };
+    const functions = [_]ir.Function{.{
+        .id = f,
+        .local_places = &.{p_state},
+        .blocks = &.{ b_entry, b_allocate, b_use, b_exit },
+        .entry_block = b_entry,
+    }};
+    const program: ir.Program = .{
+        .program_id = "non-dominating-place-allocation",
+        .entry_function = f,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+        .places = &places,
+    };
+
+    var report = try validation.validate(std.testing.allocator, &program, .core);
+    defer report.deinit();
+    try std.testing.expect(report.contains(.non_dominating_place_allocation));
+}
+
+test "table tail packs store a producer across an observable gap" {
+    const fixture = lifter.fixtures.open_pack_adjust_module;
+    var values = fixture.values;
+    values[fixture.v_first.index()].type = .{ .kind = .table };
+    var instructions = fixture.instructions;
+    instructions[fixture.i_adjust.index()].operation = .{ .make_table_literal = .{
+        .fields = &.{},
+        .tail_pack = fixture.p_results,
+    } };
+    instructions[fixture.i_adjust.index()].effects = .table_constructor;
+    var program = fixture.program;
+    program.values = &values;
+    program.instructions = &instructions;
+
+    var valid_report = try validation.validate(std.testing.allocator, &program, .readable_luau);
+    defer valid_report.deinit();
+    try std.testing.expect(valid_report.isClean());
+
+    const gap_id = ir.InstructionId.fromIndex(fixture.instructions.len);
+    const delayed_instructions = fixture.instructions ++ [_]ir.Instruction{.{
+        .id = gap_id,
+        .block = fixture.b_entry,
+        .operation = .{ .environment_set = .{
+            .target = .{ .ambient = {} },
+            .name = "after_producer",
+            .value = fixture.v_callee,
+        } },
+        .results = &.{},
+        .effects = .semantic_environment_write,
+        .evidence = &.{fixture.proof},
+    }};
+    const nonadjacent = [_]ir.InstructionId{ fixture.i_get, fixture.i_call, gap_id, fixture.i_adjust };
+    var blocks = fixture.blocks;
+    blocks[fixture.b_entry.index()].instructions = &nonadjacent;
+    program.blocks = &blocks;
+    program.instructions = &delayed_instructions;
+    var stored_report = try validation.validate(std.testing.allocator, &program, .readable_luau);
+    defer stored_report.deinit();
+    try std.testing.expect(stored_report.isClean());
+}
+
+test "table pack writes validate effects and pack ownership" {
+    const fixture = lifter.fixtures.ordered_table_vararg_module;
+
+    var valid_report = try validation.validate(std.testing.allocator, &fixture.program, .readable_luau);
+    defer valid_report.deinit();
+    try std.testing.expect(valid_report.isClean());
+
+    var instructions = fixture.instructions;
+    instructions[fixture.i_append.index()].effects = .pure;
+    var effect_program = fixture.program;
+    effect_program.instructions = &instructions;
+    var effect_report = try validation.validate(std.testing.allocator, &effect_program, .core);
+    defer effect_report.deinit();
+    try std.testing.expect(effect_report.contains(.invalid_table_set_pack_effects));
+
+    const f_other = ir.FunctionId.fromIndex(1);
+    const b_other = ir.BlockId.fromIndex(1);
+    const blocks = fixture.blocks ++ [_]ir.Block{.{
+        .id = b_other,
+        .function = f_other,
+        .terminator = .{ .return_values = &.{} },
+        .evidence = &.{fixture.proof},
+    }};
+    var functions = fixture.functions ++ [_]ir.Function{.{
+        .id = f_other,
+        .blocks = &.{b_other},
+        .entry_block = b_other,
+        .is_variadic = true,
+        .vararg_pack = fixture.p_varargs,
+        .evidence = &.{fixture.proof},
+    }};
+    functions[fixture.f_entry.index()].is_variadic = false;
+    functions[fixture.f_entry.index()].vararg_pack = null;
+    var packs = fixture.value_packs;
+    packs[fixture.p_varargs.index()].function = f_other;
+    packs[fixture.p_varargs.index()].origin = .{ .varargs = f_other };
+    var ownership_program = fixture.program;
+    ownership_program.functions = &functions;
+    ownership_program.blocks = &blocks;
+    ownership_program.value_packs = &packs;
+    var ownership_report = try validation.validate(std.testing.allocator, &ownership_program, .core);
+    defer ownership_report.deinit();
+    try std.testing.expect(ownership_report.contains(.cross_function_value_pack));
+}
+
+test "all table constructors require allocation effects" {
+    const fixture = lifter.fixtures.fresh_reference_module;
+    var instructions = fixture.instructions;
+    var program = fixture.program;
+    program.instructions = &instructions;
+
+    var valid_report = try validation.validate(std.testing.allocator, &program, .core);
+    defer valid_report.deinit();
+    try std.testing.expect(valid_report.isClean());
+
+    instructions[fixture.i_table_a.index()].effects = .pure;
+    var empty_report = try validation.validate(std.testing.allocator, &program, .core);
+    defer empty_report.deinit();
+    try std.testing.expect(empty_report.contains(.invalid_table_constructor_effects));
+
+    instructions[fixture.i_table_a.index()].effects = .table_constructor;
+    instructions[fixture.i_table_b.index()].effects = .pure;
+    var literal_report = try validation.validate(std.testing.allocator, &program, .core);
+    defer literal_report.deinit();
+    try std.testing.expect(literal_report.contains(.invalid_table_constructor_effects));
+}
+
+test "string interpolation validates segment arity and dynamic effects" {
+    const fixture = lifter.fixtures.arithmetic_module;
+    var values = fixture.values;
+    values[fixture.v_result.index()].type = .string;
+    var instructions = fixture.instructions;
+    instructions[fixture.i_result.index()].operation = .{ .string_interpolate = .{
+        .segments = &.{"only-one-segment"},
+        .values = &.{fixture.v_left},
+    } };
+    instructions[fixture.i_result.index()].effects = .string_interpolation;
+    var program = fixture.program;
+    program.values = &values;
+    program.instructions = &instructions;
+
+    var shape_report = try validation.validate(std.testing.allocator, &program, .core);
+    defer shape_report.deinit();
+    try std.testing.expect(shape_report.contains(.invalid_string_interpolation_shape));
+
+    instructions[fixture.i_result.index()].operation.string_interpolate.segments = &.{ "left=", "" };
+    instructions[fixture.i_result.index()].effects = .pure;
+    var effect_report = try validation.validate(std.testing.allocator, &program, .core);
+    defer effect_report.deinit();
+    try std.testing.expect(effect_report.contains(.invalid_string_interpolation_effects));
+}
