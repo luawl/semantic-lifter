@@ -197,6 +197,23 @@ pub const ResumeSeed = struct {
     proof: CollisionSeedProof = .node_split,
 };
 
+const CollisionSeedValidation = enum {
+    live,
+    invalid_function,
+    missing_provenance,
+    invalid_block,
+    unreachable_graph,
+    missing_live_edge,
+    live_target_mismatch,
+    missing_rewrite,
+    forwarding_shape_mismatch,
+    owner_edge_missing,
+    owner_edge_mismatch,
+    owner_tuple_mismatch,
+    no_reentry,
+    parameter_mismatch,
+};
+
 const CollisionSeed = struct {
     function_index: usize,
     target: ir.BlockId,
@@ -1455,6 +1472,23 @@ fn findNodeSplitArmEdgeInGroup(
         {
             return rewrite;
         }
+    }
+    return null;
+}
+
+fn hasNodeSplitTargetArmEdgeInGroup(
+    projection: *const structural_overlap.ReplayProjectionContext,
+    kind: ir.CfgEdgeKind,
+    from: ir.BlockId,
+    to: ir.BlockId,
+    group: ir.NodeSplitGroupId,
+) ?ir.CfgEdgeRewrite {
+    for (projection.nodeSplitRewriteIndicesForGroup(group)) |rewrite_index| {
+        const rewrite = projection.program.edge_rewrites[rewrite_index];
+        if (rewrite.rule == .node_split and
+            rewrite.kind == kind and
+            rewrite.from.target == from and
+            rewrite.to.target == to) return rewrite;
     }
     return null;
 }
@@ -3442,6 +3476,200 @@ test "collision group containing previous owner narrows to current edge" {
     try std.testing.expect(collisionGroupContainsPreviousOwner(&collision));
 }
 
+fn planUnvisitedFrontiersAllocWithAnalysis(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    function_index: usize,
+    analysis: ?*const cfg.Analysis,
+    projection_context: ?*structural_overlap.ReplayProjectionContext,
+    frontiers: []const structure.UnvisitedFrontier,
+    prior_arms: []const CollisionArm,
+) NormalizeError!?SplitPlan {
+    if (frontiers.len == 0) return null;
+    const secondaries = try allocator.alloc(Secondary, frontiers.len);
+    var secondary_count: usize = 0;
+    errdefer deinitSecondaryPrefix(allocator, secondaries, secondary_count);
+    for (frontiers) |frontier| {
+        if (frontier.incoming_contexts.len != 0 and
+            frontier.incoming_contexts.len != frontier.incoming.len)
+        {
+            deinitSecondaryPrefix(allocator, secondaries, secondary_count);
+            return null;
+        }
+        const first_secondary = if (frontier.incoming.len > 1) @as(usize, 1) else 0;
+        var selected: std.ArrayList(ir.CfgEdgeRef) = .empty;
+        defer selected.deinit(allocator);
+        var selected_contexts: std.ArrayList(?structure.CollisionContext) = .empty;
+        defer selected_contexts.deinit(allocator);
+        for (frontier.incoming[first_secondary..], first_secondary..) |reference, incoming_index| {
+            const context = if (frontier.incoming_contexts.len == 0)
+                null
+            else
+                frontier.incoming_contexts[incoming_index];
+            const arm: CollisionArm = .{
+                .source = reference.source,
+                .kind = reference.kind,
+                .target = reference.target,
+                .context = context,
+            };
+            if (try collisionArmWasTriedWithAnalysis(
+                program,
+                analysis,
+                prior_arms,
+                arm,
+                projection_context,
+            )) continue;
+            var duplicate = false;
+            for (selected.items) |existing| {
+                if (std.meta.eql(existing, reference)) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) continue;
+            try selected.append(allocator, reference);
+            try selected_contexts.append(allocator, context);
+        }
+        if (selected.items.len == 0) {
+            deinitSecondaryPrefix(allocator, secondaries, secondary_count);
+            return null;
+        }
+        var split = (try structural_overlap.findCollisionClosureSplitAlloc(
+            allocator,
+            program,
+            function_index,
+            frontier.block,
+            selected.items,
+            frontier.closure,
+        )) orelse {
+            deinitSecondaryPrefix(allocator, secondaries, secondary_count);
+            return null;
+        };
+        // Each secondary is prepared against the same immutable graph
+        // snapshot.  If two frontier closures overlap, applying both would
+        // clone one live continuation through two stale contexts.  Keep the
+        // independent prefix and let the next feedback iteration recompute
+        // the overlapping frontier after the first clone is published.
+        var overlaps_previous = false;
+        for (secondaries[0..secondary_count]) |previous| {
+            if (closuresOverlap(previous.closure, split.closure)) {
+                overlaps_previous = true;
+                break;
+            }
+        }
+        if (overlaps_previous) {
+            split.deinit();
+            break;
+        }
+        var incoming_contexts: []?structure.CollisionContext = &.{};
+        errdefer {
+            if (incoming_contexts.len != 0) allocator.free(incoming_contexts);
+            split.deinit();
+        }
+        if (frontier.incoming_contexts.len != 0) {
+            incoming_contexts = try allocator.alloc(?structure.CollisionContext, split.incoming.len);
+            for (split.incoming, 0..) |reference, split_index| {
+                var found_context = false;
+                for (selected.items, 0..) |selected_reference, selected_index| {
+                    if (!std.meta.eql(selected_reference, reference)) continue;
+                    incoming_contexts[split_index] = selected_contexts.items[selected_index];
+                    found_context = true;
+                    break;
+                }
+                if (!found_context) {
+                    return error.NormalizationInvariantFailed;
+                }
+            }
+        }
+        const split_incoming = split.incoming;
+        const split_closure = split.closure;
+        split.incoming = &.{};
+        split.closure = &.{};
+        split.deinit();
+        secondaries[secondary_count] = .{
+            .block = frontier.block,
+            .incoming = split_incoming,
+            .closure = split_closure,
+            .incoming_contexts = incoming_contexts,
+        };
+        incoming_contexts = &.{};
+        secondary_count += 1;
+    }
+    if (secondary_count == 0) {
+        allocator.free(secondaries);
+        return null;
+    }
+    return .{
+        .allocator = allocator,
+        .function_index = function_index,
+        .secondaries = secondaries,
+        .secondary_count = secondary_count,
+    };
+}
+
+fn closuresOverlap(left: []const ir.BlockId, right: []const ir.BlockId) bool {
+    for (left) |left_block| {
+        for (right) |right_block| {
+            if (left_block == right_block) return true;
+        }
+    }
+    return false;
+}
+
+fn deinitSecondaryPrefix(
+    allocator: std.mem.Allocator,
+    secondaries: []Secondary,
+    count: usize,
+) void {
+    for (secondaries[0..count]) |secondary| {
+        allocator.free(secondary.incoming);
+        if (secondary.incoming_contexts.len != 0) allocator.free(secondary.incoming_contexts);
+        allocator.free(secondary.closure);
+    }
+    allocator.free(secondaries);
+}
+
+/// Prove that a post-split collision seed still names the same owned
+/// continuation without rebuilding the complete structure plan.  The seed is
+/// accepted only when its exact node-split rewrite is still present, the live
+/// edge still enters the seeded clone, and the prior structured tuple can be
+/// replayed into the clone.  Any missing provenance returns false and forces
+/// the ordinary full scan.
+// A paired fold may retain a historical owner target while a later split has
+// moved the live owner edge to an authenticated descendant.  Accept that
+// transition only when the source-owned split chain reaches the historical
+// target and its first step carries the live tuple.
+fn ownerEdgeDescendsFromSeedTarget(
+    program: *const ir.Program,
+    projection: *const structural_overlap.ReplayProjectionContext,
+    source: ir.BlockId,
+    kind: ir.CfgEdgeKind,
+    historical_target: ir.BlockId,
+    live_target: ir.BlockId,
+    live_arguments: []const ir.ValueId,
+) bool {
+    if (live_target == historical_target) return true;
+
+    var current = live_target;
+    var depth: usize = 0;
+    var first_step = true;
+    while (current != historical_target) : (depth += 1) {
+        if (depth >= program.blocks.len) return false;
+        const parent = projection.cloneLineageParent(current) orelse return false;
+        const rewrite = findNodeSplitArmEdge(
+            program.edge_rewrites,
+            source,
+            kind,
+            parent.block,
+            current,
+        ) orelse return false;
+        if (first_step and !std.mem.eql(ir.ValueId, rewrite.to.arguments, live_arguments)) return false;
+        first_step = false;
+        current = parent.block;
+    }
+    return true;
+}
+
 // Validate one source-owned historical split step.  The lineage index can
 // reject a target with multiple incoming clone parents, but a repeated edge
 // may legitimately have other owners for the same clone.  Restrict the proof
@@ -3486,6 +3714,595 @@ fn authenticatedSourceOwnedNodeSplitStep(
         rewrite.from.arguments,
         rewrite.to.arguments,
     );
+}
+
+// A node-split clone may re-enter through a nested clone lineage instead of
+// the historical owner block.  Reuse that path only when the seeded source
+// owns a unique chain from the live clone through the recorded original
+// target to the recorded owner, every step has a replayable tuple, and the
+// live clone contains a nonempty CFG cycle.  This keeps clone-local reentry
+// distinct from arbitrary graph reachability or unrelated clone history.
+fn authenticatedClonedReentry(
+    analysis: *const cfg.Analysis,
+    projection: *structural_overlap.ReplayProjectionContext,
+    source: ir.BlockId,
+    kind: ir.CfgEdgeKind,
+    target: ir.BlockId,
+    owner: ir.BlockId,
+    original_target: ir.BlockId,
+    group: ir.NodeSplitGroupId,
+) NormalizeError!bool {
+    if (target == owner) return false;
+
+    var current = target;
+    var depth: usize = 0;
+    while (current != owner) : (depth += 1) {
+        if (depth >= projection.blockCount()) return false;
+
+        var selected: ?ir.CfgEdgeRewrite = null;
+        for (projection.program.edge_rewrites) |rewrite| {
+            if (rewrite.source != source or rewrite.kind != kind or
+                rewrite.to.target != current)
+            {
+                continue;
+            }
+            if (selected != null) return false;
+            selected = rewrite;
+        }
+        const rewrite = selected orelse return false;
+        if (depth == 0 and (rewrite.from.target != original_target or
+            rewrite.node_split_group != group)) return false;
+        if (!try authenticatedSourceOwnedNodeSplitStep(
+            projection.program,
+            projection,
+            rewrite,
+            analysis.function,
+        )) return false;
+        current = rewrite.from.target;
+    }
+
+    return try analysis.canReachNonEmptyPath(target, target);
+}
+
+fn seededCollisionStatus(
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    seed: CollisionSeed,
+    replay_context: *structural_overlap.ReplayProjectionContext,
+) NormalizeError!CollisionSeedValidation {
+    if (seed.function_index >= program.functions.len or
+        analysis.function.id != program.functions[seed.function_index].id or
+        seed.source == null or seed.kind == null or seed.original_target == null or
+        seed.previous == null or seed.context == null)
+    {
+        return if (seed.function_index >= program.functions.len or
+            analysis.function.id != program.functions[seed.function_index].id)
+            CollisionSeedValidation.invalid_function
+        else
+            CollisionSeedValidation.missing_provenance;
+    }
+
+    const source = seed.source.?;
+    const kind = seed.kind.?;
+    const original_target = seed.original_target.?;
+    const previous = seed.previous.?;
+    const target = seed.target;
+    if (source.index() >= program.blocks.len or
+        original_target.index() >= program.blocks.len or
+        target.index() >= program.blocks.len or
+        previous.index() >= program.blocks.len or
+        program.blocks[source.index()].function != analysis.function.id or
+        program.blocks[original_target.index()].function != analysis.function.id or
+        program.blocks[target.index()].function != analysis.function.id or
+        program.blocks[previous.index()].function != analysis.function.id or
+        !analysis.isReachable(source) or
+        !analysis.isReachable(target) or
+        !analysis.isReachable(previous))
+    {
+        return if (source.index() >= program.blocks.len or
+            original_target.index() >= program.blocks.len or
+            target.index() >= program.blocks.len or
+            previous.index() >= program.blocks.len)
+            CollisionSeedValidation.invalid_block
+        else
+            CollisionSeedValidation.unreachable_graph;
+    }
+
+    const reference = ir.CfgEdgeRef{ .source = source, .kind = kind, .target = target };
+    const live = cfg_edge.value(program, reference) orelse return CollisionSeedValidation.missing_live_edge;
+    if (live.target != target) return CollisionSeedValidation.live_target_mismatch;
+
+    if (trace_normalize_phases and seed.proof == .paired_forwarding) {
+        var printed: usize = 0;
+        for (program.edge_rewrites) |rewrite| {
+            if (rewrite.source != source or rewrite.kind != kind or printed >= 8) continue;
+            traceNormalize("normalize_phase collision_seed_rewrite_candidate source={} kind={s} from={} to={} rule={s} from_args={any} to_args={any} live_args={any}\n", .{
+                source.index(),
+                @tagName(kind),
+                rewrite.from.target.index(),
+                rewrite.to.target.index(),
+                @tagName(rewrite.rule),
+                rewrite.from.arguments,
+                rewrite.to.arguments,
+                live.arguments,
+            });
+            printed += 1;
+        }
+    }
+
+    var authenticated_rewrite = false;
+    var authenticated_group: ?ir.NodeSplitGroupId = null;
+    for (program.edge_rewrites) |rewrite| {
+        if (rewrite.source != source or rewrite.kind != kind or
+            rewrite.from.target != original_target or rewrite.to.target != target or
+            !std.mem.eql(ir.ValueId, rewrite.to.arguments, live.arguments)) continue;
+        switch (seed.proof) {
+            .node_split => {
+                const group = rewrite.node_split_group orelse continue;
+                if (rewrite.rule != .node_split) continue;
+                if (seed.context.?.parameter_arguments) |expected| {
+                    if (!std.mem.eql(ir.ValueId, rewrite.from.arguments, expected)) continue;
+                } else if (rewrite.from.arguments.len != 0) {
+                    continue;
+                }
+                authenticated_group = group;
+            },
+            .paired_forwarding => {
+                if (rewrite.rule != .forwarding_jump or previous == source) continue;
+                if (rewrite.from.arguments.len != program.blocks[original_target.index()].parameters.len or
+                    rewrite.to.arguments.len != program.blocks[target.index()].parameters.len)
+                {
+                    return CollisionSeedValidation.forwarding_shape_mismatch;
+                }
+                // The fold's owner edge must still be live. This prevents a
+                // stale forwarding record from turning an unrelated edge into
+                // a directed retry after another graph mutation.
+                const owner_reference: ir.CfgEdgeRef = .{
+                    .source = previous,
+                    .kind = kind,
+                    .target = target,
+                };
+                const owner_edge = cfg_edge.value(program, owner_reference) orelse
+                    return CollisionSeedValidation.owner_edge_missing;
+                if (!ownerEdgeDescendsFromSeedTarget(
+                    program,
+                    replay_context,
+                    previous,
+                    kind,
+                    target,
+                    owner_edge.target,
+                    owner_edge.arguments,
+                ) or
+                    owner_edge.arguments.len != program.blocks[target.index()].parameters.len or
+                    !std.mem.eql(ir.ValueId, owner_edge.arguments, rewrite.to.arguments))
+                {
+                    traceNormalize("normalize_phase collision_seed_owner_mismatch previous={} owner_target={} owner_args={any} rewrite_to={} rewrite_args={any} expected={any}\n", .{
+                        previous.index(),
+                        owner_edge.target.index(),
+                        owner_edge.arguments,
+                        target.index(),
+                        rewrite.to.arguments,
+                        seed.context.?.parameter_arguments,
+                    });
+                    return CollisionSeedValidation.owner_edge_mismatch;
+                }
+                if (seed.context.?.parameter_arguments) |expected| {
+                    if (!std.mem.eql(ir.ValueId, expected, owner_edge.arguments))
+                        return CollisionSeedValidation.owner_tuple_mismatch;
+                }
+            },
+            .clone_fold => {
+                if (rewrite.rule != .clone_fold or previous != target) continue;
+                const group = rewrite.node_split_group orelse continue;
+                const parent = replay_context.cloneLineageParent(original_target) orelse continue;
+                if (parent.block != target or parent.group != group) continue;
+                if (rewrite.from.arguments.len != program.blocks[original_target.index()].parameters.len or
+                    rewrite.to.arguments.len != program.blocks[target.index()].parameters.len)
+                {
+                    return CollisionSeedValidation.forwarding_shape_mismatch;
+                }
+                if (seed.context.?.parameter_arguments) |expected| {
+                    if (!std.mem.eql(ir.ValueId, expected, live.arguments)) continue;
+                } else if (live.arguments.len != 0) {
+                    continue;
+                }
+            },
+        }
+        authenticated_rewrite = true;
+        break;
+    }
+    if (!authenticated_rewrite) return CollisionSeedValidation.missing_rewrite;
+
+    // The original obstruction was a structured re-entry, not merely an
+    // edge into a clone.  Preserve the historical owner path when it remains
+    // live, or accept the separately authenticated clone-local cycle.  An
+    // acyclic clone entry still falls back to the full structurer.
+    const reaches_previous = if (target == previous)
+        try analysis.canReachNonEmptyPath(target, previous)
+    else
+        try analysis.canReach(target, previous);
+    const reaches_cloned_owner = if (seed.proof == .node_split and authenticated_group != null)
+        try authenticatedClonedReentry(
+            analysis,
+            replay_context,
+            source,
+            kind,
+            target,
+            previous,
+            original_target,
+            authenticated_group.?,
+        )
+    else
+        false;
+    if (!reaches_previous and !reaches_cloned_owner) return CollisionSeedValidation.no_reentry;
+
+    if (!try replay_context.parametersEquivalent(
+        target,
+        seed.context.?.parameter_arguments,
+        live.arguments,
+    )) return CollisionSeedValidation.parameter_mismatch;
+    return CollisionSeedValidation.live;
+}
+
+// A direct target clone can expose the same authenticated collision arm again
+// without changing its source. Reuse that exact live split boundary only when
+// the clone parent, edge rewrite, current tuple, and continuation bridge all
+// agree. This is intentionally separate from owner-composed source/target
+// lineage: a direct target chain may advance one boundary, but an arbitrary
+// predecessor has no proof of the carried continuation.
+fn directTargetBridgeIsAuthenticated(
+    analysis: *const cfg.Analysis,
+    owner: CollisionArm,
+    candidate: CollisionArm,
+    projection_context: *structural_overlap.ReplayProjectionContext,
+) NormalizeError!bool {
+    if (owner.kind != candidate.kind or owner.target == candidate.target) {
+        return false;
+    }
+    const target_parent = projection_context.cloneLineageParent(candidate.target) orelse return false;
+    if (target_parent.block != owner.target) return false;
+    if (owner.source != candidate.source) {
+        // A target clone may be entered by a separately cloned source.  The
+        // target-side node-split boundary plus replayCloneFold authenticates
+        // that fold; source identity is not part of clone equivalence.
+        return hasNodeSplitTargetArmEdgeInGroup(
+            projection_context,
+            candidate.kind,
+            owner.target,
+            candidate.target,
+            target_parent.group,
+        ) != null;
+    }
+
+    const reference: ir.CfgEdgeRef = .{
+        .source = owner.source,
+        .kind = owner.kind,
+        .target = candidate.target,
+    };
+    return projection_context.hasNodeSplitArmEdge(
+        owner.source,
+        owner.kind,
+        owner.target,
+        candidate.target,
+        null,
+    ) and try projection_context.hasAuthenticatedContinuationBridgeForEdge(analysis, reference);
+}
+
+// A persisted node-split seed can land on an effectful direct target clone.
+// Re-cloning that block is not a new semantic decision: replayMappingsForClone
+// proves that the clone has the same operations, effects, values, packs, and
+// structural terminator as its owner.  Fold only that exact authenticated
+// boundary back to the owner and retain the forwarding record for replay.
+fn collapseAuthenticatedDirectTargetCollisionEdge(
+    allocator: std.mem.Allocator,
+    program: *ir.Program,
+    blocks: *std.ArrayList(ir.Block),
+    rewrites: *std.ArrayList(ir.CfgEdgeRewrite),
+    analysis: *const cfg.Analysis,
+    owner: CollisionArm,
+    candidate: CollisionArm,
+    projection_context: *structural_overlap.ReplayProjectionContext,
+) NormalizeError!bool {
+    if (!try directTargetBridgeIsAuthenticated(
+        analysis,
+        owner,
+        candidate,
+        projection_context,
+    )) return false;
+    if (owner.target.index() >= blocks.items.len or
+        candidate.source.index() >= blocks.items.len or
+        candidate.target.index() >= blocks.items.len or
+        blocks.items[owner.target.index()].id != owner.target or
+        blocks.items[candidate.source.index()].id != candidate.source or
+        blocks.items[candidate.target.index()].id != candidate.target or
+        blocks.items[candidate.source.index()].function != blocks.items[owner.target.index()].function or
+        blocks.items[candidate.target.index()].function != blocks.items[owner.target.index()].function or
+        isHistoricalForwardingTarget(rewrites.items, owner.target))
+    {
+        return false;
+    }
+
+    const reference: ir.CfgEdgeRef = .{
+        .source = candidate.source,
+        .kind = candidate.kind,
+        .target = candidate.target,
+    };
+    const live = cfg_edge.value(program, reference) orelse return false;
+    if (live.target != candidate.target) return false;
+
+    const target_parent = projection_context.cloneLineageParent(candidate.target) orelse return false;
+    if (target_parent.block != owner.target) return false;
+    const target_rewrite = findNodeSplitArmEdgeInGroup(
+        rewrites.items,
+        candidate.source,
+        candidate.kind,
+        owner.target,
+        candidate.target,
+        target_parent.group,
+    ) orelse hasNodeSplitTargetArmEdgeInGroup(
+        projection_context,
+        candidate.kind,
+        owner.target,
+        candidate.target,
+        target_parent.group,
+    ) orelse return false;
+    if (!std.mem.eql(ir.ValueId, live.arguments, target_rewrite.to.arguments) or
+        live.arguments.len != blocks.items[candidate.target.index()].parameters.len)
+    {
+        return false;
+    }
+
+    // Authenticate the complete clone before changing the live edge.  The
+    // argument projection below must agree with the same replay contract that
+    // proof validation will use for the persisted clone_fold record.
+    const replayed = (try node_split.replayCloneFold(
+        allocator,
+        program,
+        live,
+        owner.target,
+        target_parent.group,
+    )) orelse return false;
+    defer if (replayed.arguments.len != 0) allocator.free(replayed.arguments);
+    if (replayed.target != owner.target) return false;
+
+    var mappings = (try node_split.replayMappingsForCloneAlloc(
+        allocator,
+        program,
+        owner.target,
+        candidate.target,
+        target_parent.group,
+    )) orelse return false;
+    defer mappings.deinit();
+
+    const projected = (try mapEdgeArgumentsBackwardThroughClone(
+        allocator,
+        program,
+        owner.target,
+        candidate.target,
+        target_parent.group,
+        live.arguments,
+    )) orelse return false;
+    errdefer allocator.free(projected);
+    if (projected.len != blocks.items[owner.target.index()].parameters.len or
+        !std.mem.eql(ir.ValueId, projected, replayed.arguments)) return false;
+
+    if (!(try redirectEdgeWithDominancePreflight(
+        allocator,
+        program,
+        blocks.items,
+        analysis.function.id,
+        &blocks.items[candidate.source.index()],
+        reference,
+        owner.target,
+        projected,
+    ))) return false;
+    const from_arguments = try allocator.dupe(ir.ValueId, live.arguments);
+    errdefer allocator.free(from_arguments);
+    try rewrites.append(allocator, .{
+        .id = ir.EdgeRewriteId.fromIndex(rewrites.items.len),
+        .source = candidate.source,
+        .kind = candidate.kind,
+        .from = .{ .target = candidate.target, .arguments = from_arguments },
+        .to = .{ .target = owner.target, .arguments = projected },
+        .rule = .clone_fold,
+        .node_split_group = target_parent.group,
+    });
+    program.blocks = blocks.items;
+    program.edge_rewrites = rewrites.items;
+    return true;
+}
+
+// A collision may expose a chain of independently authenticated target
+// clones.  Each fold changes the live CFG edge, so rebuild the small CFG
+// analysis before the next proof; the immutable clone-lineage index remains
+// reusable because clone_fold records do not create new clone ownership.
+// Stop at the first failed proof and leave the caller's ordinary feedback
+// scan responsible for any shape that is not this exact target chain.
+fn collapseAuthenticatedTargetLineageChain(
+    allocator: std.mem.Allocator,
+    scratch_allocator: std.mem.Allocator,
+    program: *ir.Program,
+    blocks: *std.ArrayList(ir.Block),
+    rewrites: *std.ArrayList(ir.CfgEdgeRewrite),
+    function_index: usize,
+    initial_owner: CollisionArm,
+    initial_candidate: CollisionArm,
+    projection: *structural_overlap.ReplayProjectionContext,
+) NormalizeError!usize {
+    if (function_index >= program.functions.len) return 0;
+
+    var owner = initial_owner;
+    var candidate = initial_candidate;
+    var folded: usize = 0;
+    var depth: usize = 0;
+    const depth_limit = @max(program.blocks.len, 1);
+    while (depth < depth_limit) : (depth += 1) {
+        if (owner.target == candidate.target) break;
+
+        var analysis = cfg.Analysis.init(
+            scratch_allocator,
+            program,
+            program.functions[function_index],
+        ) catch |err| switch (err) {
+            error.InvalidCfg => break,
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        defer analysis.deinit();
+
+        const folded_here = if (try collapseOwnerComposedCollisionEdge(
+            allocator,
+            program,
+            blocks,
+            rewrites,
+            &analysis,
+            owner,
+            candidate,
+            projection,
+        )) true else try collapseAuthenticatedDirectTargetCollisionEdge(
+            allocator,
+            program,
+            blocks,
+            rewrites,
+            &analysis,
+            owner,
+            candidate,
+            projection,
+        );
+        if (!folded_here) break;
+        folded += 1;
+
+        // The live edge now targets the owner.  Walk both endpoint lineages
+        // to discover the next independently-authenticated owner; do not
+        // infer a relationship from block IDs or source layout.
+        const source_parent = projection.cloneLineageParent(candidate.source) orelse break;
+        const target_parent = projection.cloneLineageParent(owner.target) orelse break;
+        candidate = .{
+            .source = candidate.source,
+            .kind = candidate.kind,
+            .target = owner.target,
+            .context = null,
+        };
+        owner = .{
+            .source = source_parent.block,
+            .kind = candidate.kind,
+            .target = target_parent.block,
+            .context = null,
+        };
+    }
+    return folded;
+}
+
+test "persisted direct target chain folds an effectful clone without collision history" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const owner = ir.BlockId.fromIndex(1);
+    const owner_exit = ir.BlockId.fromIndex(2);
+    const candidate = ir.BlockId.fromIndex(3);
+    const candidate_exit = ir.BlockId.fromIndex(4);
+    const condition = ir.ValueId.fromIndex(0);
+    const owner_result = ir.ValueId.fromIndex(1);
+    const candidate_result = ir.ValueId.fromIndex(2);
+    const owner_instruction = ir.InstructionId.fromIndex(0);
+    const candidate_instruction = ir.InstructionId.fromIndex(1);
+    const group = ir.NodeSplitGroupId.fromIndex(0);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = condition,
+            .then_edge = .{ .target = candidate },
+            .else_edge = .{ .target = owner },
+        } } },
+        .{ .id = owner, .function = function_id, .instructions = &.{owner_instruction}, .terminator = .{ .jump = .{ .target = owner_exit } } },
+        .{ .id = owner_exit, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = candidate, .function = function_id, .instructions = &.{candidate_instruction}, .terminator = .{ .jump = .{ .target = candidate_exit } } },
+        .{ .id = candidate_exit, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &.{condition},
+        .blocks = &.{ entry, owner, owner_exit, candidate, candidate_exit },
+        .entry_block = entry,
+    };
+    const values = [_]ir.Value{
+        .{ .id = condition, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = owner_result, .function = function_id, .type = .integer, .origin = .{ .instruction_result = .{ .instruction = owner_instruction, .index = 0 } } },
+        .{ .id = candidate_result, .function = function_id, .type = .integer, .origin = .{ .instruction_result = .{ .instruction = candidate_instruction, .index = 0 } } },
+    };
+    const instructions = [_]ir.Instruction{
+        .{ .id = owner_instruction, .block = owner, .operation = .{ .constant = .{ .integer = "1" } }, .results = &.{owner_result}, .effects = .pure },
+        .{ .id = candidate_instruction, .block = candidate, .operation = .{ .constant = .{ .integer = "1" } }, .results = &.{candidate_result}, .effects = .pure },
+    };
+    const rewrites = [_]ir.CfgEdgeRewrite{
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(0),
+            .source = entry,
+            .kind = .branch_then,
+            .from = .{ .target = owner },
+            .to = .{ .target = candidate },
+            .rule = .node_split,
+            .node_split_group = group,
+        },
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(1),
+            .source = candidate,
+            .kind = .jump,
+            .from = .{ .target = owner_exit },
+            .to = .{ .target = candidate_exit },
+            .rule = .node_split,
+            .node_split_group = group,
+        },
+    };
+    var block_storage: std.ArrayList(ir.Block) = .empty;
+    defer block_storage.deinit(std.testing.allocator);
+    try block_storage.appendSlice(std.testing.allocator, &blocks);
+    var rewrite_storage: std.ArrayList(ir.CfgEdgeRewrite) = .empty;
+    defer rewrite_storage.deinit(std.testing.allocator);
+    try rewrite_storage.appendSlice(std.testing.allocator, &rewrites);
+    var program = ir.Program{
+        .program_id = "persisted-direct-target-fold",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = block_storage.items,
+        .instructions = &instructions,
+        .values = &values,
+        .edge_rewrites = rewrite_storage.items,
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, function);
+    defer analysis.deinit();
+    var replay = try structural_overlap.ReplayProjectionContext.init(
+        std.testing.allocator,
+        &program,
+    );
+    defer replay.deinit();
+
+    const owner_arm: CollisionArm = .{ .source = entry, .kind = .branch_then, .target = owner };
+    const candidate_arm: CollisionArm = .{ .source = entry, .kind = .branch_then, .target = candidate };
+    try std.testing.expect(try directTargetBridgeIsAuthenticated(
+        &analysis,
+        owner_arm,
+        candidate_arm,
+        &replay,
+    ));
+    try std.testing.expectEqual(@as(usize, 1), try collapseAuthenticatedTargetLineageChain(
+        std.testing.allocator,
+        std.testing.allocator,
+        &program,
+        &block_storage,
+        &rewrite_storage,
+        0,
+        owner_arm,
+        candidate_arm,
+        &replay,
+    ));
+    try std.testing.expectEqual(owner, program.blocks[entry.index()].terminator.branch.then_edge.target);
+    try std.testing.expectEqual(@as(usize, 3), program.edge_rewrites.len);
+    try std.testing.expectEqual(ir.EdgeRewriteRule.clone_fold, program.edge_rewrites[2].rule);
+    try std.testing.expectEqual(group, program.edge_rewrites[2].node_split_group.?);
+    try std.testing.expectEqual(candidate, program.edge_rewrites[2].from.target);
+    try std.testing.expectEqual(owner, program.edge_rewrites[2].to.target);
+
+    var report = try @import("validate.zig").validate(std.testing.allocator, &program, .core);
+    defer report.deinit();
+    try std.testing.expect(report.isClean());
 }
 
 // A predecessor fallback does not have a fresh structured visit context, but
