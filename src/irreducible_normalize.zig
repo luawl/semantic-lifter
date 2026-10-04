@@ -15,7 +15,47 @@ const build_options = @import("build_options");
 
 pub const NormalizeError = error{NormalizationInvariantFailed} || std.mem.Allocator.Error;
 
+pub const NormalizeOptions = struct {
+    // A bounded feedback pass returns the current serialized IR instead of
+    // treating the budget as a normalization failure. The next invocation
+    // can resume from that IR and retain its authenticated rewrite history.
+    feedback_iteration_limit: ?usize = null,
+    // Checkpoints are emitted after the irreducible and overlap phases. A
+    // resumed pass must not pay for those already-proven scans again.
+    skip_initial_phases: bool = false,
+    initial_resume_seed: ?ResumeSeed = null,
+};
+
 const trace_normalize_phases = build_options.trace_normalize_phases;
+
+fn normalizePhaseNow() i96 {
+    if (!trace_normalize_phases) return 0;
+    return Io.Clock.awake.now(Io.Threaded.global_single_threaded.io()).nanoseconds;
+}
+
+fn normalizePhaseMillis(start: i96) i64 {
+    if (!trace_normalize_phases) return 0;
+    return @intCast(@divTrunc(normalizePhaseNow() - start, std.time.ns_per_ms));
+}
+
+fn traceNormalize(comptime format: []const u8, args: anytype) void {
+    if (trace_normalize_phases) std.debug.print(format, args);
+}
+
+fn traceAppliedSplit(phase: []const u8, function_index: usize, before: Result, after: Result) void {
+    traceNormalize("normalize_research phase={s} function={} blocks={} instructions={} values={} packs={} rewrite_start={} rewrite_end={}\n", .{
+        phase,
+        function_index,
+        after.cloned_blocks - before.cloned_blocks,
+        after.cloned_instructions - before.cloned_instructions,
+        after.cloned_values - before.cloned_values,
+        after.cloned_packs - before.cloned_packs,
+        before.program.edge_rewrites.len,
+        after.program.edge_rewrites.len,
+    });
+}
+
+const max_structural_clone_expansion = 4;
 
 fn normalizationIterationLimit(source: *const ir.Program, only_function: ?usize) usize {
     if (only_function) |function_index| {
@@ -76,6 +116,13 @@ const Secondary = struct {
     // Optional context aligned with incoming.  Ordinary overlap plans do not
     // need it; unvisited frontier plans preserve it for feedback freshness.
     incoming_contexts: []?structure.CollisionContext = &.{},
+};
+
+const OverlapIdentity = struct {
+    branch: ir.BlockId,
+    entry: ir.BlockId,
+    join: ir.BlockId,
+    entry_measure_kind: structural_overlap.EntryMeasureKind,
 };
 
 const SplitPlan = struct {
@@ -160,6 +207,47 @@ const CollisionSeed = struct {
     context: ?structure.CollisionContext,
     proof: CollisionSeedProof = .node_split,
 };
+
+fn collisionSeedFromResumeSeed(seed: ResumeSeed) CollisionSeed {
+    return .{
+        .function_index = seed.function_index,
+        .target = seed.target,
+        .source = seed.source,
+        .kind = seed.kind,
+        .original_target = seed.original_target,
+        .previous = seed.previous,
+        .context = .{
+            .start = seed.context_start,
+            .stop = seed.context_stop,
+            .loop_exit = seed.context_loop_exit,
+            .continue_target = seed.context_continue_target,
+            .parameter_arguments = seed.parameter_arguments,
+        },
+        .proof = seed.proof,
+    };
+}
+
+fn resumeSeedFromCollisionSeed(seed: CollisionSeed) ?ResumeSeed {
+    const context = seed.context orelse return null;
+    const source = seed.source orelse return null;
+    const kind = seed.kind orelse return null;
+    const original_target = seed.original_target orelse return null;
+    const previous = seed.previous orelse return null;
+    return .{
+        .function_index = seed.function_index,
+        .target = seed.target,
+        .source = source,
+        .kind = kind,
+        .original_target = original_target,
+        .previous = previous,
+        .context_start = context.start,
+        .context_stop = context.stop,
+        .context_loop_exit = context.loop_exit,
+        .context_continue_target = context.continue_target,
+        .parameter_arguments = context.parameter_arguments,
+        .proof = seed.proof,
+    };
+}
 
 fn collisionSeedForAppliedArm(
     function_index: usize,
@@ -274,6 +362,191 @@ fn collisionSeedForAppliedArmAfterApply(
         clone_base,
     );
     return seed;
+}
+
+// A lineage fold leaves a live edge at the authenticated owner while its
+// clone-fold record identifies the historical clone that was removed from
+// that edge. Preserve that exact boundary as a resume cursor only when the
+// post-fold graph still has a cyclic re-entry and the structured context can
+// be moved from the clone to its owner.
+fn collisionSeedForCloneFoldRewrite(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    function_index: usize,
+    rewrite: ir.CfgEdgeRewrite,
+    context: ?structure.CollisionContext,
+    projection: *const structural_overlap.ReplayProjectionContext,
+) NormalizeError!?CollisionSeed {
+    if (rewrite.rule != .clone_fold or rewrite.node_split_group == null or
+        function_index >= program.functions.len or
+        rewrite.source.index() >= program.blocks.len or
+        rewrite.from.target.index() >= program.blocks.len or
+        rewrite.to.target.index() >= program.blocks.len)
+    {
+        return null;
+    }
+    const function_id = program.functions[function_index].id;
+    if (program.blocks[rewrite.source.index()].function != function_id or
+        program.blocks[rewrite.from.target.index()].function != function_id or
+        program.blocks[rewrite.to.target.index()].function != function_id)
+    {
+        return null;
+    }
+    const parent = projection.cloneLineageParent(rewrite.from.target) orelse return null;
+    if (parent.block != rewrite.to.target or parent.group != rewrite.node_split_group.?) return null;
+
+    const reference = ir.CfgEdgeRef{
+        .source = rewrite.source,
+        .kind = rewrite.kind,
+        .target = rewrite.to.target,
+    };
+    const live = cfg_edge.value(program, reference) orelse return null;
+    if (!std.mem.eql(ir.ValueId, live.arguments, rewrite.to.arguments)) return null;
+
+    var analysis = cfg.Analysis.init(
+        allocator,
+        program,
+        program.functions[function_index],
+    ) catch |err| switch (err) {
+        error.InvalidCfg => return null,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    defer analysis.deinit();
+    if (!analysis.isReachable(rewrite.source) or
+        !analysis.isReachable(rewrite.to.target) or
+        !try analysis.canReachNonEmptyPath(rewrite.to.target, rewrite.to.target))
+    {
+        return null;
+    }
+
+    var remapped_context = context orelse return null;
+    if (remapped_context.start != rewrite.from.target) return null;
+    remapped_context.start = rewrite.to.target;
+    if (remapped_context.stop) |block| {
+        if (block == rewrite.from.target) remapped_context.stop = rewrite.to.target;
+    }
+    if (remapped_context.loop_exit) |block| {
+        if (block == rewrite.from.target) remapped_context.loop_exit = rewrite.to.target;
+    }
+    if (remapped_context.continue_target) |block| {
+        if (block == rewrite.from.target) remapped_context.continue_target = rewrite.to.target;
+    }
+    if (remapped_context.parameter_arguments) |arguments| {
+        if (!std.mem.eql(ir.ValueId, arguments, live.arguments)) return null;
+    } else if (live.arguments.len != 0) {
+        return null;
+    }
+
+    return .{
+        .function_index = function_index,
+        .target = rewrite.to.target,
+        .source = rewrite.source,
+        .kind = rewrite.kind,
+        .original_target = rewrite.from.target,
+        .previous = rewrite.to.target,
+        .context = remapped_context,
+        .proof = .clone_fold,
+    };
+}
+
+fn collisionSeedForLatestCloneFold(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    function_index: usize,
+    rewrite_start: usize,
+    context: ?structure.CollisionContext,
+    projection: *const structural_overlap.ReplayProjectionContext,
+) NormalizeError!?CollisionSeed {
+    var index = program.edge_rewrites.len;
+    while (index > rewrite_start) {
+        index -= 1;
+        const rewrite = program.edge_rewrites[index];
+        if (rewrite.rule != .clone_fold) continue;
+        if (try collisionSeedForCloneFoldRewrite(
+            allocator,
+            program,
+            function_index,
+            rewrite,
+            context,
+            projection,
+        )) |seed| return seed;
+    }
+    return null;
+}
+
+// Older checkpoints may have serialized the historical owner itself.  When
+// that owner was the direct target replaced by the authenticated node-split
+// rewrite, rebase the seed onto the live clone before validating it.  This is
+// deliberately limited to the exact rewrite and a real clone-local cycle;
+// an arbitrary reachable clone must still fall back to a fresh scan.
+fn rebaseUnreachableNodeSplitSeedOwner(
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    seed: *CollisionSeed,
+    projection: *structural_overlap.ReplayProjectionContext,
+) NormalizeError!bool {
+    const previous = seed.previous orelse return false;
+    if (seed.proof != .node_split or
+        seed.original_target == null or
+        previous != seed.original_target.? or
+        analysis.isReachable(previous) or
+        !analysis.isReachable(seed.source orelse return false) or
+        !analysis.isReachable(seed.target)) return false;
+
+    const rewrite = findNodeSplitArmEdge(
+        program.edge_rewrites,
+        seed.source.?,
+        seed.kind orelse return false,
+        seed.original_target.?,
+        seed.target,
+    ) orelse return false;
+    _ = rewrite.node_split_group orelse return false;
+    if (!try authenticatedSourceOwnedNodeSplitStep(
+        program,
+        projection,
+        rewrite,
+        analysis.function,
+    )) return false;
+    if (!try analysis.canReachNonEmptyPath(seed.target, seed.target)) return false;
+
+    var context = seed.context orelse return false;
+    if (context.start == previous) context.start = seed.target;
+    if (context.stop) |block| {
+        if (block == previous) context.stop = seed.target;
+    }
+    if (context.loop_exit) |block| {
+        if (block == previous) context.loop_exit = seed.target;
+    }
+    if (context.continue_target) |block| {
+        if (block == previous) context.continue_target = seed.target;
+    }
+    seed.previous = seed.target;
+    seed.context = context;
+    return true;
+}
+
+// A paired replay fold has already authenticated the owner/candidate lineage
+// before replacing the candidate edge with a forwarding edge. Preserve that
+// proof for one feedback iteration so the scheduler does not immediately
+// rebuild the full structural plan. The owner context is the post-fold target
+// context; the candidate context described the pre-fold target and cannot be
+// reused for the owner tuple.
+fn collisionSeedForPairedForwarding(
+    function_index: usize,
+    owner: CollisionArm,
+    candidate: CollisionArm,
+) ?CollisionSeed {
+    if (owner.context == null) return null;
+    return .{
+        .function_index = function_index,
+        .target = owner.target,
+        .source = candidate.source,
+        .kind = candidate.kind,
+        .original_target = candidate.target,
+        .previous = owner.source,
+        .context = owner.context,
+        .proof = .paired_forwarding,
+    };
 }
 
 // A direct sibling or predecessor search returns an overlap split, but it
@@ -731,6 +1004,166 @@ test "fresh collision alternatives remain tuple-sensitive" {
     )).?;
     defer fresh.deinit();
     try std.testing.expectEqual(source, fresh.incoming[0].source);
+}
+
+// Remove only semantically transparent forwarding blocks before control
+// restructuring.  Keep the blocks and record each edge substitution so the
+// admitted history remains replayable and auditable.
+fn collapseTransparentForwardingBlocks(
+    allocator: std.mem.Allocator,
+    program: *ir.Program,
+    blocks: *std.ArrayList(ir.Block),
+    rewrites: *std.ArrayList(ir.CfgEdgeRewrite),
+    only_function: ?usize,
+) NormalizeError!usize {
+    const selected_function = if (only_function) |function_index|
+        if (function_index < program.functions.len) program.functions[function_index].id else return 0
+    else
+        null;
+    var collapsed: usize = 0;
+    var pass: usize = 0;
+    const pass_limit = @max(blocks.items.len, 1);
+    while (pass < pass_limit) : (pass += 1) {
+        program.blocks = blocks.items;
+        program.edge_rewrites = rewrites.items;
+
+        const reachable = try allocator.alloc(bool, blocks.items.len);
+        defer allocator.free(reachable);
+        @memset(reachable, false);
+        for (program.functions, 0..) |function, function_index| {
+            if (only_function) |selected_index| if (function_index != selected_index) continue;
+            var analysis = cfg.Analysis.init(allocator, program, function) catch |err| switch (err) {
+                error.InvalidCfg => continue,
+                error.OutOfMemory => return error.OutOfMemory,
+            };
+            defer analysis.deinit();
+            for (function.blocks) |block_id| {
+                if (block_id.index() < reachable.len and analysis.isReachable(block_id)) {
+                    reachable[block_id.index()] = true;
+                }
+            }
+        }
+
+        var changed = false;
+        for (blocks.items, 0..) |candidate, candidate_index| {
+            if (selected_function) |function_id| if (candidate.function != function_id) continue;
+            if (!reachable[candidate_index] or candidate.parameters.len != 0 or
+                candidate.instructions.len != 0)
+            {
+                continue;
+            }
+            var is_function_entry = false;
+            for (program.functions, 0..) |function, function_index| {
+                if (only_function) |selected_index| if (function_index != selected_index) continue;
+                if (function.id == candidate.function and function.entry_block == candidate.id) {
+                    is_function_entry = true;
+                    break;
+                }
+            }
+            if (is_function_entry) continue;
+
+            const outgoing = switch (candidate.terminator) {
+                .jump => |edge| edge,
+                .branch, .return_values, .return_pack, .return_expanded, .throw_error, .unreachable_block => continue,
+            };
+            if (outgoing.target == candidate.id or outgoing.target.index() >= blocks.items.len) {
+                continue;
+            }
+            const target_block = blocks.items[outgoing.target.index()];
+            if (target_block.id != outgoing.target or target_block.function != candidate.function or
+                outgoing.arguments.len != target_block.parameters.len or
+                (target_block.parameters.len != 0 and
+                    !node_split.parametersAreCanonical(program.values, target_block)))
+            {
+                continue;
+            }
+            // The rewrite history is replayed through the generic forwarding
+            // contract. An empty block cannot lend an unrelated block
+            // parameter to its successor tuple.
+            if (!try forwardingJumpIsReplayable(allocator, program, candidate.id, outgoing)) continue;
+
+            for (blocks.items, 0..) |*source_block, source_index| {
+                if (source_index >= reachable.len or !reachable[source_index] or
+                    source_block.id == candidate.id or source_block.function != candidate.function or
+                    (selected_function != null and source_block.function != selected_function.?) or
+                    isHistoricalForwardingTarget(rewrites.items, source_block.id))
+                {
+                    continue;
+                }
+                var kind: ?ir.CfgEdgeKind = null;
+                var current: ?ir.Edge = null;
+                switch (source_block.terminator) {
+                    .jump => |edge| {
+                        if (edge.target == candidate.id and edge.arguments.len == 0) {
+                            kind = .jump;
+                            current = edge;
+                        }
+                    },
+                    .branch => |branch| {
+                        if (branch.then_edge.target == candidate.id and branch.then_edge.arguments.len == 0) {
+                            kind = .branch_then;
+                            current = branch.then_edge;
+                        } else if (branch.else_edge.target == candidate.id and branch.else_edge.arguments.len == 0) {
+                            kind = .branch_else;
+                            current = branch.else_edge;
+                        }
+                    },
+                    .return_values, .return_pack, .return_expanded, .throw_error, .unreachable_block => {},
+                }
+                const edge_kind = kind orelse continue;
+                const from = current.?;
+                const replacement = ir.Edge{ .target = outgoing.target, .arguments = outgoing.arguments };
+                switch (source_block.terminator) {
+                    .jump => source_block.terminator = .{ .jump = replacement },
+                    .branch => |branch| source_block.terminator = .{ .branch = if (edge_kind == .branch_then)
+                        .{ .condition = branch.condition, .then_edge = replacement, .else_edge = branch.else_edge }
+                    else
+                        .{ .condition = branch.condition, .then_edge = branch.then_edge, .else_edge = replacement } },
+                    .return_values, .return_pack, .return_expanded, .throw_error, .unreachable_block => unreachable,
+                }
+                try rewrites.append(allocator, .{
+                    .id = ir.EdgeRewriteId.fromIndex(rewrites.items.len),
+                    .source = source_block.id,
+                    .kind = edge_kind,
+                    .from = .{ .target = from.target },
+                    .to = replacement,
+                    .rule = .forwarding_jump,
+                });
+                collapsed += 1;
+                changed = true;
+                program.blocks = blocks.items;
+                program.edge_rewrites = rewrites.items;
+            }
+        }
+        if (!changed) break;
+    }
+    return collapsed;
+}
+
+fn forwardingJumpIsReplayable(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    forwarding: ir.BlockId,
+    outgoing: ir.Edge,
+) NormalizeError!bool {
+    const replayed = try control_flow.replayForwardingJump(
+        allocator,
+        program,
+        .{ .target = forwarding },
+    ) orelse return false;
+    defer if (replayed.arguments.len != 0) allocator.free(replayed.arguments);
+    return replayed.target == outgoing.target and
+        std.mem.eql(ir.ValueId, replayed.arguments, outgoing.arguments);
+}
+
+fn isHistoricalForwardingTarget(
+    rewrites: []const ir.CfgEdgeRewrite,
+    block: ir.BlockId,
+) bool {
+    for (rewrites) |rewrite| {
+        if (rewrite.rule == .forwarding_jump and rewrite.from.target == block) return true;
+    }
+    return false;
 }
 
 fn findCollisionArm(arms: []const CollisionArm, candidate: CollisionArm) ?CollisionArm {
@@ -1483,6 +1916,149 @@ fn sameNodeSplitOwnerComposedArmLineageWithReplay(
     );
 }
 
+test "post-apply transparent collapse preserves canonical successor tuple" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const forwarder = ir.BlockId.fromIndex(1);
+    const successor = ir.BlockId.fromIndex(2);
+    const input = ir.ValueId.fromIndex(0);
+    const formal = ir.ValueId.fromIndex(1);
+    const successor_arguments = [_]ir.ValueId{input};
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .jump = .{ .target = forwarder } } },
+        .{ .id = forwarder, .function = function_id, .terminator = .{ .jump = .{
+            .target = successor,
+            .arguments = successor_arguments[0..],
+        } } },
+        .{ .id = successor, .function = function_id, .parameters = &.{formal}, .terminator = .{ .return_values = &.{formal} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &.{input},
+        .blocks = &.{ entry, forwarder, successor },
+        .entry_block = entry,
+    };
+    const values = [_]ir.Value{
+        .{ .id = input, .function = function_id, .origin = .{ .parameter = 0 } },
+        .{ .id = formal, .function = function_id, .origin = .{ .block_parameter = .{ .block = successor, .index = 0 } } },
+    };
+    var blocks_owned: std.ArrayList(ir.Block) = .empty;
+    defer blocks_owned.deinit(std.testing.allocator);
+    try blocks_owned.appendSlice(std.testing.allocator, &blocks);
+    var rewrites: std.ArrayList(ir.CfgEdgeRewrite) = .empty;
+    defer rewrites.deinit(std.testing.allocator);
+    var program = ir.Program{
+        .program_id = "post-apply-transparent-collapse",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = blocks_owned.items,
+        .instructions = &.{},
+        .values = &values,
+        .edge_rewrites = rewrites.items,
+    };
+
+    try std.testing.expectEqual(@as(usize, 1), try collapseTransparentForwardingBlocks(
+        std.testing.allocator,
+        &program,
+        &blocks_owned,
+        &rewrites,
+        0,
+    ));
+    try std.testing.expectEqual(successor, program.blocks[entry.index()].terminator.jump.target);
+    try std.testing.expectEqualSlices(
+        ir.ValueId,
+        successor_arguments[0..],
+        program.blocks[entry.index()].terminator.jump.arguments,
+    );
+    try std.testing.expectEqual(@as(usize, 1), rewrites.items.len);
+    try std.testing.expectEqual(forwarder, rewrites.items[0].from.target);
+    try std.testing.expectEqual(successor, rewrites.items[0].to.target);
+    try std.testing.expectEqualSlices(ir.ValueId, successor_arguments[0..], rewrites.items[0].to.arguments);
+
+    program.blocks = blocks_owned.items;
+    program.edge_rewrites = rewrites.items;
+    try std.testing.expectEqual(@as(usize, 0), try collapseTransparentForwardingBlocks(
+        std.testing.allocator,
+        &program,
+        &blocks_owned,
+        &rewrites,
+        0,
+    ));
+}
+
+test "transparent collapse refuses a non-local successor tuple" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const source = ir.BlockId.fromIndex(1);
+    const foreign = ir.BlockId.fromIndex(2);
+    const forwarder = ir.BlockId.fromIndex(3);
+    const successor = ir.BlockId.fromIndex(4);
+    const condition = ir.ValueId.fromIndex(0);
+    const foreign_value = ir.ValueId.fromIndex(1);
+    const source_result = ir.ValueId.fromIndex(2);
+    const successor_parameter = ir.ValueId.fromIndex(3);
+    const instruction_id = ir.InstructionId.fromIndex(0);
+    const successor_arguments = [_]ir.ValueId{foreign_value};
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = condition,
+            .then_edge = .{ .target = source },
+            .else_edge = .{ .target = foreign },
+        } } },
+        .{ .id = source, .function = function_id, .instructions = &.{instruction_id}, .terminator = .{ .jump = .{ .target = forwarder } } },
+        .{ .id = foreign, .function = function_id, .parameters = &.{foreign_value}, .terminator = .{ .jump = .{
+            .target = successor,
+            .arguments = successor_arguments[0..],
+        } } },
+        .{ .id = forwarder, .function = function_id, .terminator = .{ .jump = .{
+            .target = successor,
+            .arguments = successor_arguments[0..],
+        } } },
+        .{ .id = successor, .function = function_id, .parameters = &.{successor_parameter}, .terminator = .{ .return_values = &.{successor_parameter} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &.{condition},
+        .blocks = &.{ entry, source, foreign, forwarder, successor },
+        .entry_block = entry,
+    };
+    const values = [_]ir.Value{
+        .{ .id = condition, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = foreign_value, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = foreign, .index = 0 } } },
+        .{ .id = source_result, .function = function_id, .type = .integer, .origin = .{ .instruction_result = .{ .instruction = instruction_id, .index = 0 } } },
+        .{ .id = successor_parameter, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = successor, .index = 0 } } },
+    };
+    const instructions = [_]ir.Instruction{
+        .{ .id = instruction_id, .block = source, .operation = .{ .constant = .{ .integer = "1" } }, .results = &.{source_result}, .effects = .pure },
+    };
+    const program = ir.Program{
+        .program_id = "non-local-forwarding-tuple",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+    };
+    var block_list: std.ArrayList(ir.Block) = .empty;
+    defer block_list.deinit(std.testing.allocator);
+    try block_list.appendSlice(std.testing.allocator, &blocks);
+    var rewrite_list: std.ArrayList(ir.CfgEdgeRewrite) = .empty;
+    defer rewrite_list.deinit(std.testing.allocator);
+    var working_program = program;
+    working_program.blocks = block_list.items;
+    working_program.edge_rewrites = rewrite_list.items;
+
+    try std.testing.expectEqual(@as(usize, 0), try collapseTransparentForwardingBlocks(
+        std.testing.allocator,
+        &working_program,
+        &block_list,
+        &rewrite_list,
+        0,
+    ));
+    try std.testing.expectEqual(forwarder, block_list.items[source.index()].terminator.jump.target);
+    try std.testing.expectEqual(@as(usize, 0), rewrite_list.items.len);
+}
+
 fn sameCollisionArmPositionWithReplay(
     projection: *const structural_overlap.ReplayProjectionContext,
     left: CollisionArm,
@@ -2134,6 +2710,52 @@ test "repeated collision arm composes a multi-step parameterized continuation" {
     )) == null);
 }
 
+// Validate one source-owned historical split step.  The lineage index can
+// reject a target with multiple incoming clone parents, but a repeated edge
+// may legitimately have other owners for the same clone.  Restrict the proof
+// to the seeded edge owner and replay each step's complete entry tuple.
+fn authenticatedSourceOwnedNodeSplitStep(
+    program: *const ir.Program,
+    projection: *structural_overlap.ReplayProjectionContext,
+    rewrite: ir.CfgEdgeRewrite,
+    function: ir.Function,
+) NormalizeError!bool {
+    if (rewrite.rule != .node_split or rewrite.node_split_group == null or
+        rewrite.from.target == rewrite.to.target or
+        rewrite.source.index() >= program.blocks.len or
+        rewrite.from.target.index() >= program.blocks.len or
+        rewrite.to.target.index() >= program.blocks.len)
+    {
+        return false;
+    }
+
+    const edge_source = program.blocks[rewrite.source.index()];
+    const from = program.blocks[rewrite.from.target.index()];
+    const to = program.blocks[rewrite.to.target.index()];
+    if (edge_source.id != rewrite.source or from.id != rewrite.from.target or
+        to.id != rewrite.to.target or edge_source.function != function.id or
+        from.function != function.id or to.function != function.id or
+        rewrite.from.arguments.len != from.parameters.len or
+        rewrite.to.arguments.len != to.parameters.len)
+    {
+        return false;
+    }
+
+    if (!projection.hasNodeSplitArmEdge(
+        rewrite.source,
+        rewrite.kind,
+        rewrite.from.target,
+        rewrite.to.target,
+        rewrite.node_split_group,
+    )) return false;
+
+    return try projection.parametersEquivalent(
+        rewrite.to.target,
+        rewrite.from.arguments,
+        rewrite.to.arguments,
+    );
+}
+
 // A predecessor fallback does not have a fresh structured visit context, but
 // the collision itself may carry the exact entry context for the target. Keep
 // that context for arm freshness only when its boundary and tuple match the
@@ -2368,6 +2990,72 @@ test "collision fallback filters a repeated projected arm before application" {
     )).?;
     defer fresh.deinit();
     try std.testing.expectEqual(second, fresh.incoming[0].source);
+}
+
+test "collision fallback retains a fresh arm after a repeated split arm" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const first = ir.BlockId.fromIndex(1);
+    const second = ir.BlockId.fromIndex(2);
+    const target = ir.BlockId.fromIndex(3);
+    const condition = ir.ValueId.fromIndex(0);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = condition,
+            .then_edge = .{ .target = first },
+            .else_edge = .{ .target = second },
+        } } },
+        .{ .id = first, .function = function_id, .terminator = .{ .jump = .{ .target = target } } },
+        .{ .id = second, .function = function_id, .terminator = .{ .jump = .{ .target = target } } },
+        .{ .id = target, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &.{condition},
+        .blocks = &.{ entry, first, second, target },
+        .entry_block = entry,
+    };
+    const values = [_]ir.Value{.{
+        .id = condition,
+        .function = function_id,
+        .type = .boolean,
+        .origin = .{ .parameter = 0 },
+    }};
+    const program: ir.Program = .{
+        .program_id = "fresh-arm-after-repeated-split-arm",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+    };
+    const prior = [_]CollisionArm{.{
+        .source = first,
+        .kind = .jump,
+        .target = target,
+    }};
+    var split = structural_overlap.Split{
+        .allocator = std.testing.allocator,
+        .function_index = 0,
+        .branch = entry,
+        .entry = first,
+        .join = target,
+        .incoming = try std.testing.allocator.dupe(ir.CfgEdgeRef, &.{
+            .{ .source = first, .kind = .jump, .target = target },
+            .{ .source = second, .kind = .jump, .target = target },
+        }),
+        .closure = try std.testing.allocator.dupe(ir.BlockId, &.{first}),
+    };
+    split = (try freshCollisionAlternative(
+        &program,
+        split,
+        &prior,
+        null,
+        null,
+    )).?;
+    defer split.deinit();
+    try std.testing.expectEqual(@as(usize, 1), split.incoming.len);
+    try std.testing.expectEqual(second, split.incoming[0].source);
 }
 
 fn nodeSplitRoot(rewrites: []const ir.CfgEdgeRewrite, initial: ir.BlockId) ?ir.BlockId {
