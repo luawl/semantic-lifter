@@ -6903,6 +6903,296 @@ fn blockInRegion(region: []const ir.BlockId, candidate: ir.BlockId) bool {
     return false;
 }
 
+fn applyPlan(
+    allocator: std.mem.Allocator,
+    program: *ir.Program,
+    blocks: *std.ArrayList(ir.Block),
+    functions: *std.ArrayList(ir.Function),
+    instructions: *std.ArrayList(ir.Instruction),
+    values: *std.ArrayList(ir.Value),
+    packs: *std.ArrayList(ir.ValuePack),
+    rewrites: *std.ArrayList(ir.CfgEdgeRewrite),
+    plan: *const SplitPlan,
+    result: *Result,
+) NormalizeError!void {
+    if (plan.function_index >= functions.items.len) {
+        return error.NormalizationInvariantFailed;
+    }
+    const function = &functions.items[plan.function_index];
+    const secondaries = plan.secondaries[0..plan.secondary_count];
+    const apply_start = normalizePhaseNow();
+    const initial_program = program.*;
+    const initial_block_count = blocks.items.len;
+    const initial_function_blocks = function.blocks;
+    const initial_instruction_count = instructions.items.len;
+    const initial_value_count = values.items.len;
+    const initial_pack_count = packs.items.len;
+    const initial_rewrite_count = rewrites.items.len;
+    const initial_result = result.*;
+    var clone_count: usize = 0;
+    for (secondaries) |secondary| clone_count = std.math.add(usize, clone_count, secondary.closure.len) catch
+        return error.NormalizationInvariantFailed;
+    const expanded_blocks = try allocator.alloc(ir.BlockId, function.blocks.len + clone_count);
+    errdefer allocator.free(expanded_blocks);
+    const block_snapshot = try allocator.dupe(ir.Block, blocks.items);
+    defer allocator.free(block_snapshot);
+    var committed = false;
+    errdefer if (!committed) {
+        blocks.shrinkRetainingCapacity(initial_block_count);
+        @memcpy(blocks.items, block_snapshot);
+        functions.items[plan.function_index].blocks = initial_function_blocks;
+        instructions.shrinkRetainingCapacity(initial_instruction_count);
+        values.shrinkRetainingCapacity(initial_value_count);
+        packs.shrinkRetainingCapacity(initial_pack_count);
+        rewrites.shrinkRetainingCapacity(initial_rewrite_count);
+        program.* = initial_program;
+        program.blocks = blocks.items;
+        program.functions = functions.items;
+        program.instructions = instructions.items;
+        program.values = values.items;
+        program.value_packs = packs.items;
+        program.edge_rewrites = rewrites.items;
+        result.* = initial_result;
+    };
+    @memcpy(expanded_blocks[0..function.blocks.len], function.blocks);
+    var expanded_index = function.blocks.len;
+
+    program.blocks = blocks.items;
+    program.functions = functions.items;
+    program.instructions = instructions.items;
+    program.values = values.items;
+    program.value_packs = packs.items;
+    program.edge_rewrites = rewrites.items;
+
+    // All secondary mappings must be authenticated against one immutable
+    // graph snapshot. Applying one incoming edge first can make the remaining
+    // edge references invalid until the function block list is published.
+    const prepared = try allocator.alloc(PreparedSecondary, secondaries.len);
+    var prepared_count: usize = 0;
+    defer {
+        for (prepared[0..prepared_count]) |*item| item.external.deinit();
+        allocator.free(prepared);
+    }
+    var snapshot_analysis = cfg.Analysis.init(allocator, program, functions.items[plan.function_index]) catch |err| switch (err) {
+        error.InvalidCfg => return error.NormalizationInvariantFailed,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    defer snapshot_analysis.deinit();
+    for (secondaries) |secondary| {
+        const external = (structural_overlap.collectExternalCloneMappingsAlloc(
+            allocator,
+            program,
+            &snapshot_analysis,
+            secondary.closure,
+            secondary.incoming,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+        }) orelse {
+            return error.NormalizationInvariantFailed;
+        };
+        prepared[prepared_count] = .{ .external = external };
+        prepared_count += 1;
+    }
+
+    for (secondaries, 0..) |secondary, secondary_index| {
+        if (secondary.block.index() >= blocks.items.len) {
+            return error.NormalizationInvariantFailed;
+        }
+        const node_split_group = ir.NodeSplitGroupId.fromIndex(rewrites.items.len);
+        const source_block = blocks.items[secondary.block.index()];
+        const clones = try allocator.alloc(ir.BlockId, secondary.closure.len);
+        defer allocator.free(clones);
+        const external = prepared[secondary_index].external;
+        var mapped_source_values: std.ArrayList(ir.ValueId) = .empty;
+        defer mapped_source_values.deinit(allocator);
+        var mapped_clone_values: std.ArrayList(ir.ValueId) = .empty;
+        defer mapped_clone_values.deinit(allocator);
+        var mapped_source_packs: std.ArrayList(ir.ValuePackId) = .empty;
+        defer mapped_source_packs.deinit(allocator);
+        var mapped_clone_packs: std.ArrayList(ir.ValuePackId) = .empty;
+        defer mapped_clone_packs.deinit(allocator);
+        try mapped_source_values.appendSlice(allocator, external.values);
+        try mapped_clone_values.appendSlice(allocator, external.clone_values);
+        try mapped_source_packs.appendSlice(allocator, external.packs);
+        try mapped_clone_packs.appendSlice(allocator, external.clone_packs);
+        const clone_start = normalizePhaseNow();
+        for (secondary.closure, 0..) |source_id, closure_index| {
+            if (trace_normalize_phases and secondary.closure.len >= 128 and closure_index % 512 == 0) {
+                std.debug.print("normalize_phase clone_progress function={} entry={} index={} total={} ms={} blocks={} instructions={}\\n", .{
+                    plan.function_index,
+                    secondary.block.index(),
+                    closure_index,
+                    secondary.closure.len,
+                    normalizePhaseMillis(clone_start),
+                    blocks.items.len,
+                    instructions.items.len,
+                });
+            }
+            if (source_id.index() >= blocks.items.len) return error.NormalizationInvariantFailed;
+            const clone_id = ir.BlockId.fromIndex(blocks.items.len);
+            const cloned = node_split.cloneBlockWithMappingsInArena(
+                allocator,
+                program,
+                instructions,
+                values,
+                packs,
+                blocks.items[source_id.index()],
+                clone_id,
+                mapped_source_values.items,
+                mapped_clone_values.items,
+                mapped_source_packs.items,
+                mapped_clone_packs.items,
+            ) catch |err| switch (err) {
+                error.InvalidNodeSplitSource => {
+                    return error.NormalizationInvariantFailed;
+                },
+                error.OutOfMemory => return error.OutOfMemory,
+            };
+            try blocks.append(allocator, cloned.block);
+            clones[closure_index] = clone_id;
+            expanded_blocks[expanded_index] = clone_id;
+            expanded_index += 1;
+            result.cloned_blocks += 1;
+            result.cloned_values += cloned.cloned_values;
+            result.cloned_packs += cloned.cloned_packs;
+            result.cloned_instructions += cloned.cloned_instructions;
+            program.blocks = blocks.items;
+            program.instructions = instructions.items;
+            program.values = values.items;
+            program.value_packs = packs.items;
+            try appendCloneMappings(
+                allocator,
+                program,
+                blocks.items[source_id.index()],
+                cloned.block,
+                &mapped_source_values,
+                &mapped_clone_values,
+                &mapped_source_packs,
+                &mapped_clone_packs,
+            );
+        }
+        const clone_ms = normalizePhaseMillis(clone_start);
+        const edge_start = normalizePhaseNow();
+        for (secondary.closure, clones) |source_id, clone_id| {
+            result.rewritten_edges += try rewriteClonedClosureEdges(
+                allocator,
+                program,
+                blocks,
+                rewrites,
+                secondary.closure,
+                clones,
+                mapped_source_values.items,
+                mapped_clone_values.items,
+                node_split_group,
+                source_id,
+                clone_id,
+                block_snapshot,
+                &snapshot_analysis,
+            );
+        }
+        const edge_ms = normalizePhaseMillis(edge_start);
+        const secondary_clone = mappedClone(secondary.closure, clones, secondary.block) orelse {
+            return error.NormalizationInvariantFailed;
+        };
+
+        const incoming_start = normalizePhaseNow();
+        for (secondary.incoming) |reference| {
+            const incoming = cfg_edge.value(program, reference) orelse {
+                return error.NormalizationInvariantFailed;
+            };
+            if (incoming.target != secondary.block or incoming.arguments.len != source_block.parameters.len) {
+                return error.NormalizationInvariantFailed;
+            }
+            const from_arguments = try allocator.dupe(ir.ValueId, incoming.arguments);
+            const to_arguments = try allocator.dupe(ir.ValueId, incoming.arguments);
+            if (!redirectEdge(&blocks.items[reference.source.index()], reference, secondary_clone, to_arguments)) {
+                return error.NormalizationInvariantFailed;
+            }
+            try rewrites.append(allocator, .{
+                .id = ir.EdgeRewriteId.fromIndex(rewrites.items.len),
+                .source = reference.source,
+                .kind = reference.kind,
+                .from = .{ .target = secondary.block, .arguments = from_arguments },
+                .to = .{ .target = secondary_clone, .arguments = to_arguments },
+                .rule = .node_split,
+                .node_split_group = node_split_group,
+            });
+            result.rewritten_edges += 1;
+            program.edge_rewrites = rewrites.items;
+
+            // Clone publication and the preceding incoming redirects mutate
+            // the dominance graph.  Rebuild the proof view from the current
+            // function membership before forwarding any successor tuple;
+            // the immutable snapshot above is only for clone preparation.
+            function.blocks = expanded_blocks[0..expanded_index];
+            program.functions = functions.items;
+            result.rewritten_edges += try forwardClonedIterationEntry(
+                allocator,
+                program,
+                blocks,
+                rewrites,
+                function.*,
+                reference.source,
+                reference.kind,
+                secondary_clone,
+            );
+        }
+        const incoming_ms = normalizePhaseMillis(incoming_start);
+        if (trace_normalize_phases and secondary.closure.len >= 128) {
+            std.debug.print("normalize_phase apply function={} entry={} closure={} clone_ms={} edge_ms={} incoming_ms={} total_ms={} blocks={} instructions={} values={}\\n", .{
+                plan.function_index,
+                secondary.block.index(),
+                secondary.closure.len,
+                clone_ms,
+                edge_ms,
+                incoming_ms,
+                normalizePhaseMillis(apply_start),
+                blocks.items.len,
+                instructions.items.len,
+                values.items.len,
+            });
+        }
+    }
+    if (expanded_index != expanded_blocks.len) {
+        return error.NormalizationInvariantFailed;
+    }
+    function.blocks = expanded_blocks;
+    program.blocks = blocks.items;
+    program.functions = functions.items;
+    program.instructions = instructions.items;
+    program.values = values.items;
+    program.value_packs = packs.items;
+    program.edge_rewrites = rewrites.items;
+    var availability_analysis = cfg.Analysis.init(allocator, program, function.*) catch |err| switch (err) {
+        error.InvalidCfg => return error.NormalizationInvariantFailed,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    defer availability_analysis.deinit();
+    if (!(try clone_availability.functionUsesAreAvailable(allocator, program, &availability_analysis))) {
+        std.debug.print("normalize diagnostic clone-availability-plan function={} secondaries={} blocks={} rewrites={}\n", .{
+            plan.function_index,
+            secondaries.len,
+            blocks.items.len,
+            rewrites.items.len,
+        });
+        for (secondaries, 0..) |secondary, index| {
+            std.debug.print("normalize diagnostic clone-availability-secondary index={} entry={} closure={any} incoming={any}\n", .{
+                index,
+                secondary.block.index(),
+                secondary.closure,
+                secondary.incoming,
+            });
+        }
+        std.debug.print("normalize failure phase=clone-availability function={} blocks={} rewrites={}\n", .{
+            function.id.index(),
+            function.blocks.len,
+            rewrites.items.len,
+        });
+        return error.NormalizationInvariantFailed;
+    }
+    committed = true;
+}
+
 fn appendCloneMappings(
     allocator: std.mem.Allocator,
     program: *const ir.Program,
@@ -6942,6 +7232,83 @@ fn appendCloneMappings(
 fn mappedClone(source: []const ir.BlockId, clones: []const ir.BlockId, target: ir.BlockId) ?ir.BlockId {
     for (source, clones) |candidate, clone| if (candidate == target) return clone;
     return null;
+}
+
+fn rewriteClonedClosureEdges(
+    allocator: std.mem.Allocator,
+    program: *ir.Program,
+    blocks: *std.ArrayList(ir.Block),
+    rewrites: *std.ArrayList(ir.CfgEdgeRewrite),
+    source_blocks: []const ir.BlockId,
+    clone_blocks: []const ir.BlockId,
+    mapped_source_values: []const ir.ValueId,
+    mapped_clone_values: []const ir.ValueId,
+    node_split_group: ir.NodeSplitGroupId,
+    source_id: ir.BlockId,
+    clone_id: ir.BlockId,
+    source_blocks_snapshot: []const ir.Block,
+    source_analysis: *const cfg.Analysis,
+) NormalizeError!usize {
+    if (source_id.index() >= source_blocks_snapshot.len or clone_id.index() >= blocks.items.len) return error.NormalizationInvariantFailed;
+    const source = source_blocks_snapshot[source_id.index()];
+    var changed: usize = 0;
+    switch (source.terminator) {
+        .jump => |edge| changed += try rewriteClonedClosureEdge(
+            allocator,
+            program,
+            blocks,
+            rewrites,
+            source_blocks,
+            clone_blocks,
+            mapped_source_values,
+            mapped_clone_values,
+            node_split_group,
+            source_id,
+            clone_id,
+            .jump,
+            edge.target,
+            edge,
+            source_analysis,
+        ),
+        .branch => |branch| {
+            changed += try rewriteClonedClosureEdge(
+                allocator,
+                program,
+                blocks,
+                rewrites,
+                source_blocks,
+                clone_blocks,
+                mapped_source_values,
+                mapped_clone_values,
+                node_split_group,
+                source_id,
+                clone_id,
+                .branch_then,
+                branch.then_edge.target,
+                branch.then_edge,
+                source_analysis,
+            );
+            changed += try rewriteClonedClosureEdge(
+                allocator,
+                program,
+                blocks,
+                rewrites,
+                source_blocks,
+                clone_blocks,
+                mapped_source_values,
+                mapped_clone_values,
+                node_split_group,
+                source_id,
+                clone_id,
+                .branch_else,
+                branch.else_edge.target,
+                branch.else_edge,
+                source_analysis,
+            );
+        },
+        .return_values, .return_pack, .return_expanded, .throw_error, .unreachable_block => {},
+    }
+    return changed;
 }
 
 fn rewriteClonedClosureEdge(
@@ -7013,6 +7380,89 @@ fn rewriteClonedClosureEdge(
     return 1;
 }
 
+fn forwardClonedIterationEntry(
+    allocator: std.mem.Allocator,
+    program: *ir.Program,
+    blocks: *std.ArrayList(ir.Block),
+    rewrites: *std.ArrayList(ir.CfgEdgeRewrite),
+    function: ir.Function,
+    source: ir.BlockId,
+    kind: ir.CfgEdgeKind,
+    clone_id: ir.BlockId,
+) !usize {
+    var analysis = cfg.Analysis.init(allocator, program, function) catch |err| switch (err) {
+        error.InvalidCfg => return error.NormalizationInvariantFailed,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    defer analysis.deinit();
+    const reference: ir.CfgEdgeRef = .{ .source = source, .kind = kind, .target = clone_id };
+    const incoming = cfg_edge.value(program, reference) orelse return 0;
+    if (incoming.target != clone_id) return 0;
+
+    var path: std.ArrayList(ir.Edge) = .empty;
+    defer {
+        for (path.items) |edge| if (edge.arguments.len != 0) allocator.free(edge.arguments);
+        path.deinit(allocator);
+    }
+    var current = incoming;
+    while (path.items.len < program.blocks.len) {
+        const forwarded = try control_flow.replayForwardingJump(allocator, program, current) orelse return 0;
+        if (forwarded.target == source or
+            forwardingTargetWasVisited(rewrites.items, source, kind, forwarded.target) or
+            pathContainsTarget(incoming.target, path.items, forwarded.target) or
+            forwarded.target.index() >= program.blocks.len)
+        {
+            if (forwarded.arguments.len != 0) allocator.free(forwarded.arguments);
+            return 0;
+        }
+        try path.append(allocator, forwarded);
+        const target = program.blocks[forwarded.target.index()];
+        if (iteration_protocol.transitionForHeader(program, target) != null) break;
+        current = forwarded;
+    }
+    if (path.items.len == 0 or path.items.len >= program.blocks.len) return 0;
+    const final = path.items[path.items.len - 1];
+    if (final.target.index() >= program.blocks.len or
+        iteration_protocol.transitionForHeader(program, program.blocks[final.target.index()]) == null)
+    {
+        return 0;
+    }
+    // The forwarding block may carry values that are valid only because the
+    // forwarding block is reached from a narrower context.  Substituting its
+    // final tuple directly into the original source edge is sound only when
+    // every value is already available at that source.  Keep the forwarding
+    // path explicit otherwise; its intermediate block owns that context.
+    if (!edgeArgumentsAvailableAtSource(program, &analysis, source, final.arguments)) return 0;
+
+    current = incoming;
+    for (path.items) |forwarded| {
+        try rewrites.append(allocator, .{
+            .id = ir.EdgeRewriteId.fromIndex(rewrites.items.len),
+            .source = source,
+            .kind = kind,
+            .from = .{
+                .target = current.target,
+                .arguments = try allocator.dupe(ir.ValueId, current.arguments),
+            },
+            .to = .{
+                .target = forwarded.target,
+                .arguments = try allocator.dupe(ir.ValueId, forwarded.arguments),
+            },
+            .rule = .forwarding_jump,
+        });
+        current = forwarded;
+    }
+    if (!replaceEdge(&blocks.items[source.index()], kind, incoming, final)) return error.NormalizationInvariantFailed;
+    for (path.items[0 .. path.items.len - 1]) |*edge| {
+        if (edge.arguments.len != 0) allocator.free(edge.arguments);
+        edge.arguments = &.{};
+    }
+    path.items[path.items.len - 1].arguments = &.{};
+    program.blocks = blocks.items;
+    program.edge_rewrites = rewrites.items;
+    return path.items.len;
+}
+
 fn edgeArgumentsAvailableAtSource(
     program: *const ir.Program,
     analysis: *const cfg.Analysis,
@@ -7066,6 +7516,160 @@ fn edgeArgumentsAvailableAtSource(
         }
     }
     return true;
+}
+
+test "forwarded iteration entry requires source-available successor arguments" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const foreign = ir.BlockId.fromIndex(1);
+    const source = ir.BlockId.fromIndex(2);
+    const clone = ir.BlockId.fromIndex(3);
+    const header = ir.BlockId.fromIndex(4);
+    const exit = ir.BlockId.fromIndex(5);
+
+    const selector = ir.ValueId.fromIndex(0);
+    const payload = ir.ValueId.fromIndex(1);
+    const foreign_value = ir.ValueId.fromIndex(2);
+    const clone_values = [_]ir.ValueId{
+        ir.ValueId.fromIndex(3),
+        ir.ValueId.fromIndex(4),
+        ir.ValueId.fromIndex(5),
+        ir.ValueId.fromIndex(6),
+    };
+    const header_values = [_]ir.ValueId{
+        ir.ValueId.fromIndex(7),
+        ir.ValueId.fromIndex(8),
+        ir.ValueId.fromIndex(9),
+        ir.ValueId.fromIndex(10),
+    };
+    const transition_results = [_]ir.ValueId{
+        ir.ValueId.fromIndex(11),
+        ir.ValueId.fromIndex(12),
+        ir.ValueId.fromIndex(13),
+        ir.ValueId.fromIndex(14),
+    };
+    const transition_id = ir.InstructionId.fromIndex(0);
+    const positive_source_arguments = [_]ir.ValueId{ foreign_value, payload, payload, payload };
+    const negative_source_arguments = [_]ir.ValueId{ foreign_value, payload, payload, payload };
+
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = selector,
+            .then_edge = .{ .target = foreign, .arguments = &.{payload} },
+            .else_edge = .{ .target = foreign, .arguments = &.{payload} },
+        } } },
+        .{ .id = foreign, .function = function_id, .parameters = &.{foreign_value}, .terminator = .{ .jump = .{ .target = source } } },
+        .{ .id = source, .function = function_id, .terminator = .{ .jump = .{
+            .target = clone,
+            .arguments = &positive_source_arguments,
+        } } },
+        .{ .id = clone, .function = function_id, .parameters = &clone_values, .terminator = .{ .jump = .{
+            .target = header,
+            .arguments = &clone_values,
+        } } },
+        .{ .id = header, .function = function_id, .parameters = &header_values, .instructions = &.{transition_id}, .terminator = .{ .branch = .{
+            .condition = transition_results[0],
+            .then_edge = .{ .target = exit },
+            .else_edge = .{ .target = exit },
+        } } },
+        .{ .id = exit, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &.{ selector, payload },
+        .blocks = &.{ entry, foreign, source, clone, header, exit },
+        .entry_block = entry,
+    };
+    const values = [_]ir.Value{
+        .{ .id = selector, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = payload, .function = function_id, .type = .integer, .origin = .{ .parameter = 1 } },
+        .{ .id = foreign_value, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = foreign, .index = 0 } } },
+        .{ .id = clone_values[0], .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = clone, .index = 0 } } },
+        .{ .id = clone_values[1], .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = clone, .index = 1 } } },
+        .{ .id = clone_values[2], .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = clone, .index = 2 } } },
+        .{ .id = clone_values[3], .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = clone, .index = 3 } } },
+        .{ .id = header_values[0], .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = header, .index = 0 } } },
+        .{ .id = header_values[1], .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = header, .index = 1 } } },
+        .{ .id = header_values[2], .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = header, .index = 2 } } },
+        .{ .id = header_values[3], .function = function_id, .type = .boolean, .origin = .{ .block_parameter = .{ .block = header, .index = 3 } } },
+        .{ .id = transition_results[0], .function = function_id, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = transition_id, .index = 0 } } },
+        .{ .id = transition_results[1], .function = function_id, .type = .integer, .origin = .{ .instruction_result = .{ .instruction = transition_id, .index = 1 } } },
+        .{ .id = transition_results[2], .function = function_id, .type = .integer, .origin = .{ .instruction_result = .{ .instruction = transition_id, .index = 2 } } },
+        .{ .id = transition_results[3], .function = function_id, .type = .integer, .origin = .{ .instruction_result = .{ .instruction = transition_id, .index = 3 } } },
+    };
+    const instructions = [_]ir.Instruction{.{
+        .id = transition_id,
+        .block = header,
+        .operation = .{ .numeric_for_next = .{
+            .control = header_values[0],
+            .limit = header_values[1],
+            .step = header_values[2],
+            .initial = header_values[3],
+            .mode = .semantic_normalized,
+        } },
+        .results = &transition_results,
+        .effects = .numeric_for_next,
+    }};
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const work = arena.allocator();
+    var block_list: std.ArrayList(ir.Block) = .empty;
+    try block_list.appendSlice(work, &blocks);
+    var rewrite_list: std.ArrayList(ir.CfgEdgeRewrite) = .empty;
+    var program = ir.Program{
+        .program_id = "forwarded-iteration-entry-availability",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = block_list.items,
+        .instructions = &instructions,
+        .values = &values,
+        .edge_rewrites = rewrite_list.items,
+    };
+    try std.testing.expectEqual(@as(usize, 1), try forwardClonedIterationEntry(
+        work,
+        &program,
+        &block_list,
+        &rewrite_list,
+        function,
+        source,
+        .jump,
+        clone,
+    ));
+    try std.testing.expectEqual(header, program.blocks[source.index()].terminator.jump.target);
+    try std.testing.expectEqual(@as(usize, 1), rewrite_list.items.len);
+    try std.testing.expectEqualSlices(
+        ir.ValueId,
+        positive_source_arguments[0..],
+        rewrite_list.items[0].to.arguments,
+    );
+
+    // Bypass the defining block after the first successful call.  A stale
+    // dominance snapshot would still accept foreign_value here.
+    block_list.items[entry.index()].terminator = .{ .branch = .{
+        .condition = selector,
+        .then_edge = .{ .target = foreign, .arguments = &.{payload} },
+        .else_edge = .{ .target = source },
+    } };
+    block_list.items[source.index()].terminator = .{ .jump = .{
+        .target = clone,
+        .arguments = &negative_source_arguments,
+    } };
+    rewrite_list.clearRetainingCapacity();
+    program.blocks = block_list.items;
+    program.edge_rewrites = rewrite_list.items;
+    try std.testing.expectEqual(@as(usize, 0), try forwardClonedIterationEntry(
+        work,
+        &program,
+        &block_list,
+        &rewrite_list,
+        function,
+        source,
+        .jump,
+        clone,
+    ));
+    try std.testing.expectEqual(clone, program.blocks[source.index()].terminator.jump.target);
+    try std.testing.expectEqual(@as(usize, 0), rewrite_list.items.len);
 }
 
 test "cloned closure edge remaps the immutable source tuple once" {
@@ -7165,6 +7769,55 @@ test "cloned closure edge remaps the immutable source tuple once" {
     try std.testing.expectEqualSlices(ir.ValueId, &.{external_clone}, rewritten_edge.arguments);
     try std.testing.expectEqualSlices(ir.ValueId, &.{external_clone}, rewrite_list.items[0].from.arguments);
     try std.testing.expectEqualSlices(ir.ValueId, &.{external_clone}, rewrite_list.items[0].to.arguments);
+}
+
+fn pathContainsTarget(initial: ir.BlockId, path: []const ir.Edge, target: ir.BlockId) bool {
+    if (target == initial) return true;
+    for (path) |edge| if (edge.target == target) return true;
+    return false;
+}
+
+fn forwardingTargetWasVisited(
+    rewrites: []const ir.CfgEdgeRewrite,
+    source: ir.BlockId,
+    kind: ir.CfgEdgeKind,
+    target: ir.BlockId,
+) bool {
+    for (rewrites) |rewrite| {
+        if (rewrite.source != source or rewrite.kind != kind) continue;
+        if (rewrite.from.target == target or rewrite.to.target == target) return true;
+    }
+    return false;
+}
+
+fn replaceEdge(block: *ir.Block, kind: ir.CfgEdgeKind, expected: ir.Edge, replacement: ir.Edge) bool {
+    switch (block.terminator) {
+        .jump => |edge| {
+            if (kind != .jump or !sameEdge(edge, expected)) return false;
+            block.terminator = .{ .jump = replacement };
+        },
+        .branch => |branch| {
+            var changed = branch;
+            switch (kind) {
+                .branch_then => {
+                    if (!sameEdge(branch.then_edge, expected)) return false;
+                    changed.then_edge = replacement;
+                },
+                .branch_else => {
+                    if (!sameEdge(branch.else_edge, expected)) return false;
+                    changed.else_edge = replacement;
+                },
+                .jump => return false,
+            }
+            block.terminator = .{ .branch = changed };
+        },
+        else => return false,
+    }
+    return true;
+}
+
+fn sameEdge(left: ir.Edge, right: ir.Edge) bool {
+    return left.target == right.target and std.mem.eql(ir.ValueId, left.arguments, right.arguments);
 }
 
 fn remapEdgeArgumentsAlloc(
@@ -7409,6 +8062,243 @@ test "mapped parameterized continuations clone while stable ones remain shared" 
     try std.testing.expect(blockInRegion(closure.items, primary));
     try std.testing.expect(blockInRegion(closure.items, mapped_continuation));
     try std.testing.expect(!blockInRegion(closure.items, stable_continuation));
+}
+
+test "continuation cloning carries secondary values through a zero-parameter primary" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const secondary = ir.BlockId.fromIndex(1);
+    const primary = ir.BlockId.fromIndex(2);
+    const continuation = ir.BlockId.fromIndex(3);
+    const target = ir.BlockId.fromIndex(4);
+    const payload = ir.ValueId.fromIndex(0);
+    const secondary_value = ir.ValueId.fromIndex(1);
+    const target_value = ir.ValueId.fromIndex(2);
+    const evidence_id = ir.EvidenceId.fromIndex(0);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .jump = .{
+            .target = secondary,
+            .arguments = &.{payload},
+        } }, .evidence = &.{evidence_id} },
+        .{ .id = secondary, .function = function_id, .parameters = &.{secondary_value}, .terminator = .{ .jump = .{
+            .target = primary,
+        } }, .evidence = &.{evidence_id} },
+        .{ .id = primary, .function = function_id, .terminator = .{ .jump = .{ .target = continuation } }, .evidence = &.{evidence_id} },
+        .{ .id = continuation, .function = function_id, .terminator = .{ .jump = .{
+            .target = target,
+            .arguments = &.{secondary_value},
+        } }, .evidence = &.{evidence_id} },
+        .{ .id = target, .function = function_id, .parameters = &.{target_value}, .terminator = .{ .return_values = &.{target_value} }, .evidence = &.{evidence_id} },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .parameters = &.{payload},
+        .blocks = &.{ entry, secondary, primary, continuation, target },
+        .entry_block = entry,
+        .evidence = &.{evidence_id},
+    }};
+    const values = [_]ir.Value{
+        .{ .id = payload, .function = function_id, .type = .integer, .origin = .{ .parameter = 0 } },
+        .{ .id = secondary_value, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = secondary, .index = 0 } } },
+        .{ .id = target_value, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = target, .index = 0 } } },
+    };
+    const evidence = [_]ir.Evidence{.{ .id = evidence_id, .kind = .dynamic_fixture, .locator = "fixture:continuation-value-clone" }};
+    const program: ir.Program = .{
+        .program_id = "continuation-value-clone",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+        .evidence = &evidence,
+    };
+
+    var primary_incoming = [_]ir.CfgEdgeRef{.{ .source = secondary, .kind = .jump, .target = primary }};
+    var secondary_incoming = [_]ir.CfgEdgeRef{.{ .source = entry, .kind = .jump, .target = secondary }};
+    var region_blocks = [_]ir.BlockId{ primary, secondary };
+    var entries = [_]irreducible_region.Entry{
+        .{ .block = primary, .incoming = &primary_incoming, .is_function_entry = false },
+        .{ .block = secondary, .incoming = &secondary_incoming, .is_function_entry = false },
+    };
+    const region: irreducible_region.Region = .{ .blocks = &region_blocks, .entries = &entries };
+
+    var graph = try cfg.Analysis.init(std.testing.allocator, &program, functions[0]);
+    defer graph.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const work = arena.allocator();
+    const closure = (try cloneClosure(
+        work,
+        &program,
+        &graph,
+        region,
+        primary,
+        secondary,
+        secondary_incoming[0..],
+    )).?;
+    try std.testing.expectEqual(@as(usize, 3), closure.len);
+    try std.testing.expect(blockInRegion(closure, secondary));
+    try std.testing.expect(blockInRegion(closure, primary));
+    try std.testing.expect(blockInRegion(closure, continuation));
+
+    const incoming = try work.dupe(ir.CfgEdgeRef, &secondary_incoming);
+    const secondaries = try work.alloc(Secondary, 1);
+    secondaries[0] = .{ .block = secondary, .incoming = incoming, .closure = closure };
+    var plan = SplitPlan{
+        .allocator = work,
+        .function_index = 0,
+        .secondaries = secondaries,
+        .secondary_count = 1,
+    };
+    defer plan.deinit();
+
+    var block_list: std.ArrayList(ir.Block) = .empty;
+    try block_list.appendSlice(work, &blocks);
+    var function_list: std.ArrayList(ir.Function) = .empty;
+    try function_list.appendSlice(work, &functions);
+    var instruction_list: std.ArrayList(ir.Instruction) = .empty;
+    var value_list: std.ArrayList(ir.Value) = .empty;
+    try value_list.appendSlice(work, &values);
+    var pack_list: std.ArrayList(ir.ValuePack) = .empty;
+    var rewrite_list: std.ArrayList(ir.CfgEdgeRewrite) = .empty;
+    var working_program = program;
+    var result: Result = .{ .program = working_program };
+    try applyPlan(
+        work,
+        &working_program,
+        &block_list,
+        &function_list,
+        &instruction_list,
+        &value_list,
+        &pack_list,
+        &rewrite_list,
+        &plan,
+        &result,
+    );
+
+    var clones: [3]ir.BlockId = undefined;
+    for (closure, 0..) |_, index| clones[index] = ir.BlockId.fromIndex(blocks.len + index);
+    const secondary_clone = mappedClone(closure, &clones, secondary).?;
+    const continuation_clone = mappedClone(closure, &clones, continuation).?;
+    try std.testing.expectEqual(secondary_clone, working_program.blocks[entry.index()].terminator.jump.target);
+    switch (working_program.blocks[continuation_clone.index()].terminator) {
+        .jump => |edge| {
+            try std.testing.expectEqual(target, edge.target);
+            try std.testing.expectEqual(@as(usize, 1), edge.arguments.len);
+            try std.testing.expectEqual(working_program.blocks[secondary_clone.index()].parameters[0], edge.arguments[0]);
+        },
+        else => try std.testing.expect(false),
+    }
+    var report = try @import("validate.zig").validate(std.testing.allocator, &working_program, .core);
+    defer report.deinit();
+    try std.testing.expect(report.isClean());
+}
+
+test "failed clone application rolls back graph and rewrite state" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const secondary = ir.BlockId.fromIndex(1);
+    const target = ir.BlockId.fromIndex(2);
+    const payload = ir.ValueId.fromIndex(0);
+    const secondary_value = ir.ValueId.fromIndex(1);
+    const target_value = ir.ValueId.fromIndex(2);
+    const evidence_id = ir.EvidenceId.fromIndex(0);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .jump = .{
+            .target = secondary,
+            .arguments = &.{payload},
+        } }, .evidence = &.{evidence_id} },
+        .{ .id = secondary, .function = function_id, .parameters = &.{secondary_value}, .terminator = .{ .jump = .{
+            .target = target,
+            .arguments = &.{secondary_value},
+        } }, .evidence = &.{evidence_id} },
+        .{ .id = target, .function = function_id, .parameters = &.{target_value}, .terminator = .{ .return_values = &.{target_value} }, .evidence = &.{evidence_id} },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &.{payload},
+        .blocks = &.{ entry, secondary, target },
+        .entry_block = entry,
+        .evidence = &.{evidence_id},
+    };
+    const values = [_]ir.Value{
+        .{ .id = payload, .function = function_id, .type = .integer, .origin = .{ .parameter = 0 } },
+        .{ .id = secondary_value, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = secondary, .index = 0 } } },
+        .{ .id = target_value, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = target, .index = 0 } } },
+    };
+    const evidence = [_]ir.Evidence{.{ .id = evidence_id, .kind = .dynamic_fixture, .locator = "fixture:transactional-clone-rollback" }};
+    const program: ir.Program = .{
+        .program_id = "transactional-clone-rollback",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+        .evidence = &evidence,
+    };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const work = arena.allocator();
+    const incoming = try work.dupe(ir.CfgEdgeRef, &.{
+        .{ .source = entry, .kind = .jump, .target = secondary },
+        .{ .source = entry, .kind = .jump, .target = secondary },
+    });
+    const closure = try work.dupe(ir.BlockId, &.{secondary});
+    const secondaries = try work.alloc(Secondary, 1);
+    secondaries[0] = .{ .block = secondary, .incoming = incoming, .closure = closure };
+    var plan = SplitPlan{
+        .allocator = work,
+        .function_index = 0,
+        .secondaries = secondaries,
+        .secondary_count = 1,
+    };
+    defer plan.deinit();
+
+    var block_list: std.ArrayList(ir.Block) = .empty;
+    defer block_list.deinit(work);
+    try block_list.appendSlice(work, &blocks);
+    var function_list: std.ArrayList(ir.Function) = .empty;
+    defer function_list.deinit(work);
+    try function_list.appendSlice(work, &.{function});
+    var instruction_list: std.ArrayList(ir.Instruction) = .empty;
+    defer instruction_list.deinit(work);
+    var value_list: std.ArrayList(ir.Value) = .empty;
+    defer value_list.deinit(work);
+    try value_list.appendSlice(work, &values);
+    var pack_list: std.ArrayList(ir.ValuePack) = .empty;
+    defer pack_list.deinit(work);
+    var rewrite_list: std.ArrayList(ir.CfgEdgeRewrite) = .empty;
+    defer rewrite_list.deinit(work);
+    var working_program = program;
+    var result: Result = .{ .program = working_program };
+
+    try std.testing.expectError(
+        error.NormalizationInvariantFailed,
+        applyPlan(
+            work,
+            &working_program,
+            &block_list,
+            &function_list,
+            &instruction_list,
+            &value_list,
+            &pack_list,
+            &rewrite_list,
+            &plan,
+            &result,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, blocks.len), block_list.items.len);
+    try std.testing.expectEqual(@as(usize, values.len), value_list.items.len);
+    try std.testing.expectEqual(@as(usize, 0), instruction_list.items.len);
+    try std.testing.expectEqual(@as(usize, 0), rewrite_list.items.len);
+    try std.testing.expectEqual(secondary, block_list.items[entry.index()].terminator.jump.target);
+    try std.testing.expectEqualSlices(ir.BlockId, function.blocks, function_list.items[0].blocks);
+    try std.testing.expectEqual(@as(usize, 0), result.cloned_blocks);
+    try std.testing.expectEqual(@as(usize, 0), result.cloned_values);
+    try std.testing.expectEqual(@as(usize, 0), result.rewritten_edges);
+    try std.testing.expectEqual(block_list.items.ptr, working_program.blocks.ptr);
+    try std.testing.expectEqual(rewrite_list.items.ptr, working_program.edge_rewrites.ptr);
 }
 
 test "mixed region plan retains only eligible secondary entries" {
