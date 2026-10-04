@@ -1166,6 +1166,178 @@ fn isHistoricalForwardingTarget(
     return false;
 }
 
+fn traceUnvisitedPlanCloneLimit(
+    program: *const ir.Program,
+    plan: *const SplitPlan,
+    structural_clones: usize,
+    limit: usize,
+    rewrites: usize,
+    arms: usize,
+) void {
+    const secondaries = plan.secondaries[0..plan.secondary_count];
+    var total_closure: usize = 0;
+    for (secondaries) |secondary| total_closure += secondary.closure.len;
+    std.debug.print("normalize diagnostic phase=feedback-batch-clone-limit secondaries={} total_closure={} structural_clones={} limit={} rewrites={} arms={}\n", .{
+        secondaries.len,
+        total_closure,
+        structural_clones,
+        limit,
+        rewrites,
+        arms,
+    });
+    for (secondaries, 0..) |secondary, index| {
+        if (index >= 64) {
+            std.debug.print("normalize diagnostic secondary-truncated remaining={}\n", .{secondaries.len - index});
+            break;
+        }
+        std.debug.print("normalize diagnostic secondary index={} block={} closure={} incoming={}\n", .{
+            index,
+            secondary.block.index(),
+            secondary.closure.len,
+            secondary.incoming.len,
+        });
+        for (secondary.incoming) |reference| {
+            std.debug.print("normalize diagnostic incoming source={} kind={s} target={}\n", .{
+                reference.source.index(),
+                @tagName(reference.kind),
+                reference.target.index(),
+            });
+        }
+        for (secondary.closure) |block_id| {
+            const root = nodeSplitRoot(program.edge_rewrites, block_id);
+            if (block_id.index() >= program.blocks.len) {
+                std.debug.print("normalize diagnostic closure-block id={} invalid\n", .{block_id.index()});
+                continue;
+            }
+            const block = program.blocks[block_id.index()];
+            std.debug.print("normalize diagnostic closure-block id={} root={?d} parameters={} instructions={} terminator={s}\n", .{
+                block_id.index(),
+                if (root) |value| value.index() else null,
+                block.parameters.len,
+                block.instructions.len,
+                @tagName(std.meta.activeTag(block.terminator)),
+            });
+        }
+        if (plan.function_index < program.functions.len) {
+            for (secondary.closure) |closure_block| {
+                const root = nodeSplitRoot(program.edge_rewrites, closure_block) orelse continue;
+                var root_count: usize = 0;
+                for (program.functions[plan.function_index].blocks) |candidate| {
+                    if (nodeSplitRoot(program.edge_rewrites, candidate) == root) root_count += 1;
+                }
+                std.debug.print("normalize diagnostic lineage-root root={} existing_blocks={} current_block={}\n", .{
+                    root.index(),
+                    root_count,
+                    closure_block.index(),
+                });
+            }
+        }
+        for (program.edge_rewrites) |rewrite| {
+            if (rewrite.rule != .node_split or rewrite.source != secondary.incoming[0].source) continue;
+            std.debug.print("normalize diagnostic source-rewrite source={} kind={s} from={} to={} arguments={any}\n", .{
+                rewrite.source.index(),
+                @tagName(rewrite.kind),
+                rewrite.from.target.index(),
+                rewrite.to.target.index(),
+                rewrite.to.arguments,
+            });
+        }
+        if (plan.function_index < program.functions.len) {
+            const function = program.functions[plan.function_index];
+            for (function.blocks) |source_id| {
+                if (source_id.index() >= program.blocks.len) continue;
+                const block = program.blocks[source_id.index()];
+                switch (block.terminator) {
+                    .jump => |edge| if (edge.target == secondary.block) {
+                        std.debug.print("normalize diagnostic live-incoming source={} kind=jump target={} arguments={any}\n", .{
+                            source_id.index(),
+                            edge.target.index(),
+                            edge.arguments,
+                        });
+                    },
+                    .branch => |branch| {
+                        if (branch.then_edge.target == secondary.block) {
+                            std.debug.print("normalize diagnostic live-incoming source={} kind=branch_then target={} arguments={any}\n", .{
+                                source_id.index(),
+                                branch.then_edge.target.index(),
+                                branch.then_edge.arguments,
+                            });
+                        }
+                        if (branch.else_edge.target == secondary.block) {
+                            std.debug.print("normalize diagnostic live-incoming source={} kind=branch_else target={} arguments={any}\n", .{
+                                source_id.index(),
+                                branch.else_edge.target.index(),
+                                branch.else_edge.arguments,
+                            });
+                        }
+                    },
+                    .return_values, .return_pack, .return_expanded, .throw_error, .unreachable_block => {},
+                }
+            }
+        }
+        var closure_members: std.AutoHashMapUnmanaged(ir.BlockId, void) = .empty;
+        defer closure_members.deinit(std.heap.page_allocator);
+        for (secondary.closure) |block_id| closure_members.put(std.heap.page_allocator, block_id, {}) catch {};
+        for (secondary.closure) |block_id| {
+            if (block_id.index() >= program.blocks.len) continue;
+            const block = program.blocks[block_id.index()];
+            switch (block.terminator) {
+                .jump => |edge| if (!closure_members.contains(edge.target)) {
+                    std.debug.print("normalize diagnostic closure-exit source={} kind=jump target={} arguments={any}\n", .{
+                        block_id.index(),
+                        edge.target.index(),
+                        edge.arguments,
+                    });
+                },
+                .branch => |branch| {
+                    if (!closure_members.contains(branch.then_edge.target)) {
+                        std.debug.print("normalize diagnostic closure-exit source={} kind=branch_then target={} arguments={any}\n", .{
+                            block_id.index(),
+                            branch.then_edge.target.index(),
+                            branch.then_edge.arguments,
+                        });
+                    }
+                    if (!closure_members.contains(branch.else_edge.target)) {
+                        std.debug.print("normalize diagnostic closure-exit source={} kind=branch_else target={} arguments={any}\n", .{
+                            block_id.index(),
+                            branch.else_edge.target.index(),
+                            branch.else_edge.arguments,
+                        });
+                    }
+                },
+                .return_values, .return_pack, .return_expanded, .throw_error, .unreachable_block => {},
+            }
+        }
+    }
+    var overlap_records: usize = 0;
+    for (secondaries, 0..) |left, left_index| {
+        for (secondaries[left_index + 1 ..], left_index + 1..) |right, right_index| {
+            var overlap: usize = 0;
+            var first_overlap: ?ir.BlockId = null;
+            for (left.closure) |left_block| {
+                for (right.closure) |right_block| {
+                    if (left_block != right_block) continue;
+                    overlap += 1;
+                    if (first_overlap == null) first_overlap = left_block;
+                }
+            }
+            if (overlap == 0) continue;
+            if (overlap_records < 128) {
+                std.debug.print("normalize diagnostic closure-overlap left={} right={} count={} first={}\n", .{
+                    left_index,
+                    right_index,
+                    overlap,
+                    first_overlap.?.index(),
+                });
+            }
+            overlap_records += 1;
+        }
+    }
+    if (overlap_records > 128) {
+        std.debug.print("normalize diagnostic closure-overlap-truncated remaining={}\n", .{overlap_records - 128});
+    }
+}
+
 fn findCollisionArm(arms: []const CollisionArm, candidate: CollisionArm) ?CollisionArm {
     for (arms) |arm| {
         if (arm.source == candidate.source and arm.kind == candidate.kind and arm.target == candidate.target and
@@ -1183,6 +1355,21 @@ fn sameCollisionContext(
 ) bool {
     if (left == null or right == null) return true;
     return std.meta.eql(left.?, right.?);
+}
+
+// A seeded collision retry preserves the control boundary from the previous
+// visit, but the edge may now enter a clone with a remapped loop-carried tuple.
+// Keep the structural context and refresh only the tuple from the live edge;
+// replay authentication still decides whether the two tuples are equivalent.
+fn collisionContextWithCurrentEdgeArguments(
+    program: *const ir.Program,
+    context: ?structure.CollisionContext,
+    reference: ir.CfgEdgeRef,
+) ?structure.CollisionContext {
+    var refreshed = context orelse return null;
+    const edge = cfg_edge.value(program, reference) orelse return context;
+    refreshed.parameter_arguments = edge.arguments;
+    return refreshed;
 }
 
 fn findLineageCollisionArm(
@@ -1214,6 +1401,35 @@ fn sameNodeSplitDirectTargetLineage(
         if (rewrite.rule == .node_split and
             rewrite.from.target == left and
             rewrite.to.target == right)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn sameNodeSplitDirectArmLineage(
+    rewrites: []const ir.CfgEdgeRewrite,
+    left: CollisionArm,
+    right: CollisionArm,
+) bool {
+    if (left.kind != right.kind) return false;
+    for (rewrites) |rewrite| {
+        if (rewrite.rule == .node_split and
+            rewrite.source == left.source and
+            rewrite.kind == left.kind and
+            left.source == right.source and
+            rewrite.from.target == left.target and
+            rewrite.to.target == right.target)
+        {
+            return true;
+        }
+        if (rewrite.rule == .node_split and
+            rewrite.source == right.source and
+            rewrite.kind == right.kind and
+            left.source == right.source and
+            rewrite.from.target == right.target and
+            rewrite.to.target == left.target)
         {
             return true;
         }
@@ -1340,6 +1556,37 @@ fn collisionContextsEquivalent(
         left_context.parameter_arguments,
         right_context.parameter_arguments,
     );
+}
+
+// Reconstruct the durable owner of an independently composed source/target
+// clone pair.  The owner is not scratch history: both parent blocks and their
+// split groups are authenticated by the persisted node-split lineage.  Keep
+// the helper conservative and let the full bridge proof validate the live
+// edge, tuple, and continuation before any rewrite is applied.
+fn historicalOwnerComposedArmForCandidate(
+    program: *const ir.Program,
+    candidate: CollisionArm,
+    projection: *const structural_overlap.ReplayProjectionContext,
+) ?CollisionArm {
+    if (candidate.source.index() >= program.blocks.len or
+        candidate.target.index() >= program.blocks.len)
+    {
+        return null;
+    }
+    const source_parent = projection.cloneLineageParent(candidate.source) orelse return null;
+    const target_parent = projection.cloneLineageParent(candidate.target) orelse return null;
+    if (source_parent.block == candidate.source or
+        target_parent.block == candidate.target or
+        source_parent.group == target_parent.group)
+    {
+        return null;
+    }
+    return .{
+        .source = source_parent.block,
+        .kind = candidate.kind,
+        .target = target_parent.block,
+        .context = null,
+    };
 }
 
 fn findPreviouslyTriedCollisionArm(
@@ -1876,6 +2123,452 @@ fn sameNodeSplitPairedArmLineageWithReplay(
 ) bool {
     return sameNodeSplitPairedArmLineageForwardWithReplay(program, projection, left, right) or
         sameNodeSplitPairedArmLineageForwardWithReplay(program, projection, right, left);
+}
+
+fn mapEdgeArgumentsBackwardThroughClone(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    source: ir.BlockId,
+    clone: ir.BlockId,
+    group: ir.NodeSplitGroupId,
+    arguments: []const ir.ValueId,
+) NormalizeError!?[]ir.ValueId {
+    var replay = (try node_split.replayMappingsForCloneAlloc(
+        allocator,
+        program,
+        source,
+        clone,
+        group,
+    )) orelse return null;
+    defer replay.deinit();
+
+    const mapped = try allocator.alloc(ir.ValueId, arguments.len);
+    errdefer allocator.free(mapped);
+    for (arguments, 0..) |argument, argument_index| {
+        switch (node_split.reverseReplayValue(replay, argument)) {
+            .mapped => |source_value| {
+                mapped[argument_index] = source_value;
+                continue;
+            },
+            .ambiguous => return null,
+            .missing => {},
+        }
+        if (argument.index() >= program.values.len) return null;
+        const value = program.values[argument.index()];
+        if (value.id != argument) return null;
+        switch (value.origin) {
+            .parameter, .capture => {},
+            .block_parameter => |origin| if (origin.block == clone) return null,
+            .instruction_result => |origin| {
+                if (origin.instruction.index() >= program.instructions.len) return null;
+                if (program.instructions[origin.instruction.index()].block == clone) return null;
+            },
+        }
+        mapped[argument_index] = argument;
+    }
+    return mapped;
+}
+
+// A paired clone can reproduce a collision edge inside the very closure that
+// was cloned to resolve it.  Splitting that edge again is self-replicating:
+// the next clone contains the same edge with fresh block/value ids.  Replay
+// the edge back to its authenticated owner boundary instead.  The source
+// lineage maps the complete argument tuple; target-only lineage steps use
+// the original rewrite tuple.  No reachability or root equality is enough
+// to enter this path.
+fn collapsePairedCollisionEdge(
+    allocator: std.mem.Allocator,
+    program: *ir.Program,
+    blocks: *std.ArrayList(ir.Block),
+    rewrites: *std.ArrayList(ir.CfgEdgeRewrite),
+    owner: CollisionArm,
+    candidate: CollisionArm,
+    projection: *const structural_overlap.ReplayProjectionContext,
+) NormalizeError!bool {
+    if (!sameNodeSplitPairedArmLineageForwardWithReplay(
+        program,
+        projection,
+        owner,
+        candidate,
+    )) return false;
+    if (candidate.source.index() >= blocks.items.len or
+        candidate.target.index() >= blocks.items.len or
+        owner.target.index() >= blocks.items.len or
+        blocks.items[candidate.source.index()].id != candidate.source or
+        blocks.items[candidate.target.index()].id != candidate.target or
+        blocks.items[owner.target.index()].id != owner.target or
+        blocks.items[candidate.source.index()].function != blocks.items[owner.target.index()].function)
+    {
+        return false;
+    }
+    if (isHistoricalForwardingTarget(rewrites.items, owner.target)) return false;
+
+    const reference: ir.CfgEdgeRef = .{
+        .source = candidate.source,
+        .kind = candidate.kind,
+        .target = candidate.target,
+    };
+    const live = cfg_edge.value(program, reference) orelse return false;
+    if (live.target != candidate.target or
+        live.arguments.len != blocks.items[candidate.target.index()].parameters.len)
+    {
+        return false;
+    }
+
+    // Keep the candidate-local tuple used by the live edge. A second tuple is
+    // replayed back into the owner source to authenticate that this edge is
+    // the same semantic arm; that historical tuple may not dominate the
+    // cloned source and must not be written back into the live CFG.
+    const projected = try allocator.dupe(ir.ValueId, live.arguments);
+    var projected_owned = true;
+    defer if (projected_owned) allocator.free(projected);
+    var owner_projected = try allocator.dupe(ir.ValueId, live.arguments);
+    defer allocator.free(owner_projected);
+
+    var current_source = candidate.source;
+    var current_target = candidate.target;
+    var steps: usize = 0;
+    var paired_steps: usize = 0;
+    while (current_source != owner.source or current_target != owner.target) : (steps += 1) {
+        if (steps >= blocks.items.len) return false;
+
+        const source_parent = projection.cloneLineageParent(current_source);
+        const target_parent = projection.cloneLineageParent(current_target);
+        if (source_parent) |source_step| {
+            if (target_parent) |target_step| {
+                if (source_step.group == target_step.group) {
+                    const rewrite = findNodeSplitArmEdgeInGroup(
+                        rewrites.items,
+                        current_source,
+                        candidate.kind,
+                        target_step.block,
+                        current_target,
+                        source_step.group,
+                    ) orelse return false;
+                    if (steps == 0 and !std.mem.eql(ir.ValueId, live.arguments, rewrite.to.arguments)) {
+                        return false;
+                    }
+                    const next_projected = (try mapEdgeArgumentsBackwardThroughClone(
+                        allocator,
+                        program,
+                        source_step.block,
+                        current_source,
+                        source_step.group,
+                        owner_projected,
+                    )) orelse return false;
+                    allocator.free(owner_projected);
+                    owner_projected = next_projected;
+                    current_source = source_step.block;
+                    current_target = target_step.block;
+                    paired_steps += 1;
+                    continue;
+                }
+            }
+        }
+
+        const target_step = target_parent orelse return false;
+        const rewrite = findNodeSplitArmEdge(
+            rewrites.items,
+            current_source,
+            candidate.kind,
+            target_step.block,
+            current_target,
+        ) orelse return false;
+        if (steps == 0 and !std.mem.eql(ir.ValueId, live.arguments, rewrite.to.arguments)) {
+            return false;
+        }
+        const next_projected = try allocator.dupe(ir.ValueId, rewrite.from.arguments);
+        allocator.free(owner_projected);
+        owner_projected = next_projected;
+        current_target = target_step.block;
+    }
+    if (paired_steps == 0 or
+        projected.len != blocks.items[owner.target.index()].parameters.len or
+        owner_projected.len != blocks.items[owner.target.index()].parameters.len)
+    {
+        return false;
+    }
+    for (owner_projected) |value_id| {
+        if (value_id.index() >= program.values.len or program.values[value_id.index()].id != value_id) {
+            return false;
+        }
+    }
+    const owner_edge = cfg_edge.value(program, .{
+        .source = owner.source,
+        .kind = owner.kind,
+        .target = owner.target,
+    }) orelse return false;
+    if (owner_edge.target != owner.target or
+        !std.mem.eql(ir.ValueId, owner_projected, owner_edge.arguments)) return false;
+
+    const from_arguments = try allocator.dupe(ir.ValueId, live.arguments);
+    errdefer allocator.free(from_arguments);
+    if (!(try redirectEdgeWithDominancePreflight(
+        allocator,
+        program,
+        blocks.items,
+        blocks.items[candidate.source.index()].function,
+        &blocks.items[candidate.source.index()],
+        reference,
+        owner.target,
+        projected,
+    ))) {
+        return false;
+    }
+    try rewrites.append(allocator, .{
+        .id = ir.EdgeRewriteId.fromIndex(rewrites.items.len),
+        .source = candidate.source,
+        .kind = candidate.kind,
+        .from = .{ .target = candidate.target, .arguments = from_arguments },
+        .to = .{ .target = owner.target, .arguments = projected },
+        .rule = .forwarding_jump,
+    });
+    projected_owned = false;
+    program.blocks = blocks.items;
+    program.edge_rewrites = rewrites.items;
+    traceNormalize("normalize_phase paired_replay_fold source={} from={} to={} paired_steps={} arguments={any}\n", .{
+        candidate.source.index(),
+        candidate.target.index(),
+        owner.target.index(),
+        paired_steps,
+        projected,
+    });
+    return true;
+}
+
+// Independently composed source and target clones can reproduce an owner arm
+// without sharing a node-split group.  When the owner-composed bridge proves
+// the complete external tuple, fold the live edge back to the durable owner
+// target instead of cloning the same continuation again.  The bridge proof
+// authenticates both endpoint lineages, the target rewrite, and the mapped
+// value/formal tuple; this fold only records that already-proven projection.
+fn collapseOwnerComposedCollisionEdge(
+    allocator: std.mem.Allocator,
+    program: *ir.Program,
+    blocks: *std.ArrayList(ir.Block),
+    rewrites: *std.ArrayList(ir.CfgEdgeRewrite),
+    analysis: *const cfg.Analysis,
+    owner: CollisionArm,
+    candidate: CollisionArm,
+    projection: *structural_overlap.ReplayProjectionContext,
+) NormalizeError!bool {
+    if (!try sameNodeSplitOwnerComposedArmLineageWithReplay(
+        program,
+        analysis,
+        projection,
+        owner,
+        candidate,
+    )) return false;
+
+    const source_parent = projection.cloneLineageParent(candidate.source) orelse return false;
+    const target_parent = projection.cloneLineageParent(candidate.target) orelse return false;
+    if (source_parent.block != owner.source or target_parent.block != owner.target or
+        source_parent.group == target_parent.group)
+    {
+        return false;
+    }
+    if (owner.target.index() >= blocks.items.len or
+        candidate.source.index() >= blocks.items.len or
+        candidate.target.index() >= blocks.items.len or
+        blocks.items[owner.target.index()].id != owner.target or
+        blocks.items[candidate.source.index()].id != candidate.source or
+        blocks.items[candidate.target.index()].id != candidate.target or
+        blocks.items[candidate.source.index()].function != blocks.items[owner.target.index()].function or
+        blocks.items[candidate.target.index()].function != blocks.items[owner.target.index()].function)
+    {
+        return false;
+    }
+    if (isHistoricalForwardingTarget(rewrites.items, owner.target)) return false;
+
+    const reference: ir.CfgEdgeRef = .{
+        .source = candidate.source,
+        .kind = candidate.kind,
+        .target = candidate.target,
+    };
+    const live = cfg_edge.value(program, reference) orelse return false;
+    if (live.target != candidate.target or
+        live.arguments.len != blocks.items[candidate.target.index()].parameters.len)
+    {
+        return false;
+    }
+
+    // The target-side rewrite is the durable owner boundary. Require the
+    // exact group and edge tuple rather than reconstructing it from roots.
+    const target_rewrite = findNodeSplitArmEdgeInGroup(
+        rewrites.items,
+        candidate.source,
+        candidate.kind,
+        owner.target,
+        candidate.target,
+        target_parent.group,
+    ) orelse findNodeSplitArmEdgeInGroup(
+        rewrites.items,
+        owner.source,
+        candidate.kind,
+        owner.target,
+        candidate.target,
+        target_parent.group,
+    ) orelse return false;
+    if (!std.mem.eql(ir.ValueId, live.arguments, target_rewrite.to.arguments) or
+        target_rewrite.from.arguments.len != blocks.items[owner.target.index()].parameters.len)
+    {
+        return false;
+    }
+
+    const from_arguments = try allocator.dupe(ir.ValueId, live.arguments);
+    errdefer allocator.free(from_arguments);
+    const to_arguments = try allocator.dupe(ir.ValueId, target_rewrite.from.arguments);
+    errdefer allocator.free(to_arguments);
+    if (!(try redirectEdgeWithDominancePreflight(
+        allocator,
+        program,
+        blocks.items,
+        analysis.function.id,
+        &blocks.items[candidate.source.index()],
+        reference,
+        owner.target,
+        to_arguments,
+    ))) {
+        allocator.free(from_arguments);
+        allocator.free(to_arguments);
+        return false;
+    }
+    try rewrites.append(allocator, .{
+        .id = ir.EdgeRewriteId.fromIndex(rewrites.items.len),
+        .source = candidate.source,
+        .kind = candidate.kind,
+        .from = .{ .target = candidate.target, .arguments = from_arguments },
+        .to = .{ .target = owner.target, .arguments = to_arguments },
+        .rule = .clone_fold,
+        .node_split_group = target_parent.group,
+    });
+    program.blocks = blocks.items;
+    program.edge_rewrites = rewrites.items;
+    traceNormalize("normalize_phase owner_composed_replay_fold source={} from={} to={} arguments={any}\n", .{
+        candidate.source.index(),
+        candidate.target.index(),
+        owner.target.index(),
+        to_arguments,
+    });
+    return true;
+}
+
+test "paired collision replay fold preserves an available owner-equivalent tuple" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const source_root = ir.BlockId.fromIndex(1);
+    const target_root = ir.BlockId.fromIndex(2);
+    const source_clone = ir.BlockId.fromIndex(3);
+    const target_clone = ir.BlockId.fromIndex(4);
+    const input = ir.ValueId.fromIndex(0);
+    const source_parameter = ir.ValueId.fromIndex(1);
+    const target_parameter = ir.ValueId.fromIndex(2);
+    const clone_parameter = ir.ValueId.fromIndex(3);
+    const clone_target_parameter = ir.ValueId.fromIndex(4);
+    const group = ir.NodeSplitGroupId.fromIndex(7);
+    const entry_arguments = [_]ir.ValueId{input};
+    const source_arguments = [_]ir.ValueId{source_parameter};
+    const clone_arguments = [_]ir.ValueId{clone_parameter};
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .jump = .{
+            .target = source_clone,
+            .arguments = entry_arguments[0..],
+        } } },
+        .{ .id = source_root, .function = function_id, .parameters = &.{source_parameter}, .terminator = .{ .jump = .{
+            .target = target_root,
+            .arguments = source_arguments[0..],
+        } } },
+        .{ .id = target_root, .function = function_id, .parameters = &.{target_parameter}, .terminator = .{ .return_values = &.{} } },
+        .{ .id = source_clone, .function = function_id, .parameters = &.{clone_parameter}, .terminator = .{ .jump = .{
+            .target = target_clone,
+            .arguments = clone_arguments[0..],
+        } } },
+        .{ .id = target_clone, .function = function_id, .parameters = &.{clone_target_parameter}, .terminator = .{ .return_values = &.{} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &.{input},
+        .blocks = &.{ entry, source_root, target_root, source_clone, target_clone },
+        .entry_block = entry,
+    };
+    const values = [_]ir.Value{
+        .{ .id = input, .function = function_id, .type = .integer, .origin = .{ .parameter = 0 } },
+        .{ .id = source_parameter, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = source_root, .index = 0 } } },
+        .{ .id = target_parameter, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = target_root, .index = 0 } } },
+        .{ .id = clone_parameter, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = source_clone, .index = 0 } } },
+        .{ .id = clone_target_parameter, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = target_clone, .index = 0 } } },
+    };
+    const rewrites = [_]ir.CfgEdgeRewrite{
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(0),
+            .source = entry,
+            .kind = .jump,
+            .from = .{ .target = source_root, .arguments = entry_arguments[0..] },
+            .to = .{ .target = source_clone, .arguments = entry_arguments[0..] },
+            .rule = .node_split,
+            .node_split_group = group,
+        },
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(1),
+            .source = source_clone,
+            .kind = .jump,
+            .from = .{ .target = target_root, .arguments = clone_arguments[0..] },
+            .to = .{ .target = target_clone, .arguments = clone_arguments[0..] },
+            .rule = .node_split,
+            .node_split_group = group,
+        },
+    };
+    var blocks_owned: std.ArrayList(ir.Block) = .empty;
+    defer blocks_owned.deinit(std.testing.allocator);
+    try blocks_owned.appendSlice(std.testing.allocator, &blocks);
+    var rewrites_owned: std.ArrayList(ir.CfgEdgeRewrite) = .empty;
+    defer rewrites_owned.deinit(std.testing.allocator);
+    try rewrites_owned.appendSlice(std.testing.allocator, &rewrites);
+    var program = ir.Program{
+        .program_id = "paired-collision-replay-fold",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = blocks_owned.items,
+        .instructions = &.{},
+        .values = &values,
+        .edge_rewrites = rewrites_owned.items,
+    };
+    var projection = try structural_overlap.ReplayProjectionContext.init(
+        std.testing.allocator,
+        &program,
+    );
+    defer projection.deinit();
+
+    const owner: CollisionArm = .{ .source = source_root, .kind = .jump, .target = target_root };
+    const candidate: CollisionArm = .{ .source = source_clone, .kind = .jump, .target = target_clone };
+    try std.testing.expect(sameNodeSplitPairedArmLineageForwardWithReplay(
+        &program,
+        &projection,
+        owner,
+        candidate,
+    ));
+    try std.testing.expect(try collapsePairedCollisionEdge(
+        std.testing.allocator,
+        &program,
+        &blocks_owned,
+        &rewrites_owned,
+        owner,
+        candidate,
+        &projection,
+    ));
+    defer std.testing.allocator.free(program.edge_rewrites[2].from.arguments);
+    defer std.testing.allocator.free(program.edge_rewrites[2].to.arguments);
+    try std.testing.expectEqual(target_root, program.blocks[source_clone.index()].terminator.jump.target);
+    try std.testing.expectEqualSlices(
+        ir.ValueId,
+        clone_arguments[0..],
+        program.blocks[source_clone.index()].terminator.jump.arguments,
+    );
+    try std.testing.expectEqual(@as(usize, 3), program.edge_rewrites.len);
+    try std.testing.expectEqual(ir.EdgeRewriteRule.forwarding_jump, program.edge_rewrites[2].rule);
+    try std.testing.expectEqual(target_clone, program.edge_rewrites[2].from.target);
+    try std.testing.expectEqual(target_root, program.edge_rewrites[2].to.target);
+    try std.testing.expectEqualSlices(ir.ValueId, clone_arguments[0..], program.edge_rewrites[2].to.arguments);
 }
 
 // A continuation may clone both endpoints of the owner arm through separate
@@ -2710,6 +3403,45 @@ test "repeated collision arm composes a multi-step parameterized continuation" {
     )) == null);
 }
 
+fn collisionCanSplit(reason: structure.CollisionReason) bool {
+    return switch (reason) {
+        .already_owned, .unvisited_loop_member, .unvisited_reachable => true,
+        .outside_region => false,
+    };
+}
+
+// A stable incoming group may contain the edge that already owns the
+// continuation plus a new edge that collided with it. Cloning both edges
+// recreates the same shared owner on every pass; split only the new edge so
+// the authenticated owner remains on its existing path.
+fn collisionGroupContainsPreviousOwner(collision: *const structure.Collision) bool {
+    const previous = collision.previous orelse return false;
+    const incoming = collision.incoming orelse return false;
+    if (incoming.source == previous) return false;
+    for (collision.incoming_group) |reference| {
+        if (reference.source == previous and reference.target == collision.block) return true;
+    }
+    return false;
+}
+
+test "collision group containing previous owner narrows to current edge" {
+    const block = ir.BlockId.fromIndex(3);
+    const current = ir.BlockId.fromIndex(7);
+    const previous = ir.BlockId.fromIndex(11);
+    var group = [_]ir.CfgEdgeRef{
+        .{ .source = current, .kind = .branch_else, .target = block },
+        .{ .source = previous, .kind = .branch_else, .target = block },
+    };
+    const collision = structure.Collision{
+        .block = block,
+        .previous = previous,
+        .incoming = group[0],
+        .reason = .already_owned,
+        .incoming_group = group[0..],
+    };
+    try std.testing.expect(collisionGroupContainsPreviousOwner(&collision));
+}
+
 // Validate one source-owned historical split step.  The lineage index can
 // reject a target with multiple incoming clone parents, but a repeated edge
 // may legitimately have other owners for the same clone.  Restrict the proof
@@ -3076,4 +3808,161 @@ fn nodeSplitRoot(rewrites: []const ir.CfgEdgeRewrite, initial: ir.BlockId) ?ir.B
         current = parent;
     }
     return null;
+}
+
+fn redirectEdge(
+    block: *ir.Block,
+    reference: ir.CfgEdgeRef,
+    target: ir.BlockId,
+    arguments: []const ir.ValueId,
+) bool {
+    if (block.id != reference.source) return false;
+    switch (block.terminator) {
+        .jump => |edge| {
+            if (reference.kind != .jump or edge.target != reference.target) return false;
+            var redirected = edge;
+            redirected.target = target;
+            redirected.arguments = arguments;
+            block.terminator = .{ .jump = redirected };
+        },
+        .branch => |branch| {
+            var redirected = branch;
+            switch (reference.kind) {
+                .branch_then => {
+                    if (branch.then_edge.target != reference.target) return false;
+                    redirected.then_edge.target = target;
+                    redirected.then_edge.arguments = arguments;
+                },
+                .branch_else => {
+                    if (branch.else_edge.target != reference.target) return false;
+                    redirected.else_edge.target = target;
+                    redirected.else_edge.arguments = arguments;
+                },
+                .jump => return false,
+            }
+            block.terminator = .{ .branch = redirected };
+        },
+        else => return false,
+    }
+    return true;
+}
+
+// A clone fold changes the live control-flow graph without creating a new
+// block or value.  Recheck availability on the redirected graph before the
+// fold is published; otherwise a valid clone-equivalence proof can still
+// erase the only dominating producer of a later use.
+fn redirectEdgeWithDominancePreflight(
+    allocator: std.mem.Allocator,
+    program: *ir.Program,
+    blocks: []ir.Block,
+    function_id: ir.FunctionId,
+    block: *ir.Block,
+    reference: ir.CfgEdgeRef,
+    target: ir.BlockId,
+    arguments: []const ir.ValueId,
+) NormalizeError!bool {
+    const original_terminator = block.terminator;
+    if (!redirectEdge(block, reference, target, arguments)) return false;
+    program.blocks = blocks;
+    var committed = false;
+    defer {
+        if (!committed) block.terminator = original_terminator;
+    }
+
+    if (function_id.index() >= program.functions.len or
+        program.functions[function_id.index()].id != function_id)
+    {
+        return false;
+    }
+    var post_redirect_analysis = cfg.Analysis.init(
+        allocator,
+        program,
+        program.functions[function_id.index()],
+    ) catch |err| switch (err) {
+        error.InvalidCfg => return false,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    defer post_redirect_analysis.deinit();
+
+    const available = try clone_availability.functionUsesAreAvailable(
+        allocator,
+        program,
+        &post_redirect_analysis,
+    );
+    traceNormalize("normalize_phase clone_fold_dominance_preflight source={} kind={s} from={} to={} available={} blocks={} reachable={}\n", .{
+        reference.source.index(),
+        @tagName(reference.kind),
+        reference.target.index(),
+        target.index(),
+        available,
+        post_redirect_analysis.function.blocks.len,
+        post_redirect_analysis.reachableCount(),
+    });
+    if (!available) {
+        return false;
+    }
+    committed = true;
+    return true;
+}
+
+test "clone fold dominance preflight rolls back an unsafe redirect" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const source = ir.BlockId.fromIndex(1);
+    const clone = ir.BlockId.fromIndex(2);
+    const producer = ir.BlockId.fromIndex(3);
+    const use = ir.BlockId.fromIndex(4);
+    const producer_instruction = ir.InstructionId.fromIndex(0);
+    const produced = ir.ValueId.fromIndex(0);
+    var blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .jump = .{ .target = source } } },
+        .{ .id = source, .function = function_id, .terminator = .{ .jump = .{ .target = clone } } },
+        .{ .id = clone, .function = function_id, .terminator = .{ .jump = .{ .target = producer } } },
+        .{ .id = producer, .function = function_id, .instructions = &.{producer_instruction}, .terminator = .{ .jump = .{ .target = use } } },
+        .{ .id = use, .function = function_id, .terminator = .{ .return_values = &.{produced} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .blocks = &.{ entry, source, clone, producer, use },
+        .entry_block = entry,
+    };
+    const values = [_]ir.Value{.{
+        .id = produced,
+        .function = function_id,
+        .type = .integer,
+        .origin = .{ .instruction_result = .{ .instruction = producer_instruction, .index = 0 } },
+    }};
+    const instructions = [_]ir.Instruction{.{
+        .id = producer_instruction,
+        .block = producer,
+        .operation = .{ .constant = .{ .integer = "1" } },
+        .results = &.{produced},
+        .effects = .pure,
+    }};
+    const functions = [_]ir.Function{function};
+    var program = ir.Program{
+        .program_id = "clone-fold-dominance-preflight",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = blocks[0..],
+        .instructions = &instructions,
+        .values = &values,
+    };
+    const reference: ir.CfgEdgeRef = .{
+        .source = source,
+        .kind = .jump,
+        .target = clone,
+    };
+
+    try std.testing.expect(!(try redirectEdgeWithDominancePreflight(
+        std.testing.allocator,
+        &program,
+        blocks[0..],
+        function_id,
+        &blocks[source.index()],
+        reference,
+        use,
+        &.{},
+    )));
+    try std.testing.expectEqual(clone, blocks[source.index()].terminator.jump.target);
 }
