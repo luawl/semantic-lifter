@@ -1023,6 +1023,10 @@ test "fresh collision alternatives remain tuple-sensitive" {
     try std.testing.expectEqual(source, fresh.incoming[0].source);
 }
 
+const DeferredCollisionAlternative = struct {
+    split: structural_overlap.Split,
+};
+
 // Remove only semantically transparent forwarding blocks before control
 // restructuring.  Keep the blocks and record each edge substitution so the
 // admitted history remains replayable and auditable.
@@ -5153,6 +5157,207 @@ fn findOwnerComposedDirectBridgeAlternativeWithAnalysis(
     return split;
 }
 
+// When a repeated collision arm is authenticated as a composition of cloned
+// endpoints, the current edge cannot be split again: that would manufacture
+// the same logical arm indefinitely. Try the owner target and source as
+// generic ownership boundaries, retaining only a genuinely fresh incoming
+// edge. No family or sample policy is involved; the owner-composed replay
+// proof is the only admission to this fallback.
+fn findOwnerComposedBoundaryAlternativeWithAnalysis(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    function_index: usize,
+    owner: CollisionArm,
+    candidate: CollisionArm,
+    prior_arms: []const CollisionArm,
+    projection_context: *structural_overlap.ReplayProjectionContext,
+) NormalizeError!?structural_overlap.Split {
+    if (!try sameNodeSplitOwnerComposedArmLineageWithReplay(
+        program,
+        analysis,
+        projection_context,
+        owner,
+        candidate,
+    )) return null;
+
+    const boundaries = [_]ir.BlockId{ owner.target, owner.source };
+    for (boundaries) |boundary| {
+        const split = try findPredecessorCollisionSplitAllocWithAnalysisAndReplayContext(
+            allocator,
+            program,
+            analysis,
+            function_index,
+            boundary,
+            null,
+            prior_arms,
+            false,
+            null,
+            projection_context,
+        );
+        if (split) |candidate_split| {
+            if (try freshCollisionAlternativeWithAnalysis(
+                program,
+                analysis,
+                candidate_split,
+                prior_arms,
+                projection_context,
+                null,
+            )) |fresh| return fresh;
+        }
+    }
+    return null;
+}
+
+fn findPredecessorCollisionSplitAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    function_index: usize,
+    target: ir.BlockId,
+    prior_arms: []const CollisionArm,
+    allow_repeated: bool,
+    candidate_context: ?structure.CollisionContext,
+    projection_context: ?*structural_overlap.ReplayProjectionContext,
+) NormalizeError!?structural_overlap.Split {
+    if (projection_context != null) {
+        if (function_index >= program.functions.len) return null;
+        var local_analysis = cfg.Analysis.init(
+            allocator,
+            program,
+            program.functions[function_index],
+        ) catch |err| switch (err) {
+            error.InvalidCfg => return null,
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        defer local_analysis.deinit();
+        return findPredecessorCollisionSplitAllocWithAnalysisAndReplayContext(
+            allocator,
+            program,
+            &local_analysis,
+            function_index,
+            target,
+            null,
+            prior_arms,
+            allow_repeated,
+            candidate_context,
+            projection_context,
+        );
+    }
+    return findPredecessorCollisionSplitAllocWithAnalysisAndReplayContext(
+        allocator,
+        program,
+        null,
+        function_index,
+        target,
+        null,
+        prior_arms,
+        allow_repeated,
+        candidate_context,
+        projection_context,
+    );
+}
+
+fn findPredecessorCollisionSplitAllocWithAnalysisAndReplayContext(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    analysis: ?*const cfg.Analysis,
+    function_index: usize,
+    target: ir.BlockId,
+    source_filter: ?ir.BlockId,
+    prior_arms: []const CollisionArm,
+    allow_repeated: bool,
+    candidate_context: ?structure.CollisionContext,
+    projection_context: ?*structural_overlap.ReplayProjectionContext,
+) NormalizeError!?structural_overlap.Split {
+    if (function_index >= program.functions.len) return null;
+    var repeated: ?ir.CfgEdgeRef = null;
+    const function = program.functions[function_index];
+    var predecessor_sources: []const ir.BlockId = function.blocks;
+    var owned_predecessor_sources: ?[]ir.BlockId = null;
+    defer if (owned_predecessor_sources) |sources| allocator.free(sources);
+    if (analysis) |graph| {
+        if (graph.function.id != function.id) return error.NormalizationInvariantFailed;
+        if (!graph.isReachable(target)) return null;
+        const predecessor_count = graph.predecessorCount(target);
+        const sources = try allocator.alloc(ir.BlockId, predecessor_count);
+        errdefer allocator.free(sources);
+        for (sources, 0..) |*source, predecessor_index| {
+            source.* = graph.predecessorAt(target, predecessor_index) orelse
+                return error.NormalizationInvariantFailed;
+        }
+        predecessor_sources = sources;
+        owned_predecessor_sources = sources;
+    }
+    for (predecessor_sources) |source| {
+        if (source.index() >= program.blocks.len) return error.NormalizationInvariantFailed;
+        if (source_filter) |expected| {
+            if (source != expected and !sameNodeSplitLineage(program.edge_rewrites, source, expected)) continue;
+        }
+        const terminator = program.blocks[source.index()].terminator;
+        const candidates: [2]?ir.CfgEdgeRef = switch (terminator) {
+            .jump => |edge| .{
+                if (edge.target == target) .{ .source = source, .kind = .jump, .target = target } else null,
+                null,
+            },
+            .branch => |branch| .{
+                if (branch.then_edge.target == target) .{ .source = source, .kind = .branch_then, .target = target } else null,
+                if (branch.else_edge.target == target) .{ .source = source, .kind = .branch_else, .target = target } else null,
+            },
+            .return_values, .return_pack, .return_expanded, .throw_error, .unreachable_block => .{ null, null },
+        };
+        for (candidates) |candidate_optional| {
+            const candidate = candidate_optional orelse continue;
+            const arm: CollisionArm = .{
+                .source = candidate.source,
+                .kind = candidate.kind,
+                .target = candidate.target,
+                .context = candidate_context,
+            };
+            if (try collisionArmWasTriedWithAnalysis(
+                program,
+                analysis,
+                prior_arms,
+                arm,
+                projection_context,
+            )) {
+                if (repeated == null) repeated = candidate;
+                continue;
+            }
+            const split = try findCollisionSplitWithContext(
+                allocator,
+                program,
+                analysis,
+                function_index,
+                target,
+                &.{candidate},
+                projection_context,
+            );
+            if (split) |candidate_split| {
+                if (try freshCollisionAlternativeWithAnalysis(
+                    program,
+                    analysis,
+                    candidate_split,
+                    prior_arms,
+                    projection_context,
+                    fallbackCollisionContextForArm(program, candidate, candidate_context),
+                )) |fresh| return fresh;
+            }
+        }
+    }
+    if (!allow_repeated) return null;
+    const candidate = repeated orelse return null;
+    const repeated_split = try findCollisionSplitWithContext(
+        allocator,
+        program,
+        analysis,
+        function_index,
+        target,
+        &.{candidate},
+        projection_context,
+    );
+    return repeated_split;
+}
+
 // A predecessor fallback does not have a fresh structured visit context, but
 // the collision itself may carry the exact entry context for the target. Keep
 // that context for arm freshness only when its boundary and tuple match the
@@ -5172,6 +5377,99 @@ fn fallbackCollisionContextForArm(
         return null;
     }
     return candidate;
+}
+
+// A fallback split does not carry the structurer's visit context.  Recover it
+// only for freshness accounting when its first live incoming edge preserves
+// the exact boundary and parameter tuple.  The caller still marks the split
+// unseedable: this context prevents duplicate scheduling, but it is not a
+// substitute for a fresh structured traversal.
+fn fallbackCollisionContextForSplit(
+    program: *const ir.Program,
+    split: structural_overlap.Split,
+    context: ?structure.CollisionContext,
+) ?structure.CollisionContext {
+    if (split.incoming.len == 0) return null;
+    return fallbackCollisionContextForArm(program, split.incoming[0], context);
+}
+
+test "fallback freshness retains an authenticated four-value context" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const target = ir.BlockId.fromIndex(1);
+    const values = [_]ir.Value{
+        .{ .id = ir.ValueId.fromIndex(0), .function = function_id, .type = .integer, .origin = .{ .parameter = 0 } },
+        .{ .id = ir.ValueId.fromIndex(1), .function = function_id, .type = .integer, .origin = .{ .parameter = 1 } },
+        .{ .id = ir.ValueId.fromIndex(2), .function = function_id, .type = .integer, .origin = .{ .parameter = 2 } },
+        .{ .id = ir.ValueId.fromIndex(3), .function = function_id, .type = .integer, .origin = .{ .parameter = 3 } },
+    };
+    const arguments = [_]ir.ValueId{
+        ir.ValueId.fromIndex(0),
+        ir.ValueId.fromIndex(1),
+        ir.ValueId.fromIndex(2),
+        ir.ValueId.fromIndex(3),
+    };
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .jump = .{
+            .target = target,
+            .arguments = arguments[0..],
+        } } },
+        .{ .id = target, .function = function_id, .parameters = arguments[0..], .terminator = .{ .return_values = &.{} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .blocks = &.{ entry, target },
+        .entry_block = entry,
+    };
+    const program = ir.Program{
+        .program_id = "fallback-four-value-context",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+    };
+    const context: structure.CollisionContext = .{
+        .start = target,
+        .stop = null,
+        .loop_exit = null,
+        .continue_target = null,
+        .parameter_arguments = arguments[0..],
+    };
+    const prior = [_]CollisionArm{.{
+        .source = entry,
+        .kind = .jump,
+        .target = target,
+        .context = context,
+    }};
+    var projection = try structural_overlap.ReplayProjectionContext.init(
+        std.testing.allocator,
+        &program,
+    );
+    defer projection.deinit();
+
+    const split = structural_overlap.Split{
+        .allocator = std.testing.allocator,
+        .function_index = 0,
+        .branch = entry,
+        .entry = target,
+        .join = target,
+        .incoming = try std.testing.allocator.dupe(ir.CfgEdgeRef, &.{.{
+            .source = entry,
+            .kind = .jump,
+            .target = target,
+        }}),
+        .closure = try std.testing.allocator.dupe(ir.BlockId, &.{target}),
+    };
+    const retained = fallbackCollisionContextForSplit(&program, split, context);
+    try std.testing.expect(retained != null);
+    try std.testing.expect((try freshCollisionAlternative(
+        &program,
+        split,
+        &prior,
+        &projection,
+        retained,
+    )) == null);
 }
 
 fn findCollisionSplitWithContext(
@@ -5364,6 +5662,259 @@ fn freshCollisionAlternativeWithAnalysis(
     );
 }
 
+fn freshCollisionAlternativeForDeferred(
+    program: *const ir.Program,
+    split: structural_overlap.Split,
+    deferred: CollisionArm,
+    prior_arms: []const CollisionArm,
+    projection_context: ?*structural_overlap.ReplayProjectionContext,
+) NormalizeError!?structural_overlap.Split {
+    return freshCollisionAlternativeWithContext(
+        program,
+        split,
+        prior_arms,
+        projection_context,
+        .{ .deferred = deferred },
+    );
+}
+
+test "deferred freshness retains an exact arm context across a different start" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const source = ir.BlockId.fromIndex(0);
+    const target = ir.BlockId.fromIndex(1);
+    const argument = ir.ValueId.fromIndex(0);
+    const arguments = [_]ir.ValueId{argument};
+    const blocks = [_]ir.Block{
+        .{ .id = source, .function = function_id, .terminator = .{ .jump = .{
+            .target = target,
+            .arguments = arguments[0..],
+        } } },
+        .{ .id = target, .function = function_id, .parameters = arguments[0..], .terminator = .{ .return_values = &.{} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .blocks = &.{ source, target },
+        .entry_block = source,
+    };
+    const program = ir.Program{
+        .program_id = "deferred-exact-context",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &.{.{
+            .id = argument,
+            .function = function_id,
+            .type = .integer,
+            .origin = .{ .parameter = 0 },
+        }},
+    };
+    const context: structure.CollisionContext = .{
+        .start = source,
+        .stop = null,
+        .loop_exit = null,
+        .continue_target = null,
+        .parameter_arguments = arguments[0..],
+    };
+    const deferred: CollisionArm = .{
+        .source = source,
+        .kind = .jump,
+        .target = target,
+        .context = context,
+    };
+    const split = structural_overlap.Split{
+        .allocator = std.testing.allocator,
+        .function_index = 0,
+        .branch = source,
+        .entry = target,
+        .join = target,
+        .incoming = try std.testing.allocator.dupe(ir.CfgEdgeRef, &.{.{
+            .source = source,
+            .kind = .jump,
+            .target = target,
+        }}),
+        .closure = try std.testing.allocator.dupe(ir.BlockId, &.{target}),
+    };
+    const prior = [_]CollisionArm{deferred};
+    try std.testing.expect((try freshCollisionAlternativeForDeferred(
+        &program,
+        split,
+        deferred,
+        &prior,
+        null,
+    )) == null);
+}
+
+test "predecessor collision fallback prefers an untried incoming arm" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const first = ir.BlockId.fromIndex(1);
+    const second = ir.BlockId.fromIndex(2);
+    const target = ir.BlockId.fromIndex(3);
+    const condition = ir.ValueId.fromIndex(0);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = condition,
+            .then_edge = .{ .target = first },
+            .else_edge = .{ .target = second },
+        } } },
+        .{ .id = first, .function = function_id, .terminator = .{ .jump = .{ .target = target } } },
+        .{ .id = second, .function = function_id, .terminator = .{ .jump = .{ .target = target } } },
+        .{ .id = target, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .parameters = &.{condition},
+        .blocks = &.{ entry, first, second, target },
+        .entry_block = entry,
+    }};
+    const values = [_]ir.Value{.{
+        .id = condition,
+        .function = function_id,
+        .type = .boolean,
+        .origin = .{ .parameter = 0 },
+    }};
+    const program: ir.Program = .{
+        .program_id = "predecessor-collision-fallback",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+    };
+    const prior = [_]CollisionArm{.{
+        .source = first,
+        .kind = .jump,
+        .target = target,
+    }};
+
+    var split = (try findPredecessorCollisionSplitAlloc(
+        std.testing.allocator,
+        &program,
+        0,
+        target,
+        &prior,
+        false,
+        null,
+        null,
+    )).?;
+    defer split.deinit();
+    try std.testing.expectEqual(@as(usize, 1), split.incoming.len);
+    try std.testing.expectEqual(second, split.incoming[0].source);
+    try std.testing.expectEqual(ir.CfgEdgeKind.jump, split.incoming[0].kind);
+}
+
+test "sibling collision fallback rejects a root-equivalent different target" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const repeated_source = ir.BlockId.fromIndex(1);
+    const candidate_source = ir.BlockId.fromIndex(2);
+    const target_root = ir.BlockId.fromIndex(3);
+    const previous_target = ir.BlockId.fromIndex(4);
+    const current_target = ir.BlockId.fromIndex(5);
+    const condition = ir.ValueId.fromIndex(0);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = condition,
+            .then_edge = .{ .target = repeated_source },
+            .else_edge = .{ .target = candidate_source },
+        } } },
+        .{ .id = repeated_source, .function = function_id, .terminator = .{ .jump = .{ .target = current_target } } },
+        .{ .id = candidate_source, .function = function_id, .terminator = .{ .jump = .{ .target = previous_target } } },
+        .{ .id = target_root, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = previous_target, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = current_target, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &.{condition},
+        .blocks = &.{ entry, repeated_source, candidate_source, target_root, previous_target, current_target },
+        .entry_block = entry,
+    };
+    const values = [_]ir.Value{.{
+        .id = condition,
+        .function = function_id,
+        .type = .boolean,
+        .origin = .{ .parameter = 0 },
+    }};
+    const rewrites = [_]ir.CfgEdgeRewrite{
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(0),
+            .source = entry,
+            .kind = .branch_else,
+            .from = .{ .target = repeated_source },
+            .to = .{ .target = candidate_source },
+            .rule = .node_split,
+            .node_split_group = ir.NodeSplitGroupId.fromIndex(0),
+        },
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(1),
+            .source = candidate_source,
+            .kind = .jump,
+            .from = .{ .target = target_root },
+            .to = .{ .target = previous_target },
+            .rule = .node_split,
+            .node_split_group = ir.NodeSplitGroupId.fromIndex(1),
+        },
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(2),
+            .source = repeated_source,
+            .kind = .jump,
+            .from = .{ .target = target_root },
+            .to = .{ .target = current_target },
+            .rule = .node_split,
+            .node_split_group = ir.NodeSplitGroupId.fromIndex(2),
+        },
+    };
+    const program = ir.Program{
+        .program_id = "sibling-target-ownership",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+        .edge_rewrites = &rewrites,
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, function);
+    defer analysis.deinit();
+    var projection = try structural_overlap.ReplayProjectionContext.initForFunction(
+        std.testing.allocator,
+        &program,
+        function_id,
+    );
+    defer projection.deinit();
+
+    const prior = [_]CollisionArm{};
+    var accepted = (try findSiblingCollisionSplitAllocWithAnalysis(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        0,
+        previous_target,
+        repeated_source,
+        &prior,
+        null,
+        &projection,
+        previous_target,
+    )).?;
+    defer accepted.deinit();
+    try std.testing.expectEqual(candidate_source, accepted.incoming[0].source);
+    try std.testing.expectEqual(previous_target, accepted.incoming[0].target);
+
+    try std.testing.expect((try findSiblingCollisionSplitAllocWithAnalysis(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        0,
+        previous_target,
+        repeated_source,
+        &prior,
+        null,
+        &projection,
+        current_target,
+    )) == null);
+}
+
 test "collision fallback filters a repeated projected arm before application" {
     const function_id = ir.FunctionId.fromIndex(0);
     const entry = ir.BlockId.fromIndex(0);
@@ -5521,6 +6072,304 @@ test "collision fallback retains a fresh arm after a repeated split arm" {
     defer split.deinit();
     try std.testing.expectEqual(@as(usize, 1), split.incoming.len);
     try std.testing.expectEqual(second, split.incoming[0].source);
+}
+
+test "predecessor fallback scans past an authenticated projected arm" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const source = ir.BlockId.fromIndex(1);
+    const second = ir.BlockId.fromIndex(2);
+    const clone = ir.BlockId.fromIndex(3);
+    const condition = ir.ValueId.fromIndex(0);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = condition,
+            .then_edge = .{ .target = clone },
+            .else_edge = .{ .target = second },
+        } } },
+        .{ .id = source, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = second, .function = function_id, .terminator = .{ .jump = .{ .target = clone } } },
+        .{ .id = clone, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &.{condition},
+        .blocks = &.{ entry, source, second, clone },
+        .entry_block = entry,
+    };
+    const values = [_]ir.Value{.{
+        .id = condition,
+        .function = function_id,
+        .type = .boolean,
+        .origin = .{ .parameter = 0 },
+    }};
+    const rewrites = [_]ir.CfgEdgeRewrite{.{
+        .id = ir.EdgeRewriteId.fromIndex(0),
+        .source = entry,
+        .kind = .branch_then,
+        .from = .{ .target = source },
+        .to = .{ .target = clone },
+        .rule = .node_split,
+        .node_split_group = ir.NodeSplitGroupId.fromIndex(0),
+    }};
+    const program = ir.Program{
+        .program_id = "predecessor-projected-arm-scan",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+        .edge_rewrites = &rewrites,
+    };
+    const prior = [_]CollisionArm{.{
+        .source = entry,
+        .kind = .branch_then,
+        .target = source,
+    }};
+
+    var projection = try structural_overlap.ReplayProjectionContext.init(
+        std.testing.allocator,
+        &program,
+    );
+    defer projection.deinit();
+    var split = (try findPredecessorCollisionSplitAlloc(
+        std.testing.allocator,
+        &program,
+        0,
+        clone,
+        &prior,
+        false,
+        null,
+        &projection,
+    )).?;
+    defer split.deinit();
+    try std.testing.expectEqual(@as(usize, 1), split.incoming.len);
+    try std.testing.expectEqual(second, split.incoming[0].source);
+    try std.testing.expectEqual(ir.CfgEdgeKind.jump, split.incoming[0].kind);
+
+    var tampered_rewrites = rewrites;
+    tampered_rewrites[0].to.target = ir.BlockId.fromIndex(99);
+    var tampered_program = program;
+    tampered_program.edge_rewrites = &tampered_rewrites;
+    var tampered_projection = try structural_overlap.ReplayProjectionContext.init(
+        std.testing.allocator,
+        &tampered_program,
+    );
+    defer tampered_projection.deinit();
+    var tampered_split = (try findPredecessorCollisionSplitAlloc(
+        std.testing.allocator,
+        &tampered_program,
+        0,
+        clone,
+        &prior,
+        false,
+        null,
+        &tampered_projection,
+    )).?;
+    defer tampered_split.deinit();
+    try std.testing.expectEqual(entry, tampered_split.incoming[0].source);
+}
+
+fn findSiblingCollisionSplitAllocWithAnalysis(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    function_index: usize,
+    original_target: ir.BlockId,
+    repeated_source: ir.BlockId,
+    prior_arms: []const CollisionArm,
+    candidate_context: ?structure.CollisionContext,
+    projection_context: *structural_overlap.ReplayProjectionContext,
+    required_target: ir.BlockId,
+) NormalizeError!?structural_overlap.Split {
+    if (function_index >= program.functions.len) return null;
+    if (analysis.function.id != program.functions[function_index].id) return null;
+    const repeated_root = nodeSplitRoot(program.edge_rewrites, repeated_source) orelse return null;
+    const target_root = nodeSplitRoot(program.edge_rewrites, original_target) orelse return null;
+    for (program.functions[function_index].blocks) |source| {
+        if (source.index() >= program.blocks.len) return error.NormalizationInvariantFailed;
+        const terminator = program.blocks[source.index()].terminator;
+        switch (terminator) {
+            .jump => |edge| {
+                const reference: ir.CfgEdgeRef = .{ .source = source, .kind = .jump, .target = edge.target };
+                if (try siblingCollisionSplitAlloc(
+                    allocator,
+                    program,
+                    analysis,
+                    function_index,
+                    repeated_root,
+                    target_root,
+                    reference,
+                    prior_arms,
+                    candidate_context,
+                    projection_context,
+                    required_target,
+                )) |split| return split;
+            },
+            .branch => |branch| {
+                const candidates = [_]ir.CfgEdgeRef{
+                    .{ .source = source, .kind = .branch_then, .target = branch.then_edge.target },
+                    .{ .source = source, .kind = .branch_else, .target = branch.else_edge.target },
+                };
+                for (candidates) |reference| {
+                    if (try siblingCollisionSplitAlloc(
+                        allocator,
+                        program,
+                        analysis,
+                        function_index,
+                        repeated_root,
+                        target_root,
+                        reference,
+                        prior_arms,
+                        candidate_context,
+                        projection_context,
+                        required_target,
+                    )) |split| return split;
+                }
+            },
+            .return_values, .return_pack, .return_expanded, .throw_error, .unreachable_block => {},
+        }
+    }
+    return null;
+}
+
+fn siblingCollisionSplitAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    function_index: usize,
+    repeated_root: ir.BlockId,
+    target_root: ir.BlockId,
+    reference: ir.CfgEdgeRef,
+    prior_arms: []const CollisionArm,
+    candidate_context: ?structure.CollisionContext,
+    projection_context: *structural_overlap.ReplayProjectionContext,
+    required_target: ir.BlockId,
+) NormalizeError!?structural_overlap.Split {
+    if (!cfg_edge.isCurrent(program, reference)) return null;
+    // A shared lineage root is not a substitute for the live collision edge.
+    // Keep this fallback on the actual target; a distinct target needs its own
+    // authenticated bridge or contextual proof before it can be selected.
+    if (reference.target != required_target) return null;
+    const source_root = nodeSplitRoot(program.edge_rewrites, reference.source) orelse return null;
+    if (source_root != repeated_root or source_root == reference.source) return null;
+    if (nodeSplitRoot(program.edge_rewrites, reference.target) != target_root) return null;
+    const candidate: CollisionArm = .{
+        .source = reference.source,
+        .kind = reference.kind,
+        .target = reference.target,
+        .context = candidate_context,
+    };
+    if (try collisionArmWasTriedWithAnalysis(
+        program,
+        analysis,
+        prior_arms,
+        candidate,
+        projection_context,
+    )) {
+        return null;
+    }
+    const split = try findCollisionSplitWithContext(
+        allocator,
+        program,
+        analysis,
+        function_index,
+        reference.target,
+        &.{reference},
+        projection_context,
+    ) orelse return null;
+    return freshCollisionAlternativeWithAnalysis(
+        program,
+        analysis,
+        split,
+        prior_arms,
+        projection_context,
+        null,
+    );
+}
+
+fn maskTriedPlanningArms(
+    blocks: []ir.Block,
+    deferred: CollisionArm,
+    prior_arms: []const CollisionArm,
+) void {
+    for (blocks) |*block| switch (block.terminator) {
+        .jump => {
+            if (armSlotWasTried(deferred, prior_arms, block.id, .jump, block.terminator.jump.target)) {
+                block.terminator = .{ .unreachable_block = {} };
+            }
+        },
+        .branch => |branch| {
+            const then_tried = armSlotWasTried(deferred, prior_arms, block.id, .branch_then, branch.then_edge.target);
+            const else_tried = armSlotWasTried(deferred, prior_arms, block.id, .branch_else, branch.else_edge.target);
+            if (then_tried and else_tried) {
+                block.terminator = .{ .unreachable_block = {} };
+            } else if (then_tried) {
+                block.terminator = .{ .jump = branch.else_edge };
+            } else if (else_tried) {
+                block.terminator = .{ .jump = branch.then_edge };
+            }
+        },
+        .return_values, .return_pack, .return_expanded, .throw_error, .unreachable_block => {},
+    };
+}
+
+fn armSlotWasTried(
+    deferred: CollisionArm,
+    prior_arms: []const CollisionArm,
+    source: ir.BlockId,
+    kind: ir.CfgEdgeKind,
+    target: ir.BlockId,
+) bool {
+    if (deferred.source == source and deferred.kind == kind and deferred.target == target) return true;
+    for (prior_arms) |arm| {
+        if (arm.source == source and arm.kind == kind and arm.target == target) return true;
+    }
+    return false;
+}
+
+test "deferred planning masks tried edge slots in one pass" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const first = ir.BlockId.fromIndex(0);
+    const second = ir.BlockId.fromIndex(1);
+    const then_target = ir.BlockId.fromIndex(2);
+    const else_target = ir.BlockId.fromIndex(3);
+    const condition = ir.ValueId.fromIndex(0);
+    var blocks = [_]ir.Block{
+        .{ .id = first, .function = function_id, .terminator = .{ .branch = .{
+            .condition = condition,
+            .then_edge = .{ .target = then_target },
+            .else_edge = .{ .target = else_target },
+        } } },
+        .{ .id = second, .function = function_id, .terminator = .{ .branch = .{
+            .condition = condition,
+            .then_edge = .{ .target = then_target },
+            .else_edge = .{ .target = else_target },
+        } } },
+    };
+    const deferred: CollisionArm = .{
+        .source = first,
+        .kind = .branch_then,
+        .target = then_target,
+    };
+    const prior = [_]CollisionArm{
+        .{ .source = first, .kind = .branch_else, .target = else_target },
+        .{ .source = second, .kind = .branch_then, .target = then_target },
+    };
+
+    maskTriedPlanningArms(&blocks, deferred, &prior);
+    try std.testing.expect(std.meta.activeTag(blocks[0].terminator) == .unreachable_block);
+    try std.testing.expect(std.meta.activeTag(blocks[1].terminator) == .jump);
+    try std.testing.expectEqual(else_target, blocks[1].terminator.jump.target);
+
+    var alternate = [_]ir.Block{.{ .id = second, .function = function_id, .terminator = .{ .branch = .{
+        .condition = condition,
+        .then_edge = .{ .target = else_target },
+        .else_edge = .{ .target = then_target },
+    } } }};
+    maskTriedPlanningArms(&alternate, deferred, &prior);
+    try std.testing.expect(std.meta.activeTag(alternate[0].terminator) == .branch);
+    try std.testing.expectEqual(else_target, alternate[0].terminator.branch.then_edge.target);
 }
 
 fn nodeSplitRoot(rewrites: []const ir.CfgEdgeRewrite, initial: ir.BlockId) ?ir.BlockId {
