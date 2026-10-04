@@ -1045,6 +1045,71 @@ pub fn normalizeControlInArena(allocator: std.mem.Allocator, source: *const ir.P
     return normalizeControlWithScratchInArena(allocator, allocator, source);
 }
 
+pub fn normalizeFunctionWithScratchInArena(
+    allocator: std.mem.Allocator,
+    scratch_allocator: std.mem.Allocator,
+    source: *const ir.Program,
+    function_index: usize,
+) NormalizeError!Result {
+    return normalizeImpl(allocator, scratch_allocator, source, true, function_index, .{});
+}
+
+pub fn normalizeFunctionWithScratchInArenaBudget(
+    allocator: std.mem.Allocator,
+    scratch_allocator: std.mem.Allocator,
+    source: *const ir.Program,
+    function_index: usize,
+    feedback_iteration_limit: usize,
+) NormalizeError!Result {
+    return normalizeImpl(
+        allocator,
+        scratch_allocator,
+        source,
+        true,
+        function_index,
+        .{ .feedback_iteration_limit = feedback_iteration_limit },
+    );
+}
+
+pub fn normalizeFunctionWithScratchInArenaResumeBudget(
+    allocator: std.mem.Allocator,
+    scratch_allocator: std.mem.Allocator,
+    source: *const ir.Program,
+    function_index: usize,
+    feedback_iteration_limit: usize,
+) NormalizeError!Result {
+    return normalizeFunctionWithScratchInArenaResumeSeedBudget(
+        allocator,
+        scratch_allocator,
+        source,
+        function_index,
+        feedback_iteration_limit,
+        null,
+    );
+}
+
+pub fn normalizeFunctionWithScratchInArenaResumeSeedBudget(
+    allocator: std.mem.Allocator,
+    scratch_allocator: std.mem.Allocator,
+    source: *const ir.Program,
+    function_index: usize,
+    feedback_iteration_limit: usize,
+    initial_resume_seed: ?ResumeSeed,
+) NormalizeError!Result {
+    return normalizeImpl(
+        allocator,
+        scratch_allocator,
+        source,
+        true,
+        function_index,
+        .{
+            .feedback_iteration_limit = feedback_iteration_limit,
+            .skip_initial_phases = true,
+            .initial_resume_seed = initial_resume_seed,
+        },
+    );
+}
+
 pub fn normalizeControlWithScratchInArena(
     allocator: std.mem.Allocator,
     scratch_allocator: std.mem.Allocator,
@@ -2840,6 +2905,16 @@ fn findLineageCollisionArm(
     return null;
 }
 
+fn sameCollisionBoundary(
+    rewrites: []const ir.CfgEdgeRewrite,
+    left: ir.BlockId,
+    right: ir.BlockId,
+) bool {
+    return left == right or
+        sameNodeSplitLineage(rewrites, left, right) or
+        sameNodeSplitDirectTargetLineage(rewrites, left, right);
+}
+
 // A cloned block may have several authenticated incoming edges after a
 // continuation closure is copied.  In that case nodeSplitLineageParent
 // deliberately reports an ambiguous parent, but an exact rewrite on the
@@ -2889,6 +2964,150 @@ fn sameNodeSplitDirectArmLineage(
         }
     }
     return false;
+}
+
+// A repeated parameterized continuation can acquire a fresh stop block on
+// every sibling split. The stop is a structural context boundary, so a shared
+// split root remains admissible there when the tuple proof below succeeds.
+// Continuation endpoints use the stricter helper below: a shared root alone
+// must never merge two nested feedback continuations.
+fn sameCollisionContextStop(
+    rewrites: []const ir.CfgEdgeRewrite,
+    left: ?ir.BlockId,
+    right: ?ir.BlockId,
+) bool {
+    if (left == null or right == null) return left == right;
+    if (sameCollisionBoundary(rewrites, left.?, right.?)) return true;
+    const left_root = nodeSplitRoot(rewrites, left.?) orelse return false;
+    const right_root = nodeSplitRoot(rewrites, right.?) orelse return false;
+    return left_root == right_root;
+}
+
+fn sameCollisionContextContinue(
+    rewrites: []const ir.CfgEdgeRewrite,
+    left: ?ir.BlockId,
+    right: ?ir.BlockId,
+) bool {
+    if (left == null or right == null) return left == right;
+    return sameCollisionBoundary(rewrites, left.?, right.?);
+}
+
+fn sameCollisionArmPosition(
+    rewrites: []const ir.CfgEdgeRewrite,
+    left: CollisionArm,
+    right: CollisionArm,
+) bool {
+    if (left.kind != right.kind) return false;
+
+    // Prefer the exact incoming arm rewrite.  The destination may be a join
+    // with multiple cloned predecessors, for which whole-node lineage is
+    // intentionally ambiguous.
+    if (sameNodeSplitDirectArmLineage(rewrites, left, right)) return true;
+
+    // A cloned continuation rewrites the outgoing edge from the cloned
+    // source as well as the cloned target.  That authenticated edge step is
+    // sufficient to recognize the next arm in the same continuation chain;
+    // require it before the stricter source-lineage comparison below.
+    if (sameNodeSplitAdjacentArmLineage(rewrites, left, right)) return true;
+
+    // The source edge is the owner of the incoming transition. Permit an
+    // exact source or a complete authenticated source lineage only. Target
+    // identity follows the same rule: a shared split root is not a complete
+    // lineage, because nested continuation groups can share that root.
+    const source_matches = left.source == right.source or
+        sameNodeSplitLineage(rewrites, left.source, right.source);
+    if (!source_matches) return false;
+    return left.target == right.target or
+        sameNodeSplitAncestorArmLineage(rewrites, left, right) or
+        sameNodeSplitAncestorArmLineage(rewrites, right, left) or
+        sameNodeSplitLineage(rewrites, left.target, right.target) or
+        sameNodeSplitRootBoundary(rewrites, left.target, right.target);
+}
+
+// A root and its direct split clone are one authenticated destination
+// boundary. Once both targets are descendants, root equality is insufficient:
+// nested continuation groups can share that root while representing different
+// feedback arms.
+fn sameNodeSplitRootBoundary(
+    rewrites: []const ir.CfgEdgeRewrite,
+    left: ir.BlockId,
+    right: ir.BlockId,
+) bool {
+    const left_root = nodeSplitRoot(rewrites, left) orelse return false;
+    const right_root = nodeSplitRoot(rewrites, right) orelse return false;
+    if (left_root != right_root) return false;
+    if (left == left_root) {
+        return switch (nodeSplitLineageParent(rewrites, right)) {
+            .parent => |parent| parent.block == left_root,
+            else => false,
+        };
+    }
+    if (right == right_root) {
+        return switch (nodeSplitLineageParent(rewrites, left)) {
+            .parent => |parent| parent.block == right_root,
+            else => false,
+        };
+    }
+    return false;
+}
+
+fn hasDirectNodeSplitArmEdge(
+    rewrites: []const ir.CfgEdgeRewrite,
+    source: ir.BlockId,
+    kind: ir.CfgEdgeKind,
+    from: ir.BlockId,
+    to: ir.BlockId,
+) bool {
+    for (rewrites) |rewrite| {
+        if (rewrite.rule == .node_split and
+            rewrite.source == source and
+            rewrite.kind == kind and
+            rewrite.from.target == from and
+            rewrite.to.target == to)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+// A repeated edge can walk through a chain of clones that were each created
+// by that same edge. Treat adjacent targets in that chain as one arm only
+// when exact rewrite records authenticate both steps. This does not merge a
+// nested target created by another incoming edge merely because the roots
+// happen to agree.
+fn sameNodeSplitAdjacentArmLineage(
+    rewrites: []const ir.CfgEdgeRewrite,
+    left: CollisionArm,
+    right: CollisionArm,
+) bool {
+    if (left.kind != right.kind) return false;
+
+    const left_parent = nodeSplitLineageParent(rewrites, left.target);
+    const right_parent = nodeSplitLineageParent(rewrites, right.target);
+    const left_to_right = switch (left_parent) {
+        .parent => |parent| parent.block == right.target,
+        else => false,
+    };
+    const right_to_left = switch (right_parent) {
+        .parent => |parent| parent.block == left.target,
+        else => false,
+    };
+    const left_direct = left_to_right and hasDirectNodeSplitArmEdge(
+        rewrites,
+        left.source,
+        left.kind,
+        right.target,
+        left.target,
+    );
+    const right_direct = right_to_left and hasDirectNodeSplitArmEdge(
+        rewrites,
+        right.source,
+        right.kind,
+        left.target,
+        right.target,
+    );
+    return left_direct or right_direct;
 }
 
 fn findNodeSplitArmEdgeInGroup(
@@ -2949,6 +3168,38 @@ fn findNodeSplitArmEdge(
         }
     }
     return null;
+}
+
+// A repeated continuation split can advance the destination through more
+// than one authenticated clone while the incoming edge owner stays fixed.
+// Compare the complete target chain and require every step to be owned by the
+// same edge source. This is deliberately separate from root equality: a
+// shared clone root does not authenticate nested continuation groups.
+fn sameNodeSplitAncestorArmLineage(
+    rewrites: []const ir.CfgEdgeRewrite,
+    left: CollisionArm,
+    right: CollisionArm,
+) bool {
+    if (left.kind != right.kind or left.source != right.source or left.target == right.target) return false;
+
+    var current = right.target;
+    var depth: usize = 0;
+    while (current != left.target) : (depth += 1) {
+        if (depth > rewrites.len) return false;
+        const parent = switch (nodeSplitLineageParent(rewrites, current)) {
+            .parent => |value| value,
+            else => return false,
+        };
+        if (!hasDirectNodeSplitArmEdge(
+            rewrites,
+            right.source,
+            right.kind,
+            parent.block,
+            current,
+        )) return false;
+        current = parent.block;
+    }
+    return true;
 }
 
 fn collisionContextsEquivalent(
@@ -3441,6 +3692,39 @@ fn sameNodeSplitLineage(
         }
     }
     return false;
+}
+
+fn sameCollisionBoundaryWithIndex(
+    index: *const FeedbackLineageIndex,
+    rewrites: []const ir.CfgEdgeRewrite,
+    left: ir.BlockId,
+    right: ir.BlockId,
+) bool {
+    return left == right or index.sameLineage(left, right) or
+        sameNodeSplitDirectTargetLineage(rewrites, left, right);
+}
+
+fn sameCollisionContextStopWithIndex(
+    index: *const FeedbackLineageIndex,
+    rewrites: []const ir.CfgEdgeRewrite,
+    left: ?ir.BlockId,
+    right: ?ir.BlockId,
+) bool {
+    if (left == null or right == null) return left == right;
+    if (sameCollisionBoundaryWithIndex(index, rewrites, left.?, right.?)) return true;
+    const left_root = index.root(left.?) orelse return false;
+    const right_root = index.root(right.?) orelse return false;
+    return left_root == right_root;
+}
+
+fn sameCollisionContextContinueWithIndex(
+    index: *const FeedbackLineageIndex,
+    rewrites: []const ir.CfgEdgeRewrite,
+    left: ?ir.BlockId,
+    right: ?ir.BlockId,
+) bool {
+    if (left == null or right == null) return left == right;
+    return sameCollisionBoundaryWithIndex(index, rewrites, left.?, right.?);
 }
 
 fn sameNodeSplitRootBoundaryWithReplay(
@@ -4886,6 +5170,158 @@ test "collision arm identity includes the rewritten destination" {
     }) == null);
 }
 
+test "lineage collision distinguishes nested continuation groups" {
+    const source_root = ir.BlockId.fromIndex(0);
+    const target_root = ir.BlockId.fromIndex(1);
+    const source_clone = ir.BlockId.fromIndex(2);
+    const first_target = ir.BlockId.fromIndex(3);
+    const nested_target = ir.BlockId.fromIndex(4);
+    const same_level_target = ir.BlockId.fromIndex(5);
+    const rewrites = [_]ir.CfgEdgeRewrite{
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(0),
+            .source = source_root,
+            .kind = .jump,
+            .from = .{ .target = source_root },
+            .to = .{ .target = source_clone },
+            .rule = .node_split,
+            .node_split_group = ir.NodeSplitGroupId.fromIndex(10),
+        },
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(1),
+            .source = target_root,
+            .kind = .jump,
+            .from = .{ .target = target_root },
+            .to = .{ .target = first_target },
+            .rule = .node_split,
+            .node_split_group = ir.NodeSplitGroupId.fromIndex(20),
+        },
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(2),
+            .source = first_target,
+            .kind = .jump,
+            .from = .{ .target = first_target },
+            .to = .{ .target = nested_target },
+            .rule = .node_split,
+            .node_split_group = ir.NodeSplitGroupId.fromIndex(30),
+        },
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(3),
+            .source = target_root,
+            .kind = .jump,
+            .from = .{ .target = target_root },
+            .to = .{ .target = same_level_target },
+            .rule = .node_split,
+            .node_split_group = ir.NodeSplitGroupId.fromIndex(20),
+        },
+    };
+    const prior = [_]CollisionArm{.{
+        .source = source_clone,
+        .kind = .jump,
+        .target = first_target,
+    }};
+
+    try std.testing.expect(findLineageCollisionArm(
+        &rewrites,
+        &prior,
+        .{ .source = source_clone, .kind = .jump, .target = nested_target },
+    ) == null);
+    try std.testing.expect(findLineageCollisionArm(
+        &rewrites,
+        &prior,
+        .{ .source = source_clone, .kind = .jump, .target = same_level_target },
+    ) != null);
+
+    try std.testing.expect(!sameCollisionArmPosition(
+        &rewrites,
+        .{ .source = source_clone, .kind = .jump, .target = first_target },
+        .{ .source = source_clone, .kind = .jump, .target = nested_target },
+    ));
+    try std.testing.expect(sameCollisionArmPosition(
+        &rewrites,
+        .{ .source = source_clone, .kind = .jump, .target = first_target },
+        .{ .source = source_clone, .kind = .jump, .target = same_level_target },
+    ));
+}
+
+test "same-source adjacent clone lineage is one collision arm" {
+    const source = ir.BlockId.fromIndex(0);
+    const root = ir.BlockId.fromIndex(1);
+    const first = ir.BlockId.fromIndex(2);
+    const second = ir.BlockId.fromIndex(3);
+    const foreign = ir.BlockId.fromIndex(4);
+    const foreign_nested = ir.BlockId.fromIndex(5);
+    const rewrites = [_]ir.CfgEdgeRewrite{
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(0),
+            .source = source,
+            .kind = .jump,
+            .from = .{ .target = root },
+            .to = .{ .target = first },
+            .rule = .node_split,
+            .node_split_group = ir.NodeSplitGroupId.fromIndex(10),
+        },
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(1),
+            .source = source,
+            .kind = .jump,
+            .from = .{ .target = first },
+            .to = .{ .target = second },
+            .rule = .node_split,
+            .node_split_group = ir.NodeSplitGroupId.fromIndex(11),
+        },
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(2),
+            .source = foreign,
+            .kind = .jump,
+            .from = .{ .target = root },
+            .to = .{ .target = foreign },
+            .rule = .node_split,
+            .node_split_group = ir.NodeSplitGroupId.fromIndex(12),
+        },
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(3),
+            .source = foreign,
+            .kind = .jump,
+            .from = .{ .target = foreign },
+            .to = .{ .target = foreign_nested },
+            .rule = .node_split,
+            .node_split_group = ir.NodeSplitGroupId.fromIndex(13),
+        },
+        // Multiple incoming sources may share a node-split group. They must
+        // not make the exact source-owned adjacent edge unverifiable.
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(4),
+            .source = foreign,
+            .kind = .jump,
+            .from = .{ .target = root },
+            .to = .{ .target = first },
+            .rule = .node_split,
+            .node_split_group = ir.NodeSplitGroupId.fromIndex(10),
+        },
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(5),
+            .source = foreign,
+            .kind = .jump,
+            .from = .{ .target = first },
+            .to = .{ .target = second },
+            .rule = .node_split,
+            .node_split_group = ir.NodeSplitGroupId.fromIndex(11),
+        },
+    };
+
+    try std.testing.expect(sameCollisionArmPosition(
+        &rewrites,
+        .{ .source = source, .kind = .jump, .target = first },
+        .{ .source = source, .kind = .jump, .target = second },
+    ));
+    try std.testing.expect(!sameCollisionArmPosition(
+        &rewrites,
+        .{ .source = foreign, .kind = .jump, .target = first },
+        .{ .source = foreign, .kind = .jump, .target = foreign_nested },
+    ));
+}
+
 test "cross-source adjacent lineage requires authenticated collision context" {
     const function_id = ir.FunctionId.fromIndex(0);
     const source = ir.BlockId.fromIndex(0);
@@ -5014,6 +5450,134 @@ test "exact arm rewrite survives ambiguous destination lineage" {
         &program,
         &prior,
         .{ .source = source, .kind = .jump, .target = alternate_target, .context = context },
+        &projection,
+    )) == null);
+}
+
+test "paired cloned source and target lineage is one collision arm" {
+    const source = ir.BlockId.fromIndex(0);
+    const target = ir.BlockId.fromIndex(1);
+    const cloned_source = ir.BlockId.fromIndex(2);
+    const cloned_target = ir.BlockId.fromIndex(3);
+    const unrelated_source = ir.BlockId.fromIndex(4);
+    const rewrites = [_]ir.CfgEdgeRewrite{
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(0),
+            .source = cloned_source,
+            .kind = .jump,
+            .from = .{ .target = target },
+            .to = .{ .target = cloned_target },
+            .rule = .node_split,
+            .node_split_group = ir.NodeSplitGroupId.fromIndex(10),
+        },
+    };
+
+    try std.testing.expect(sameCollisionArmPosition(
+        &rewrites,
+        .{ .source = source, .kind = .jump, .target = target },
+        .{ .source = cloned_source, .kind = .jump, .target = cloned_target },
+    ));
+    try std.testing.expect(!sameCollisionArmPosition(
+        &rewrites,
+        .{ .source = source, .kind = .jump, .target = target },
+        .{ .source = unrelated_source, .kind = .jump, .target = cloned_target },
+    ));
+}
+
+test "unauthenticated live clone edge cannot consume a projected collision arm" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const source = ir.BlockId.fromIndex(1);
+    const first_clone = ir.BlockId.fromIndex(2);
+    const second_clone = ir.BlockId.fromIndex(3);
+    const exit = ir.BlockId.fromIndex(4);
+    const condition = ir.ValueId.fromIndex(0);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = condition,
+            .then_edge = .{ .target = first_clone },
+            .else_edge = .{ .target = second_clone },
+        } } },
+        .{ .id = source, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = first_clone, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = second_clone, .function = function_id, .terminator = .{ .jump = .{ .target = exit } } },
+        .{ .id = exit, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &.{condition},
+        .blocks = &.{ entry, source, first_clone, second_clone, exit },
+        .entry_block = entry,
+    };
+    const values = [_]ir.Value{.{
+        .id = condition,
+        .function = function_id,
+        .type = .boolean,
+        .origin = .{ .parameter = 0 },
+    }};
+    const group = ir.NodeSplitGroupId.fromIndex(0);
+    const rewrites = [_]ir.CfgEdgeRewrite{
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(0),
+            .source = entry,
+            .kind = .branch_then,
+            .from = .{ .target = source },
+            .to = .{ .target = first_clone },
+            .rule = .node_split,
+            .node_split_group = group,
+        },
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(1),
+            .source = entry,
+            .kind = .branch_else,
+            .from = .{ .target = source },
+            .to = .{ .target = second_clone },
+            .rule = .node_split,
+            .node_split_group = group,
+        },
+    };
+    const program = ir.Program{
+        .program_id = "unauthenticated-live-clone-edge",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+        .edge_rewrites = &rewrites,
+    };
+    const prior = [_]CollisionArm{.{
+        .source = first_clone,
+        .kind = .jump,
+        .target = exit,
+    }};
+    const candidate: CollisionArm = .{
+        .source = second_clone,
+        .kind = .jump,
+        .target = exit,
+    };
+    try std.testing.expect(sameCollisionArmPosition(
+        program.edge_rewrites,
+        prior[0],
+        candidate,
+    ));
+
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, function);
+    defer analysis.deinit();
+    var projection = try structural_overlap.ReplayProjectionContext.initForFunction(
+        std.testing.allocator,
+        &program,
+        function_id,
+    );
+    defer projection.deinit();
+    try std.testing.expect(!try projection.hasAuthenticatedContinuationBridgeForEdge(
+        &analysis,
+        .{ .source = second_clone, .kind = .jump, .target = exit },
+    ));
+    try std.testing.expect((try findPreviouslyTriedCollisionArmWithAnalysis(
+        &program,
+        &analysis,
+        &prior,
+        candidate,
         &projection,
     )) == null);
 }
