@@ -1041,6 +1041,18 @@ const Scan = struct {
     }
 };
 
+pub fn normalizeControlInArena(allocator: std.mem.Allocator, source: *const ir.Program) NormalizeError!Result {
+    return normalizeControlWithScratchInArena(allocator, allocator, source);
+}
+
+pub fn normalizeControlWithScratchInArena(
+    allocator: std.mem.Allocator,
+    scratch_allocator: std.mem.Allocator,
+    source: *const ir.Program,
+) NormalizeError!Result {
+    return normalizeImpl(allocator, scratch_allocator, source, false, null, .{});
+}
+
 // Remove only semantically transparent forwarding blocks before control
 // restructuring.  Keep the blocks and record each edge substitution so the
 // admitted history remains replayable and auditable.
@@ -1199,6 +1211,1413 @@ fn isHistoricalForwardingTarget(
         if (rewrite.rule == .forwarding_jump and rewrite.from.target == block) return true;
     }
     return false;
+}
+
+fn normalizeImpl(
+    allocator: std.mem.Allocator,
+    scratch_allocator: std.mem.Allocator,
+    source: *const ir.Program,
+    include_structure_feedback: bool,
+    only_function: ?usize,
+    options: NormalizeOptions,
+) NormalizeError!Result {
+    var blocks: std.ArrayList(ir.Block) = .empty;
+    try blocks.appendSlice(allocator, source.blocks);
+    var functions: std.ArrayList(ir.Function) = .empty;
+    try functions.appendSlice(allocator, source.functions);
+    var values: std.ArrayList(ir.Value) = .empty;
+    try values.appendSlice(allocator, source.values);
+    var packs: std.ArrayList(ir.ValuePack) = .empty;
+    try packs.appendSlice(allocator, source.value_packs);
+    var instructions: std.ArrayList(ir.Instruction) = .empty;
+    try instructions.appendSlice(allocator, source.instructions);
+    var rewrites: std.ArrayList(ir.CfgEdgeRewrite) = .empty;
+    try rewrites.appendSlice(allocator, source.edge_rewrites);
+
+    var result: Result = .{ .program = source.* };
+    result.program.blocks = blocks.items;
+    result.program.functions = functions.items;
+    result.program.values = values.items;
+    result.program.value_packs = packs.items;
+    result.program.instructions = instructions.items;
+    result.program.edge_rewrites = rewrites.items;
+    if (!blockParametersAreCanonical(source)) return result;
+
+    const iteration_limit = normalizationIterationLimit(source, only_function);
+    const structural_clone_limit = std.math.mul(
+        usize,
+        iteration_limit,
+        max_structural_clone_expansion,
+    ) catch return error.NormalizationInvariantFailed;
+    var iteration: usize = 0;
+    var split_identities: std.ArrayList(OverlapIdentity) = .empty;
+    defer split_identities.deinit(scratch_allocator);
+    var structural_cloned_blocks: usize = 0;
+
+    if (!options.skip_initial_phases) {
+        if (only_function != null) {
+            _ = try collapseTransparentForwardingBlocks(allocator, &result.program, &blocks, &rewrites, only_function);
+        }
+
+        while (iteration < iteration_limit) : (iteration += 1) {
+            result.program.blocks = blocks.items;
+            result.program.functions = functions.items;
+            result.program.values = values.items;
+            result.program.value_packs = packs.items;
+            result.program.instructions = instructions.items;
+            result.program.edge_rewrites = rewrites.items;
+            var scan = try scanProgram(scratch_allocator, &result.program, only_function);
+            defer scan.deinit();
+            const plan = if (scan.plan) |*value| value else break;
+            const before = scan.entry_measure;
+            const prior_split = result;
+            try applyPlan(allocator, &result.program, &blocks, &functions, &instructions, &values, &packs, &rewrites, plan, &result);
+            traceAppliedSplit("irreducible", plan.function_index, prior_split, result);
+            result.program.blocks = blocks.items;
+            result.program.functions = functions.items;
+            result.program.values = values.items;
+            result.program.value_packs = packs.items;
+            result.program.instructions = instructions.items;
+            result.program.edge_rewrites = rewrites.items;
+            const after = try irreducibleEntryMeasure(scratch_allocator, &result.program, only_function);
+            if (after >= before) {
+                std.debug.print("normalize failure phase=irreducible-progress iteration={} before={} after={} blocks={} rewrites={}\n", .{ iteration, before, after, blocks.items.len, rewrites.items.len });
+                return error.NormalizationInvariantFailed;
+            }
+        } else {
+            std.debug.print("normalize failure phase=irreducible-iteration-limit iterations={} blocks={} rewrites={}\n", .{ iteration, blocks.items.len, rewrites.items.len });
+            return error.NormalizationInvariantFailed;
+        }
+
+        iteration = 0;
+        while (iteration < iteration_limit) : (iteration += 1) {
+            result.program.blocks = blocks.items;
+            result.program.functions = functions.items;
+            result.program.values = values.items;
+            result.program.value_packs = packs.items;
+            result.program.instructions = instructions.items;
+            result.program.edge_rewrites = rewrites.items;
+            var overlap = (try structural_overlap.findSplitAllocForFunction(
+                scratch_allocator,
+                &result.program,
+                only_function,
+            )) orelse break;
+            defer overlap.deinit();
+            for (split_identities.items) |identity| {
+                if (identity.branch == overlap.branch and
+                    identity.entry == overlap.entry and
+                    identity.join == overlap.join and
+                    identity.entry_measure_kind == overlap.entry_measure_kind)
+                {
+                    std.debug.print("normalize failure phase=overlap-repeat iteration={} branch={} entry={} join={} kind={s} blocks={} structural_clones={} rewrites={}\n", .{
+                        iteration,
+                        overlap.branch.index(),
+                        overlap.entry.index(),
+                        overlap.join.index(),
+                        @tagName(overlap.entry_measure_kind),
+                        blocks.items.len,
+                        structural_cloned_blocks,
+                        rewrites.items.len,
+                    });
+                    return error.NormalizationInvariantFailed;
+                }
+            }
+            try split_identities.append(scratch_allocator, .{
+                .branch = overlap.branch,
+                .entry = overlap.entry,
+                .join = overlap.join,
+                .entry_measure_kind = overlap.entry_measure_kind,
+            });
+            const batch_count = if (overlap.entry_measure_kind == .conditional)
+                overlap.incoming.len
+            else
+                1;
+            const batch_cloned_blocks = std.math.mul(usize, overlap.closure.len, batch_count) catch
+                return error.NormalizationInvariantFailed;
+            structural_cloned_blocks = std.math.add(usize, structural_cloned_blocks, batch_cloned_blocks) catch
+                return error.NormalizationInvariantFailed;
+            if (structural_cloned_blocks > structural_clone_limit) {
+                std.debug.print("normalize failure phase=overlap-clone-limit iteration={} blocks={} structural_clones={} limit={} rewrites={}\n", .{ iteration, blocks.items.len, structural_cloned_blocks, structural_clone_limit, rewrites.items.len });
+                return error.NormalizationInvariantFailed;
+            }
+
+            const secondaries = try scratch_allocator.alloc(Secondary, batch_count);
+            var initialized_secondaries: usize = 0;
+            var plan_owned = false;
+            errdefer if (!plan_owned) {
+                for (secondaries[0..initialized_secondaries]) |secondary| {
+                    scratch_allocator.free(secondary.incoming);
+                    scratch_allocator.free(secondary.closure);
+                }
+                scratch_allocator.free(secondaries);
+            };
+            if (batch_count == 1 and overlap.entry_measure_kind != .conditional) {
+                const incoming = try scratch_allocator.dupe(ir.CfgEdgeRef, overlap.incoming);
+                errdefer scratch_allocator.free(incoming);
+                const closure = try scratch_allocator.dupe(ir.BlockId, overlap.closure);
+                errdefer scratch_allocator.free(closure);
+                secondaries[0] = .{ .block = overlap.entry, .incoming = incoming, .closure = closure };
+                initialized_secondaries = 1;
+            } else {
+                for (overlap.incoming) |reference| {
+                    const incoming = try scratch_allocator.dupe(ir.CfgEdgeRef, &.{reference});
+                    const closure = try scratch_allocator.dupe(ir.BlockId, overlap.closure);
+                    secondaries[initialized_secondaries] = .{ .block = overlap.entry, .incoming = incoming, .closure = closure };
+                    initialized_secondaries += 1;
+                }
+            }
+            var plan: SplitPlan = .{
+                .allocator = scratch_allocator,
+                .function_index = overlap.function_index,
+                .secondaries = secondaries,
+                .secondary_count = batch_count,
+            };
+            plan_owned = true;
+            defer plan.deinit();
+            const prior_split = result;
+            try applyPlan(allocator, &result.program, &blocks, &functions, &instructions, &values, &packs, &rewrites, &plan, &result);
+            traceAppliedSplit("overlap", plan.function_index, prior_split, result);
+            // The scalar entry count is not monotonic: splitting one authenticated
+            // edge can expose another edge while preserving the count. Exact
+            // overlap identity replay protection and the structural clone budget
+            // provide the bounded termination proof for this phase.
+        } else {
+            std.debug.print("normalize failure phase=overlap-iteration-limit iterations={} blocks={} structural_clones={} rewrites={}\n", .{ iteration, blocks.items.len, structural_cloned_blocks, rewrites.items.len });
+            return error.NormalizationInvariantFailed;
+        }
+    }
+
+    if (include_structure_feedback) feedback: {
+        var collision_arms: std.ArrayList(CollisionArm) = .empty;
+        defer collision_arms.deinit(scratch_allocator);
+        var collision_seed: ?CollisionSeed = if (options.initial_resume_seed) |seed|
+            collisionSeedFromResumeSeed(seed)
+        else
+            null;
+        var feedback_arena = std.heap.ArenaAllocator.init(scratch_allocator);
+        defer feedback_arena.deinit();
+        const feedback_allocator = feedback_arena.allocator();
+        iteration = 0;
+        const feedback_iteration_limit = options.feedback_iteration_limit orelse iteration_limit;
+        while (iteration < feedback_iteration_limit) : (iteration += 1) {
+            // A failed structure probe owns substantial temporary CFG and
+            // replay state. Reclaim it at the iteration boundary instead of
+            // retaining every failed plan until the whole function exits.
+            _ = feedback_arena.reset(.retain_capacity);
+
+            result.program.blocks = blocks.items;
+            result.program.functions = functions.items;
+            result.program.values = values.items;
+            result.program.value_packs = packs.items;
+            result.program.instructions = instructions.items;
+            result.program.edge_rewrites = rewrites.items;
+
+            var selected: ?structural_overlap.Split = null;
+            var selected_context: ?structure.CollisionContext = null;
+            var unvisited_plan: ?SplitPlan = null;
+            var found_collision = false;
+            var seeded_fallback = false;
+
+            // A targeted feedback iteration does not mutate the program
+            // until after the selected split is authenticated. Reuse the
+            // immutable replay index across a full scan and its collision
+            // fallback instead of rebuilding it for the same pre-apply graph.
+            // A resumed seed builds its own index below; delaying this shared
+            // index until a scan is needed avoids retaining two copies of the
+            // same targeted projection on the seed fast path.
+            var shared_feedback_replay: ?structural_overlap.ReplayProjectionContext = null;
+            if (collision_seed == null) {
+                if (only_function) |selected_function| {
+                    if (selected_function < result.program.functions.len) {
+                        shared_feedback_replay = try structural_overlap.ReplayProjectionContext.initForFunction(
+                            feedback_allocator,
+                            &result.program,
+                            result.program.functions[selected_function].id,
+                        );
+                    }
+                }
+            }
+            defer if (shared_feedback_replay) |*context| context.deinit();
+
+            // A prior full structuring pass already authenticated this target
+            // as an owned-context collision.  Try another incoming arm
+            // directly before rebuilding the entire function plan.  The
+            // overlap proof remains authoritative; failure falls through to
+            // the complete collision-aware structurer.
+            if (collision_seed) |*seed| {
+                if (seed.function_index < result.program.functions.len) {
+                    var seed_graph = cfg.Analysis.init(
+                        feedback_allocator,
+                        &result.program,
+                        result.program.functions[seed.function_index],
+                    ) catch |err| switch (err) {
+                        error.InvalidCfg => null,
+                        error.OutOfMemory => return error.OutOfMemory,
+                    };
+                    if (seed_graph) |*graph| {
+                        defer graph.deinit();
+                        var seed_replay = try structural_overlap.ReplayProjectionContext.initForFunction(
+                            feedback_allocator,
+                            &result.program,
+                            result.program.functions[seed.function_index].id,
+                        );
+                        defer seed_replay.deinit();
+                        const rebased = try rebaseUnreachableNodeSplitSeedOwner(
+                            &result.program,
+                            graph,
+                            seed,
+                            &seed_replay,
+                        );
+                        if (rebased) traceNormalize("normalize_phase collision_seed_rebased iteration={} target={} previous={}\n", .{
+                            iteration,
+                            seed.target.index(),
+                            seed.previous.?.index(),
+                        });
+                        // The overlap splitter can construct a valid clone
+                        // for an ordinary loop even when the structurer no
+                        // longer reports a collision.  A seed is only a
+                        // scheduling hint from the previous pass, not proof
+                        // that the newly cloned target still needs a split.
+                        // Revalidate the collision before using the fast path
+                        // or this loop can grow one clone per iteration.
+                        const seed_status = try seededCollisionStatus(
+                            &result.program,
+                            graph,
+                            seed.*,
+                            &seed_replay,
+                        );
+                        traceNormalize("normalize_phase collision_seed_attempt iteration={} function={} proof={s} source={?} target={} previous={?} status={s}\n", .{
+                            iteration,
+                            seed.function_index,
+                            @tagName(seed.proof),
+                            seed.source,
+                            seed.target.index(),
+                            seed.previous,
+                            @tagName(seed_status),
+                        });
+                        const seed_is_collision = seed_status == .live;
+                        if (seed_is_collision) {
+                            try reserveCloneFoldResumeArm(
+                                scratch_allocator,
+                                &collision_arms,
+                                seed.*,
+                            );
+                        }
+                        // A contextual split may clone both the collision
+                        // target and the prior owner.  Folding that target
+                        // back immediately would erase the ownership boundary
+                        // and rediscover the same collision on the next scan.
+                        // The direct fold is safe only when the seed still
+                        // names the exact historical owner; otherwise the
+                        // authenticated clone is the live continuation.
+                        const direct_fold_has_historical_owner =
+                            seed.previous != null and seed.original_target != null and
+                            seed.previous.? == seed.original_target.?;
+                        if (seed_is_collision and seed.proof == .node_split and direct_fold_has_historical_owner) {
+                            const owner = CollisionArm{
+                                .source = seed.source.?,
+                                .kind = seed.kind.?,
+                                .target = seed.original_target.?,
+                                .context = seed.context,
+                            };
+                            const candidate = CollisionArm{
+                                .source = seed.source.?,
+                                .kind = seed.kind.?,
+                                .target = seed.target,
+                                .context = seed.context,
+                            };
+                            if (try collapseAuthenticatedDirectTargetCollisionEdge(
+                                allocator,
+                                &result.program,
+                                &blocks,
+                                &rewrites,
+                                graph,
+                                owner,
+                                candidate,
+                                &seed_replay,
+                            )) {
+                                traceNormalize("normalize_phase collision_seed_direct_target_fold iteration={} source={} from={} to={}\n", .{
+                                    iteration,
+                                    candidate.source.index(),
+                                    candidate.target.index(),
+                                    owner.target.index(),
+                                });
+                                collision_seed = null;
+                                continue;
+                            }
+                        }
+                        const seeded = if (seed_is_collision)
+                            try findPredecessorCollisionSplitAllocWithAnalysisAndReplayContext(
+                                feedback_allocator,
+                                &result.program,
+                                graph,
+                                seed.function_index,
+                                seed.target,
+                                seed.source,
+                                collision_arms.items,
+                                false,
+                                seed.context,
+                                &seed_replay,
+                            )
+                        else
+                            null;
+                        const split = seeded orelse if (seed_is_collision and seed.source != null)
+                            try findPredecessorCollisionSplitAllocWithAnalysisAndReplayContext(
+                                feedback_allocator,
+                                &result.program,
+                                graph,
+                                seed.function_index,
+                                seed.target,
+                                null,
+                                collision_arms.items,
+                                false,
+                                seed.context,
+                                &seed_replay,
+                            )
+                        else
+                            null;
+                        if (split) |value| {
+                            selected = value;
+                            if (seeded != null) {
+                                selected_context = seed.context;
+                            } else {
+                                // A predecessor fallback is only a fresh
+                                // structural candidate. It did not inherit a
+                                // live structurer visit context, so do not
+                                // publish a resume seed that would replay the
+                                // same fallback edge on the next process.
+                                selected_context = null;
+                                collision_seed = null;
+                                seeded_fallback = true;
+                                traceNormalize("normalize_phase collision_seed_fallback iteration={} function={} entry={} branch={}\n", .{
+                                    iteration,
+                                    seed.function_index,
+                                    value.entry.index(),
+                                    value.branch.index(),
+                                });
+                            }
+                            found_collision = true;
+                            traceNormalize("normalize_phase collision_seed_selected iteration={} entry={} branch={} join={} closure={} incoming={}\n", .{
+                                iteration,
+                                value.entry.index(),
+                                value.branch.index(),
+                                value.join.index(),
+                                value.closure.len,
+                                value.incoming.len,
+                            });
+                        } else {
+                            traceNormalize("normalize_phase collision_seed_no_split iteration={} status={s}\n", .{
+                                iteration,
+                                @tagName(seed_status),
+                            });
+                            collision_seed = null;
+                        }
+                    } else {
+                        collision_seed = null;
+                    }
+                } else {
+                    collision_seed = null;
+                }
+            }
+            const feedback_scan_start = normalizePhaseNow();
+            if (selected == null) {
+                for (result.program.functions, 0..) |function, function_index| {
+                    if (only_function) |selected_function| if (function_index != selected_function) continue;
+                    const graph_start = normalizePhaseNow();
+                    var graph = cfg.Analysis.init(feedback_allocator, &result.program, function) catch |err| switch (err) {
+                        error.InvalidCfg => continue,
+                        error.OutOfMemory => return error.OutOfMemory,
+                    };
+                    defer graph.deinit();
+                    const graph_ms = normalizePhaseMillis(graph_start);
+                    const replay_start = normalizePhaseNow();
+                    var replay_context_owned: ?structural_overlap.ReplayProjectionContext = null;
+                    const replay_context: *structural_overlap.ReplayProjectionContext = if (shared_feedback_replay) |*context|
+                        context
+                    else blk: {
+                        replay_context_owned = try structural_overlap.ReplayProjectionContext.initForFunction(
+                            feedback_allocator,
+                            &result.program,
+                            function.id,
+                        );
+                        break :blk &replay_context_owned.?;
+                    };
+                    defer if (replay_context_owned) |*context| context.deinit();
+                    const replay_ms = normalizePhaseMillis(replay_start);
+                    var collision: ?structure.Collision = null;
+                    defer {
+                        if (collision) |*value| value.deinit(scratch_allocator);
+                    }
+                    const collision_start = normalizePhaseNow();
+                    // A structure probe owns many speculative regions.  Keep
+                    // those allocations on the reclaiming scratch allocator:
+                    // failed recursive probes must release their regions
+                    // before the next candidate, rather than retaining every
+                    // abandoned allocation in the feedback arena.
+                    const collision_plan = structure.Plan.initWithCollisionAndReplayContext(
+                        scratch_allocator,
+                        &graph,
+                        &collision,
+                        replay_context,
+                    );
+                    const collision_ms = normalizePhaseMillis(collision_start);
+                    traceNormalize("normalize_phase feedback_parts iteration={} function={} graph_ms={} replay_ms={} collision_ms={} blocks={} rewrites={}\\n", .{
+                        iteration,
+                        function_index,
+                        graph_ms,
+                        replay_ms,
+                        collision_ms,
+                        blocks.items.len,
+                        rewrites.items.len,
+                    });
+                    if (collision_plan) |plan_value| {
+                        var plan = plan_value;
+                        plan.deinit();
+                    } else |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        error.UnsupportedShape => {
+                            const obstruction = if (collision) |*value| value else continue;
+                            traceNormalize("feedback_collision_candidate iteration={} function={} block={} previous={any} reason={s} incoming={any} incoming_group={} frontiers={}\n", .{
+                                iteration,
+                                function_index,
+                                obstruction.block.index(),
+                                obstruction.previous,
+                                @tagName(obstruction.reason),
+                                obstruction.incoming,
+                                obstruction.incoming_group.len,
+                                obstruction.unvisited_frontiers.len,
+                            });
+                            if (obstruction.block.index() < result.program.blocks.len) {
+                                const candidate_block = result.program.blocks[obstruction.block.index()];
+                                traceNormalize("feedback_collision_shape block={} parameters={} instructions={} terminator={s}\n", .{
+                                    candidate_block.id.index(),
+                                    candidate_block.parameters.len,
+                                    candidate_block.instructions.len,
+                                    @tagName(std.meta.activeTag(candidate_block.terminator)),
+                                });
+                                // Keep the forwarding decision grounded in the live edge.
+                                // Context stops are provenance, not a substitute for the
+                                // candidate's actual outgoing target and tuple.
+                                if (candidate_block.parameters.len == 0 and
+                                    candidate_block.instructions.len == 0)
+                                {
+                                    switch (candidate_block.terminator) {
+                                        .jump => |outgoing| {
+                                            const successor = if (outgoing.target.index() < result.program.blocks.len)
+                                                result.program.blocks[outgoing.target.index()]
+                                            else
+                                                null;
+                                            traceNormalize("feedback_empty_candidate block={} outgoing_target={} outgoing_args={any} successor_parameters={} successor_canonical={}\n", .{
+                                                candidate_block.id.index(),
+                                                outgoing.target.index(),
+                                                outgoing.arguments,
+                                                if (successor) |block| block.parameters.len else 0,
+                                                if (successor) |block| node_split.parametersAreCanonical(result.program.values, block) else false,
+                                            });
+                                        },
+                                        else => {},
+                                    }
+                                }
+                            }
+                            if (obstruction.previous) |previous| {
+                                if (previous.index() < result.program.blocks.len) {
+                                    const previous_block = result.program.blocks[previous.index()];
+                                    traceNormalize("feedback_collision_previous_shape block={} parameters={} instructions={} terminator={s}\n", .{
+                                        previous_block.id.index(),
+                                        previous_block.parameters.len,
+                                        previous_block.instructions.len,
+                                        @tagName(std.meta.activeTag(previous_block.terminator)),
+                                    });
+                                }
+                            }
+                            if (!collisionCanSplit(obstruction.reason)) continue;
+                            found_collision = true;
+                            if (obstruction.owner_context) |owner| {
+                                traceNormalize("feedback_collision_owner_context start={} stop={?} loop_exit={?} continue_target={?} parameter_arguments={any}\n", .{
+                                    owner.start.index(),
+                                    if (owner.stop) |block| block.index() else null,
+                                    if (owner.loop_exit) |block| block.index() else null,
+                                    if (owner.continue_target) |block| block.index() else null,
+                                    owner.parameter_arguments,
+                                });
+                            }
+                            if (obstruction.incoming_context) |incoming_context| {
+                                traceNormalize("feedback_collision_incoming_context start={} stop={?} loop_exit={?} continue_target={?} parameter_arguments={any}\n", .{
+                                    incoming_context.start.index(),
+                                    if (incoming_context.stop) |block| block.index() else null,
+                                    if (incoming_context.loop_exit) |block| block.index() else null,
+                                    if (incoming_context.continue_target) |block| block.index() else null,
+                                    incoming_context.parameter_arguments,
+                                });
+                            }
+                            if (obstruction.reason == .unvisited_reachable and obstruction.unvisited_frontiers.len != 0) {
+                                unvisited_plan = try planUnvisitedFrontiersAllocWithAnalysis(
+                                    feedback_allocator,
+                                    &result.program,
+                                    function_index,
+                                    &graph,
+                                    replay_context,
+                                    obstruction.unvisited_frontiers,
+                                    collision_arms.items,
+                                );
+                                if (unvisited_plan != null) break;
+                            }
+                            var single: [1]ir.CfgEdgeRef = undefined;
+                            const incoming = if (collisionGroupContainsPreviousOwner(obstruction)) incoming: {
+                                single[0] = obstruction.incoming.?;
+                                break :incoming single[0..];
+                            } else if (obstruction.incoming_group.len != 0)
+                                obstruction.incoming_group
+                            else if (obstruction.incoming) |reference| incoming: {
+                                single[0] = reference;
+                                break :incoming single[0..];
+                            } else incoming: {
+                                selected = try findPredecessorCollisionSplitAllocWithAnalysisAndReplayContext(
+                                    feedback_allocator,
+                                    &result.program,
+                                    &graph,
+                                    function_index,
+                                    obstruction.block,
+                                    null,
+                                    collision_arms.items,
+                                    true,
+                                    obstruction.incoming_context,
+                                    replay_context,
+                                );
+                                break :incoming &.{};
+                            };
+                            if (incoming.len != 0) {
+                                // An already-owned continuation can carry a value
+                                // whose identity is authenticated only on this
+                                // incoming context. Split that edge first so the
+                                // generic collision splitter does not clone the
+                                // entire shared continuation and manufacture new
+                                // sibling collisions.
+                                if (obstruction.reason == .already_owned) {
+                                    const contextual = try structural_overlap.findContextualValueSplitForIncomingAllocWithReplayContext(
+                                        feedback_allocator,
+                                        &result.program,
+                                        &graph,
+                                        function_index,
+                                        obstruction.block,
+                                        incoming,
+                                        if (obstruction.owner_context) |owner|
+                                            owner.parameter_arguments
+                                        else
+                                            null,
+                                        replay_context,
+                                    );
+                                    if (contextual) |candidate| {
+                                        traceNormalize("feedback_contextual_split function={} entry={} branch={} closure={} incoming={}\n", .{
+                                            candidate.function_index,
+                                            candidate.entry.index(),
+                                            candidate.branch.index(),
+                                            candidate.closure.len,
+                                            candidate.incoming.len,
+                                        });
+                                        selected = candidate;
+                                    }
+                                }
+                                if (selected == null) {
+                                    selected = try structural_overlap.findCollisionSplitAllocWithAnalysisAndReplayContext(
+                                        feedback_allocator,
+                                        &result.program,
+                                        &graph,
+                                        function_index,
+                                        obstruction.block,
+                                        incoming,
+                                        replay_context,
+                                    );
+                                }
+                                if (selected == null) {
+                                    // An internal backedge may identify the
+                                    // collision while its SCC cannot be
+                                    // cloned from that edge.  Try a fresh
+                                    // predecessor-owned entry instead; the
+                                    // splitter still authenticates the whole
+                                    // closure and the fallback remains
+                                    // unseeded for the next scan.
+                                    if (try findPredecessorCollisionSplitAllocWithAnalysisAndReplayContext(
+                                        feedback_allocator,
+                                        &result.program,
+                                        &graph,
+                                        function_index,
+                                        obstruction.block,
+                                        null,
+                                        collision_arms.items,
+                                        true,
+                                        obstruction.incoming_context,
+                                        replay_context,
+                                    )) |candidate| {
+                                        selected = candidate;
+                                        selected_context = null;
+                                        collision_seed = null;
+                                        seeded_fallback = true;
+                                        traceNormalize("normalize_phase feedback_predecessor_fallback iteration={} function={} entry={} branch={} closure={}\n", .{
+                                            iteration,
+                                            function_index,
+                                            candidate.entry.index(),
+                                            candidate.branch.index(),
+                                            candidate.closure.len,
+                                        });
+                                    }
+                                }
+                            }
+                            if (selected != null) {
+                                const seed_reference: ?ir.CfgEdgeRef = if (selected) |candidate|
+                                    if (candidate.incoming.len != 0) candidate.incoming[0] else null
+                                else
+                                    null;
+                                if (!seeded_fallback) {
+                                    collision_seed = .{
+                                        .function_index = function_index,
+                                        .target = obstruction.block,
+                                        .source = if (seed_reference) |reference| reference.source else null,
+                                        .kind = if (seed_reference) |reference| reference.kind else null,
+                                        .original_target = if (seed_reference) |reference| reference.target else null,
+                                        .previous = obstruction.previous,
+                                        .context = obstruction.incoming_context,
+                                    };
+                                    selected_context = obstruction.incoming_context;
+                                }
+                                break;
+                            }
+                        },
+                    }
+                }
+            }
+            traceNormalize("normalize_phase feedback_scan iteration={} selected={} unvisited={} found_collision={} ms={} blocks={} rewrites={}\\n", .{
+                iteration,
+                selected != null,
+                unvisited_plan != null,
+                found_collision,
+                normalizePhaseMillis(feedback_scan_start),
+                blocks.items.len,
+                rewrites.items.len,
+            });
+            if (unvisited_plan) |*plan| {
+                defer plan.deinit();
+                collision_seed = null;
+                var clone_count: usize = 0;
+                for (plan.secondaries[0..plan.secondary_count]) |secondary| {
+                    clone_count = std.math.add(usize, clone_count, secondary.closure.len) catch
+                        return error.NormalizationInvariantFailed;
+                    for (secondary.incoming, 0..) |reference, incoming_index| {
+                        try collision_arms.append(scratch_allocator, .{
+                            .source = reference.source,
+                            .kind = reference.kind,
+                            .target = reference.target,
+                            .context = if (incoming_index < secondary.incoming_contexts.len)
+                                secondary.incoming_contexts[incoming_index]
+                            else
+                                null,
+                        });
+                    }
+                }
+                structural_cloned_blocks = std.math.add(usize, structural_cloned_blocks, clone_count) catch
+                    return error.NormalizationInvariantFailed;
+                if (structural_cloned_blocks > structural_clone_limit) {
+                    traceUnvisitedPlanCloneLimit(&result.program, plan, structural_cloned_blocks, structural_clone_limit, rewrites.items.len, collision_arms.items.len);
+                    std.debug.print("normalize failure phase=feedback-batch-clone-limit iteration={} blocks={} structural_clones={} limit={} rewrites={} arms={}\n", .{ iteration, blocks.items.len, structural_cloned_blocks, structural_clone_limit, rewrites.items.len, collision_arms.items.len });
+                    return error.NormalizationInvariantFailed;
+                }
+                const apply_start = normalizePhaseNow();
+                const prior_split = result;
+                try applyPlan(allocator, &result.program, &blocks, &functions, &instructions, &values, &packs, &rewrites, plan, &result);
+                traceAppliedSplit("feedback-unvisited", plan.function_index, prior_split, result);
+                traceNormalize("normalize_phase feedback_apply iteration={} mode=unvisited ms={} blocks={} rewrites={}\\n", .{
+                    iteration,
+                    normalizePhaseMillis(apply_start),
+                    blocks.items.len,
+                    rewrites.items.len,
+                });
+                continue;
+            }
+            var overlap = if (selected) |value| value else {
+                if (found_collision) {
+                    std.debug.print("normalize failure phase=feedback-unsplittable-collision iteration={} blocks={} structural_clones={} rewrites={} arms={}\n", .{ iteration, blocks.items.len, structural_cloned_blocks, rewrites.items.len, collision_arms.items.len });
+                    return error.NormalizationInvariantFailed;
+                }
+                break;
+            };
+            defer overlap.deinit();
+            traceNormalize("feedback_selected function={} entry={} branch={} join={} closure={any} incoming={any}\n", .{
+                overlap.function_index,
+                overlap.entry.index(),
+                overlap.branch.index(),
+                overlap.join.index(),
+                overlap.closure,
+                overlap.incoming,
+            });
+            if (cfg_edge.value(&result.program, overlap.incoming[0])) |edge| {
+                traceNormalize("feedback_selected_edge_args={any}\n", .{edge.arguments});
+            }
+            selected_context = collisionContextWithCurrentEdgeArguments(
+                &result.program,
+                selected_context,
+                overlap.incoming[0],
+            );
+            var collision_projection_context_owned: ?structural_overlap.ReplayProjectionContext = null;
+            const collision_projection_context: *structural_overlap.ReplayProjectionContext = if (shared_feedback_replay) |*context|
+                context
+            else blk: {
+                collision_projection_context_owned = try structural_overlap.ReplayProjectionContext.initForFunction(
+                    feedback_allocator,
+                    &result.program,
+                    result.program.functions[overlap.function_index].id,
+                );
+                break :blk &collision_projection_context_owned.?;
+            };
+            defer if (collision_projection_context_owned) |*context| context.deinit();
+            var collision_analysis = cfg.Analysis.init(
+                feedback_allocator,
+                &result.program,
+                result.program.functions[overlap.function_index],
+            ) catch |err| switch (err) {
+                error.InvalidCfg => return error.NormalizationInvariantFailed,
+                error.OutOfMemory => return error.OutOfMemory,
+            };
+            defer collision_analysis.deinit();
+            var collision_edge = overlap.incoming[0];
+            var collision_arm: CollisionArm = .{
+                .source = collision_edge.source,
+                .kind = collision_edge.kind,
+                .target = collision_edge.target,
+                .context = selected_context,
+            };
+            var collision_seedable = !seeded_fallback;
+            const previous_collision_arm = try findPreviouslyTriedCollisionArmWithAnalysis(
+                &result.program,
+                &collision_analysis,
+                collision_arms.items,
+                collision_arm,
+                collision_projection_context,
+            );
+            // Collision arms are scratch-local, but authenticated clone
+            // ownership persists in the rewrite history.  Recover an
+            // independently composed owner before selecting another split;
+            // otherwise a resumed invocation can clone the same source/target
+            // composition forever after its in-memory arm set is reset.
+            if (previous_collision_arm == null) {
+                // A target clone can be the only historical evidence needed
+                // for a safe fold.  Use the candidate's own incoming source
+                // as the owner edge; directTargetBridgeIsAuthenticated still
+                // requires the exact node-split arm, continuation bridge, and
+                // replayed tuple before redirecting it.
+                if (collision_projection_context.cloneLineageParent(collision_arm.target)) |target_parent| {
+                    const target_owner: CollisionArm = .{
+                        .source = collision_arm.source,
+                        .kind = collision_arm.kind,
+                        .target = target_parent.block,
+                        .context = null,
+                    };
+                    const rewrite_start = rewrites.items.len;
+                    const folded = try collapseAuthenticatedTargetLineageChain(
+                        allocator,
+                        feedback_allocator,
+                        &result.program,
+                        &blocks,
+                        &rewrites,
+                        overlap.function_index,
+                        target_owner,
+                        collision_arm,
+                        collision_projection_context,
+                    );
+                    if (folded != 0) {
+                        traceNormalize("normalize_phase direct_target_parent_chain_fold iteration={} function={} folds={}\n", .{
+                            iteration,
+                            overlap.function_index,
+                            folded,
+                        });
+                        collision_seed = try collisionSeedForLatestCloneFold(
+                            feedback_allocator,
+                            &result.program,
+                            overlap.function_index,
+                            rewrite_start,
+                            collision_arm.context,
+                            collision_projection_context,
+                        );
+                        continue;
+                    }
+                }
+                if (historicalOwnerComposedArmForCandidate(
+                    &result.program,
+                    collision_arm,
+                    collision_projection_context,
+                )) |historical_owner| {
+                    const rewrite_start = rewrites.items.len;
+                    const folded = try collapseAuthenticatedTargetLineageChain(
+                        allocator,
+                        feedback_allocator,
+                        &result.program,
+                        &blocks,
+                        &rewrites,
+                        overlap.function_index,
+                        historical_owner,
+                        collision_arm,
+                        collision_projection_context,
+                    );
+                    if (folded != 0) {
+                        traceNormalize("normalize_phase target_lineage_chain_fold iteration={} function={} folds={}\n", .{
+                            iteration,
+                            overlap.function_index,
+                            folded,
+                        });
+                        collision_seed = try collisionSeedForLatestCloneFold(
+                            feedback_allocator,
+                            &result.program,
+                            overlap.function_index,
+                            rewrite_start,
+                            collision_arm.context,
+                            collision_projection_context,
+                        );
+                        continue;
+                    }
+                }
+            }
+            if (previous_collision_arm) |previous| {
+                if (try collapseAuthenticatedTransparentCollisionEdge(
+                    allocator,
+                    &result.program,
+                    &blocks,
+                    &rewrites,
+                    &collision_analysis,
+                    overlap.function_index,
+                    previous,
+                    collision_arm,
+                    collision_projection_context,
+                )) {
+                    collision_seed = null;
+                    continue;
+                }
+                if (try collapsePairedCollisionEdge(
+                    allocator,
+                    &result.program,
+                    &blocks,
+                    &rewrites,
+                    previous,
+                    collision_arm,
+                    collision_projection_context,
+                )) {
+                    collision_seed = collisionSeedForPairedForwarding(
+                        overlap.function_index,
+                        previous,
+                        collision_arm,
+                    );
+                    continue;
+                }
+                if (try collapseOwnerComposedCollisionEdge(
+                    allocator,
+                    &result.program,
+                    &blocks,
+                    &rewrites,
+                    &collision_analysis,
+                    previous,
+                    collision_arm,
+                    collision_projection_context,
+                )) {
+                    collision_seed = null;
+                    continue;
+                }
+                var alternative: ?structural_overlap.Split = null;
+                var alternative_context = selected_context;
+                var alternative_seedable = true;
+                var authenticated_boundary_alternative = false;
+                if (alternative == null) {
+                    if (try findPredecessorCollisionSplitAllocWithAnalysisAndReplayContext(
+                        feedback_allocator,
+                        &result.program,
+                        &collision_analysis,
+                        overlap.function_index,
+                        collision_arm.target,
+                        null,
+                        collision_arms.items,
+                        false,
+                        selected_context,
+                        collision_projection_context,
+                    )) |target_alternative| {
+                        alternative = try freshCollisionAlternativeWithAnalysis(
+                            &result.program,
+                            &collision_analysis,
+                            target_alternative,
+                            collision_arms.items,
+                            collision_projection_context,
+                            fallbackCollisionContextForArm(
+                                &result.program,
+                                target_alternative.incoming[0],
+                                selected_context,
+                            ),
+                        );
+                    }
+                    // A predecessor split is anchored at the live collision
+                    // target. Its edge still carries no structured visit
+                    // proof, so rebuild that context on the next scan.
+                    if (alternative != null) {
+                        alternative_context = fallbackCollisionContextForSplit(
+                            &result.program,
+                            alternative.?,
+                            selected_context,
+                        );
+                        alternative_seedable = false;
+                    }
+                }
+                if (alternative == null) {
+                    if (try findSiblingCollisionSplitAllocWithAnalysis(
+                        feedback_allocator,
+                        &result.program,
+                        &collision_analysis,
+                        overlap.function_index,
+                        previous.target,
+                        collision_arm.source,
+                        collision_arms.items,
+                        selected_context,
+                        collision_projection_context,
+                        collision_arm.target,
+                    )) |sibling_alternative| {
+                        alternative = try freshCollisionAlternativeWithAnalysis(
+                            &result.program,
+                            &collision_analysis,
+                            sibling_alternative,
+                            collision_arms.items,
+                            collision_projection_context,
+                            fallbackCollisionContextForSplit(
+                                &result.program,
+                                sibling_alternative,
+                                selected_context,
+                            ),
+                        );
+                    }
+                    // The sibling helper is now target-anchored as well as
+                    // lineage-authenticated. Its edge still carries no visit
+                    // context for the alternate incoming edge.
+                    if (alternative != null) {
+                        alternative_context = fallbackCollisionContextForSplit(
+                            &result.program,
+                            alternative.?,
+                            selected_context,
+                        );
+                        alternative_seedable = false;
+                    }
+                }
+                if (alternative == null) {
+                    if (try findPredecessorCollisionSplitAllocWithAnalysisAndReplayContext(
+                        feedback_allocator,
+                        &result.program,
+                        &collision_analysis,
+                        overlap.function_index,
+                        collision_arm.source,
+                        null,
+                        collision_arms.items,
+                        false,
+                        selected_context,
+                        collision_projection_context,
+                    )) |source_alternative| {
+                        alternative = try freshCollisionAlternativeWithAnalysis(
+                            &result.program,
+                            &collision_analysis,
+                            source_alternative,
+                            collision_arms.items,
+                            collision_projection_context,
+                            fallbackCollisionContextForArm(
+                                &result.program,
+                                source_alternative.incoming[0],
+                                selected_context,
+                            ),
+                        );
+                    }
+                    // This source-side predecessor fallback also returns only
+                    // the split edge. Its context must be rebuilt by the next
+                    // full scan rather than inherited from the repeated arm.
+                    if (alternative != null) {
+                        alternative_context = fallbackCollisionContextForSplit(
+                            &result.program,
+                            alternative.?,
+                            selected_context,
+                        );
+                        alternative_seedable = false;
+                    }
+                }
+                // Independently cloned endpoints can authenticate the same
+                // continuation without leaving a fresh arm at the current
+                // destination. In that case, split from the durable owner's
+                // boundary instead of cloning the composed edge again. The
+                // fallback is deliberately unseeded: its context belongs to
+                // the newly selected edge and must be rebuilt by the next
+                // full scan.
+                if (alternative == null) {
+                    if (try findDirectTargetBridgeAlternativeWithAnalysis(
+                        feedback_allocator,
+                        &result.program,
+                        &collision_analysis,
+                        overlap.function_index,
+                        previous,
+                        collision_arm,
+                        collision_arms.items,
+                        collision_projection_context,
+                    )) |direct_target_alternative| {
+                        alternative = direct_target_alternative;
+                        alternative_context = null;
+                        alternative_seedable = false;
+                        authenticated_boundary_alternative = true;
+                    }
+                }
+                if (alternative == null) {
+                    if (try findOwnerComposedDirectBridgeAlternativeWithAnalysis(
+                        feedback_allocator,
+                        &result.program,
+                        &collision_analysis,
+                        overlap.function_index,
+                        previous,
+                        collision_arm,
+                        collision_arms.items,
+                        collision_projection_context,
+                    )) |direct_boundary_alternative| {
+                        alternative = direct_boundary_alternative;
+                        alternative_context = null;
+                        alternative_seedable = false;
+                        authenticated_boundary_alternative = true;
+                    }
+                }
+                if (alternative == null) {
+                    if (try findOwnerComposedBoundaryAlternativeWithAnalysis(
+                        feedback_allocator,
+                        &result.program,
+                        &collision_analysis,
+                        overlap.function_index,
+                        previous,
+                        collision_arm,
+                        collision_arms.items,
+                        collision_projection_context,
+                    )) |boundary_alternative| {
+                        alternative = boundary_alternative;
+                        alternative_context = null;
+                        alternative_seedable = false;
+                    }
+                }
+                // A paired source/target clone is already an authenticated
+                // continuation step.  Do not enter the whole-program
+                // deferred planner to rediscover that chain, and do not let
+                // an unrelated deferred collision starve the local proof
+                // searches above.  Deferred scheduling is a last resort for
+                // a genuinely different arm after same-family alternatives
+                // have been exhausted.
+                if (alternative == null and
+                    !sameNodeSplitAdjacentArmLineageWithReplay(
+                        collision_projection_context,
+                        previous,
+                        collision_arm,
+                    ) and !sameNodeSplitPairedArmLineageWithReplay(
+                    &result.program,
+                    collision_projection_context,
+                    previous,
+                    collision_arm,
+                )) {
+                    if (try findDeferredCollisionSplitAlloc(
+                        feedback_allocator,
+                        &result.program,
+                        collision_arm,
+                        collision_arms.items,
+                        only_function,
+                        collision_projection_context,
+                    )) |deferred_alternative| {
+                        alternative = try freshCollisionAlternativeWithAnalysis(
+                            &result.program,
+                            &collision_analysis,
+                            deferred_alternative.split,
+                            collision_arms.items,
+                            collision_projection_context,
+                            fallbackCollisionContextForSplit(
+                                &result.program,
+                                deferred_alternative.split,
+                                selected_context,
+                            ),
+                        );
+                        if (alternative != null) {
+                            // Deferred planning runs on a masked copy of the
+                            // graph. Its visit context is not proof for the
+                            // live edge that will receive this split; rebuild
+                            // it in the next full scan instead of seeding a
+                            // retry.
+                            alternative_context = fallbackCollisionContextForSplit(
+                                &result.program,
+                                alternative.?,
+                                selected_context,
+                            );
+                            alternative_seedable = false;
+                        }
+                    }
+                }
+                collision_seedable = alternative_seedable;
+                const chosen_alternative = alternative orelse {
+                    std.debug.print("normalize failure phase=feedback-no-alternative iteration={} source={} target={} blocks={} structural_clones={} rewrites={} arms={}\n", .{ iteration, collision_arm.source.index(), collision_arm.target.index(), blocks.items.len, structural_cloned_blocks, rewrites.items.len, collision_arms.items.len });
+                    if (previous_collision_arm) |owner_arm| {
+                        const exact_position = owner_arm.source == collision_arm.source and
+                            owner_arm.kind == collision_arm.kind and
+                            owner_arm.target == collision_arm.target;
+                        const direct_position = sameNodeSplitDirectArmLineage(
+                            result.program.edge_rewrites,
+                            owner_arm,
+                            collision_arm,
+                        );
+                        const adjacent_lineage = sameNodeSplitAdjacentArmLineageWithReplay(
+                            collision_projection_context,
+                            owner_arm,
+                            collision_arm,
+                        );
+                        const paired_lineage = sameNodeSplitPairedArmLineageWithReplay(
+                            &result.program,
+                            collision_projection_context,
+                            owner_arm,
+                            collision_arm,
+                        );
+                        const owner_composed = try sameNodeSplitOwnerComposedArmLineageWithReplay(
+                            &result.program,
+                            &collision_analysis,
+                            collision_projection_context,
+                            owner_arm,
+                            collision_arm,
+                        );
+                        const source_lineage = sameNodeSplitLineage(
+                            result.program.edge_rewrites,
+                            owner_arm.source,
+                            collision_arm.source,
+                        );
+                        const target_lineage = sameNodeSplitLineage(
+                            result.program.edge_rewrites,
+                            owner_arm.target,
+                            collision_arm.target,
+                        );
+                        const continuation_bridge = try collision_projection_context.hasAuthenticatedContinuationBridgeForEdge(
+                            &collision_analysis,
+                            .{
+                                .source = collision_arm.source,
+                                .kind = collision_arm.kind,
+                                .target = collision_arm.target,
+                            },
+                        );
+                        std.debug.print("feedback_repeated_owner previous_source={} previous_target={} exact={} direct={} adjacent={} paired={} owner_composed={} source_lineage={} target_lineage={} bridge={}\n", .{
+                            owner_arm.source.index(),
+                            owner_arm.target.index(),
+                            exact_position,
+                            direct_position,
+                            adjacent_lineage,
+                            paired_lineage,
+                            owner_composed,
+                            source_lineage,
+                            target_lineage,
+                            continuation_bridge,
+                        });
+                    }
+                    for (collision_arms.items) |arm| {
+                        const source_root = if (nodeSplitRoot(result.program.edge_rewrites, arm.source)) |root| root.index() else null;
+                        const target_root = if (nodeSplitRoot(result.program.edge_rewrites, arm.target)) |root| root.index() else null;
+                        std.debug.print("feedback_tried_arm source={} kind={s} target={} source_root={?d} target_root={?d}\n", .{
+                            arm.source.index(),
+                            @tagName(arm.kind),
+                            arm.target.index(),
+                            source_root,
+                            target_root,
+                        });
+                    }
+                    const current_source_root = if (nodeSplitRoot(result.program.edge_rewrites, collision_arm.source)) |root| root.index() else null;
+                    const current_target_root = if (nodeSplitRoot(result.program.edge_rewrites, collision_arm.target)) |root| root.index() else null;
+                    std.debug.print("feedback_current_arm source={} target={} source_root={?d} target_root={?d} args=", .{
+                        collision_arm.source.index(),
+                        collision_arm.target.index(),
+                        current_source_root,
+                        current_target_root,
+                    });
+                    if (cfg_edge.value(&result.program, .{
+                        .source = collision_arm.source,
+                        .kind = collision_arm.kind,
+                        .target = collision_arm.target,
+                    })) |edge| {
+                        for (edge.arguments) |value_id| std.debug.print(" {}", .{value_id.index()});
+                    }
+                    std.debug.print("\n", .{});
+                    for (result.program.edge_rewrites) |rewrite| {
+                        if (rewrite.rule != .node_split or
+                            (rewrite.from.target != collision_arm.source and rewrite.to.target != collision_arm.source and
+                                rewrite.from.target != collision_arm.target and rewrite.to.target != collision_arm.target)) continue;
+                        std.debug.print("feedback_current_rewrite id={} source={} from={} to={} group={?} from_args={any} to_args={any}\n", .{
+                            rewrite.id.index(),
+                            rewrite.source.index(),
+                            rewrite.from.target.index(),
+                            rewrite.to.target.index(),
+                            rewrite.node_split_group,
+                            rewrite.from.arguments,
+                            rewrite.to.arguments,
+                        });
+                    }
+                    return error.NormalizationInvariantFailed;
+                };
+                if (alternative != null) {
+                    traceNormalize("normalize_phase feedback_alternative iteration={} original_source={} original_kind={s} original_target={} alternative_branch={} alternative_entry={} alternative_join={} alternative_incoming={any} authenticated_boundary={} seedable={}\n", .{
+                        iteration,
+                        collision_arm.source.index(),
+                        @tagName(collision_arm.kind),
+                        collision_arm.target.index(),
+                        alternative.?.branch.index(),
+                        alternative.?.entry.index(),
+                        alternative.?.join.index(),
+                        alternative.?.incoming,
+                        authenticated_boundary_alternative,
+                        alternative_seedable,
+                    });
+                }
+                overlap.deinit();
+                overlap = chosen_alternative;
+                collision_edge = overlap.incoming[0];
+                collision_arm = .{
+                    .source = collision_edge.source,
+                    .kind = collision_edge.kind,
+                    .target = collision_edge.target,
+                    .context = alternative_context,
+                };
+                if (!authenticated_boundary_alternative and try findPreviouslyTriedCollisionArmWithAnalysis(
+                    &result.program,
+                    &collision_analysis,
+                    collision_arms.items,
+                    collision_arm,
+                    collision_projection_context,
+                ) != null) {
+                    const source_root = if (nodeSplitRoot(result.program.edge_rewrites, collision_arm.source)) |root| root.index() else null;
+                    const target_root = if (nodeSplitRoot(result.program.edge_rewrites, collision_arm.target)) |root| root.index() else null;
+                    const previous_source_root = if (nodeSplitRoot(result.program.edge_rewrites, previous.source)) |root| root.index() else null;
+                    const previous_target_root = if (nodeSplitRoot(result.program.edge_rewrites, previous.target)) |root| root.index() else null;
+                    std.debug.print("normalize failure phase=feedback-repeated-alternative iteration={} source={} target={} previous_source={} previous_target={} source_root={?d} target_root={?d} previous_source_root={?d} previous_target_root={?d} blocks={} structural_clones={} rewrites={} arms={}\n", .{
+                        iteration,
+                        collision_arm.source.index(),
+                        collision_arm.target.index(),
+                        previous.source.index(),
+                        previous.target.index(),
+                        source_root,
+                        target_root,
+                        previous_source_root,
+                        previous_target_root,
+                        blocks.items.len,
+                        structural_cloned_blocks,
+                        rewrites.items.len,
+                        collision_arms.items.len,
+                    });
+                    return error.NormalizationInvariantFailed;
+                }
+            }
+            try collision_arms.append(scratch_allocator, collision_arm);
+            structural_cloned_blocks = std.math.add(usize, structural_cloned_blocks, overlap.closure.len) catch
+                return error.NormalizationInvariantFailed;
+            if (structural_cloned_blocks > structural_clone_limit) {
+                std.debug.print("normalize failure phase=feedback-clone-limit iteration={} blocks={} structural_clones={} limit={} rewrites={} arms={}\n", .{ iteration, blocks.items.len, structural_cloned_blocks, structural_clone_limit, rewrites.items.len, collision_arms.items.len });
+                return error.NormalizationInvariantFailed;
+            }
+
+            const incoming = try feedback_allocator.dupe(ir.CfgEdgeRef, overlap.incoming);
+            errdefer feedback_allocator.free(incoming);
+            const closure = try feedback_allocator.dupe(ir.BlockId, overlap.closure);
+            errdefer feedback_allocator.free(closure);
+            const secondaries = try feedback_allocator.alloc(Secondary, 1);
+            errdefer feedback_allocator.free(secondaries);
+            secondaries[0] = .{ .block = overlap.entry, .incoming = incoming, .closure = closure };
+            var entry_offset: ?usize = null;
+            for (overlap.closure, 0..) |source_id, closure_index| {
+                if (source_id == overlap.entry) {
+                    entry_offset = closure_index;
+                    break;
+                }
+            }
+            const entry_clone_offset = entry_offset orelse return error.NormalizationInvariantFailed;
+            const entry_clone_base = blocks.items.len;
+            var plan: SplitPlan = .{
+                .allocator = feedback_allocator,
+                .function_index = overlap.function_index,
+                .secondaries = secondaries,
+                .secondary_count = 1,
+            };
+            defer plan.deinit();
+            const apply_start = normalizePhaseNow();
+            const prior_split = result;
+            try applyPlan(allocator, &result.program, &blocks, &functions, &instructions, &values, &packs, &rewrites, &plan, &result);
+            traceAppliedSplit("feedback-collision", plan.function_index, prior_split, result);
+            traceNormalize("normalize_phase feedback_post_apply iteration={} source={} kind={s} old_target={} old_edge_present={} entry_clone={} blocks={} rewrites={}\n", .{
+                iteration,
+                collision_edge.source.index(),
+                @tagName(collision_edge.kind),
+                collision_edge.target.index(),
+                cfg_edge.value(&result.program, collision_edge) != null,
+                ir.BlockId.fromIndex(entry_clone_base + entry_clone_offset).index(),
+                blocks.items.len,
+                rewrites.items.len,
+            });
+            const forwarded = try collapseTransparentForwardingBlocks(
+                allocator,
+                &result.program,
+                &blocks,
+                &rewrites,
+                only_function,
+            );
+            if (forwarded != 0) traceNormalize("normalize_phase transparent_forwarding_after_apply iteration={} blocks={} rewrites={} collapsed={}\\n", .{
+                iteration,
+                blocks.items.len,
+                rewrites.items.len,
+                forwarded,
+            });
+            traceNormalize("normalize_phase feedback_apply iteration={} mode=collision ms={} blocks={} rewrites={}\\n", .{
+                iteration,
+                normalizePhaseMillis(apply_start),
+                blocks.items.len,
+                rewrites.items.len,
+            });
+            // The selected arm may have been replaced by a bounded
+            // alternative. Preserve the context authenticated for the arm
+            // that was actually applied; carrying the pre-alternative context
+            // makes the next live edge look like a new collision.
+            const applied_previous = if (collision_seed) |seed| seed.previous else null;
+            collision_seed = if (collision_seedable)
+                try collisionSeedForAppliedArmAfterApply(
+                    feedback_allocator,
+                    &result.program,
+                    overlap.function_index,
+                    ir.BlockId.fromIndex(entry_clone_base + entry_clone_offset),
+                    collision_arm,
+                    applied_previous,
+                    overlap.closure,
+                    entry_clone_base,
+                )
+            else
+                null;
+        } else {
+            if (options.feedback_iteration_limit != null) {
+                result.program.blocks = blocks.items;
+                result.program.functions = functions.items;
+                result.program.values = values.items;
+                result.program.value_packs = packs.items;
+                result.program.instructions = instructions.items;
+                result.program.edge_rewrites = rewrites.items;
+                result.resume_seed = if (collision_seed) |seed|
+                    resumeSeedFromCollisionSeed(seed)
+                else
+                    null;
+                return result;
+            }
+            std.debug.print("normalize failure phase=feedback-iteration-limit iterations={} blocks={} structural_clones={} rewrites={} arms={}\n", .{ iteration, blocks.items.len, structural_cloned_blocks, rewrites.items.len, collision_arms.items.len });
+            return error.NormalizationInvariantFailed;
+        }
+        result.program.blocks = blocks.items;
+        result.program.functions = functions.items;
+        result.program.values = values.items;
+        result.program.value_packs = packs.items;
+        result.program.instructions = instructions.items;
+        result.program.edge_rewrites = rewrites.items;
+        if (options.feedback_iteration_limit != null) {
+            result.resume_seed = if (collision_seed) |seed|
+                resumeSeedFromCollisionSeed(seed)
+            else
+                null;
+        }
+        break :feedback;
+    }
+
+    return result;
 }
 
 fn traceUnvisitedPlanCloneLimit(
