@@ -3110,6 +3110,107 @@ fn sameNodeSplitAdjacentArmLineage(
     return left_direct or right_direct;
 }
 
+// A continuation can clone both endpoints of an edge more than once.  A
+// shared split root is not enough to identify that chain: each step must carry
+// the same authenticated group on the source and target parents, and the
+// cloned source must still own the recorded target edge.  Check the current
+// edge arguments on the first step so a stale or tampered rewrite cannot skip
+// the deferred planner.
+fn sameNodeSplitPairedArmLineageForward(
+    program: *const ir.Program,
+    left: CollisionArm,
+    right: CollisionArm,
+) bool {
+    if (left.kind != right.kind or
+        (left.source == right.source and left.target == right.target)) return false;
+
+    var current_source = right.source;
+    var current_target = right.target;
+    var steps: usize = 0;
+    var paired_steps: usize = 0;
+    while (current_source != left.source or current_target != left.target) : (steps += 1) {
+        if (steps >= program.edge_rewrites.len) return false;
+        const source_parent: ?NodeSplitLineageParent = switch (nodeSplitLineageParent(
+            program.edge_rewrites,
+            current_source,
+        )) {
+            .parent => |parent| parent,
+            .none => null,
+            .invalid => return false,
+        };
+        const target_parent: ?NodeSplitLineageParent = switch (nodeSplitLineageParent(
+            program.edge_rewrites,
+            current_target,
+        )) {
+            .parent => |parent| parent,
+            .none => null,
+            .invalid => return false,
+        };
+
+        if (source_parent) |source_step| {
+            if (target_parent) |target_step| {
+                const group = source_step.group orelse return false;
+                if (target_step.group == group) {
+                    if (findNodeSplitArmEdgeInGroup(
+                        program.edge_rewrites,
+                        current_source,
+                        right.kind,
+                        target_step.block,
+                        current_target,
+                        group,
+                    )) |target_rewrite| {
+                        if (steps == 0) {
+                            const live = cfg_edge.value(program, .{
+                                .source = current_source,
+                                .kind = right.kind,
+                                .target = current_target,
+                            }) orelse return false;
+                            if (live.target != current_target or
+                                !std.mem.eql(ir.ValueId, live.arguments, target_rewrite.to.arguments)) return false;
+                        }
+                        current_source = source_step.block;
+                        current_target = target_step.block;
+                        paired_steps += 1;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // A target may pass through an authenticated nested clone between two
+        // paired endpoint steps. Keep the source fixed for that transition;
+        // the next paired step must still authenticate the shared group.
+        const target_step = target_parent orelse return false;
+        const target_rewrite = findNodeSplitArmEdge(
+            program.edge_rewrites,
+            current_source,
+            right.kind,
+            target_step.block,
+            current_target,
+        ) orelse return false;
+        if (steps == 0) {
+            const live = cfg_edge.value(program, .{
+                .source = current_source,
+                .kind = right.kind,
+                .target = current_target,
+            }) orelse return false;
+            if (live.target != current_target or
+                !std.mem.eql(ir.ValueId, live.arguments, target_rewrite.to.arguments)) return false;
+        }
+        current_target = target_step.block;
+    }
+    return steps != 0 and paired_steps != 0;
+}
+
+fn sameNodeSplitPairedArmLineage(
+    program: *const ir.Program,
+    left: CollisionArm,
+    right: CollisionArm,
+) bool {
+    return sameNodeSplitPairedArmLineageForward(program, left, right) or
+        sameNodeSplitPairedArmLineageForward(program, right, left);
+}
+
 fn findNodeSplitArmEdgeInGroup(
     rewrites: []const ir.CfgEdgeRewrite,
     source: ir.BlockId,
@@ -3692,6 +3793,202 @@ fn sameNodeSplitLineage(
         }
     }
     return false;
+}
+
+fn sameNodeSplitRootBoundaryWithIndex(
+    index: *const FeedbackLineageIndex,
+    left: ir.BlockId,
+    right: ir.BlockId,
+) bool {
+    const left_root = index.root(left) orelse return false;
+    const right_root = index.root(right) orelse return false;
+    if (left_root != right_root) return false;
+    if (left == left_root) {
+        return switch (index.lineageParent(right)) {
+            .parent => |parent| parent.block == left_root,
+            else => false,
+        };
+    }
+    if (right == right_root) {
+        return switch (index.lineageParent(left)) {
+            .parent => |parent| parent.block == right_root,
+            else => false,
+        };
+    }
+    return false;
+}
+
+fn sameNodeSplitAdjacentArmLineageWithIndex(
+    index: *const FeedbackLineageIndex,
+    left: CollisionArm,
+    right: CollisionArm,
+) bool {
+    if (left.kind != right.kind) return false;
+
+    const left_parent = index.lineageParent(left.target);
+    const right_parent = index.lineageParent(right.target);
+    const left_to_right = switch (left_parent) {
+        .parent => |parent| parent.block == right.target,
+        else => false,
+    };
+    const right_to_left = switch (right_parent) {
+        .parent => |parent| parent.block == left.target,
+        else => false,
+    };
+    const left_direct = left_to_right and index.hasDirectEdge(
+        left.source,
+        left.kind,
+        right.target,
+        left.target,
+    );
+    const right_direct = right_to_left and index.hasDirectEdge(
+        right.source,
+        right.kind,
+        left.target,
+        right.target,
+    );
+    return left_direct or right_direct;
+}
+
+fn sameNodeSplitAncestorArmLineageWithIndex(
+    index: *const FeedbackLineageIndex,
+    left: CollisionArm,
+    right: CollisionArm,
+) bool {
+    if (left.kind != right.kind or left.source != right.source or left.target == right.target) return false;
+
+    var current = right.target;
+    var depth: usize = 0;
+    while (current != left.target) : (depth += 1) {
+        if (depth > index.lineage_parents.len) return false;
+        const parent = switch (index.lineageParent(current)) {
+            .parent => |value| value,
+            else => return false,
+        };
+        if (!index.hasDirectEdge(right.source, right.kind, parent.block, current)) return false;
+        current = parent.block;
+    }
+    return true;
+}
+
+fn sameNodeSplitPairedArmLineageForwardWithIndex(
+    program: *const ir.Program,
+    index: *const FeedbackLineageIndex,
+    left: CollisionArm,
+    right: CollisionArm,
+) bool {
+    if (left.kind != right.kind or
+        (left.source == right.source and left.target == right.target)) return false;
+
+    var current_source = right.source;
+    var current_target = right.target;
+    var steps: usize = 0;
+    var paired_steps: usize = 0;
+    while (current_source != left.source or current_target != left.target) : (steps += 1) {
+        if (steps >= index.lineage_parents.len) return false;
+        const source_parent: ?NodeSplitLineageParent = switch (index.lineageParent(current_source)) {
+            .parent => |parent| parent,
+            .none => null,
+            .invalid => return false,
+        };
+        const target_parent: ?NodeSplitLineageParent = switch (index.lineageParent(current_target)) {
+            .parent => |parent| parent,
+            .none => null,
+            .invalid => return false,
+        };
+
+        if (source_parent) |source_step| {
+            if (target_parent) |target_step| {
+                const group = source_step.group orelse return false;
+                if (target_step.group == group and index.hasGroupedEdge(
+                    current_source,
+                    right.kind,
+                    target_step.block,
+                    current_target,
+                    group,
+                )) {
+                    if (steps == 0) {
+                        const live = cfg_edge.value(program, .{
+                            .source = current_source,
+                            .kind = right.kind,
+                            .target = current_target,
+                        }) orelse return false;
+                        const rewrite = findNodeSplitArmEdgeInGroup(
+                            program.edge_rewrites,
+                            current_source,
+                            right.kind,
+                            target_step.block,
+                            current_target,
+                            group,
+                        ) orelse return false;
+                        if (live.target != current_target or
+                            !std.mem.eql(ir.ValueId, live.arguments, rewrite.to.arguments)) return false;
+                    }
+                    current_source = source_step.block;
+                    current_target = target_step.block;
+                    paired_steps += 1;
+                    continue;
+                }
+            }
+        }
+
+        const target_step = target_parent orelse return false;
+        if (!index.hasDirectEdge(
+            current_source,
+            right.kind,
+            target_step.block,
+            current_target,
+        )) return false;
+        if (steps == 0) {
+            const live = cfg_edge.value(program, .{
+                .source = current_source,
+                .kind = right.kind,
+                .target = current_target,
+            }) orelse return false;
+            const rewrite = findNodeSplitArmEdge(
+                program.edge_rewrites,
+                current_source,
+                right.kind,
+                target_step.block,
+                current_target,
+            ) orelse return false;
+            if (live.target != current_target or
+                !std.mem.eql(ir.ValueId, live.arguments, rewrite.to.arguments)) return false;
+        }
+        current_target = target_step.block;
+    }
+    return steps != 0 and paired_steps != 0;
+}
+
+fn sameNodeSplitPairedArmLineageWithIndex(
+    program: *const ir.Program,
+    index: *const FeedbackLineageIndex,
+    left: CollisionArm,
+    right: CollisionArm,
+) bool {
+    return sameNodeSplitPairedArmLineageForwardWithIndex(program, index, left, right) or
+        sameNodeSplitPairedArmLineageForwardWithIndex(program, index, right, left);
+}
+
+fn sameCollisionArmPositionWithIndex(
+    index: *const FeedbackLineageIndex,
+    left: CollisionArm,
+    right: CollisionArm,
+) bool {
+    if (left.kind != right.kind) return false;
+    if ((left.source == right.source and
+        index.hasDirectEdge(left.source, left.kind, left.target, right.target)) or
+        (left.source == right.source and
+            index.hasDirectEdge(right.source, right.kind, right.target, left.target))) return true;
+    if (sameNodeSplitAdjacentArmLineageWithIndex(index, left, right)) return true;
+
+    const source_matches = left.source == right.source or index.sameLineage(left.source, right.source);
+    if (!source_matches) return false;
+    return left.target == right.target or
+        sameNodeSplitAncestorArmLineageWithIndex(index, left, right) or
+        sameNodeSplitAncestorArmLineageWithIndex(index, right, left) or
+        index.sameLineage(left.target, right.target) or
+        sameNodeSplitRootBoundaryWithIndex(index, left.target, right.target);
 }
 
 fn sameCollisionBoundaryWithIndex(
@@ -5582,6 +5879,159 @@ test "unauthenticated live clone edge cannot consume a projected collision arm" 
     )) == null);
 }
 
+test "paired multi-step lineage requires shared groups and a live edge" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const left_source = ir.BlockId.fromIndex(0);
+    const left_target = ir.BlockId.fromIndex(1);
+    const first_source = ir.BlockId.fromIndex(2);
+    const first_target = ir.BlockId.fromIndex(3);
+    const final_source = ir.BlockId.fromIndex(4);
+    const final_target = ir.BlockId.fromIndex(5);
+    const first_predecessor = ir.BlockId.fromIndex(6);
+    const final_predecessor = ir.BlockId.fromIndex(7);
+    const unrelated_source = ir.BlockId.fromIndex(8);
+    const unrelated_target = ir.BlockId.fromIndex(9);
+    const foreign_target = ir.BlockId.fromIndex(10);
+    const left_arguments = [_]ir.ValueId{ir.ValueId.fromIndex(0)};
+    const first_arguments = [_]ir.ValueId{ir.ValueId.fromIndex(1)};
+    const final_arguments = [_]ir.ValueId{ir.ValueId.fromIndex(2)};
+    const tampered_arguments = [_]ir.ValueId{ir.ValueId.fromIndex(3)};
+    const blocks = [_]ir.Block{
+        .{ .id = left_source, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = left_target, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = first_source, .function = function_id, .terminator = .{ .jump = .{ .target = first_target, .arguments = first_arguments[0..] } } },
+        .{ .id = first_target, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = final_source, .function = function_id, .terminator = .{ .jump = .{ .target = final_target, .arguments = final_arguments[0..] } } },
+        .{ .id = final_target, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = first_predecessor, .function = function_id, .terminator = .{ .jump = .{ .target = first_source } } },
+        .{ .id = final_predecessor, .function = function_id, .terminator = .{ .jump = .{ .target = final_source } } },
+        .{ .id = unrelated_source, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = unrelated_target, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = foreign_target, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .blocks = &.{ left_source, left_target, first_source, first_target, final_source, final_target, first_predecessor, final_predecessor, unrelated_source, unrelated_target, foreign_target },
+        .entry_block = first_predecessor,
+    };
+    const rewrites = [_]ir.CfgEdgeRewrite{
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(0),
+            .source = first_predecessor,
+            .kind = .jump,
+            .from = .{ .target = left_source },
+            .to = .{ .target = first_source },
+            .rule = .node_split,
+            .node_split_group = ir.NodeSplitGroupId.fromIndex(10),
+        },
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(1),
+            .source = first_source,
+            .kind = .jump,
+            .from = .{ .target = left_target, .arguments = left_arguments[0..] },
+            .to = .{ .target = first_target, .arguments = first_arguments[0..] },
+            .rule = .node_split,
+            .node_split_group = ir.NodeSplitGroupId.fromIndex(10),
+        },
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(2),
+            .source = final_predecessor,
+            .kind = .jump,
+            .from = .{ .target = first_source },
+            .to = .{ .target = final_source },
+            .rule = .node_split,
+            .node_split_group = ir.NodeSplitGroupId.fromIndex(20),
+        },
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(3),
+            .source = first_source,
+            .kind = .jump,
+            .from = .{ .target = first_target },
+            .to = .{ .target = unrelated_target },
+            .rule = .node_split,
+            .node_split_group = ir.NodeSplitGroupId.fromIndex(15),
+        },
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(4),
+            .source = final_source,
+            .kind = .jump,
+            .from = .{ .target = unrelated_target, .arguments = first_arguments[0..] },
+            .to = .{ .target = final_target, .arguments = final_arguments[0..] },
+            .rule = .node_split,
+            .node_split_group = ir.NodeSplitGroupId.fromIndex(20),
+        },
+    };
+    const program = ir.Program{
+        .program_id = "paired-multi-step-lineage",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &.{},
+        .edge_rewrites = &rewrites,
+    };
+    const prior: CollisionArm = .{ .source = left_source, .kind = .jump, .target = left_target };
+    const candidate: CollisionArm = .{ .source = final_source, .kind = .jump, .target = final_target };
+    var lineage_index = try FeedbackLineageIndex.init(std.testing.allocator, &program);
+    defer lineage_index.deinit();
+    try std.testing.expectEqual(
+        sameNodeSplitPairedArmLineage(&program, prior, candidate),
+        sameNodeSplitPairedArmLineageWithIndex(&program, &lineage_index, prior, candidate),
+    );
+    try std.testing.expectEqual(
+        sameCollisionArmPosition(program.edge_rewrites, prior, candidate),
+        sameCollisionArmPositionWithIndex(&lineage_index, prior, candidate),
+    );
+    try std.testing.expect(!sameNodeSplitPairedArmLineageWithIndex(
+        &program,
+        &lineage_index,
+        prior,
+        .{ .source = unrelated_source, .kind = .jump, .target = final_target },
+    ));
+    try std.testing.expect(sameNodeSplitPairedArmLineage(&program, prior, candidate));
+    var projection = try structural_overlap.ReplayProjectionContext.init(std.testing.allocator, &program);
+    defer projection.deinit();
+    const prior_arms = [_]CollisionArm{prior};
+    try std.testing.expect((try findPreviouslyTriedCollisionArm(
+        &program,
+        &prior_arms,
+        candidate,
+        &projection,
+    )) != null);
+
+    try std.testing.expect(!sameNodeSplitPairedArmLineage(&program, prior, .{
+        .source = unrelated_source,
+        .kind = .jump,
+        .target = final_target,
+    }));
+    try std.testing.expect(!sameNodeSplitPairedArmLineage(&program, prior, .{
+        .source = final_source,
+        .kind = .jump,
+        .target = unrelated_target,
+    }));
+
+    var tampered_groups = rewrites;
+    tampered_groups[4].node_split_group = ir.NodeSplitGroupId.fromIndex(99);
+    var tampered_group_program = program;
+    tampered_group_program.edge_rewrites = &tampered_groups;
+    try std.testing.expect(!sameNodeSplitPairedArmLineage(&tampered_group_program, prior, candidate));
+
+    var tampered_source = rewrites;
+    tampered_source[4].source = first_source;
+    var tampered_source_program = program;
+    tampered_source_program.edge_rewrites = &tampered_source;
+    try std.testing.expect(!sameNodeSplitPairedArmLineage(&tampered_source_program, prior, candidate));
+
+    var tampered_blocks = blocks;
+    tampered_blocks[final_source.index()].terminator = .{ .jump = .{
+        .target = final_target,
+        .arguments = tampered_arguments[0..],
+    } };
+    var tampered_edge_program = program;
+    tampered_edge_program.blocks = &tampered_blocks;
+    try std.testing.expect(!sameNodeSplitPairedArmLineage(&tampered_edge_program, prior, candidate));
+}
+
 test "lineage collision distinguishes authenticated continuation contexts" {
     const source = ir.BlockId.fromIndex(7);
     const target = ir.BlockId.fromIndex(11);
@@ -6073,6 +6523,24 @@ test "collision group containing previous owner narrows to current edge" {
     try std.testing.expect(collisionGroupContainsPreviousOwner(&collision));
 }
 
+fn planUnvisitedFrontiersAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    function_index: usize,
+    frontiers: []const structure.UnvisitedFrontier,
+    prior_arms: []const CollisionArm,
+) NormalizeError!?SplitPlan {
+    return planUnvisitedFrontiersAllocWithAnalysis(
+        allocator,
+        program,
+        function_index,
+        null,
+        null,
+        frontiers,
+        prior_arms,
+    );
+}
+
 fn planUnvisitedFrontiersAllocWithAnalysis(
     allocator: std.mem.Allocator,
     program: *const ir.Program,
@@ -6224,6 +6692,144 @@ fn deinitSecondaryPrefix(
         allocator.free(secondary.closure);
     }
     allocator.free(secondaries);
+}
+
+test "unvisited frontier planning batches independent components" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const first = ir.BlockId.fromIndex(1);
+    const second = ir.BlockId.fromIndex(2);
+    const router = ir.BlockId.fromIndex(3);
+    const condition = ir.ValueId.fromIndex(0);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = condition,
+            .then_edge = .{ .target = first },
+            .else_edge = .{ .target = router },
+        } } },
+        .{ .id = first, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = second, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = router, .function = function_id, .terminator = .{ .branch = .{
+            .condition = condition,
+            .then_edge = .{ .target = first },
+            .else_edge = .{ .target = second },
+        } } },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .parameters = &.{condition},
+        .blocks = &.{ entry, first, second, router },
+        .entry_block = entry,
+    }};
+    const values = [_]ir.Value{.{
+        .id = condition,
+        .function = function_id,
+        .type = .boolean,
+        .origin = .{ .parameter = 0 },
+    }};
+    const program: ir.Program = .{
+        .program_id = "unvisited-frontier-batch",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+    };
+    var first_incoming = [_]ir.CfgEdgeRef{
+        .{ .source = entry, .kind = .branch_then, .target = first },
+        .{ .source = router, .kind = .branch_then, .target = first },
+    };
+    var second_incoming = [_]ir.CfgEdgeRef{.{
+        .source = router,
+        .kind = .branch_else,
+        .target = second,
+    }};
+    var first_closure = [_]ir.BlockId{first};
+    var second_closure = [_]ir.BlockId{second};
+    const frontiers = [_]structure.UnvisitedFrontier{
+        .{ .block = first, .incoming = &first_incoming, .closure = &first_closure },
+        .{ .block = second, .incoming = &second_incoming, .closure = &second_closure },
+    };
+
+    var plan = (try planUnvisitedFrontiersAlloc(
+        std.testing.allocator,
+        &program,
+        0,
+        &frontiers,
+        &.{},
+    )).?;
+    defer plan.deinit();
+    try std.testing.expectEqual(@as(usize, 2), plan.secondary_count);
+    try std.testing.expectEqual(first, plan.secondaries[0].block);
+    try std.testing.expectEqual(second, plan.secondaries[1].block);
+    try std.testing.expectEqual(@as(usize, 1), plan.secondaries[0].incoming.len);
+    try std.testing.expectEqual(router, plan.secondaries[0].incoming[0].source);
+}
+
+test "unvisited frontier planning defers overlapping closures" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const first = ir.BlockId.fromIndex(1);
+    const second = ir.BlockId.fromIndex(2);
+    const shared = ir.BlockId.fromIndex(3);
+    const condition = ir.ValueId.fromIndex(0);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = condition,
+            .then_edge = .{ .target = first },
+            .else_edge = .{ .target = second },
+        } } },
+        .{ .id = first, .function = function_id, .terminator = .{ .jump = .{ .target = shared } } },
+        .{ .id = second, .function = function_id, .terminator = .{ .jump = .{ .target = shared } } },
+        .{ .id = shared, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &.{condition},
+        .blocks = &.{ entry, first, second, shared },
+        .entry_block = entry,
+    };
+    const values = [_]ir.Value{.{
+        .id = condition,
+        .function = function_id,
+        .type = .boolean,
+        .origin = .{ .parameter = 0 },
+    }};
+    const program: ir.Program = .{
+        .program_id = "overlapping-unvisited-frontier",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+    };
+    var first_incoming = [_]ir.CfgEdgeRef{.{
+        .source = entry,
+        .kind = .branch_then,
+        .target = first,
+    }};
+    var second_incoming = [_]ir.CfgEdgeRef{.{
+        .source = entry,
+        .kind = .branch_else,
+        .target = second,
+    }};
+    var first_closure = [_]ir.BlockId{ first, shared };
+    var second_closure = [_]ir.BlockId{ second, shared };
+    const frontiers = [_]structure.UnvisitedFrontier{
+        .{ .block = first, .incoming = &first_incoming, .closure = &first_closure },
+        .{ .block = second, .incoming = &second_incoming, .closure = &second_closure },
+    };
+
+    var plan = (try planUnvisitedFrontiersAlloc(
+        std.testing.allocator,
+        &program,
+        0,
+        &frontiers,
+        &.{},
+    )).?;
+    defer plan.deinit();
+    try std.testing.expectEqual(@as(usize, 1), plan.secondary_count);
+    try std.testing.expectEqual(first, plan.secondaries[0].block);
 }
 
 /// Prove that a post-split collision seed still names the same owned
@@ -6539,6 +7145,97 @@ fn seededCollisionStatus(
         live.arguments,
     )) return CollisionSeedValidation.parameter_mismatch;
     return CollisionSeedValidation.live;
+}
+
+fn seededCollisionIsLive(
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    seed: CollisionSeed,
+    replay_context: *structural_overlap.ReplayProjectionContext,
+) NormalizeError!bool {
+    return (try seededCollisionStatus(program, analysis, seed, replay_context)) == .live;
+}
+
+test "seeded collision requires a fresh structuring obstruction" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const header = ir.BlockId.fromIndex(1);
+    const body = ir.BlockId.fromIndex(2);
+    const exit = ir.BlockId.fromIndex(3);
+    const condition = ir.ValueId.fromIndex(0);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = condition,
+            .then_edge = .{ .target = header },
+            .else_edge = .{ .target = exit },
+        } } },
+        .{ .id = header, .function = function_id, .terminator = .{ .branch = .{
+            .condition = condition,
+            .then_edge = .{ .target = body },
+            .else_edge = .{ .target = exit },
+        } } },
+        .{ .id = body, .function = function_id, .terminator = .{ .jump = .{ .target = header } } },
+        .{ .id = exit, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &.{condition},
+        .blocks = &.{ entry, header, body, exit },
+        .entry_block = entry,
+    };
+    const values = [_]ir.Value{.{
+        .id = condition,
+        .function = function_id,
+        .type = .boolean,
+        .origin = .{ .parameter = 0 },
+    }};
+    const program = ir.Program{
+        .program_id = "seeded-collision-loop-proof",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+    };
+
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, function);
+    defer analysis.deinit();
+    var replay = try structural_overlap.ReplayProjectionContext.init(
+        std.testing.allocator,
+        &program,
+    );
+    defer replay.deinit();
+
+    const incoming = [_]ir.CfgEdgeRef{.{
+        .source = entry,
+        .kind = .branch_then,
+        .target = header,
+    }};
+    var overlap = (try structural_overlap.findCollisionSplitAllocWithAnalysisAndReplayContext(
+        std.testing.allocator,
+        &program,
+        &analysis,
+        0,
+        header,
+        &incoming,
+        &replay,
+    )).?;
+    defer overlap.deinit();
+    const seed: CollisionSeed = .{
+        .function_index = 0,
+        .target = header,
+        .source = entry,
+        .kind = .branch_then,
+        .original_target = header,
+        .previous = entry,
+        .context = null,
+    };
+    try std.testing.expect(!try seededCollisionIsLive(
+        &program,
+        &analysis,
+        seed,
+        &replay,
+    ));
 }
 
 // A direct target clone can expose the same authenticated collision arm again
