@@ -1041,8 +1041,20 @@ const Scan = struct {
     }
 };
 
+pub fn normalizeInArena(allocator: std.mem.Allocator, source: *const ir.Program) NormalizeError!Result {
+    return normalizeWithScratchInArena(allocator, allocator, source);
+}
+
 pub fn normalizeControlInArena(allocator: std.mem.Allocator, source: *const ir.Program) NormalizeError!Result {
     return normalizeControlWithScratchInArena(allocator, allocator, source);
+}
+
+pub fn normalizeWithScratchInArena(
+    allocator: std.mem.Allocator,
+    scratch_allocator: std.mem.Allocator,
+    source: *const ir.Program,
+) NormalizeError!Result {
+    return normalizeImpl(allocator, scratch_allocator, source, true, null, .{});
 }
 
 pub fn normalizeFunctionWithScratchInArena(
@@ -7238,6 +7250,541 @@ test "seeded collision requires a fresh structuring obstruction" {
     ));
 }
 
+test "seeded collision accepts a nested source-owned clone lineage" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const source = ir.BlockId.fromIndex(0);
+    const owner = ir.BlockId.fromIndex(1);
+    const original = ir.BlockId.fromIndex(2);
+    const target = ir.BlockId.fromIndex(3);
+    const cycle = ir.BlockId.fromIndex(4);
+    const condition = ir.ValueId.fromIndex(0);
+    var blocks = [_]ir.Block{
+        .{ .id = source, .function = function_id, .terminator = .{ .branch = .{
+            .condition = condition,
+            .then_edge = .{ .target = target },
+            .else_edge = .{ .target = owner },
+        } } },
+        .{ .id = owner, .function = function_id, .terminator = .{ .jump = .{ .target = original } } },
+        .{ .id = original, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = target, .function = function_id, .terminator = .{ .jump = .{ .target = cycle } } },
+        .{ .id = cycle, .function = function_id, .terminator = .{ .jump = .{ .target = target } } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &.{condition},
+        .blocks = &.{ source, owner, original, target, cycle },
+        .entry_block = source,
+    };
+    const values = [_]ir.Value{.{
+        .id = condition,
+        .function = function_id,
+        .type = .boolean,
+        .origin = .{ .parameter = 0 },
+    }};
+    var rewrites = [_]ir.CfgEdgeRewrite{
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(0),
+            .source = source,
+            .kind = .branch_then,
+            .from = .{ .target = original },
+            .to = .{ .target = target },
+            .rule = .node_split,
+            .node_split_group = ir.NodeSplitGroupId.fromIndex(0),
+        },
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(1),
+            .source = source,
+            .kind = .branch_then,
+            .from = .{ .target = owner },
+            .to = .{ .target = original },
+            .rule = .node_split,
+            .node_split_group = ir.NodeSplitGroupId.fromIndex(1),
+        },
+    };
+    var program = ir.Program{
+        .program_id = "seeded-collision-nested-source-lineage",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+        .edge_rewrites = &rewrites,
+    };
+    const seed: CollisionSeed = .{
+        .function_index = 0,
+        .target = target,
+        .source = source,
+        .kind = .branch_then,
+        .original_target = original,
+        .previous = owner,
+        .context = .{
+            .start = owner,
+            .stop = null,
+            .loop_exit = null,
+            .continue_target = null,
+        },
+    };
+
+    {
+        var analysis = try cfg.Analysis.init(std.testing.allocator, &program, function);
+        defer analysis.deinit();
+        var replay = try structural_overlap.ReplayProjectionContext.init(
+            std.testing.allocator,
+            &program,
+        );
+        defer replay.deinit();
+        try std.testing.expect(try analysis.canReachNonEmptyPath(target, target));
+        try std.testing.expect(try seededCollisionIsLive(&program, &analysis, seed, &replay));
+    }
+
+    var wrong_owner = seed;
+    wrong_owner.previous = source;
+    {
+        var analysis = try cfg.Analysis.init(std.testing.allocator, &program, function);
+        defer analysis.deinit();
+        var replay = try structural_overlap.ReplayProjectionContext.init(
+            std.testing.allocator,
+            &program,
+        );
+        defer replay.deinit();
+        try std.testing.expect(!try seededCollisionIsLive(&program, &analysis, wrong_owner, &replay));
+    }
+
+    rewrites[1].node_split_group = null;
+    {
+        var analysis = try cfg.Analysis.init(std.testing.allocator, &program, function);
+        defer analysis.deinit();
+        var replay = try structural_overlap.ReplayProjectionContext.init(
+            std.testing.allocator,
+            &program,
+        );
+        defer replay.deinit();
+        try std.testing.expect(!try seededCollisionIsLive(&program, &analysis, seed, &replay));
+    }
+    rewrites[1].node_split_group = ir.NodeSplitGroupId.fromIndex(1);
+
+    blocks[cycle.index()].terminator = .{ .return_values = &.{} };
+    {
+        var analysis = try cfg.Analysis.init(std.testing.allocator, &program, function);
+        defer analysis.deinit();
+        var replay = try structural_overlap.ReplayProjectionContext.init(
+            std.testing.allocator,
+            &program,
+        );
+        defer replay.deinit();
+        try std.testing.expect(!try analysis.canReachNonEmptyPath(target, target));
+        try std.testing.expect(!try seededCollisionIsLive(&program, &analysis, seed, &replay));
+    }
+}
+
+test "seeded collision requires the exact live clone rewrite" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const source = ir.BlockId.fromIndex(0);
+    const original = ir.BlockId.fromIndex(1);
+    const clone = ir.BlockId.fromIndex(2);
+    var rewrites = [_]ir.CfgEdgeRewrite{.{
+        .id = ir.EdgeRewriteId.fromIndex(0),
+        .source = source,
+        .kind = .jump,
+        .from = .{ .target = original },
+        .to = .{ .target = clone },
+        .rule = .node_split,
+        .node_split_group = ir.NodeSplitGroupId.fromIndex(0),
+    }};
+    const blocks = [_]ir.Block{
+        .{ .id = source, .function = function_id, .terminator = .{ .jump = .{ .target = clone } } },
+        .{ .id = original, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = clone, .function = function_id, .terminator = .{ .jump = .{ .target = source } } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .blocks = &.{ source, original, clone },
+        .entry_block = source,
+    };
+    var program = ir.Program{
+        .program_id = "seeded-collision-exact-rewrite",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &.{},
+        .edge_rewrites = &rewrites,
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, function);
+    defer analysis.deinit();
+    var replay = try structural_overlap.ReplayProjectionContext.init(
+        std.testing.allocator,
+        &program,
+    );
+    defer replay.deinit();
+
+    const context: structure.CollisionContext = .{
+        .start = original,
+        .stop = null,
+        .loop_exit = null,
+        .continue_target = null,
+    };
+    const seed: CollisionSeed = .{
+        .function_index = 0,
+        .target = clone,
+        .source = source,
+        .kind = .jump,
+        .original_target = original,
+        .previous = source,
+        .context = context,
+    };
+    try std.testing.expect(try seededCollisionIsLive(&program, &analysis, seed, &replay));
+
+    rewrites[0].to.target = original;
+    try std.testing.expect(!try seededCollisionIsLive(&program, &analysis, seed, &replay));
+}
+
+test "seeded collision accepts authenticated clone-local reentry" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const source = ir.BlockId.fromIndex(0);
+    const original = ir.BlockId.fromIndex(1);
+    const clone = ir.BlockId.fromIndex(2);
+    const cycle = ir.BlockId.fromIndex(3);
+    const condition = ir.ValueId.fromIndex(0);
+    const blocks = [_]ir.Block{
+        .{ .id = source, .function = function_id, .terminator = .{ .branch = .{
+            .condition = condition,
+            .then_edge = .{ .target = clone },
+            .else_edge = .{ .target = original },
+        } } },
+        .{ .id = original, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = clone, .function = function_id, .terminator = .{ .jump = .{ .target = cycle } } },
+        .{ .id = cycle, .function = function_id, .terminator = .{ .jump = .{ .target = clone } } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &.{condition},
+        .blocks = &.{ source, original, clone, cycle },
+        .entry_block = source,
+    };
+    const values = [_]ir.Value{.{
+        .id = condition,
+        .function = function_id,
+        .type = .boolean,
+        .origin = .{ .parameter = 0 },
+    }};
+    var rewrites = [_]ir.CfgEdgeRewrite{.{
+        .id = ir.EdgeRewriteId.fromIndex(0),
+        .source = source,
+        .kind = .branch_then,
+        .from = .{ .target = original },
+        .to = .{ .target = clone },
+        .rule = .node_split,
+        .node_split_group = ir.NodeSplitGroupId.fromIndex(0),
+    }};
+    var program = ir.Program{
+        .program_id = "seeded-collision-clone-local-reentry",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+        .edge_rewrites = &rewrites,
+    };
+    const seed: CollisionSeed = .{
+        .function_index = 0,
+        .target = clone,
+        .source = source,
+        .kind = .branch_then,
+        .original_target = original,
+        .previous = original,
+        .context = .{
+            .start = original,
+            .stop = null,
+            .loop_exit = null,
+            .continue_target = null,
+        },
+    };
+
+    {
+        var analysis = try cfg.Analysis.init(std.testing.allocator, &program, function);
+        defer analysis.deinit();
+        var replay = try structural_overlap.ReplayProjectionContext.init(
+            std.testing.allocator,
+            &program,
+        );
+        defer replay.deinit();
+        try std.testing.expect(!try analysis.canReach(clone, original));
+        try std.testing.expect(try analysis.canReachNonEmptyPath(clone, clone));
+        try std.testing.expect(try seededCollisionIsLive(&program, &analysis, seed, &replay));
+    }
+
+    var wrong_owner = seed;
+    wrong_owner.previous = source;
+    {
+        var analysis = try cfg.Analysis.init(std.testing.allocator, &program, function);
+        defer analysis.deinit();
+        var replay = try structural_overlap.ReplayProjectionContext.init(
+            std.testing.allocator,
+            &program,
+        );
+        defer replay.deinit();
+        try std.testing.expect(!try seededCollisionIsLive(&program, &analysis, wrong_owner, &replay));
+    }
+}
+
+test "seeded collision rejects an acyclic clone-local reentry" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const source = ir.BlockId.fromIndex(0);
+    const original = ir.BlockId.fromIndex(1);
+    const clone = ir.BlockId.fromIndex(2);
+    const continuation = ir.BlockId.fromIndex(3);
+    const condition = ir.ValueId.fromIndex(0);
+    const blocks = [_]ir.Block{
+        .{ .id = source, .function = function_id, .terminator = .{ .branch = .{
+            .condition = condition,
+            .then_edge = .{ .target = clone },
+            .else_edge = .{ .target = original },
+        } } },
+        .{ .id = original, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = clone, .function = function_id, .terminator = .{ .jump = .{ .target = continuation } } },
+        .{ .id = continuation, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &.{condition},
+        .blocks = &.{ source, original, clone, continuation },
+        .entry_block = source,
+    };
+    const values = [_]ir.Value{.{
+        .id = condition,
+        .function = function_id,
+        .type = .boolean,
+        .origin = .{ .parameter = 0 },
+    }};
+    const rewrites = [_]ir.CfgEdgeRewrite{.{
+        .id = ir.EdgeRewriteId.fromIndex(0),
+        .source = source,
+        .kind = .branch_then,
+        .from = .{ .target = original },
+        .to = .{ .target = clone },
+        .rule = .node_split,
+        .node_split_group = ir.NodeSplitGroupId.fromIndex(0),
+    }};
+    const program = ir.Program{
+        .program_id = "seeded-collision-acyclic-clone",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+        .edge_rewrites = &rewrites,
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, function);
+    defer analysis.deinit();
+    var replay = try structural_overlap.ReplayProjectionContext.init(
+        std.testing.allocator,
+        &program,
+    );
+    defer replay.deinit();
+    const seed: CollisionSeed = .{
+        .function_index = 0,
+        .target = clone,
+        .source = source,
+        .kind = .branch_then,
+        .original_target = original,
+        .previous = original,
+        .context = .{
+            .start = original,
+            .stop = null,
+            .loop_exit = null,
+            .continue_target = null,
+        },
+    };
+    try std.testing.expect(!try analysis.canReachNonEmptyPath(clone, clone));
+    try std.testing.expect(!try seededCollisionIsLive(&program, &analysis, seed, &replay));
+}
+
+test "paired forwarding seed requires its owner edge and exact rewrite" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const owner = ir.BlockId.fromIndex(1);
+    const source = ir.BlockId.fromIndex(2);
+    const target = ir.BlockId.fromIndex(3);
+    const original = ir.BlockId.fromIndex(4);
+    const selector = ir.ValueId.fromIndex(0);
+    const owner_value = ir.ValueId.fromIndex(1);
+    const source_value = ir.ValueId.fromIndex(2);
+    const target_parameter = ir.ValueId.fromIndex(3);
+    const original_parameter = ir.ValueId.fromIndex(4);
+    const owner_arguments = [_]ir.ValueId{owner_value};
+    const source_arguments = [_]ir.ValueId{source_value};
+    const values = [_]ir.Value{
+        .{ .id = selector, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = owner_value, .function = function_id, .type = .dynamic, .origin = .{ .parameter = 1 } },
+        .{ .id = source_value, .function = function_id, .type = .dynamic, .origin = .{ .parameter = 2 } },
+        .{ .id = target_parameter, .function = function_id, .type = .dynamic, .origin = .{ .parameter = 3 } },
+        .{ .id = original_parameter, .function = function_id, .type = .dynamic, .origin = .{ .parameter = 4 } },
+    };
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = selector,
+            .then_edge = .{ .target = owner },
+            .else_edge = .{ .target = source },
+        } } },
+        .{ .id = owner, .function = function_id, .terminator = .{ .jump = .{
+            .target = target,
+            .arguments = owner_arguments[0..],
+        } } },
+        .{ .id = source, .function = function_id, .terminator = .{ .jump = .{
+            .target = target,
+            .arguments = owner_arguments[0..],
+        } } },
+        .{ .id = target, .function = function_id, .parameters = &.{target_parameter}, .terminator = .{ .jump = .{
+            .target = owner,
+            .arguments = owner_arguments[0..],
+        } } },
+        .{ .id = original, .function = function_id, .parameters = &.{original_parameter}, .terminator = .{ .return_values = &.{} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &.{ selector, owner_value, source_value, target_parameter, original_parameter },
+        .blocks = &.{ entry, owner, source, target, original },
+        .entry_block = entry,
+    };
+    var rewrite = ir.CfgEdgeRewrite{
+        .id = ir.EdgeRewriteId.fromIndex(0),
+        .source = source,
+        .kind = .jump,
+        .from = .{ .target = original, .arguments = source_arguments[0..] },
+        .to = .{ .target = target, .arguments = owner_arguments[0..] },
+        .rule = .forwarding_jump,
+    };
+    var rewrites = [_]ir.CfgEdgeRewrite{rewrite};
+    var program = ir.Program{
+        .program_id = "paired-forwarding-seed",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+        .edge_rewrites = &rewrites,
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, function);
+    defer analysis.deinit();
+    var replay = try structural_overlap.ReplayProjectionContext.init(
+        std.testing.allocator,
+        &program,
+    );
+    defer replay.deinit();
+    const context: structure.CollisionContext = .{
+        .start = owner,
+        .stop = null,
+        .loop_exit = null,
+        .continue_target = null,
+        .parameter_arguments = owner_arguments[0..],
+    };
+    const seed: CollisionSeed = .{
+        .function_index = 0,
+        .target = target,
+        .source = source,
+        .kind = .jump,
+        .original_target = original,
+        .previous = owner,
+        .context = context,
+        .proof = .paired_forwarding,
+    };
+    try std.testing.expect(try seededCollisionIsLive(&program, &analysis, seed, &replay));
+
+    rewrite.to.arguments = source_arguments[0..];
+    rewrites[0] = rewrite;
+    try std.testing.expect(!try seededCollisionIsLive(&program, &analysis, seed, &replay));
+
+    rewrite = rewrites[0];
+    rewrite.to.arguments = owner_arguments[0..];
+    rewrite.rule = .node_split;
+    rewrites[0] = rewrite;
+    try std.testing.expect(!try seededCollisionIsLive(&program, &analysis, seed, &replay));
+}
+
+test "paired forwarding seed accepts an authenticated live owner descendant" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const owner = ir.BlockId.fromIndex(1);
+    const source = ir.BlockId.fromIndex(2);
+    const target = ir.BlockId.fromIndex(3);
+    const original = ir.BlockId.fromIndex(4);
+    const owner_clone = ir.BlockId.fromIndex(5);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .jump = .{ .target = source } } },
+        .{ .id = owner, .function = function_id, .terminator = .{ .jump = .{ .target = owner_clone } } },
+        .{ .id = source, .function = function_id, .terminator = .{ .jump = .{ .target = target } } },
+        .{ .id = target, .function = function_id, .terminator = .{ .jump = .{ .target = owner } } },
+        .{ .id = original, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = owner_clone, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .blocks = &.{ entry, owner, source, target, original, owner_clone },
+        .entry_block = entry,
+    };
+    var rewrites = [_]ir.CfgEdgeRewrite{
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(0),
+            .source = source,
+            .kind = .jump,
+            .from = .{ .target = original, .arguments = &.{} },
+            .to = .{ .target = target, .arguments = &.{} },
+            .rule = .forwarding_jump,
+        },
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(1),
+            .source = owner,
+            .kind = .jump,
+            .from = .{ .target = target, .arguments = &.{} },
+            .to = .{ .target = owner_clone, .arguments = &.{} },
+            .rule = .node_split,
+            .node_split_group = ir.NodeSplitGroupId.fromIndex(0),
+        },
+    };
+    var program = ir.Program{
+        .program_id = "paired-forwarding-owner-descendant",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &.{},
+        .edge_rewrites = &rewrites,
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, function);
+    defer analysis.deinit();
+    var replay = try structural_overlap.ReplayProjectionContext.init(
+        std.testing.allocator,
+        &program,
+    );
+    defer replay.deinit();
+    const seed: CollisionSeed = .{
+        .function_index = 0,
+        .target = target,
+        .source = source,
+        .kind = .jump,
+        .original_target = original,
+        .previous = owner,
+        .context = .{
+            .start = owner,
+            .stop = null,
+            .loop_exit = null,
+            .continue_target = null,
+            .parameter_arguments = null,
+        },
+        .proof = .paired_forwarding,
+    };
+    try std.testing.expect(try seededCollisionIsLive(&program, &analysis, seed, &replay));
+
+    rewrites[1].node_split_group = null;
+    replay.deinit();
+    replay = try structural_overlap.ReplayProjectionContext.init(
+        std.testing.allocator,
+        &program,
+    );
+    try std.testing.expect(!try seededCollisionIsLive(&program, &analysis, seed, &replay));
+}
+
 // A direct target clone can expose the same authenticated collision arm again
 // without changing its source. Reuse that exact live split boundary only when
 // the clone parent, edge rewrite, current tuple, and continuation bridge all
@@ -10679,6 +11226,177 @@ test "clone fold dominance preflight rolls back an unsafe redirect" {
     try std.testing.expectEqual(clone, blocks[source.index()].terminator.jump.target);
 }
 
+test "eligible two-entry cycles normalize through authenticated node splitting" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const first = ir.BlockId.fromIndex(1);
+    const second = ir.BlockId.fromIndex(2);
+    const exit = ir.BlockId.fromIndex(3);
+    const selector = ir.ValueId.fromIndex(0);
+    const keep_looping = ir.ValueId.fromIndex(1);
+    const evidence_id = ir.EvidenceId.fromIndex(0);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = selector,
+            .then_edge = .{ .target = first },
+            .else_edge = .{ .target = second },
+        } }, .evidence = &.{evidence_id} },
+        .{ .id = first, .function = function_id, .terminator = .{ .branch = .{
+            .condition = keep_looping,
+            .then_edge = .{ .target = second },
+            .else_edge = .{ .target = exit },
+        } }, .evidence = &.{evidence_id} },
+        .{ .id = second, .function = function_id, .terminator = .{ .jump = .{ .target = first } }, .evidence = &.{evidence_id} },
+        .{ .id = exit, .function = function_id, .terminator = .{ .return_values = &.{} }, .evidence = &.{evidence_id} },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .parameters = &.{ selector, keep_looping },
+        .blocks = &.{ second, entry, exit, first },
+        .entry_block = entry,
+        .evidence = &.{evidence_id},
+    }};
+    const values = [_]ir.Value{
+        .{ .id = selector, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = keep_looping, .function = function_id, .type = .boolean, .origin = .{ .parameter = 1 } },
+    };
+    const evidence = [_]ir.Evidence{.{ .id = evidence_id, .kind = .dynamic_fixture, .locator = "fixture:node-split-normalization" }};
+    const program: ir.Program = .{
+        .program_id = "node-split-normalization",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+        .evidence = &evidence,
+    };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const normalized = try normalizeInArena(arena.allocator(), &program);
+    try std.testing.expectEqual(@as(usize, 1), normalized.cloned_blocks);
+    try std.testing.expectEqual(@as(usize, 1), normalized.rewritten_edges);
+    try std.testing.expectEqual(@as(usize, 5), normalized.program.blocks.len);
+    try std.testing.expectEqual(ir.EdgeRewriteRule.node_split, normalized.program.edge_rewrites[0].rule);
+    try std.testing.expectEqual(ir.BlockId.fromIndex(4), normalized.program.blocks[entry.index()].terminator.branch.else_edge.target);
+
+    var graph = try cfg.Analysis.init(std.testing.allocator, &normalized.program, normalized.program.functions[0]);
+    defer graph.deinit();
+    var regions = try irreducible_region.analyze(std.testing.allocator, &graph);
+    defer regions.deinit();
+    try std.testing.expectEqual(@as(usize, 0), regions.regions.len);
+    var structure_plan = try @import("structure.zig").Plan.init(std.testing.allocator, &graph);
+    defer structure_plan.deinit();
+
+    var report = try @import("validate.zig").validate(std.testing.allocator, &normalized.program, .core);
+    defer report.deinit();
+    try std.testing.expect(report.isClean());
+
+    const rerun = try normalizeInArena(arena.allocator(), &normalized.program);
+    try std.testing.expectEqual(@as(usize, 0), rerun.cloned_blocks);
+    try std.testing.expectEqual(normalized.program.blocks.len, rerun.program.blocks.len);
+    try std.testing.expectEqual(normalized.program.edge_rewrites.len, rerun.program.edge_rewrites.len);
+}
+
+test "parameterized secondary entries clone value identity and terminator uses" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const primary = ir.BlockId.fromIndex(1);
+    const secondary = ir.BlockId.fromIndex(2);
+    const selector = ir.ValueId.fromIndex(0);
+    const payload = ir.ValueId.fromIndex(1);
+    const primary_value = ir.ValueId.fromIndex(2);
+    const secondary_value = ir.ValueId.fromIndex(3);
+    const evidence_id = ir.EvidenceId.fromIndex(0);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = selector,
+            .then_edge = .{ .target = primary, .arguments = &.{payload} },
+            .else_edge = .{ .target = secondary, .arguments = &.{payload} },
+        } }, .evidence = &.{evidence_id} },
+        .{ .id = primary, .function = function_id, .parameters = &.{primary_value}, .terminator = .{ .jump = .{
+            .target = secondary,
+            .arguments = &.{primary_value},
+        } }, .evidence = &.{evidence_id} },
+        .{ .id = secondary, .function = function_id, .parameters = &.{secondary_value}, .terminator = .{ .jump = .{
+            .target = primary,
+            .arguments = &.{secondary_value},
+        } }, .evidence = &.{evidence_id} },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .parameters = &.{ selector, payload },
+        .blocks = &.{ secondary, entry, primary },
+        .entry_block = entry,
+        .evidence = &.{evidence_id},
+    }};
+    const values = [_]ir.Value{
+        .{ .id = selector, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = payload, .function = function_id, .type = .integer, .name_hint = "payload", .origin = .{ .parameter = 1 } },
+        .{ .id = primary_value, .function = function_id, .type = .integer, .name_hint = "primary_value", .origin = .{ .block_parameter = .{ .block = primary, .index = 0 } } },
+        .{ .id = secondary_value, .function = function_id, .type = .integer, .name_hint = "secondary_value", .origin = .{ .block_parameter = .{ .block = secondary, .index = 0 } } },
+    };
+    const evidence = [_]ir.Evidence{.{ .id = evidence_id, .kind = .dynamic_fixture, .locator = "fixture:parameterized-node-split" }};
+    const program: ir.Program = .{
+        .program_id = "parameterized-node-split",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+        .evidence = &evidence,
+    };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const normalized = try normalizeInArena(arena.allocator(), &program);
+    const clone_id = ir.BlockId.fromIndex(3);
+    const clone_value = ir.ValueId.fromIndex(4);
+    try std.testing.expectEqual(@as(usize, 1), normalized.cloned_blocks);
+    try std.testing.expectEqual(@as(usize, 1), normalized.cloned_values);
+    try std.testing.expectEqual(@as(usize, 1), normalized.rewritten_edges);
+    try std.testing.expectEqual(@as(usize, 4), normalized.program.blocks.len);
+    try std.testing.expectEqual(@as(usize, 5), normalized.program.values.len);
+    try std.testing.expectEqualSlices(ir.ValueId, &.{payload}, normalized.program.edge_rewrites[0].from.arguments);
+    try std.testing.expectEqualSlices(ir.ValueId, &.{payload}, normalized.program.edge_rewrites[0].to.arguments);
+    try std.testing.expectEqualSlices(ir.ValueId, &.{clone_value}, normalized.program.blocks[clone_id.index()].parameters);
+    try std.testing.expectEqualSlices(ir.ValueId, &.{clone_value}, normalized.program.blocks[clone_id.index()].terminator.jump.arguments);
+    try std.testing.expectEqual(secondary, normalized.program.values[secondary_value.index()].origin.block_parameter.block);
+    try std.testing.expectEqual(clone_id, normalized.program.values[clone_value.index()].origin.block_parameter.block);
+    try std.testing.expectEqualStrings("secondary_value", normalized.program.values[clone_value.index()].name_hint.?);
+
+    var graph = try cfg.Analysis.init(std.testing.allocator, &normalized.program, normalized.program.functions[0]);
+    defer graph.deinit();
+    var regions = try irreducible_region.analyze(std.testing.allocator, &graph);
+    defer regions.deinit();
+    try std.testing.expectEqual(@as(usize, 0), regions.regions.len);
+    var structure_plan = try @import("structure.zig").Plan.init(std.testing.allocator, &graph);
+    defer structure_plan.deinit();
+
+    var report = try @import("validate.zig").validate(std.testing.allocator, &normalized.program, .core);
+    defer report.deinit();
+    try std.testing.expect(report.isClean());
+
+    const rerun = try normalizeInArena(arena.allocator(), &normalized.program);
+    try std.testing.expectEqual(@as(usize, 0), rerun.cloned_blocks);
+    try std.testing.expectEqual(@as(usize, 0), rerun.cloned_values);
+    try std.testing.expectEqual(normalized.program.values.len, rerun.program.values.len);
+
+    var invalid_values = values;
+    invalid_values[secondary_value.index()].origin = .{ .parameter = 2 };
+    var invalid_program = program;
+    invalid_program.values = &invalid_values;
+    const refused = try normalizeInArena(arena.allocator(), &invalid_program);
+    try std.testing.expectEqual(@as(usize, 0), refused.cloned_blocks);
+    var refused_report = try @import("validate.zig").validate(std.testing.allocator, &refused.program, .readable_luau);
+    defer refused_report.deinit();
+    try std.testing.expect(refused_report.contains(.block_parameter_origin_mismatch));
+    // The malformed value origin is the admission error. The node-split
+    // parameter-contract diagnostic describes a splitter limitation, not an
+    // admission error when dispatch is available.
+    try std.testing.expect(!refused_report.contains(.irreducible_entry_parameter_contract));
+}
+
 test "mapped parameterized continuations clone while stable ones remain shared" {
     const function_id = ir.FunctionId.fromIndex(0);
     const secondary = ir.BlockId.fromIndex(0);
@@ -10979,6 +11697,102 @@ test "failed clone application rolls back graph and rewrite state" {
     try std.testing.expectEqual(@as(usize, 0), result.rewritten_edges);
     try std.testing.expectEqual(block_list.items.ptr, working_program.blocks.ptr);
     try std.testing.expectEqual(rewrite_list.items.ptr, working_program.edge_rewrites.ptr);
+}
+
+test "mixed irreducible regions split self-loop secondaries to full reducibility" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const primary = ir.BlockId.fromIndex(1);
+    const eligible = ir.BlockId.fromIndex(2);
+    const blocked = ir.BlockId.fromIndex(3);
+    const router = ir.BlockId.fromIndex(4);
+    const first_condition = ir.ValueId.fromIndex(0);
+    const second_condition = ir.ValueId.fromIndex(1);
+    const evidence_id = ir.EvidenceId.fromIndex(0);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = first_condition,
+            .then_edge = .{ .target = primary },
+            .else_edge = .{ .target = router },
+        } }, .evidence = &.{evidence_id} },
+        .{ .id = primary, .function = function_id, .terminator = .{ .branch = .{
+            .condition = first_condition,
+            .then_edge = .{ .target = eligible },
+            .else_edge = .{ .target = blocked },
+        } }, .evidence = &.{evidence_id} },
+        .{ .id = eligible, .function = function_id, .terminator = .{ .jump = .{ .target = primary } }, .evidence = &.{evidence_id} },
+        .{ .id = blocked, .function = function_id, .terminator = .{ .branch = .{
+            .condition = second_condition,
+            .then_edge = .{ .target = blocked },
+            .else_edge = .{ .target = primary },
+        } }, .evidence = &.{evidence_id} },
+        .{ .id = router, .function = function_id, .terminator = .{ .branch = .{
+            .condition = second_condition,
+            .then_edge = .{ .target = eligible },
+            .else_edge = .{ .target = blocked },
+        } }, .evidence = &.{evidence_id} },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .parameters = &.{ first_condition, second_condition },
+        .blocks = &.{ blocked, router, entry, eligible, primary },
+        .entry_block = entry,
+        .evidence = &.{evidence_id},
+    }};
+    const values = [_]ir.Value{
+        .{ .id = first_condition, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = second_condition, .function = function_id, .type = .boolean, .origin = .{ .parameter = 1 } },
+    };
+    const evidence = [_]ir.Evidence{.{ .id = evidence_id, .kind = .dynamic_fixture, .locator = "fixture:mixed-irreducible-policy" }};
+    const program: ir.Program = .{
+        .program_id = "mixed-irreducible-policy",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+        .evidence = &evidence,
+    };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const normalized = try normalizeInArena(arena.allocator(), &program);
+    try std.testing.expectEqual(@as(usize, 2), normalized.cloned_blocks);
+    try std.testing.expectEqual(@as(usize, 2), normalized.rewritten_edges);
+    try std.testing.expectEqual(ir.EdgeRewriteRule.node_split, normalized.program.edge_rewrites[0].rule);
+    try std.testing.expectEqual(ir.EdgeRewriteRule.node_split, normalized.program.edge_rewrites[1].rule);
+    try std.testing.expectEqual(ir.BlockId.fromIndex(5), normalized.program.blocks[router.index()].terminator.branch.then_edge.target);
+    const blocked_clone = ir.BlockId.fromIndex(6);
+    try std.testing.expectEqual(blocked_clone, normalized.program.blocks[router.index()].terminator.branch.else_edge.target);
+    try std.testing.expectEqual(blocked_clone, normalized.program.blocks[blocked_clone.index()].terminator.branch.then_edge.target);
+    try std.testing.expectEqual(primary, normalized.program.blocks[blocked_clone.index()].terminator.branch.else_edge.target);
+
+    var graph = try cfg.Analysis.init(std.testing.allocator, &normalized.program, normalized.program.functions[0]);
+    defer graph.deinit();
+    var regions = try irreducible_region.analyze(std.testing.allocator, &graph);
+    defer regions.deinit();
+    try std.testing.expectEqual(@as(usize, 0), regions.regions.len);
+
+    var core_report = try @import("validate.zig").validate(std.testing.allocator, &normalized.program, .core);
+    defer core_report.deinit();
+    try std.testing.expect(core_report.isClean());
+    var readable_report = try @import("validate.zig").validate(std.testing.allocator, &normalized.program, .readable_luau);
+    defer readable_report.deinit();
+    try std.testing.expect(readable_report.isClean());
+
+    const rerun = try normalizeInArena(arena.allocator(), &normalized.program);
+    try std.testing.expectEqual(@as(usize, 0), rerun.cloned_blocks);
+    try std.testing.expectEqual(normalized.program.blocks.len, rerun.program.blocks.len);
+    try std.testing.expectEqual(normalized.program.edge_rewrites.len, rerun.program.edge_rewrites.len);
+
+    const tampered_blocks = try std.testing.allocator.dupe(ir.Block, normalized.program.blocks);
+    defer std.testing.allocator.free(tampered_blocks);
+    tampered_blocks[blocked_clone.index()].terminator.branch.then_edge.target = blocked;
+    var tampered = normalized.program;
+    tampered.blocks = tampered_blocks;
+    var tampered_report = try @import("validate.zig").validate(std.testing.allocator, &tampered, .core);
+    defer tampered_report.deinit();
+    try std.testing.expect(tampered_report.contains(.invalid_edge_rewrite));
 }
 
 test "mixed region plan retains only eligible secondary entries" {
