@@ -1,0 +1,1967 @@
+const std = @import("std");
+
+fn luneExe(b: *std.Build) []const u8 {
+    return b.pathFromRoot("../../../../lune.exe");
+}
+
+fn luauCompileExe(b: *std.Build) []const u8 {
+    return b.pathFromRoot("../../../../tools/bin/luau-compile.exe");
+}
+
+fn addStructureAstAudit(
+    b: *std.Build,
+    fixture_name: []const u8,
+    generated_luau: std.Build.LazyPath,
+) *std.Build.Step.Run {
+    const command = b.addSystemCommand(&.{ luneExe(b), "run" });
+    command.addFileArg(b.path("luau/structure_ast_audit.luau"));
+    command.addFileInput(b.path("luau/structure_ast_audit.luau"));
+    command.addFileArg(b.path("../../../../tools/luau-0.720/luau-ast.exe"));
+    command.addArg(fixture_name);
+    command.addFileArg(generated_luau);
+    return command;
+}
+
+fn luauAnalyzeExe(b: *std.Build) []const u8 {
+    return b.pathFromRoot("../../../../tools/bin/luau-analyze.exe");
+}
+
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+    const z3_enabled = b.option(bool, "z3", "Enable the direct Z3 C API backend") orelse false;
+    const install_proof_attest = b.option(
+        bool,
+        "install-proof-attest",
+        "Install the proof-attestation helper with the semantic-lifter executable",
+    ) orelse true;
+    const trace_normalize_phases = b.option(
+        bool,
+        "trace-normalize-phases",
+        "Enable bounded phase timing diagnostics for control normalization",
+    ) orelse false;
+    const workspace_sample_conformance = b.option(
+        bool,
+        "workspace-sample-conformance",
+        "Include optional whole-program samples owned by the parent workspace",
+    ) orelse false;
+    const z3_include = "../../../dep/z3/z3-4.16.0-x64-win/include";
+    const z3_library = "../../../dep/z3/z3-4.16.0-x64-win/bin/libz3.lib";
+    const z3_bin = "../../../dep/z3/z3-4.16.0-x64-win/bin";
+
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "z3_enabled", z3_enabled);
+    build_options.addOption(bool, "trace_normalize_phases", trace_normalize_phases);
+
+    const module = b.addModule("semantic_lifter", .{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    module.addOptions("build_options", build_options);
+    if (z3_enabled) {
+        module.addIncludePath(b.path(z3_include));
+        module.addObjectFile(b.path(z3_library));
+    }
+
+    const exe = b.addExecutable(.{
+        .name = "semantic-lifter",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "semantic_lifter", .module = module }},
+        }),
+    });
+    b.installArtifact(exe);
+
+    const proof_attest = b.addExecutable(.{
+        .name = "proof-attest",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/proof_attest.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    if (install_proof_attest) b.installArtifact(proof_attest);
+
+    const run_command = b.addRunArtifact(exe);
+    if (z3_enabled) run_command.addPathDir(b.pathFromRoot(z3_bin));
+    run_command.step.dependOn(b.getInstallStep());
+    if (b.args) |args| run_command.addArgs(args);
+    const run_step = b.step("run", "Run the semantic lifter CLI");
+    run_step.dependOn(&run_command.step);
+
+    const absolute_conformance = addZigFixtureConformance(b, exe, z3_enabled, z3_bin, "absolute");
+    const function_reference_conformance = addZigFixtureConformance(b, exe, z3_enabled, z3_bin, "function-reference-identity");
+    const dynamic_truthiness_conformance = addZigFixtureConformance(b, exe, z3_enabled, z3_bin, "dynamic-truthiness");
+    const immutable_closure_conformance = addZigFixtureConformance(b, exe, z3_enabled, z3_bin, "immutable-closure");
+    const shared_place_conformance = addZigFixtureConformance(b, exe, z3_enabled, z3_bin, "shared-place-closure");
+    const luau_control_conformance = addLuauFixtureConformance(b, exe, z3_enabled, z3_bin, "luau/conformance.luau", "choose-max");
+    const luau_loop_conformance = addLuauFixtureConformanceWithEngine(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/loop_conformance.luau",
+        "loop-control-topologies",
+        if (z3_enabled) "z3" else "internal",
+    );
+    const loop_reresolve = b.addRunArtifact(exe);
+    if (z3_enabled) loop_reresolve.addPathDir(b.pathFromRoot(z3_bin));
+    loop_reresolve.addArg("resolve-ir");
+    loop_reresolve.addFileArg(luau_loop_conformance.resolved_ir);
+    const loop_reresolved_ir = loop_reresolve.addOutputFileArg("loop-control-topologies.reresolved.lifter-ir.json");
+    loop_reresolve.addArg(if (z3_enabled) "z3" else "internal");
+    const loop_audit = b.addSystemCommand(&.{ luneExe(b), "run" });
+    loop_audit.addFileArg(b.path("luau/loop_conformance.luau"));
+    loop_audit.addFileInput(b.path("luau/lifter_ir.luau"));
+    loop_audit.addFileInput(b.path("luau/json_codec.luau"));
+    loop_audit.addArg("audit");
+    loop_audit.addFileArg(luau_loop_conformance.resolved_ir);
+    loop_audit.addFileArg(loop_reresolved_ir);
+    loop_audit.addArg(if (z3_enabled) "z3" else "internal");
+    const luau_numeric_conformance = addLuauFixtureConformanceWithEngine(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/numeric_conformance.luau",
+        "u32-numerics",
+        if (z3_enabled) "z3" else "internal",
+    );
+    const luau_promotion_conformance = addLuauFixtureConformanceWithEngine(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/promotion_conformance.luau",
+        "automatic-promotion",
+        if (z3_enabled) "z3" else "internal",
+    );
+    const luau_guarded_promotion_conformance = addLuauFixtureConformanceWithEngine(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/guarded_promotion_conformance.luau",
+        "guarded-promotion",
+        if (z3_enabled) "z3" else "internal",
+    );
+    const guarded_promotion_audit = b.addSystemCommand(&.{ luneExe(b), "run" });
+    guarded_promotion_audit.addFileArg(b.path("luau/guarded_promotion_conformance.luau"));
+    guarded_promotion_audit.addFileInput(b.path("luau/lifter_ir.luau"));
+    guarded_promotion_audit.addFileInput(b.path("luau/json_codec.luau"));
+    guarded_promotion_audit.addArg("audit");
+    guarded_promotion_audit.addFileArg(luau_guarded_promotion_conformance.resolved_ir);
+    guarded_promotion_audit.addFileArg(luau_guarded_promotion_conformance.generated_luau);
+    guarded_promotion_audit.addArg(if (z3_enabled) "z3" else "internal_facts");
+    const luau_query_promotion_conformance = addLuauFixtureConformanceWithEngine(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/query_promotion_conformance.luau",
+        "query-promotion",
+        if (z3_enabled) "z3" else "internal",
+    );
+    const query_promotion_audit = b.addSystemCommand(&.{ luneExe(b), "run" });
+    query_promotion_audit.addFileArg(b.path("luau/query_promotion_conformance.luau"));
+    query_promotion_audit.addFileInput(b.path("luau/lifter_ir.luau"));
+    query_promotion_audit.addFileInput(b.path("luau/json_codec.luau"));
+    query_promotion_audit.addArg("audit");
+    query_promotion_audit.addFileArg(luau_query_promotion_conformance.input_ir);
+    query_promotion_audit.addFileArg(luau_query_promotion_conformance.resolved_ir);
+    const query_promotion_reresolve = b.addRunArtifact(exe);
+    if (z3_enabled) query_promotion_reresolve.addPathDir(b.pathFromRoot(z3_bin));
+    query_promotion_reresolve.addArg("resolve-ir");
+    query_promotion_reresolve.addFileArg(luau_query_promotion_conformance.resolved_ir);
+    const query_promotion_reresolved_ir = query_promotion_reresolve.addOutputFileArg("query-promotion.reresolved.lifter-ir.json");
+    query_promotion_reresolve.addArg(if (z3_enabled) "z3" else "internal");
+    query_promotion_audit.addFileArg(query_promotion_reresolved_ir);
+    query_promotion_audit.addFileArg(luau_query_promotion_conformance.generated_luau);
+    query_promotion_audit.addArg(if (z3_enabled) "z3" else "internal_facts");
+    const luau_closure_conformance = addLuauFixtureConformanceWithEngine(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/closure_conformance.luau",
+        "luau-shared-place-closure",
+        if (z3_enabled) "z3" else "internal",
+    );
+    const luau_lexical_transfer_conformance = addLuauFixtureConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/lexical_transfer_conformance.luau",
+        "loop-local-lexical-transfer",
+    );
+    const luau_entry_parameter_conformance = addLuauFixtureConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/entry_parameter_conformance.luau",
+        "fixed-entry-parameters",
+    );
+    const luau_expression_depth_conformance = addLuauFixtureConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/expression_depth_conformance.luau",
+        "bounded-expression-depth",
+    );
+    const luau_structured_depth_conformance = addLuauFixtureConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/structured_depth_conformance.luau",
+        "structured-parser-depth",
+    );
+    const luau_mixed_entry_vararg_conformance = addLuauFixtureConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/mixed_entry_vararg_conformance.luau",
+        "mixed-entry-varargs",
+    );
+    const luau_pack_materialization_conformance = addLuauFixtureConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/pack_materialization_conformance.luau",
+        "pack-materialized-adjustment",
+    );
+    const luau_pack_multi_latch_conformance = addLuauFixtureConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/pack_multi_latch_conformance.luau",
+        "pack-multi-latch",
+    );
+    const luau_pack_return_storage_conformance = addLuauFixtureConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/pack_return_storage_conformance.luau",
+        "pack-return-storage",
+    );
+    const luau_iteration_exit_transfer_conformance = addLuauFixtureConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/iteration_exit_transfer_conformance.luau",
+        "iteration-exit-transfer",
+    );
+    const luau_open_pack_projection_conformance = addLuauFixtureConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/open_pack_projection_conformance.luau",
+        "open-pack-projection",
+    );
+    const luau_closed_pack_discard_conformance = addLuauFixtureConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/closed_pack_discard_conformance.luau",
+        "closed-pack-discard",
+    );
+    const luau_table_conformance = addLuauFixtureConformance(b, exe, z3_enabled, z3_bin, "luau/table_conformance.luau", "table-access-modes");
+    const luau_boundary_conformance = addLuauFixtureConformance(b, exe, z3_enabled, z3_bin, "luau/control_boundary_conformance.luau", "control-boundaries");
+    const luau_path_control_conformance = addLuauFixtureConformanceWithEngine(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/path_control_conformance.luau",
+        "edge-scoped-control",
+        if (z3_enabled) "z3" else "internal",
+    );
+    const path_control_audit = b.addSystemCommand(&.{ luneExe(b), "run" });
+    path_control_audit.addFileArg(b.path("luau/path_control_conformance.luau"));
+    path_control_audit.addFileInput(b.path("luau/lifter_ir.luau"));
+    path_control_audit.addFileInput(b.path("luau/json_codec.luau"));
+    path_control_audit.addArg("audit");
+    path_control_audit.addFileArg(luau_path_control_conformance.resolved_ir);
+    const path_control_reresolve = b.addRunArtifact(exe);
+    if (z3_enabled) path_control_reresolve.addPathDir(b.pathFromRoot(z3_bin));
+    path_control_reresolve.addArg("resolve-ir");
+    path_control_reresolve.addFileArg(luau_path_control_conformance.resolved_ir);
+    const path_control_reresolved_ir = path_control_reresolve.addOutputFileArg("edge-scoped-control.reresolved.lifter-ir.json");
+    path_control_reresolve.addArg(if (z3_enabled) "z3" else "internal");
+    path_control_audit.addFileArg(path_control_reresolved_ir);
+    path_control_audit.addArg(if (z3_enabled) "z3" else "internal");
+    const luau_relational_path_control_conformance = addLuauFixtureConformanceWithEngine(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/relational_path_control_conformance.luau",
+        "relational-edge-control",
+        if (z3_enabled) "z3" else "internal",
+    );
+    const relational_path_audit = b.addSystemCommand(&.{ luneExe(b), "run" });
+    relational_path_audit.addFileArg(b.path("luau/relational_path_control_conformance.luau"));
+    relational_path_audit.addFileInput(b.path("luau/lifter_ir.luau"));
+    relational_path_audit.addFileInput(b.path("luau/json_codec.luau"));
+    relational_path_audit.addArg("audit");
+    relational_path_audit.addFileArg(luau_relational_path_control_conformance.resolved_ir);
+    relational_path_audit.addArg(if (z3_enabled) "z3" else "internal");
+    const luau_chained_path_control_conformance = addLuauFixtureConformanceWithEngine(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/chained_path_control_conformance.luau",
+        "chained-edge-control",
+        if (z3_enabled) "z3" else "internal",
+    );
+    const chained_path_audit = b.addSystemCommand(&.{ luneExe(b), "run" });
+    chained_path_audit.addFileArg(b.path("luau/chained_path_control_conformance.luau"));
+    chained_path_audit.addFileInput(b.path("luau/lifter_ir.luau"));
+    chained_path_audit.addFileInput(b.path("luau/json_codec.luau"));
+    chained_path_audit.addArg("audit");
+    chained_path_audit.addFileArg(luau_chained_path_control_conformance.resolved_ir);
+    const chained_path_reresolve = b.addRunArtifact(exe);
+    if (z3_enabled) chained_path_reresolve.addPathDir(b.pathFromRoot(z3_bin));
+    chained_path_reresolve.addArg("resolve-ir");
+    chained_path_reresolve.addFileArg(luau_chained_path_control_conformance.resolved_ir);
+    const chained_path_reresolved_ir = chained_path_reresolve.addOutputFileArg("chained-edge-control.reresolved.lifter-ir.json");
+    chained_path_reresolve.addArg(if (z3_enabled) "z3" else "internal");
+    chained_path_audit.addFileArg(chained_path_reresolved_ir);
+    const luau_irreducible_control_conformance = addLuauFixtureConformanceWithEngine(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/irreducible_control_conformance.luau",
+        "finite-irreducible-control",
+        if (z3_enabled) "z3" else "internal",
+    );
+    const irreducible_control_structure_ast = addStructureAstAudit(
+        b,
+        "finite-irreducible-control",
+        luau_irreducible_control_conformance.generated_luau,
+    );
+    const irreducible_control_reresolve = b.addRunArtifact(exe);
+    if (z3_enabled) irreducible_control_reresolve.addPathDir(b.pathFromRoot(z3_bin));
+    irreducible_control_reresolve.addArg("resolve-ir");
+    irreducible_control_reresolve.addFileArg(luau_irreducible_control_conformance.resolved_ir);
+    const irreducible_control_reresolved_ir = irreducible_control_reresolve.addOutputFileArg("finite-irreducible-control.reresolved.lifter-ir.json");
+    irreducible_control_reresolve.addArg(if (z3_enabled) "z3" else "internal");
+    const irreducible_control_audit = b.addSystemCommand(&.{ luneExe(b), "run" });
+    irreducible_control_audit.addFileArg(b.path("luau/irreducible_control_conformance.luau"));
+    irreducible_control_audit.addFileInput(b.path("luau/irreducible_control_audit.luau"));
+    irreducible_control_audit.addFileInput(b.path("luau/lifter_ir.luau"));
+    irreducible_control_audit.addFileInput(b.path("luau/json_codec.luau"));
+    irreducible_control_audit.addArg("audit");
+    irreducible_control_audit.addFileArg(luau_irreducible_control_conformance.input_ir);
+    irreducible_control_audit.addFileArg(luau_irreducible_control_conformance.resolved_ir);
+    irreducible_control_audit.addFileArg(irreducible_control_reresolved_ir);
+    irreducible_control_audit.addFileArg(luau_irreducible_control_conformance.generated_luau);
+    const luau_irreducible_coroutine_conformance = addLuauFixtureConformanceWithEngine(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/irreducible_coroutine_conformance.luau",
+        "irreducible-coroutine-control",
+        if (z3_enabled) "z3" else "internal",
+    );
+    const irreducible_coroutine_structure_ast = addStructureAstAudit(
+        b,
+        "irreducible-coroutine-control",
+        luau_irreducible_coroutine_conformance.generated_luau,
+    );
+    const irreducible_coroutine_reresolve = b.addRunArtifact(exe);
+    if (z3_enabled) irreducible_coroutine_reresolve.addPathDir(b.pathFromRoot(z3_bin));
+    irreducible_coroutine_reresolve.addArg("resolve-ir");
+    irreducible_coroutine_reresolve.addFileArg(luau_irreducible_coroutine_conformance.resolved_ir);
+    const irreducible_coroutine_reresolved_ir = irreducible_coroutine_reresolve.addOutputFileArg("irreducible-coroutine-control.reresolved.lifter-ir.json");
+    irreducible_coroutine_reresolve.addArg(if (z3_enabled) "z3" else "internal");
+    const irreducible_coroutine_audit = b.addSystemCommand(&.{ luneExe(b), "run" });
+    irreducible_coroutine_audit.addFileArg(b.path("luau/irreducible_coroutine_conformance.luau"));
+    irreducible_coroutine_audit.addFileInput(b.path("luau/irreducible_coroutine_audit.luau"));
+    irreducible_coroutine_audit.addFileInput(b.path("luau/lifter_ir.luau"));
+    irreducible_coroutine_audit.addFileInput(b.path("luau/json_codec.luau"));
+    irreducible_coroutine_audit.addArg("audit");
+    irreducible_coroutine_audit.addFileArg(luau_irreducible_coroutine_conformance.input_ir);
+    irreducible_coroutine_audit.addFileArg(luau_irreducible_coroutine_conformance.resolved_ir);
+    irreducible_coroutine_audit.addFileArg(irreducible_coroutine_reresolved_ir);
+    irreducible_coroutine_audit.addFileArg(luau_irreducible_coroutine_conformance.generated_luau);
+    const luau_irreducible_table_conformance = addLuauFixtureConformanceWithEngine(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/irreducible_table_conformance.luau",
+        "irreducible-table-construction",
+        if (z3_enabled) "z3" else "internal",
+    );
+    const irreducible_table_structure_ast = addStructureAstAudit(
+        b,
+        "irreducible-table-construction",
+        luau_irreducible_table_conformance.generated_luau,
+    );
+    const irreducible_table_reresolve = b.addRunArtifact(exe);
+    if (z3_enabled) irreducible_table_reresolve.addPathDir(b.pathFromRoot(z3_bin));
+    irreducible_table_reresolve.addArg("resolve-ir");
+    irreducible_table_reresolve.addFileArg(luau_irreducible_table_conformance.resolved_ir);
+    const irreducible_table_reresolved_ir = irreducible_table_reresolve.addOutputFileArg("irreducible-table-construction.reresolved.lifter-ir.json");
+    irreducible_table_reresolve.addArg(if (z3_enabled) "z3" else "internal");
+    const irreducible_table_audit = b.addSystemCommand(&.{ luneExe(b), "run" });
+    irreducible_table_audit.addFileArg(b.path("luau/irreducible_table_conformance.luau"));
+    irreducible_table_audit.addFileInput(b.path("luau/irreducible_table_audit.luau"));
+    irreducible_table_audit.addFileInput(b.path("luau/lifter_ir.luau"));
+    irreducible_table_audit.addFileInput(b.path("luau/json_codec.luau"));
+    irreducible_table_audit.addArg("audit");
+    irreducible_table_audit.addFileArg(luau_irreducible_table_conformance.input_ir);
+    irreducible_table_audit.addFileArg(luau_irreducible_table_conformance.resolved_ir);
+    irreducible_table_audit.addFileArg(irreducible_table_reresolved_ir);
+    irreducible_table_audit.addFileArg(luau_irreducible_table_conformance.generated_luau);
+    const luau_irreducible_interpolation_conformance = addLuauFixtureConformanceWithEngine(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/irreducible_interpolation_conformance.luau",
+        "irreducible-string-interpolation",
+        if (z3_enabled) "z3" else "internal",
+    );
+    const irreducible_interpolation_structure_ast = addStructureAstAudit(
+        b,
+        "irreducible-string-interpolation",
+        luau_irreducible_interpolation_conformance.generated_luau,
+    );
+    const irreducible_interpolation_reresolve = b.addRunArtifact(exe);
+    if (z3_enabled) irreducible_interpolation_reresolve.addPathDir(b.pathFromRoot(z3_bin));
+    irreducible_interpolation_reresolve.addArg("resolve-ir");
+    irreducible_interpolation_reresolve.addFileArg(luau_irreducible_interpolation_conformance.resolved_ir);
+    const irreducible_interpolation_reresolved_ir = irreducible_interpolation_reresolve.addOutputFileArg("irreducible-string-interpolation.reresolved.lifter-ir.json");
+    irreducible_interpolation_reresolve.addArg(if (z3_enabled) "z3" else "internal");
+    const irreducible_interpolation_audit = b.addSystemCommand(&.{ luneExe(b), "run" });
+    irreducible_interpolation_audit.addFileArg(b.path("luau/irreducible_interpolation_conformance.luau"));
+    irreducible_interpolation_audit.addFileInput(b.path("luau/irreducible_interpolation_audit.luau"));
+    irreducible_interpolation_audit.addFileInput(b.path("luau/lifter_ir.luau"));
+    irreducible_interpolation_audit.addFileInput(b.path("luau/json_codec.luau"));
+    irreducible_interpolation_audit.addArg("audit");
+    irreducible_interpolation_audit.addFileArg(luau_irreducible_interpolation_conformance.input_ir);
+    irreducible_interpolation_audit.addFileArg(luau_irreducible_interpolation_conformance.resolved_ir);
+    irreducible_interpolation_audit.addFileArg(irreducible_interpolation_reresolved_ir);
+    irreducible_interpolation_audit.addFileArg(luau_irreducible_interpolation_conformance.generated_luau);
+    const luau_irreducible_closure_conformance = addLuauFixtureConformanceWithEngine(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/irreducible_closure_conformance.luau",
+        "irreducible-closure-captures",
+        if (z3_enabled) "z3" else "internal",
+    );
+    const irreducible_closure_structure_ast = addStructureAstAudit(
+        b,
+        "irreducible-closure-captures",
+        luau_irreducible_closure_conformance.generated_luau,
+    );
+    const irreducible_closure_reresolve = b.addRunArtifact(exe);
+    if (z3_enabled) irreducible_closure_reresolve.addPathDir(b.pathFromRoot(z3_bin));
+    irreducible_closure_reresolve.addArg("resolve-ir");
+    irreducible_closure_reresolve.addFileArg(luau_irreducible_closure_conformance.resolved_ir);
+    const irreducible_closure_reresolved_ir = irreducible_closure_reresolve.addOutputFileArg("irreducible-closure-captures.reresolved.lifter-ir.json");
+    irreducible_closure_reresolve.addArg(if (z3_enabled) "z3" else "internal");
+    const irreducible_closure_audit = b.addSystemCommand(&.{ luneExe(b), "run" });
+    irreducible_closure_audit.addFileArg(b.path("luau/irreducible_closure_conformance.luau"));
+    irreducible_closure_audit.addFileInput(b.path("luau/irreducible_closure_audit.luau"));
+    irreducible_closure_audit.addFileInput(b.path("luau/lifter_ir.luau"));
+    irreducible_closure_audit.addFileInput(b.path("luau/json_codec.luau"));
+    irreducible_closure_audit.addArg("audit");
+    irreducible_closure_audit.addFileArg(luau_irreducible_closure_conformance.input_ir);
+    irreducible_closure_audit.addFileArg(luau_irreducible_closure_conformance.resolved_ir);
+    irreducible_closure_audit.addFileArg(irreducible_closure_reresolved_ir);
+    irreducible_closure_audit.addFileArg(luau_irreducible_closure_conformance.generated_luau);
+    const luau_irreducible_iteration_conformance = addLuauFixtureConformanceWithEngine(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/irreducible_iteration_conformance.luau",
+        "irreducible-iteration-convergence",
+        if (z3_enabled) "z3" else "internal",
+    );
+    const irreducible_iteration_structure_ast = addStructureAstAudit(
+        b,
+        "irreducible-iteration-convergence",
+        luau_irreducible_iteration_conformance.generated_luau,
+    );
+    const irreducible_iteration_reresolve = b.addRunArtifact(exe);
+    if (z3_enabled) irreducible_iteration_reresolve.addPathDir(b.pathFromRoot(z3_bin));
+    irreducible_iteration_reresolve.addArg("resolve-ir");
+    irreducible_iteration_reresolve.addFileArg(luau_irreducible_iteration_conformance.resolved_ir);
+    const irreducible_iteration_reresolved_ir = irreducible_iteration_reresolve.addOutputFileArg("irreducible-iteration-convergence.reresolved.lifter-ir.json");
+    irreducible_iteration_reresolve.addArg(if (z3_enabled) "z3" else "internal");
+    const irreducible_iteration_audit = b.addSystemCommand(&.{ luneExe(b), "run" });
+    irreducible_iteration_audit.addFileArg(b.path("luau/irreducible_iteration_conformance.luau"));
+    irreducible_iteration_audit.addFileInput(b.path("luau/irreducible_iteration_audit.luau"));
+    irreducible_iteration_audit.addFileInput(b.path("luau/lifter_ir.luau"));
+    irreducible_iteration_audit.addFileInput(b.path("luau/json_codec.luau"));
+    irreducible_iteration_audit.addArg("audit");
+    irreducible_iteration_audit.addFileArg(luau_irreducible_iteration_conformance.input_ir);
+    irreducible_iteration_audit.addFileArg(luau_irreducible_iteration_conformance.resolved_ir);
+    irreducible_iteration_audit.addFileArg(irreducible_iteration_reresolved_ir);
+    irreducible_iteration_audit.addFileArg(luau_irreducible_iteration_conformance.generated_luau);
+    const source_frontend_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/straight_line_source.luau",
+        "source-frontend-straight-line",
+    );
+    const source_frontend_effectful_assignment_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/effectful_assignment_source.luau",
+        "source-frontend-effectful-assignment",
+    );
+    const source_frontend_if_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/structured_if_source.luau",
+        "source-frontend-structured-if",
+    );
+    const source_frontend_capture_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/captured_mutation_source.luau",
+        "source-frontend-captured-mutation",
+    );
+    const source_frontend_variadic_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/variadic_forward_source.luau",
+        "source-frontend-variadic-forward",
+    );
+    const source_frontend_chunk_varargs_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/chunk_varargs_source.luau",
+        "source-frontend-chunk-varargs",
+    );
+    const source_frontend_table_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/table_access_source.luau",
+        "source-frontend-table-access",
+    );
+    const source_frontend_while_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/while_loop_source.luau",
+        "source-frontend-while-loop",
+    );
+    const source_frontend_loop_control_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/loop_control_source.luau",
+        "source-frontend-loop-control",
+    );
+    const source_frontend_short_circuit_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/short_circuit_source.luau",
+        "source-frontend-short-circuit",
+    );
+    const source_frontend_multi_assignment_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/multi_assignment_source.luau",
+        "source-frontend-multi-assignment",
+    );
+    const source_frontend_method_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/method_call_source.luau",
+        "source-frontend-method-call",
+    );
+    const source_frontend_recursive_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/recursive_local_source.luau",
+        "source-frontend-recursive-local",
+    );
+    const source_frontend_repeat_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/repeat_loop_source.luau",
+        "source-frontend-repeat-loop",
+    );
+    const source_frontend_compound_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/compound_assignment_source.luau",
+        "source-frontend-compound-assignment",
+    );
+    const source_frontend_if_expression_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/if_expression_source.luau",
+        "source-frontend-if-expression",
+    );
+    const source_frontend_iteration_capture_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/per_iteration_capture_source.luau",
+        "source-frontend-per-iteration-capture",
+    );
+    const source_frontend_typed_block_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/typed_block_source.luau",
+        "source-frontend-typed-block",
+    );
+    const source_frontend_numeric_for_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/numeric_for_source.luau",
+        "source-frontend-numeric-for",
+    );
+    const source_frontend_generic_for_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/generic_for_source.luau",
+        "source-frontend-generic-for",
+    );
+    const source_frontend_table_pack_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/table_pack_source.luau",
+        "source-frontend-table-pack",
+    );
+    const source_frontend_function_statement_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/function_statement_source.luau",
+        "source-frontend-function-statement",
+    );
+    const source_frontend_interpolation_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/interpolation_source.luau",
+        "source-frontend-interpolation",
+    );
+    const source_frontend_intrinsic_invocation_conformance = addLuauSourceManifestConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/intrinsic_invocation_source.luau",
+        "luau/fixtures/intrinsic_invocation_manifest.json",
+        "source-frontend-intrinsic-invocation",
+    );
+    const source_frontend_coroutine_wrap_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/coroutine_wrap_source.luau",
+        "source-frontend-coroutine-wrap",
+    );
+    const source_frontend_target_resolution_conformance = addLuauSourceManifestProofConformance(
+        b,
+        exe,
+        proof_attest,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/target_resolution_source.luau",
+        "luau/fixtures/target_resolution_manifest.json",
+        "luau/fixtures/target_resolution_proof_bundle.json",
+        "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8",
+        "source-frontend-target-resolution",
+    );
+    const source_frontend_opaque_result_target_conformance = addLuauSourceManifestConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/opaque_result_target_source.luau",
+        "luau/fixtures/opaque_result_target_manifest.json",
+        "source-frontend-opaque-result-target",
+    );
+    const source_frontend_nonintrinsic_target_origin_conformance = addLuauSourceManifestConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/nonintrinsic_target_origin_source.luau",
+        "luau/fixtures/nonintrinsic_target_origin_manifest.json",
+        "source-frontend-nonintrinsic-target-origin",
+    );
+    const source_frontend_access_path_target_origin_conformance = addLuauSourceManifestConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/access_path_target_origin_source.luau",
+        "luau/fixtures/access_path_target_origin_manifest.json",
+        "source-frontend-access-path-target-origin",
+    );
+    const source_frontend_dynamic_key_target_origin_conformance = addLuauSourceManifestConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/dynamic_key_target_origin_source.luau",
+        "luau/fixtures/dynamic_key_target_origin_manifest.json",
+        "source-frontend-dynamic-key-target-origin",
+    );
+    const source_frontend_namecall_target_origin_conformance = addLuauSourceManifestConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/namecall_target_origin_source.luau",
+        "luau/fixtures/namecall_target_origin_manifest.json",
+        "source-frontend-namecall-target-origin",
+    );
+    const source_frontend_compositional_access_path_conformance = addLuauSourceManifestConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/compositional_access_path_source.luau",
+        "luau/fixtures/compositional_access_path_manifest.json",
+        "source-frontend-compositional-access-path",
+    );
+    const source_frontend_temporal_target_identity_conformance = addLuauSourceManifestConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/temporal_target_identity_source.luau",
+        "luau/fixtures/temporal_target_identity_manifest.json",
+        "source-frontend-temporal-target-identity",
+    );
+    const historical_readable_conformance = addLuauSourceCompileConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "../../../src/ib1/decoded/ib1-current-sample-decompiled.luau",
+        "historical-readable-whole-program",
+        if (z3_enabled) "z3" else "internal",
+    );
+    const onion_readable_source_conformance = addLuauSourceCompileConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "../../../src/ib1/decoded/onion-ndir-current-readable-source.luau",
+        "onion-readable-source-whole-program",
+        if (z3_enabled) "z3" else "internal",
+    );
+    const ast_admission_compile_conformance = addLuauSourceCompileConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/ast_admission.luau",
+        "strict-module-ast-admission",
+        if (z3_enabled) "z3" else "internal",
+    );
+    const loop_module_compile_conformance = addLuauSourceCompileConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/loop_conformance.luau",
+        "strict-module-loop-conformance",
+        if (z3_enabled) "z3" else "internal",
+    );
+    const register_budget_module_compile_conformance = addLuauSourceCompileConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/register_budget_oracle.luau",
+        "strict-module-register-budget-oracle",
+        if (z3_enabled) "z3" else "internal",
+    );
+    const onion_recovery_obligation_conformance = addLuauSourceRecoveryObligationConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "../../../src/ib1/decoded/onion-ndir-current-readable-source.luau",
+        "luau/fixtures/onion_recovery_incomplete_manifest.json",
+        "onion-target-recovery-incomplete",
+        if (z3_enabled) "z3" else "internal",
+        65,
+        &.{
+            .{ .kind = "unresolved_identity", .subject = "instruction", .operation = "call", .producer = "constant.nil_value", .value_type = "nil_value", .place_flow = "none", .proof_links = "none", .count = 36 },
+            .{ .kind = "unresolved_identity", .subject = "instruction", .operation = "call", .producer = "constant.boolean", .value_type = "boolean", .place_flow = "none", .proof_links = "none", .count = 1 },
+            .{ .kind = "unresolved_identity", .subject = "instruction", .operation = "call", .producer = "place_read", .value_type = "dynamic", .place_flow = "unique.constant.nil_value", .proof_links = "none", .count = 11 },
+            .{ .kind = "unresolved_identity", .subject = "instruction", .operation = "call", .producer = "place_read", .value_type = "dynamic", .place_flow = "unique.constant.integer", .proof_links = "none", .count = 1 },
+            .{ .kind = "unresolved_identity", .subject = "instruction", .operation = "call", .producer = "place_read", .value_type = "dynamic", .place_flow = "unique.binary", .proof_links = "none", .count = 5 },
+            .{ .kind = "unresolved_identity", .subject = "instruction", .operation = "call", .producer = "place_read", .value_type = "dynamic", .place_flow = "unique.pack.call.0", .proof_links = "none", .count = 4 },
+            .{ .kind = "unresolved_identity", .subject = "instruction", .operation = "call", .producer = "place_read", .value_type = "dynamic", .place_flow = "multiple", .proof_links = "none", .count = 1 },
+            .{ .kind = "unresolved_identity", .subject = "instruction", .operation = "call", .producer = "place_read", .value_type = "nil_value", .place_flow = "unique.constant.nil_value", .proof_links = "none", .count = 6 },
+        },
+    );
+
+    const register_budget_oracle = addRegisterBudgetOracle(b);
+    const compile_check_positive = b.addRunArtifact(exe);
+    if (z3_enabled) compile_check_positive.addPathDir(b.pathFromRoot(z3_bin));
+    compile_check_positive.addArg("emit-luau");
+    compile_check_positive.addFileArg(absolute_conformance.input_ir);
+    _ = compile_check_positive.addOutputFileArg("compile-check-positive.generated.luau");
+    compile_check_positive.addArg("standard-luau");
+    compile_check_positive.addFileArg(b.path("../../../../tools/bin/luau-compile.exe"));
+    const rejection_output_files = b.addWriteFiles();
+    const rejection_output = rejection_output_files.add(
+        "compile-check-preserved-invalid.luau",
+        "local =\n",
+    );
+    const compile_check_rejection = b.addRunArtifact(exe);
+    if (z3_enabled) compile_check_rejection.addPathDir(b.pathFromRoot(z3_bin));
+    compile_check_rejection.addArg("emit-luau-solved-checked");
+    compile_check_rejection.addFileArg(absolute_conformance.resolved_ir);
+    compile_check_rejection.addFileArg(rejection_output);
+    compile_check_rejection.addArg(if (z3_enabled) "z3" else "internal");
+    compile_check_rejection.addArg("standard-luau");
+    compile_check_rejection.addArtifactArg(exe);
+    compile_check_rejection.expectExitCode(1);
+    compile_check_rejection.expectStdErrMatch("diagnostic=luau_compile_check_failed entity=null");
+    compile_check_rejection.expectStdErrMatch("reason=compiler_rejected");
+    compile_check_rejection.expectStdErrMatch("termination=exited code=1");
+    compile_check_rejection.expectStdErrMatch("stdout_bytes=0 stdout=\"\"");
+    compile_check_rejection.expectStdErrMatch("stderr_bytes=");
+    const compile_check_preserved_output = b.addSystemCommand(&.{ luauCompileExe(b), "--null" });
+    compile_check_preserved_output.addFileArg(rejection_output);
+    compile_check_preserved_output.step.dependOn(&compile_check_rejection.step);
+    compile_check_preserved_output.expectExitCode(1);
+    const legacy_unchecked_output_files = b.addWriteFiles();
+    const legacy_unchecked_output = legacy_unchecked_output_files.add(
+        "legacy-unchecked-preserved-invalid.luau",
+        "local =\n",
+    );
+    const legacy_unchecked_rejection = b.addRunArtifact(exe);
+    if (z3_enabled) legacy_unchecked_rejection.addPathDir(b.pathFromRoot(z3_bin));
+    legacy_unchecked_rejection.addArg("emit-luau");
+    legacy_unchecked_rejection.addFileArg(absolute_conformance.input_ir);
+    legacy_unchecked_rejection.addFileArg(legacy_unchecked_output);
+    legacy_unchecked_rejection.addArg("standard-luau");
+    legacy_unchecked_rejection.expectExitCode(1);
+    const legacy_unchecked_preserved_output = std.Build.Step.CheckFile.create(b, legacy_unchecked_output, .{
+        .expected_exact = "local =\n",
+    });
+    legacy_unchecked_preserved_output.step.dependOn(&legacy_unchecked_rejection.step);
+    const conformance_step = b.step("conformance", "Validate, emit, and compile Zig- and Luau-built generic fixtures");
+    conformance_step.dependOn(&register_budget_oracle.step);
+    conformance_step.dependOn(&compile_check_positive.step);
+    conformance_step.dependOn(&compile_check_rejection.step);
+    conformance_step.dependOn(&compile_check_preserved_output.step);
+    conformance_step.dependOn(&legacy_unchecked_rejection.step);
+    conformance_step.dependOn(&legacy_unchecked_preserved_output.step);
+    absolute_conformance.addTo(conformance_step);
+    function_reference_conformance.addTo(conformance_step);
+    dynamic_truthiness_conformance.addTo(conformance_step);
+    immutable_closure_conformance.addTo(conformance_step);
+    shared_place_conformance.addTo(conformance_step);
+    luau_control_conformance.addTo(conformance_step);
+    luau_loop_conformance.addTo(conformance_step);
+    conformance_step.dependOn(&loop_audit.step);
+    luau_numeric_conformance.addTo(conformance_step);
+    luau_promotion_conformance.addTo(conformance_step);
+    luau_guarded_promotion_conformance.addTo(conformance_step);
+    conformance_step.dependOn(&guarded_promotion_audit.step);
+    luau_query_promotion_conformance.addTo(conformance_step);
+    conformance_step.dependOn(&query_promotion_audit.step);
+    luau_closure_conformance.addTo(conformance_step);
+    luau_lexical_transfer_conformance.addTo(conformance_step);
+    luau_entry_parameter_conformance.addTo(conformance_step);
+    luau_expression_depth_conformance.addTo(conformance_step);
+    luau_structured_depth_conformance.addTo(conformance_step);
+    luau_mixed_entry_vararg_conformance.addTo(conformance_step);
+    luau_pack_materialization_conformance.addTo(conformance_step);
+    luau_pack_multi_latch_conformance.addTo(conformance_step);
+    luau_pack_return_storage_conformance.addTo(conformance_step);
+    luau_iteration_exit_transfer_conformance.addTo(conformance_step);
+    luau_open_pack_projection_conformance.addTo(conformance_step);
+    luau_closed_pack_discard_conformance.addTo(conformance_step);
+    luau_table_conformance.addTo(conformance_step);
+    luau_boundary_conformance.addTo(conformance_step);
+    luau_path_control_conformance.addTo(conformance_step);
+    conformance_step.dependOn(&path_control_audit.step);
+    luau_relational_path_control_conformance.addTo(conformance_step);
+    conformance_step.dependOn(&relational_path_audit.step);
+    luau_chained_path_control_conformance.addTo(conformance_step);
+    conformance_step.dependOn(&chained_path_audit.step);
+    luau_irreducible_control_conformance.addTo(conformance_step);
+    conformance_step.dependOn(&irreducible_control_audit.step);
+    conformance_step.dependOn(&irreducible_control_structure_ast.step);
+    luau_irreducible_coroutine_conformance.addTo(conformance_step);
+    conformance_step.dependOn(&irreducible_coroutine_audit.step);
+    conformance_step.dependOn(&irreducible_coroutine_structure_ast.step);
+    luau_irreducible_table_conformance.addTo(conformance_step);
+    conformance_step.dependOn(&irreducible_table_audit.step);
+    conformance_step.dependOn(&irreducible_table_structure_ast.step);
+    luau_irreducible_interpolation_conformance.addTo(conformance_step);
+    conformance_step.dependOn(&irreducible_interpolation_audit.step);
+    conformance_step.dependOn(&irreducible_interpolation_structure_ast.step);
+    luau_irreducible_closure_conformance.addTo(conformance_step);
+    conformance_step.dependOn(&irreducible_closure_audit.step);
+    conformance_step.dependOn(&irreducible_closure_structure_ast.step);
+    luau_irreducible_iteration_conformance.addTo(conformance_step);
+    conformance_step.dependOn(&irreducible_iteration_audit.step);
+    conformance_step.dependOn(&irreducible_iteration_structure_ast.step);
+    source_frontend_conformance.addTo(conformance_step);
+    source_frontend_effectful_assignment_conformance.addTo(conformance_step);
+    source_frontend_if_conformance.addTo(conformance_step);
+    source_frontend_capture_conformance.addTo(conformance_step);
+    source_frontend_variadic_conformance.addTo(conformance_step);
+    source_frontend_chunk_varargs_conformance.addTo(conformance_step);
+    source_frontend_table_conformance.addTo(conformance_step);
+    source_frontend_while_conformance.addTo(conformance_step);
+    source_frontend_loop_control_conformance.addTo(conformance_step);
+    source_frontend_short_circuit_conformance.addTo(conformance_step);
+    source_frontend_multi_assignment_conformance.addTo(conformance_step);
+    source_frontend_method_conformance.addTo(conformance_step);
+    source_frontend_recursive_conformance.addTo(conformance_step);
+    source_frontend_repeat_conformance.addTo(conformance_step);
+    source_frontend_compound_conformance.addTo(conformance_step);
+    source_frontend_if_expression_conformance.addTo(conformance_step);
+    source_frontend_iteration_capture_conformance.addTo(conformance_step);
+    source_frontend_typed_block_conformance.addTo(conformance_step);
+    source_frontend_numeric_for_conformance.addTo(conformance_step);
+    source_frontend_generic_for_conformance.addTo(conformance_step);
+    source_frontend_table_pack_conformance.addTo(conformance_step);
+    source_frontend_function_statement_conformance.addTo(conformance_step);
+    source_frontend_interpolation_conformance.addTo(conformance_step);
+    source_frontend_intrinsic_invocation_conformance.addTo(conformance_step);
+    source_frontend_coroutine_wrap_conformance.addTo(conformance_step);
+    source_frontend_target_resolution_conformance.addTo(conformance_step);
+    source_frontend_opaque_result_target_conformance.addTo(conformance_step);
+    source_frontend_nonintrinsic_target_origin_conformance.addTo(conformance_step);
+    source_frontend_access_path_target_origin_conformance.addTo(conformance_step);
+    source_frontend_dynamic_key_target_origin_conformance.addTo(conformance_step);
+    source_frontend_namecall_target_origin_conformance.addTo(conformance_step);
+    source_frontend_compositional_access_path_conformance.addTo(conformance_step);
+    source_frontend_temporal_target_identity_conformance.addTo(conformance_step);
+    if (workspace_sample_conformance) {
+        historical_readable_conformance.addTo(conformance_step);
+        onion_readable_source_conformance.addTo(conformance_step);
+        onion_recovery_obligation_conformance.addTo(conformance_step);
+    }
+    ast_admission_compile_conformance.addTo(conformance_step);
+    loop_module_compile_conformance.addTo(conformance_step);
+    register_budget_module_compile_conformance.addTo(conformance_step);
+
+    const module_tests = b.addTest(.{
+        .root_module = module,
+    });
+    const run_module_tests = b.addRunArtifact(module_tests);
+    if (z3_enabled) run_module_tests.addPathDir(b.pathFromRoot(z3_bin));
+    const structure_projection_tests = b.addTest(.{
+        .root_module = module,
+        .filters = &.{
+            "builder consumes arbitrary",
+            "raw parameterized numeric join",
+            "branching internal SCC boundary clones only its authenticated block",
+            "jumping internal SCC boundary clones only its authenticated block",
+            "dead pure forwarding boundary clones its one-block projection",
+            "authenticated zero-parameter group SCC boundary requires complete replay ownership",
+            "complete internal SCC availability roots at the cloned target",
+            "effectful terminal continuation replay requires complete authenticated witness",
+            "internal loop collision clones a bounded effectful suffix",
+            "continuation extension retains a shared effectful jump suffix before iteration handoff",
+            "external-use projection rescans definitions added by the first pass",
+            "contextual boundary rejects an unprojected shared predecessor",
+            "authenticated group carrier path projects a shared predecessor",
+            "authenticated group carrier path rejects an unowned ingress before nested clones",
+            "authenticated carrier path keeps an alternate edge",
+            "authenticated carrier path retains an alternate predecessor",
+            "effectful parameterized jump SCC boundary authenticates its tuple",
+            "node-split replay restores a consumed branch before reversing clone history",
+        },
+    });
+    const run_structure_projection_tests = b.addRunArtifact(structure_projection_tests);
+    if (z3_enabled) run_structure_projection_tests.addPathDir(b.pathFromRoot(z3_bin));
+    const structure_projection_test_step = b.step(
+        "test-structure-projection",
+        "Run the arbitrary-arity continuation projection witness",
+    );
+    structure_projection_test_step.dependOn(&run_structure_projection_tests.step);
+
+    const parameterized_replay_tests = b.addTest(.{
+        .root_module = module,
+        .filters = &.{"effectful parameterized replay rebinds distinct"},
+    });
+    const run_parameterized_replay_tests = b.addRunArtifact(parameterized_replay_tests);
+    if (z3_enabled) run_parameterized_replay_tests.addPathDir(b.pathFromRoot(z3_bin));
+    const parameterized_replay_test_step = b.step(
+        "test-parameterized-replay",
+        "Run the distinct-tuple effectful replay witness",
+    );
+    parameterized_replay_test_step.dependOn(&run_parameterized_replay_tests.step);
+
+    const transparent_forwarding_tests = b.addTest(.{
+        .root_module = module,
+        .filters = &.{
+            "authenticated transparent forwarding preserves parameterized successor tuple",
+            "empty zero-parameter forwarder accepts canonical successor tuple",
+            "post-apply transparent collapse preserves canonical successor tuple",
+            "transparent collapse refuses a non-local successor tuple",
+            "failed clone application rolls back graph and rewrite state",
+            "transparent empty continuation reuses a different stop",
+            "clone fold dominance preflight rolls back an unsafe redirect",
+            "clone-fold resume arm reservation is idempotent",
+            "clone-fold reservation does not consume a distinct predecessor",
+        },
+    });
+    const run_transparent_forwarding_tests = b.addRunArtifact(transparent_forwarding_tests);
+    if (z3_enabled) run_transparent_forwarding_tests.addPathDir(b.pathFromRoot(z3_bin));
+    const transparent_forwarding_test_step = b.step(
+        "test-transparent-forwarding",
+        "Run the parameterized transparent forwarding witness",
+    );
+    transparent_forwarding_test_step.dependOn(&run_transparent_forwarding_tests.step);
+
+    const cli_tests = b.addTest(.{
+        .root_module = exe.root_module,
+    });
+    const run_cli_tests = b.addRunArtifact(cli_tests);
+    if (z3_enabled) run_cli_tests.addPathDir(b.pathFromRoot(z3_bin));
+
+    const proof_attest_tests = b.addTest(.{
+        .root_module = proof_attest.root_module,
+    });
+    const run_proof_attest_tests = b.addRunArtifact(proof_attest_tests);
+
+    const run_validator_tests = addStandaloneTests(b, module, target, optimize, z3_enabled, z3_bin, "src/validate_test.zig");
+    const run_emitter_tests = addStandaloneTests(b, module, target, optimize, z3_enabled, z3_bin, "src/emit_luau_test.zig");
+    const emitter_test_step = b.step("test-emitter", "Run Luau emitter tests");
+    emitter_test_step.dependOn(&run_emitter_tests.step);
+    const run_semantics_tests = addStandaloneTests(b, module, target, optimize, z3_enabled, z3_bin, "src/validate_semantics_test.zig");
+    const run_structure_tests = addStandaloneTests(b, module, target, optimize, z3_enabled, z3_bin, "src/structure_test.zig");
+    const structure_internal_module = b.createModule(.{
+        .root_source_file = b.path("src/structure.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    structure_internal_module.addOptions("build_options", build_options);
+    const structure_internal_tests = b.addTest(.{
+        .root_module = structure_internal_module,
+        .filters = &.{
+            "independent zero-parameter loop reentry requires one authenticated entry",
+            "effectful zero-parameter prefix replay requires an authenticated SCC",
+            "parameterized stop replay rejects non-carried continuation values",
+            "same-entry parameterized prefix replay requires a semantic handoff",
+            "same-entry numeric reentry accepts contextual state without a node split",
+            "same-SCC numeric reentry requires an authenticated loop-carried tuple",
+            "nonempty prefix reuses an authenticated same-SCC parameterized branch",
+        },
+    });
+    const run_structure_internal_tests = b.addRunArtifact(structure_internal_tests);
+    if (z3_enabled) run_structure_internal_tests.addPathDir(b.pathFromRoot(z3_bin));
+    const structure_internal_test_step = b.step(
+        "test-structure-internal",
+        "Run internal structural replay witnesses",
+    );
+    structure_internal_test_step.dependOn(&run_structure_internal_tests.step);
+    const one_parameter_continuation_tests = b.addTest(.{
+        .root_module = module,
+        .filters = &.{"one-parameter continuation witness"},
+    });
+    const run_one_parameter_continuation_tests = b.addRunArtifact(one_parameter_continuation_tests);
+    if (z3_enabled) run_one_parameter_continuation_tests.addPathDir(b.pathFromRoot(z3_bin));
+    const run_terminal_loop_structure_tests = addStandaloneTests(b, module, target, optimize, z3_enabled, z3_bin, "src/terminal_loop_structure_test.zig");
+    const structure_test_step = b.step("test-structure", "Run focused structural reconstruction tests");
+    structure_test_step.dependOn(&run_structure_tests.step);
+    structure_test_step.dependOn(&run_structure_internal_tests.step);
+    structure_test_step.dependOn(&run_one_parameter_continuation_tests.step);
+    const run_generated_lexical_oracle_tests = b.addSystemCommand(&.{ luneExe(b), "run" });
+    run_generated_lexical_oracle_tests.addFileArg(b.path("luau/generated_lexical_oracle.luau"));
+    run_generated_lexical_oracle_tests.addArg("self-test");
+    run_generated_lexical_oracle_tests.addFileArg(b.path("../../../../tools/bin/luau-analyze.exe"));
+    _ = run_generated_lexical_oracle_tests.addOutputFileArg("generated-lexical-oracle-source.luau");
+    _ = run_generated_lexical_oracle_tests.addOutputFileArg("generated-lexical-oracle-negative.luau");
+    const run_luau_ir_typecheck = b.addSystemCommand(&.{luauAnalyzeExe(b)});
+    run_luau_ir_typecheck.addFileArg(b.path("luau/lifter_ir.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/ast_frontend_outcome.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/ast_local_binding.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/ast_local_identity.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/ast_lexical_scope.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/ast_runtime_context.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/ast_expression_slots.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/ast_expression_scalar.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/ast_expression_scalar_test.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/ast_statement_slots.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/ast_admission.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/ast_admission_test.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/ast_local_identity_test.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/ast_frontend_control.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/ast_frontend_iteration.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/ast_frontend_expressions.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/ast_frontend_tables.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/ast_frontend_operator_domains.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/ast_frontend_place_domains.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/source_domain_fixed_point_test.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/intrinsic_bindings.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/invocation_frame.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/target_origin_expression_matcher.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/target_origin_return_selector.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/target_origin_matcher.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/structured_definition_sets.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/temporal_alias_graph.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/temporal_callee_resolver.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/temporal_invocation_flow.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/temporal_source_index.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/temporal_target_identity.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/temporal_test_support.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/temporal_invocation_test_support.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/direct_closure_return_test.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/local_function_return_test.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/conditional_factory_return_test.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/fixed_vararg_return_test.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/local_factory_return_test.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/local_factory_alias_test.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/statement_factory_return_test.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/parameter_factory_call_test.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/temporal_target_identity_test.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/temporal_future_write_test.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/temporal_assignment_commit_test.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/temporal_for_header_test.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/temporal_guard_test.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/temporal_immediate_invocation_test.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/temporal_invocation_chain_test.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/temporal_invocation_capture_test.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/temporal_invocation_set_test.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/temporal_invocation_fanout_test.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/temporal_nested_invocation_set_test.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/temporal_invocation_kill_test.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/temporal_invocation_definition_test.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/temporal_loop_fixed_point_test.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/temporal_loop_phase_test.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/temporal_loop_transfer_test.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/target_recovery.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/target_result_contracts.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/target_result_contract_test.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/target_proof_bundle.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/target_proof_bundle_test.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/closure_target_recovery_test.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/recovery_admission.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/recovery_admission_test.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/recovery_manifest.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/ast_target_recovery.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/ast_frontend.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/iteration_exit_transfer_runtime_oracle.luau"));
+    run_luau_ir_typecheck.addFileInput(b.path("luau/json_codec.luau"));
+    const run_frontend_tests = b.addSystemCommand(&.{ luneExe(b), "run" });
+    run_frontend_tests.addFileArg(b.path("luau/frontend_contract_test.luau"));
+    run_frontend_tests.addFileInput(b.path("luau/ast_local_binding.luau"));
+    run_frontend_tests.addFileInput(b.path("luau/ast_local_identity.luau"));
+    run_frontend_tests.addFileInput(b.path("luau/ast_lexical_scope.luau"));
+    run_frontend_tests.addFileInput(b.path("luau/ast_runtime_context.luau"));
+    run_frontend_tests.addFileInput(b.path("luau/ast_expression_slots.luau"));
+    run_frontend_tests.addFileInput(b.path("luau/ast_expression_scalar.luau"));
+    run_frontend_tests.addFileInput(b.path("luau/ast_statement_slots.luau"));
+    run_frontend_tests.addFileInput(b.path("luau/ast_admission.luau"));
+    run_frontend_tests.addFileInput(b.path("luau/ast_target_recovery.luau"));
+    run_frontend_tests.addFileInput(b.path("luau/ast_frontend.luau"));
+    run_frontend_tests.addFileInput(b.path("luau/ast_frontend_outcome.luau"));
+    run_frontend_tests.addFileInput(b.path("luau/ast_frontend_expressions.luau"));
+    run_frontend_tests.addFileInput(b.path("luau/ast_frontend_tables.luau"));
+    run_frontend_tests.addFileInput(b.path("luau/ast_frontend_operator_domains.luau"));
+    run_frontend_tests.addFileInput(b.path("luau/ast_frontend_place_domains.luau"));
+    run_frontend_tests.addFileInput(b.path("luau/ast_frontend_control.luau"));
+    run_frontend_tests.addFileInput(b.path("luau/ast_frontend_iteration.luau"));
+    run_frontend_tests.addFileInput(b.path("luau/source_domain_fixed_point_test.luau"));
+    run_frontend_tests.addFileInput(b.path("luau/intrinsic_bindings.luau"));
+    run_frontend_tests.addFileInput(b.path("luau/recovery_admission.luau"));
+    addTemporalIdentityInputs(b, run_frontend_tests);
+    run_frontend_tests.addFileInput(b.path("luau/target_recovery.luau"));
+    run_frontend_tests.addFileInput(b.path("luau/target_result_contracts.luau"));
+    run_frontend_tests.addFileInput(b.path("luau/target_proof_bundle.luau"));
+    run_frontend_tests.addFileInput(b.path("luau/lifter_ir.luau"));
+    run_frontend_tests.addFileInput(b.path("luau/json_codec.luau"));
+    const run_recovery_manifest_tests = b.addSystemCommand(&.{ luneExe(b), "run" });
+    run_recovery_manifest_tests.addFileArg(b.path("luau/recovery_manifest_test.luau"));
+    run_recovery_manifest_tests.addFileInput(b.path("luau/recovery_admission_test.luau"));
+    run_recovery_manifest_tests.addFileInput(b.path("luau/target_origin_contract_test.luau"));
+    run_recovery_manifest_tests.addFileInput(b.path("luau/closure_target_recovery_test.luau"));
+    run_recovery_manifest_tests.addFileInput(b.path("luau/ast_local_binding.luau"));
+    run_recovery_manifest_tests.addFileInput(b.path("luau/ast_local_identity.luau"));
+    run_recovery_manifest_tests.addFileInput(b.path("luau/ast_lexical_scope.luau"));
+    run_recovery_manifest_tests.addFileInput(b.path("luau/ast_runtime_context.luau"));
+    run_recovery_manifest_tests.addFileInput(b.path("luau/ast_expression_slots.luau"));
+    run_recovery_manifest_tests.addFileInput(b.path("luau/ast_expression_scalar.luau"));
+    run_recovery_manifest_tests.addFileInput(b.path("luau/ast_statement_slots.luau"));
+    run_recovery_manifest_tests.addFileInput(b.path("luau/ast_admission.luau"));
+    run_recovery_manifest_tests.addFileInput(b.path("luau/ast_target_recovery.luau"));
+    run_recovery_manifest_tests.addFileInput(b.path("luau/namecall_target_recovery_test.luau"));
+    run_recovery_manifest_tests.addFileInput(b.path("luau/access_path_target_recovery_test.luau"));
+    run_recovery_manifest_tests.addFileInput(b.path("luau/recovery_manifest.luau"));
+    addTemporalIdentityInputs(b, run_recovery_manifest_tests);
+    run_recovery_manifest_tests.addFileInput(b.path("luau/target_recovery.luau"));
+    run_recovery_manifest_tests.addFileInput(b.path("luau/target_result_contracts.luau"));
+    run_recovery_manifest_tests.addFileInput(b.path("luau/target_result_contract_test.luau"));
+    run_recovery_manifest_tests.addFileInput(b.path("luau/temporal_test_support.luau"));
+    run_recovery_manifest_tests.addFileInput(b.path("luau/target_proof_bundle.luau"));
+    run_recovery_manifest_tests.addFileInput(b.path("luau/ast_frontend.luau"));
+    run_recovery_manifest_tests.addFileInput(b.path("luau/ast_frontend_outcome.luau"));
+    run_recovery_manifest_tests.addFileInput(b.path("luau/ast_frontend_expressions.luau"));
+    run_recovery_manifest_tests.addFileInput(b.path("luau/ast_frontend_tables.luau"));
+    run_recovery_manifest_tests.addFileInput(b.path("luau/ast_frontend_operator_domains.luau"));
+    run_recovery_manifest_tests.addFileInput(b.path("luau/ast_frontend_place_domains.luau"));
+    run_recovery_manifest_tests.addFileInput(b.path("luau/ast_frontend_control.luau"));
+    run_recovery_manifest_tests.addFileInput(b.path("luau/ast_frontend_iteration.luau"));
+    run_recovery_manifest_tests.addFileInput(b.path("luau/intrinsic_bindings.luau"));
+    run_recovery_manifest_tests.addFileInput(b.path("luau/recovery_admission.luau"));
+    run_recovery_manifest_tests.addFileInput(b.path("luau/lifter_ir.luau"));
+    run_recovery_manifest_tests.addFileInput(b.path("luau/json_codec.luau"));
+    const run_target_proof_bundle_tests = b.addSystemCommand(&.{ luneExe(b), "run" });
+    run_target_proof_bundle_tests.addFileArg(b.path("luau/target_proof_bundle_test.luau"));
+    run_target_proof_bundle_tests.addFileInput(b.path("luau/target_proof_bundle.luau"));
+    run_target_proof_bundle_tests.addFileInput(b.path("luau/target_recovery.luau"));
+    run_target_proof_bundle_tests.addFileInput(b.path("luau/target_result_contracts.luau"));
+    run_target_proof_bundle_tests.addFileInput(b.path("luau/recovery_manifest.luau"));
+    run_target_proof_bundle_tests.addFileInput(b.path("luau/lifter_ir.luau"));
+    run_target_proof_bundle_tests.addFileInput(b.path("luau/intrinsic_bindings.luau"));
+    run_target_proof_bundle_tests.addFileInput(b.path("luau/recovery_admission.luau"));
+    addTemporalIdentityInputs(b, run_target_proof_bundle_tests);
+    const run_ast_admission_tests = b.addSystemCommand(&.{ luneExe(b), "run" });
+    run_ast_admission_tests.addFileArg(b.path("luau/ast_admission_test.luau"));
+    run_ast_admission_tests.addFileInput(b.path("luau/ast_local_binding.luau"));
+    run_ast_admission_tests.addFileInput(b.path("luau/ast_local_identity.luau"));
+    run_ast_admission_tests.addFileInput(b.path("luau/ast_lexical_scope.luau"));
+    run_ast_admission_tests.addFileInput(b.path("luau/ast_runtime_context.luau"));
+    run_ast_admission_tests.addFileInput(b.path("luau/ast_expression_slots.luau"));
+    run_ast_admission_tests.addFileInput(b.path("luau/ast_expression_scalar.luau"));
+    run_ast_admission_tests.addFileInput(b.path("luau/ast_expression_scalar_test.luau"));
+    run_ast_admission_tests.addFileInput(b.path("luau/ast_statement_slots.luau"));
+    run_ast_admission_tests.addFileInput(b.path("luau/ast_local_identity_test.luau"));
+    run_ast_admission_tests.addFileInput(b.path("luau/ast_admission.luau"));
+    run_ast_admission_tests.addFileInput(b.path("luau/ast_target_recovery.luau"));
+    run_ast_admission_tests.addFileInput(b.path("luau/ast_frontend.luau"));
+    run_ast_admission_tests.addFileInput(b.path("luau/ast_frontend_outcome.luau"));
+    run_ast_admission_tests.addFileInput(b.path("luau/ast_frontend_expressions.luau"));
+    run_ast_admission_tests.addFileInput(b.path("luau/ast_frontend_tables.luau"));
+    run_ast_admission_tests.addFileInput(b.path("luau/ast_frontend_operator_domains.luau"));
+    run_ast_admission_tests.addFileInput(b.path("luau/ast_frontend_place_domains.luau"));
+    run_ast_admission_tests.addFileInput(b.path("luau/ast_frontend_control.luau"));
+    run_ast_admission_tests.addFileInput(b.path("luau/ast_frontend_iteration.luau"));
+    run_ast_admission_tests.addFileInput(b.path("luau/intrinsic_bindings.luau"));
+    run_ast_admission_tests.addFileInput(b.path("luau/recovery_admission.luau"));
+    addTemporalIdentityInputs(b, run_ast_admission_tests);
+    run_ast_admission_tests.addFileInput(b.path("luau/target_recovery.luau"));
+    run_ast_admission_tests.addFileInput(b.path("luau/target_result_contracts.luau"));
+    run_ast_admission_tests.addFileInput(b.path("luau/target_proof_bundle.luau"));
+    run_ast_admission_tests.addFileInput(b.path("luau/lifter_ir.luau"));
+    run_ast_admission_tests.addFileInput(b.path("luau/json_codec.luau"));
+    const run_temporal_target_identity_tests = b.addSystemCommand(&.{ luneExe(b), "run" });
+    run_temporal_target_identity_tests.addFileArg(b.path("luau/temporal_target_identity_test.luau"));
+    addTemporalTestInputs(b, run_temporal_target_identity_tests);
+    const run_direct_closure_return_tests = b.addSystemCommand(&.{ luneExe(b), "run" });
+    run_direct_closure_return_tests.addFileArg(b.path("luau/direct_closure_return_test.luau"));
+    run_direct_closure_return_tests.addFileInput(b.path("luau/local_function_return_test.luau"));
+    run_direct_closure_return_tests.addFileInput(b.path("luau/conditional_factory_return_test.luau"));
+    addTemporalTestInputs(b, run_direct_closure_return_tests);
+    const run_fixed_vararg_return_tests = b.addSystemCommand(&.{ luneExe(b), "run" });
+    run_fixed_vararg_return_tests.addFileArg(b.path("luau/fixed_vararg_return_test.luau"));
+    addTemporalTestInputs(b, run_fixed_vararg_return_tests);
+    const run_local_factory_return_tests = b.addSystemCommand(&.{ luneExe(b), "run" });
+    run_local_factory_return_tests.addFileArg(b.path("luau/local_factory_return_test.luau"));
+    addTemporalTestInputs(b, run_local_factory_return_tests);
+    const run_local_factory_alias_tests = b.addSystemCommand(&.{ luneExe(b), "run" });
+    run_local_factory_alias_tests.addFileArg(b.path("luau/local_factory_alias_test.luau"));
+    addTemporalTestInputs(b, run_local_factory_alias_tests);
+    const run_statement_factory_return_tests = b.addSystemCommand(&.{ luneExe(b), "run" });
+    run_statement_factory_return_tests.addFileArg(b.path("luau/statement_factory_return_test.luau"));
+    addTemporalTestInputs(b, run_statement_factory_return_tests);
+    const run_parameter_factory_call_tests = b.addSystemCommand(&.{ luneExe(b), "run" });
+    run_parameter_factory_call_tests.addFileArg(b.path("luau/parameter_factory_call_test.luau"));
+    addTemporalTestInputs(b, run_parameter_factory_call_tests);
+    const run_temporal_future_write_tests = b.addSystemCommand(&.{ luneExe(b), "run" });
+    run_temporal_future_write_tests.addFileArg(b.path("luau/temporal_future_write_test.luau"));
+    addTemporalTestInputs(b, run_temporal_future_write_tests);
+    const run_temporal_assignment_commit_tests = b.addSystemCommand(&.{ luneExe(b), "run" });
+    run_temporal_assignment_commit_tests.addFileArg(b.path("luau/temporal_assignment_commit_test.luau"));
+    addTemporalTestInputs(b, run_temporal_assignment_commit_tests);
+    const run_temporal_for_header_tests = b.addSystemCommand(&.{ luneExe(b), "run" });
+    run_temporal_for_header_tests.addFileArg(b.path("luau/temporal_for_header_test.luau"));
+    addTemporalTestInputs(b, run_temporal_for_header_tests);
+    const run_temporal_guard_tests = b.addSystemCommand(&.{ luneExe(b), "run" });
+    run_temporal_guard_tests.addFileArg(b.path("luau/temporal_guard_test.luau"));
+    addTemporalTestInputs(b, run_temporal_guard_tests);
+    const run_temporal_immediate_invocation_tests = b.addSystemCommand(&.{ luneExe(b), "run" });
+    run_temporal_immediate_invocation_tests.addFileArg(b.path("luau/temporal_immediate_invocation_test.luau"));
+    addTemporalTestInputs(b, run_temporal_immediate_invocation_tests);
+    run_temporal_immediate_invocation_tests.addFileInput(b.path("luau/target_recovery.luau"));
+    run_temporal_immediate_invocation_tests.addFileInput(b.path("luau/target_result_contracts.luau"));
+    run_temporal_immediate_invocation_tests.addFileInput(b.path("luau/recovery_admission.luau"));
+    run_temporal_immediate_invocation_tests.addFileInput(b.path("luau/target_proof_bundle.luau"));
+    const run_temporal_invocation_chain_tests = b.addSystemCommand(&.{ luneExe(b), "run" });
+    run_temporal_invocation_chain_tests.addFileArg(b.path("luau/temporal_invocation_chain_test.luau"));
+    addTemporalTestInputs(b, run_temporal_invocation_chain_tests);
+    const run_temporal_invocation_capture_tests = b.addSystemCommand(&.{ luneExe(b), "run" });
+    run_temporal_invocation_capture_tests.addFileArg(b.path("luau/temporal_invocation_capture_test.luau"));
+    addTemporalTestInputs(b, run_temporal_invocation_capture_tests);
+    const run_temporal_invocation_set_tests = b.addSystemCommand(&.{ luneExe(b), "run" });
+    run_temporal_invocation_set_tests.addFileArg(b.path("luau/temporal_invocation_set_test.luau"));
+    addTemporalTestInputs(b, run_temporal_invocation_set_tests);
+    const run_temporal_invocation_fanout_tests = b.addSystemCommand(&.{ luneExe(b), "run" });
+    run_temporal_invocation_fanout_tests.addFileArg(b.path("luau/temporal_invocation_fanout_test.luau"));
+    addTemporalTestInputs(b, run_temporal_invocation_fanout_tests);
+    const run_temporal_nested_invocation_set_tests = b.addSystemCommand(&.{ luneExe(b), "run" });
+    run_temporal_nested_invocation_set_tests.addFileArg(b.path("luau/temporal_nested_invocation_set_test.luau"));
+    addTemporalTestInputs(b, run_temporal_nested_invocation_set_tests);
+    const run_temporal_invocation_kill_tests = b.addSystemCommand(&.{ luneExe(b), "run" });
+    run_temporal_invocation_kill_tests.addFileArg(b.path("luau/temporal_invocation_kill_test.luau"));
+    addTemporalTestInputs(b, run_temporal_invocation_kill_tests);
+    const run_temporal_invocation_definition_tests = b.addSystemCommand(&.{ luneExe(b), "run" });
+    run_temporal_invocation_definition_tests.addFileArg(b.path("luau/temporal_invocation_definition_test.luau"));
+    addTemporalTestInputs(b, run_temporal_invocation_definition_tests);
+    const run_temporal_loop_fixed_point_tests = b.addSystemCommand(&.{ luneExe(b), "run" });
+    run_temporal_loop_fixed_point_tests.addFileArg(b.path("luau/temporal_loop_fixed_point_test.luau"));
+    addTemporalTestInputs(b, run_temporal_loop_fixed_point_tests);
+    const run_temporal_loop_phase_tests = b.addSystemCommand(&.{ luneExe(b), "run" });
+    run_temporal_loop_phase_tests.addFileArg(b.path("luau/temporal_loop_phase_test.luau"));
+    addTemporalTestInputs(b, run_temporal_loop_phase_tests);
+    const run_temporal_loop_transfer_tests = b.addSystemCommand(&.{ luneExe(b), "run" });
+    run_temporal_loop_transfer_tests.addFileArg(b.path("luau/temporal_loop_transfer_test.luau"));
+    addTemporalTestInputs(b, run_temporal_loop_transfer_tests);
+
+    const test_step = b.step("test", "Run semantic lifter tests");
+    test_step.dependOn(&run_module_tests.step);
+    test_step.dependOn(&run_cli_tests.step);
+    test_step.dependOn(&run_proof_attest_tests.step);
+    test_step.dependOn(&run_validator_tests.step);
+    test_step.dependOn(&run_emitter_tests.step);
+    test_step.dependOn(&run_semantics_tests.step);
+    test_step.dependOn(&run_structure_tests.step);
+    test_step.dependOn(&run_terminal_loop_structure_tests.step);
+    test_step.dependOn(&run_generated_lexical_oracle_tests.step);
+    test_step.dependOn(&run_luau_ir_typecheck.step);
+    test_step.dependOn(&run_frontend_tests.step);
+    test_step.dependOn(&run_recovery_manifest_tests.step);
+    test_step.dependOn(&run_target_proof_bundle_tests.step);
+    test_step.dependOn(&run_ast_admission_tests.step);
+    test_step.dependOn(&run_temporal_target_identity_tests.step);
+    test_step.dependOn(&run_direct_closure_return_tests.step);
+    test_step.dependOn(&run_fixed_vararg_return_tests.step);
+    test_step.dependOn(&run_local_factory_return_tests.step);
+    test_step.dependOn(&run_local_factory_alias_tests.step);
+    test_step.dependOn(&run_statement_factory_return_tests.step);
+    test_step.dependOn(&run_parameter_factory_call_tests.step);
+    test_step.dependOn(&run_temporal_future_write_tests.step);
+    test_step.dependOn(&run_temporal_assignment_commit_tests.step);
+    test_step.dependOn(&run_temporal_for_header_tests.step);
+    test_step.dependOn(&run_temporal_guard_tests.step);
+    test_step.dependOn(&run_temporal_immediate_invocation_tests.step);
+    test_step.dependOn(&run_temporal_invocation_chain_tests.step);
+    test_step.dependOn(&run_temporal_invocation_capture_tests.step);
+    test_step.dependOn(&run_temporal_invocation_set_tests.step);
+    test_step.dependOn(&run_temporal_invocation_fanout_tests.step);
+    test_step.dependOn(&run_temporal_nested_invocation_set_tests.step);
+    test_step.dependOn(&run_temporal_invocation_kill_tests.step);
+    test_step.dependOn(&run_temporal_invocation_definition_tests.step);
+    test_step.dependOn(&run_temporal_loop_fixed_point_tests.step);
+    test_step.dependOn(&run_temporal_loop_phase_tests.step);
+    test_step.dependOn(&run_temporal_loop_transfer_tests.step);
+    if (z3_enabled) {
+        const run_z3_tests = addStandaloneTests(b, module, target, optimize, true, z3_bin, "src/z3_backend_test.zig");
+        test_step.dependOn(&run_z3_tests.step);
+    }
+}
+
+fn addRegisterBudgetOracle(b: *std.Build) *std.Build.Step.Run {
+    const command = b.addSystemCommand(&.{ luneExe(b), "run" });
+    command.addFileArg(b.path("luau/register_budget_oracle.luau"));
+    command.addFileArg(b.path("../../../../tools/bin/luau-compile.exe"));
+    _ = command.addOutputFileArg("register-budget-oracle.txt");
+    const cases = [_][]const u8{
+        "local-200",
+        "local-201",
+        "invocation-254",
+        "invocation-256",
+        "table-255",
+        "table-257",
+        "interpolation-255",
+        "interpolation-257",
+        "reordered-return-255",
+        "reordered-return-257",
+        "expanded-return-254",
+        "expanded-return-256",
+        "stored-expanded-return-254",
+        "stored-expanded-return-256",
+        "reentrant-stored-expanded-return-local-200",
+        "reentrant-stored-expanded-return-local-202",
+        "stored-adjustment-local-200",
+        "stored-adjustment-local-201",
+        "fixed-return-254",
+        "fixed-return-255",
+        "fixed-results-254",
+        "fixed-results-255",
+        "expression-depth-998",
+        "expression-depth-999",
+        "syntax-depth-998",
+        "syntax-depth-999",
+        "combined-depth-512",
+        "combined-depth-640",
+        "upvalue-200",
+        "upvalue-201",
+        "closure-32768",
+        "closure-32769",
+        "jump-distance-8388604",
+        "jump-distance-8388611",
+        "constant-loadkx-32768",
+    };
+    for (cases) |case_name| {
+        _ = command.addOutputFileArg(b.fmt("register-budget-{s}.luau", .{case_name}));
+    }
+    return command;
+}
+
+const FixtureConformance = struct {
+    validate: *std.Build.Step,
+    compile: *std.Build.Step,
+    runtime: *std.Build.Step,
+    source_compile: ?*std.Build.Step = null,
+    source_runtime: ?*std.Build.Step = null,
+    input_ir: std.Build.LazyPath,
+    resolved_ir: std.Build.LazyPath,
+    generated_luau: std.Build.LazyPath,
+
+    fn addTo(self: FixtureConformance, step: *std.Build.Step) void {
+        step.dependOn(self.validate);
+        step.dependOn(self.compile);
+        step.dependOn(self.runtime);
+        if (self.source_compile) |source_compile| step.dependOn(source_compile);
+        if (self.source_runtime) |source_runtime| step.dependOn(source_runtime);
+    }
+};
+
+const CompileOnlyConformance = struct {
+    validate: *std.Build.Step,
+    compile: *std.Build.Step,
+    lexical: ?*std.Build.Step = null,
+    resolved_ir: std.Build.LazyPath,
+    generated_luau: std.Build.LazyPath,
+
+    fn addTo(self: CompileOnlyConformance, step: *std.Build.Step) void {
+        step.dependOn(self.validate);
+        step.dependOn(self.compile);
+        if (self.lexical) |lexical| step.dependOn(lexical);
+    }
+};
+
+const RecoveryObligationConformance = struct {
+    core_validate: *std.Build.Step,
+    readable_rejection: *std.Build.Step,
+    census: *std.Build.Step,
+
+    fn addTo(self: RecoveryObligationConformance, step: *std.Build.Step) void {
+        step.dependOn(self.core_validate);
+        step.dependOn(self.readable_rejection);
+        step.dependOn(self.census);
+    }
+};
+
+const BlockerCensusRow = struct {
+    kind: []const u8,
+    subject: []const u8,
+    operation: []const u8,
+    producer: []const u8,
+    value_type: []const u8,
+    place_flow: []const u8,
+    proof_links: []const u8,
+    count: usize,
+};
+
+fn addZigFixtureConformance(
+    b: *std.Build,
+    exe: *std.Build.Step.Compile,
+    z3_enabled: bool,
+    z3_bin: []const u8,
+    fixture_name: []const u8,
+) FixtureConformance {
+    const fixture_command = b.addRunArtifact(exe);
+    if (z3_enabled) fixture_command.addPathDir(b.pathFromRoot(z3_bin));
+    fixture_command.addArgs(&.{ "fixture-json", fixture_name });
+    const fixture_json = fixture_command.addOutputFileArg(b.fmt("{s}.lifter-ir.json", .{fixture_name}));
+
+    return addSerializedConformance(b, exe, z3_enabled, z3_bin, fixture_name, fixture_json);
+}
+
+fn addLuauFixtureConformance(
+    b: *std.Build,
+    exe: *std.Build.Step.Compile,
+    z3_enabled: bool,
+    z3_bin: []const u8,
+    script_path: []const u8,
+    fixture_name: []const u8,
+) FixtureConformance {
+    return addLuauFixtureConformanceWithEngine(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        script_path,
+        fixture_name,
+        if (z3_enabled) "z3" else "internal",
+    );
+}
+
+fn addLuauFixtureConformanceWithEngine(
+    b: *std.Build,
+    exe: *std.Build.Step.Compile,
+    z3_enabled: bool,
+    z3_bin: []const u8,
+    script_path: []const u8,
+    fixture_name: []const u8,
+    engine_name: []const u8,
+) FixtureConformance {
+    const fixture_command = b.addSystemCommand(&.{ luneExe(b), "run" });
+    fixture_command.addFileArg(b.path(script_path));
+    fixture_command.addFileInput(b.path("luau/lifter_ir.luau"));
+    fixture_command.addFileInput(b.path("luau/json_codec.luau"));
+    const fixture_json = fixture_command.addOutputFileArg(b.fmt("{s}.lifter-ir.json", .{fixture_name}));
+
+    return addSerializedConformanceWithEngine(b, exe, z3_enabled, z3_bin, fixture_name, fixture_json, engine_name);
+}
+
+fn addLuauSourceConformance(
+    b: *std.Build,
+    exe: *std.Build.Step.Compile,
+    z3_enabled: bool,
+    z3_bin: []const u8,
+    source_path: []const u8,
+    fixture_name: []const u8,
+) FixtureConformance {
+    const fixture_json = addLuauSourceIr(b, source_path, null, fixture_name);
+    var result = addSerializedConformance(b, exe, z3_enabled, z3_bin, fixture_name, fixture_json);
+    result.source_compile = addSourceCompileConformance(b, source_path);
+    result.source_runtime = addSourceRuntimeConformance(b, source_path, fixture_name, result.generated_luau);
+    return result;
+}
+
+fn addLuauSourceManifestConformance(
+    b: *std.Build,
+    exe: *std.Build.Step.Compile,
+    z3_enabled: bool,
+    z3_bin: []const u8,
+    source_path: []const u8,
+    manifest_path: []const u8,
+    fixture_name: []const u8,
+) FixtureConformance {
+    const fixture_json = addLuauSourceIr(b, source_path, manifest_path, fixture_name);
+    var result = addSerializedConformance(b, exe, z3_enabled, z3_bin, fixture_name, fixture_json);
+    result.source_compile = addSourceCompileConformance(b, source_path);
+    result.source_runtime = addSourceRuntimeConformance(b, source_path, fixture_name, result.generated_luau);
+    return result;
+}
+
+fn addLuauSourceManifestProofConformance(
+    b: *std.Build,
+    exe: *std.Build.Step.Compile,
+    proof_attest: *std.Build.Step.Compile,
+    z3_enabled: bool,
+    z3_bin: []const u8,
+    source_path: []const u8,
+    manifest_path: []const u8,
+    proof_bundle_path: []const u8,
+    trusted_public_key: []const u8,
+    fixture_name: []const u8,
+) FixtureConformance {
+    const fixture_json = addLuauSourceIrConfigured(b, source_path, manifest_path, fixture_name, .{
+        .verifier = proof_attest,
+        .path = proof_bundle_path,
+        .trusted_public_key = trusted_public_key,
+    });
+    var result = addSerializedConformance(b, exe, z3_enabled, z3_bin, fixture_name, fixture_json);
+    result.source_compile = addSourceCompileConformance(b, source_path);
+    result.source_runtime = addSourceRuntimeConformance(b, source_path, fixture_name, result.generated_luau);
+    return result;
+}
+
+fn addSourceCompileConformance(b: *std.Build, source_path: []const u8) *std.Build.Step {
+    const compile_command = b.addSystemCommand(&.{ luauCompileExe(b), "--null" });
+    compile_command.addFileArg(b.path(source_path));
+    return &compile_command.step;
+}
+
+fn addSourceRuntimeConformance(
+    b: *std.Build,
+    source_path: []const u8,
+    fixture_name: []const u8,
+    generated_luau: std.Build.LazyPath,
+) *std.Build.Step {
+    const runtime_command = b.addSystemCommand(&.{ luneExe(b), "run" });
+    runtime_command.addFileArg(b.path("luau/runtime_oracle.luau"));
+    runtime_command.addFileInput(b.path("luau/source_runtime_oracle.luau"));
+    runtime_command.addFileInput(b.path("luau/pack_multi_latch_runtime_oracle.luau"));
+    runtime_command.addFileInput(b.path("luau/pack_return_storage_runtime_oracle.luau"));
+    runtime_command.addFileInput(b.path("luau/iteration_exit_transfer_runtime_oracle.luau"));
+    runtime_command.addArg(fixture_name);
+    runtime_command.addFileArg(b.path(source_path));
+    runtime_command.addFileArg(generated_luau);
+    runtime_command.step.dependOn(addGeneratedLexicalConformance(b, source_path, generated_luau));
+    return &runtime_command.step;
+}
+
+fn addGeneratedLexicalConformance(
+    b: *std.Build,
+    source_path: []const u8,
+    generated_luau: std.Build.LazyPath,
+) *std.Build.Step {
+    const command = b.addSystemCommand(&.{ luneExe(b), "run" });
+    command.addFileArg(b.path("luau/generated_lexical_oracle.luau"));
+    command.addArg("check");
+    command.addFileArg(b.path("../../../../tools/bin/luau-analyze.exe"));
+    command.addFileArg(b.path(source_path));
+    command.addFileArg(generated_luau);
+    return &command.step;
+}
+
+fn addLuauSourceCompileConformance(
+    b: *std.Build,
+    exe: *std.Build.Step.Compile,
+    z3_enabled: bool,
+    z3_bin: []const u8,
+    source_path: []const u8,
+    fixture_name: []const u8,
+    engine_name: []const u8,
+) CompileOnlyConformance {
+    const fixture_json = addLuauSourceIr(b, source_path, null, fixture_name);
+    var result = addSerializedCompileConformanceWithEngine(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        fixture_name,
+        fixture_json,
+        engine_name,
+    );
+    result.lexical = addGeneratedLexicalConformance(b, source_path, result.generated_luau);
+    return result;
+}
+
+fn addLuauSourceRecoveryObligationConformance(
+    b: *std.Build,
+    exe: *std.Build.Step.Compile,
+    z3_enabled: bool,
+    z3_bin: []const u8,
+    source_path: []const u8,
+    manifest_path: []const u8,
+    fixture_name: []const u8,
+    engine_name: []const u8,
+    expected_total: usize,
+    expected_rows: []const BlockerCensusRow,
+) RecoveryObligationConformance {
+    const fixture_json = addLuauSourceIr(b, source_path, manifest_path, fixture_name);
+
+    const resolve_command = b.addRunArtifact(exe);
+    if (z3_enabled) resolve_command.addPathDir(b.pathFromRoot(z3_bin));
+    resolve_command.addArg("resolve-ir");
+    resolve_command.addFileArg(fixture_json);
+    const resolved_json = resolve_command.addOutputFileArg(b.fmt("{s}.resolved.lifter-ir.json", .{fixture_name}));
+    resolve_command.addArg(engine_name);
+
+    const core_validate = b.addRunArtifact(exe);
+    if (z3_enabled) core_validate.addPathDir(b.pathFromRoot(z3_bin));
+    core_validate.addArg("validate");
+    core_validate.addFileArg(resolved_json);
+    core_validate.addArg("core");
+
+    const readable_rejection = b.addRunArtifact(exe);
+    if (z3_enabled) readable_rejection.addPathDir(b.pathFromRoot(z3_bin));
+    readable_rejection.addArg("expect-diagnostic");
+    readable_rejection.addFileArg(resolved_json);
+    readable_rejection.addArgs(&.{ "readable-luau", "open_profile_obligation" });
+
+    const census = b.addRunArtifact(exe);
+    if (z3_enabled) census.addPathDir(b.pathFromRoot(z3_bin));
+    census.addArg("expect-blocker-proof-census");
+    census.addFileArg(resolved_json);
+    census.addArg("readable-luau");
+    census.addArg(b.fmt("{d}", .{expected_total}));
+    for (expected_rows) |row| {
+        census.addArgs(&.{ row.kind, row.subject, row.operation, row.producer, row.value_type, row.place_flow, row.proof_links, b.fmt("{d}", .{row.count}) });
+    }
+
+    return .{
+        .core_validate = &core_validate.step,
+        .readable_rejection = &readable_rejection.step,
+        .census = &census.step,
+    };
+}
+
+fn addLuauSourceIr(
+    b: *std.Build,
+    source_path: []const u8,
+    manifest_path: ?[]const u8,
+    fixture_name: []const u8,
+) std.Build.LazyPath {
+    return addLuauSourceIrConfigured(b, source_path, manifest_path, fixture_name, null);
+}
+
+const ProofBundleConfig = struct {
+    verifier: *std.Build.Step.Compile,
+    path: []const u8,
+    trusted_public_key: []const u8,
+};
+
+fn addLuauSourceIrConfigured(
+    b: *std.Build,
+    source_path: []const u8,
+    manifest_path: ?[]const u8,
+    fixture_name: []const u8,
+    proof_bundle: ?ProofBundleConfig,
+) std.Build.LazyPath {
+    const frontend_command = b.addSystemCommand(&.{ luneExe(b), "run" });
+    frontend_command.addFileArg(b.path("luau/lift_source.luau"));
+    frontend_command.addFileInput(b.path("luau/ast_frontend.luau"));
+    frontend_command.addFileInput(b.path("luau/ast_local_binding.luau"));
+    frontend_command.addFileInput(b.path("luau/ast_local_identity.luau"));
+    frontend_command.addFileInput(b.path("luau/ast_lexical_scope.luau"));
+    frontend_command.addFileInput(b.path("luau/ast_runtime_context.luau"));
+    frontend_command.addFileInput(b.path("luau/ast_expression_slots.luau"));
+    frontend_command.addFileInput(b.path("luau/ast_expression_scalar.luau"));
+    frontend_command.addFileInput(b.path("luau/ast_statement_slots.luau"));
+    frontend_command.addFileInput(b.path("luau/ast_admission.luau"));
+    frontend_command.addFileInput(b.path("luau/ast_target_recovery.luau"));
+    frontend_command.addFileInput(b.path("luau/ast_frontend_outcome.luau"));
+    frontend_command.addFileInput(b.path("luau/ast_frontend_expressions.luau"));
+    frontend_command.addFileInput(b.path("luau/ast_frontend_tables.luau"));
+    frontend_command.addFileInput(b.path("luau/ast_frontend_operator_domains.luau"));
+    frontend_command.addFileInput(b.path("luau/ast_frontend_place_domains.luau"));
+    frontend_command.addFileInput(b.path("luau/ast_frontend_control.luau"));
+    frontend_command.addFileInput(b.path("luau/ast_frontend_iteration.luau"));
+    frontend_command.addFileInput(b.path("luau/intrinsic_bindings.luau"));
+    frontend_command.addFileInput(b.path("luau/recovery_admission.luau"));
+    frontend_command.addFileInput(b.path("luau/lifter_ir.luau"));
+    frontend_command.addFileInput(b.path("luau/json_codec.luau"));
+    frontend_command.addFileInput(b.path("luau/recovery_manifest.luau"));
+    addTemporalIdentityInputs(b, frontend_command);
+    frontend_command.addFileInput(b.path("luau/target_recovery.luau"));
+    frontend_command.addFileInput(b.path("luau/target_result_contracts.luau"));
+    frontend_command.addFileInput(b.path("luau/target_proof_bundle.luau"));
+    frontend_command.addFileArg(b.path("../../../../tools/luau-0.720/luau-ast.exe"));
+    frontend_command.addFileArg(b.path(source_path));
+    frontend_command.addArg(fixture_name);
+    const fixture_json = frontend_command.addOutputFileArg(b.fmt("{s}.lifter-ir.json", .{fixture_name}));
+    frontend_command.addArg(fixture_name);
+    if (manifest_path) |path| frontend_command.addFileArg(b.path(path));
+    if (proof_bundle) |bundle| {
+        frontend_command.addFileArg(b.path(bundle.path));
+        frontend_command.addArtifactArg(bundle.verifier);
+        frontend_command.addArg(bundle.trusted_public_key);
+    }
+    return fixture_json;
+}
+
+fn addSerializedConformance(
+    b: *std.Build,
+    exe: *std.Build.Step.Compile,
+    z3_enabled: bool,
+    z3_bin: []const u8,
+    fixture_name: []const u8,
+    fixture_json: std.Build.LazyPath,
+) FixtureConformance {
+    return addSerializedConformanceWithEngine(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        fixture_name,
+        fixture_json,
+        if (z3_enabled) "z3" else "internal",
+    );
+}
+
+fn addSerializedConformanceWithEngine(
+    b: *std.Build,
+    exe: *std.Build.Step.Compile,
+    z3_enabled: bool,
+    z3_bin: []const u8,
+    fixture_name: []const u8,
+    fixture_json: std.Build.LazyPath,
+    engine_name: []const u8,
+) FixtureConformance {
+    const resolve_command = b.addRunArtifact(exe);
+    if (z3_enabled) resolve_command.addPathDir(b.pathFromRoot(z3_bin));
+    resolve_command.addArg("resolve-ir");
+    resolve_command.addFileArg(fixture_json);
+    const resolved_json = resolve_command.addOutputFileArg(b.fmt("{s}.resolved.lifter-ir.json", .{fixture_name}));
+    resolve_command.addArg(engine_name);
+
+    const validate_command = b.addRunArtifact(exe);
+    if (z3_enabled) validate_command.addPathDir(b.pathFromRoot(z3_bin));
+    validate_command.addArg("validate");
+    validate_command.addFileArg(resolved_json);
+    validate_command.addArg("readable-luau");
+
+    const emit_command = b.addRunArtifact(exe);
+    if (z3_enabled) emit_command.addPathDir(b.pathFromRoot(z3_bin));
+    emit_command.addArg("emit-luau-solved");
+    emit_command.addFileArg(resolved_json);
+    const emitted_luau = emit_command.addOutputFileArg(b.fmt("{s}.generated.luau", .{fixture_name}));
+    emit_command.addArg(engine_name);
+    emit_command.addArg("standard-luau");
+    emit_command.addFileArg(b.path("../../../../tools/bin/luau-compile.exe"));
+
+    const runtime_command = b.addSystemCommand(&.{ luneExe(b), "run" });
+    runtime_command.addFileArg(b.path("luau/runtime_oracle.luau"));
+    runtime_command.addFileInput(b.path("luau/source_runtime_oracle.luau"));
+    runtime_command.addFileInput(b.path("luau/pack_multi_latch_runtime_oracle.luau"));
+    runtime_command.addFileInput(b.path("luau/pack_return_storage_runtime_oracle.luau"));
+    runtime_command.addFileInput(b.path("luau/iteration_exit_transfer_runtime_oracle.luau"));
+    runtime_command.addArg(fixture_name);
+    runtime_command.addFileArg(emitted_luau);
+
+    return .{
+        .validate = &validate_command.step,
+        .compile = &emit_command.step,
+        .runtime = &runtime_command.step,
+        .input_ir = fixture_json,
+        .resolved_ir = resolved_json,
+        .generated_luau = emitted_luau,
+    };
+}
+
+fn addSerializedCompileConformanceWithEngine(
+    b: *std.Build,
+    exe: *std.Build.Step.Compile,
+    z3_enabled: bool,
+    z3_bin: []const u8,
+    fixture_name: []const u8,
+    fixture_json: std.Build.LazyPath,
+    engine_name: []const u8,
+) CompileOnlyConformance {
+    const resolve_command = b.addRunArtifact(exe);
+    if (z3_enabled) resolve_command.addPathDir(b.pathFromRoot(z3_bin));
+    resolve_command.addArg("resolve-ir");
+    resolve_command.addFileArg(fixture_json);
+    const resolved_json = resolve_command.addOutputFileArg(b.fmt("{s}.resolved.lifter-ir.json", .{fixture_name}));
+    resolve_command.addArg(engine_name);
+
+    const validate_command = b.addRunArtifact(exe);
+    if (z3_enabled) validate_command.addPathDir(b.pathFromRoot(z3_bin));
+    validate_command.addArg("validate");
+    validate_command.addFileArg(resolved_json);
+    validate_command.addArg("readable-luau");
+
+    const emit_command = b.addRunArtifact(exe);
+    if (z3_enabled) emit_command.addPathDir(b.pathFromRoot(z3_bin));
+    emit_command.addArg("emit-luau-solved");
+    emit_command.addFileArg(resolved_json);
+    const emitted_luau = emit_command.addOutputFileArg(b.fmt("{s}.generated.luau", .{fixture_name}));
+    emit_command.addArg(engine_name);
+    emit_command.addArg("standard-luau");
+    emit_command.addFileArg(b.path("../../../../tools/bin/luau-compile.exe"));
+
+    return .{
+        .validate = &validate_command.step,
+        .compile = &emit_command.step,
+        .resolved_ir = resolved_json,
+        .generated_luau = emitted_luau,
+    };
+}
+
+fn addTemporalIdentityInputs(b: *std.Build, command: *std.Build.Step.Run) void {
+    command.addFileInput(b.path("luau/ast_expression_scalar.luau"));
+    command.addFileInput(b.path("luau/ast_expression_slots.luau"));
+    command.addFileInput(b.path("luau/target_origin_expression_matcher.luau"));
+    command.addFileInput(b.path("luau/target_origin_return_selector.luau"));
+    command.addFileInput(b.path("luau/target_origin_matcher.luau"));
+    command.addFileInput(b.path("luau/structured_definition_sets.luau"));
+    command.addFileInput(b.path("luau/temporal_alias_graph.luau"));
+    command.addFileInput(b.path("luau/temporal_callee_resolver.luau"));
+    command.addFileInput(b.path("luau/temporal_invocation_flow.luau"));
+    command.addFileInput(b.path("luau/temporal_source_index.luau"));
+    command.addFileInput(b.path("luau/temporal_target_identity.luau"));
+}
+
+fn addTemporalTestInputs(b: *std.Build, command: *std.Build.Step.Run) void {
+    addTemporalIdentityInputs(b, command);
+    command.addFileInput(b.path("luau/temporal_test_support.luau"));
+    command.addFileInput(b.path("luau/temporal_invocation_test_support.luau"));
+}
+
+fn addStandaloneTests(
+    b: *std.Build,
+    module: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    z3_enabled: bool,
+    z3_bin: []const u8,
+    source_path: []const u8,
+) *std.Build.Step.Run {
+    const tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(source_path),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "semantic_lifter", .module = module }},
+        }),
+    });
+    const run_tests = b.addRunArtifact(tests);
+    if (z3_enabled) run_tests.addPathDir(b.pathFromRoot(z3_bin));
+    return run_tests;
+}
