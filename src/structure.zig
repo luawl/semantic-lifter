@@ -857,6 +857,155 @@ const Builder = struct {
         }
     }
 
+    fn noteCollisionNode(
+        self: *Builder,
+        block: ir.BlockId,
+        node: ?Node,
+        incoming_reference: ?ir.CfgEdgeRef,
+        reason: CollisionReason,
+        incoming_context: CollisionContext,
+    ) BuildError!void {
+        const output = self.collision orelse return;
+        if (output.* != null) return;
+        const previous = if (node) |value| value.blockId() else null;
+        if (reason == .already_owned) {
+            const owner = self.contextForBlock(block);
+            structural_overlap.traceStructural("structural_phase collision_note function={} depth={} block={} previous={?} incoming_source={?} incoming_target={?} owner_start={?} owner_stop={?} owner_loop_exit={?} owner_continue_target={?} incoming_start={} incoming_stop={?} incoming_loop_exit={?} incoming_continue_target={?}\n", .{
+                self.analysis.function.id.index(),
+                self.trace_region_depth,
+                block.index(),
+                if (previous) |value| value.index() else null,
+                if (incoming_reference) |reference| reference.source.index() else null,
+                if (incoming_reference) |reference| reference.target.index() else null,
+                if (owner) |context| context.start.index() else null,
+                if (owner) |context| if (context.stop) |value| value.index() else null else null,
+                if (owner) |context| if (context.loop_exit) |value| value.index() else null else null,
+                if (owner) |context| if (context.continue_target) |value| value.index() else null else null,
+                incoming_context.start.index(),
+                if (incoming_context.stop) |value| value.index() else null,
+                if (incoming_context.loop_exit) |value| value.index() else null,
+                if (incoming_context.continue_target) |value| value.index() else null,
+            });
+        }
+        var incoming: ?ir.CfgEdgeRef = null;
+        var incoming_group: []ir.CfgEdgeRef = &.{};
+        // The traversal edge is the ownership collision's actual context.
+        // A previous structured node may have a different predecessor into
+        // the same block, especially after a parameterized clone. Preserve
+        // the supplied edge before consulting node-owned predecessors.
+        if (reason == .already_owned) {
+            if (incoming_reference) |reference| {
+                if (reference.target == block and
+                    cfg_edge.value(self.analysis.program, reference) != null)
+                {
+                    incoming = reference;
+                }
+            }
+        }
+        if (incoming == null) {
+            if (node) |value| {
+                incoming = directEdgeReference(self.analysis.program, value, block);
+                if (incoming == null) {
+                    const owned = try nodeIncomingEdgesAlloc(self.allocator, self.analysis, value, block);
+                    if (owned.len == 1) {
+                        incoming = owned[0];
+                        self.allocator.free(owned);
+                    } else if (owned.len > 1) {
+                        incoming = owned[0];
+                        incoming_group = owned;
+                    } else {
+                        self.allocator.free(owned);
+                    }
+                }
+            } else if (reason == .already_owned) {
+                // A region may begin at an already-owned block, so there is no
+                // preceding structured node from which to recover the entry edge.
+                // Preserve the caller's exact edge as a single split candidate.
+                // Authentication is not required at this handoff: an
+                // unauthenticated entry is precisely the context that the
+                // downstream contextual splitter must prove before cloning.
+                // Never replace it with an arbitrary predecessor; that loses the
+                // value tuple which caused the ownership collision.
+                if (incoming_reference) |reference| {
+                    if (reference.target == block and
+                        cfg_edge.value(self.analysis.program, reference) != null)
+                    {
+                        incoming = reference;
+                    }
+                }
+                if (incoming == null) {
+                    incoming_group = (try stableNodeSplitIncomingGroupAlloc(
+                        self.allocator,
+                        self.analysis,
+                        block,
+                    )) orelse &.{};
+                }
+            }
+        }
+        if (incoming_group.len > 1) {
+            const representative = incoming orelse incoming_group[0];
+            incoming_group = try narrowIncomingGroupByArgumentsAlloc(
+                self.allocator,
+                self.analysis.program,
+                incoming_group,
+                representative,
+            );
+            incoming_group = try narrowIncomingGroupByContextAlloc(
+                self.allocator,
+                self,
+                incoming_group,
+                representative,
+            );
+        }
+        output.* = .{
+            .block = block,
+            .previous = previous,
+            .incoming = incoming,
+            .reason = reason,
+            .owner_context = self.contextForBlock(block),
+            .incoming_context = incoming_context,
+            .incoming_group = incoming_group,
+        };
+    }
+
+    fn contextForBlock(self: *const Builder, block: ir.BlockId) ?CollisionContext {
+        const local_index = self.analysis.blockIndex(block) orelse return null;
+        const context = self.visited_contexts[local_index] orelse return null;
+        return .{
+            .start = context.start,
+            .stop = context.stop,
+            .loop_exit = context.loop_exit,
+            .continue_target = context.continue_target,
+            .parameter_arguments = context.parameter_arguments,
+        };
+    }
+
+    fn parameterProjectionMatches(
+        self: *Builder,
+        block_id: ir.BlockId,
+        expected: ?[]const ir.ValueId,
+        actual: ?[]const ir.ValueId,
+    ) BuildError!bool {
+        self.trace_parameter_calls += 1;
+        const trace_start = structural_overlap.structuralPhaseNow();
+        defer self.trace_parameter_ms += structural_overlap.structuralPhaseMillis(trace_start);
+        if (block_id.index() >= self.analysis.program.blocks.len) return false;
+        const block = self.analysis.program.blocks[block_id.index()];
+        if (block.id != block_id) return false;
+        if (block.parameters.len == 0) {
+            return (expected == null or expected.?.len == 0) and
+                (actual == null or actual.?.len == 0);
+        }
+        const expected_arguments = expected orelse return false;
+        const actual_arguments = actual orelse return false;
+        if (self.replay_context) |context| {
+            return try context.parametersEquivalent(block_id, expected_arguments, actual_arguments);
+        }
+        return expected_arguments.len == block.parameters.len and
+            actual_arguments.len == block.parameters.len and
+            std.mem.eql(ir.ValueId, expected_arguments, actual_arguments);
+    }
+
     fn hasAuthenticatedContinuationBridge(
         self: *Builder,
         reference: ir.CfgEdgeRef,
@@ -870,6 +1019,462 @@ const Builder = struct {
             self.analysis,
             reference,
         );
+    }
+
+    const AuthenticatedBoundaryProjection = struct {
+        target: ir.BlockId,
+        edge: ir.Edge,
+        continue_projection: bool,
+    };
+
+    fn authenticatedUnvisitedBoundaryProjection(
+        self: *Builder,
+        current: ir.BlockId,
+        start: ir.BlockId,
+        stop: ?ir.BlockId,
+        loop_exit: ?ir.BlockId,
+        continue_target: ?ir.BlockId,
+        escape_targets: ?*const EscapeTarget,
+        continue_targets: ?*const EscapeTarget,
+        current_arguments: ?[]const ir.ValueId,
+        current_incoming: ?ir.CfgEdgeRef,
+    ) BuildError!?AuthenticatedBoundaryProjection {
+        const reference = current_incoming orelse return null;
+        const arguments = current_arguments orelse return null;
+        const replay = self.replay_context orelse return null;
+        const projection = try replay.authenticatedContinuationCloneForEdge(self.analysis, reference) orelse return null;
+        const root = projection.root;
+        const is_continue_boundary = (continue_target != null and continue_target.? == root) or
+            isEscapeTarget(continue_targets, root);
+        const is_escape_boundary = (stop != null and stop.? == root) or
+            (loop_exit != null and loop_exit.? == root) or
+            isEscapeTarget(escape_targets, root);
+        if (!is_continue_boundary and !is_escape_boundary) return null;
+
+        const root_index = self.analysis.blockIndex(root) orelse return null;
+        if (root.index() >= self.analysis.program.blocks.len) return null;
+        const root_block = self.analysis.program.blocks[root.index()];
+        if (root_block.id != root or
+            !node_split.parametersAreCanonical(self.analysis.program.values, root_block)) return null;
+        if (current.index() >= self.analysis.program.blocks.len) return null;
+        const clone_block = self.analysis.program.blocks[current.index()];
+        if (clone_block.id != current or
+            !node_split.parametersAreCanonical(self.analysis.program.values, clone_block) or
+            root_block.parameters.len != arguments.len or
+            clone_block.parameters.len != arguments.len)
+        {
+            return null;
+        }
+        if (self.visited[root_index]) {
+            const root_context = self.visited_contexts[root_index] orelse return null;
+            if (!try self.parameterProjectionMatches(root, root_context.parameter_arguments, arguments)) return null;
+        }
+
+        const edge = cfg_edge.value(self.analysis.program, reference) orelse return null;
+        if (edge.target != current) return null;
+        if (!try self.coverAuthenticatedCloneGroup(
+            projection.group,
+            current,
+            reference.source,
+            .{
+                .start = start,
+                .stop = stop,
+                .loop_exit = loop_exit,
+                .continue_target = continue_target,
+                .parameter_arguments = arguments,
+                .entry_reference = reference,
+            },
+        )) return null;
+        return .{
+            .target = root,
+            .edge = .{ .target = root, .arguments = edge.arguments },
+            .continue_projection = is_continue_boundary,
+        };
+    }
+
+    fn coverAuthenticatedCloneGroup(
+        self: *Builder,
+        group: ir.NodeSplitGroupId,
+        entry: ir.BlockId,
+        entry_source: ir.BlockId,
+        entry_context: VisitContext,
+    ) BuildError!bool {
+        var clone_blocks: std.ArrayList(ir.BlockId) = .empty;
+        defer clone_blocks.deinit(self.allocator);
+        const indexed_rewrites = if (self.replay_context) |replay|
+            replay.nodeSplitRewriteIndicesForGroup(group)
+        else
+            &.{};
+        if (indexed_rewrites.len != 0 or self.replay_context != null) {
+            for (indexed_rewrites) |rewrite_index| {
+                const rewrite = self.analysis.program.edge_rewrites[rewrite_index];
+                const target_index = self.analysis.blockIndex(rewrite.to.target) orelse return false;
+                if (!self.analysis.isReachable(rewrite.to.target)) return false;
+                var duplicate = false;
+                for (clone_blocks.items) |existing| {
+                    if (existing == rewrite.to.target) duplicate = true;
+                }
+                if (!duplicate) try clone_blocks.append(self.allocator, rewrite.to.target);
+                _ = target_index;
+            }
+        } else for (self.analysis.program.edge_rewrites) |rewrite| {
+            if (rewrite.rule != .node_split or rewrite.node_split_group != group) continue;
+            const target_index = self.analysis.blockIndex(rewrite.to.target) orelse return false;
+            if (!self.analysis.isReachable(rewrite.to.target)) return false;
+            var duplicate = false;
+            for (clone_blocks.items) |existing| {
+                if (existing == rewrite.to.target) duplicate = true;
+            }
+            if (!duplicate) try clone_blocks.append(self.allocator, rewrite.to.target);
+            _ = target_index;
+        }
+        if (clone_blocks.items.len == 0) return false;
+        var contains_entry = false;
+        for (clone_blocks.items) |block_id| {
+            if (block_id == entry) contains_entry = true;
+        }
+        if (!contains_entry) return false;
+
+        const authenticated_entries = try self.allocator.alloc(bool, clone_blocks.items.len);
+        defer self.allocator.free(authenticated_entries);
+        @memset(authenticated_entries, false);
+
+        // A clone group is a closed structural body.  Any predecessor from
+        // outside the group must be one of the authenticated entry rewrites;
+        // otherwise covering it would hide an independent live path.
+        for (clone_blocks.items, 0..) |block_id, clone_index| {
+            for (0..self.analysis.predecessorCount(block_id)) |predecessor_index| {
+                const predecessor = self.analysis.predecessorAt(block_id, predecessor_index) orelse return false;
+                var owned_predecessor = false;
+                for (clone_blocks.items) |candidate| {
+                    if (candidate == predecessor) owned_predecessor = true;
+                }
+                if (owned_predecessor) continue;
+                const reference = directEdgeReference(self.analysis.program, .{ .block = predecessor }, block_id) orelse return false;
+                var authenticated_entry = reference.source == entry_source;
+                if (!authenticated_entry) {
+                    if (self.replay_context) |replay| {
+                        authenticated_entry = replay.hasNodeSplitEntryEdge(
+                            reference.source,
+                            reference.kind,
+                            block_id,
+                            group,
+                        );
+                    } else {
+                        for (self.analysis.program.edge_rewrites) |rewrite| {
+                            if (rewrite.rule == .node_split and rewrite.node_split_group == group and
+                                rewrite.source == reference.source and rewrite.kind == reference.kind and
+                                rewrite.to.target == block_id)
+                            {
+                                authenticated_entry = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (!authenticated_entry) return false;
+                authenticated_entries[clone_index] = true;
+            }
+        }
+
+        for (clone_blocks.items, 0..) |block_id, clone_index| {
+            const local_index = self.analysis.blockIndex(block_id) orelse return false;
+            try self.markVisited(local_index);
+            if (block_id == entry) {
+                // The exact incoming edge authenticated this clone entry. If
+                // it was newly covered, retain that caller-owned context so a
+                // later traversal can identify the owner without reconstructing
+                // it from equality or reachability.
+                if (self.visited_contexts[local_index] == null) {
+                    try self.setVisitedContext(local_index, entry_context);
+                }
+            } else if (!authenticated_entries[clone_index]) {
+                try self.setVisitedContext(local_index, null);
+            }
+        }
+        return true;
+    }
+
+    fn hasStableNodeSplitBridgeFromNode(
+        self: *Builder,
+        node: Node,
+        target: ir.BlockId,
+    ) BuildError!bool {
+        return hasStableNodeSplitBridgeFromNodeWithContext(
+            self.allocator,
+            self.analysis,
+            node,
+            target,
+            self.replay_context,
+        );
+    }
+
+    // A raw structured join can lose its live tuple when both branch arms
+    // finish and the builder transfers to the join. Recover that tuple only
+    // for a branch-owned edge whose arguments are the complete positional
+    // tuple of a dominating block-parameter producer. This proves a real
+    // forwarding contract without comparing it to, or guessing, the owner's
+    // visit tuple. Split/replay edges use the stronger bridge proofs above.
+    fn hasAuthenticatedRawParameterizedJoinEdge(
+        self: *Builder,
+        node: Node,
+        target: ir.BlockId,
+        reference: ir.CfgEdgeRef,
+    ) BuildError!bool {
+        if (node != .branch or
+            !isParameterizedNumericTransitionHeader(self.analysis.program, target) or
+            reference.target != target)
+        {
+            return false;
+        }
+        if (target.index() >= self.analysis.program.blocks.len or
+            reference.source.index() >= self.analysis.program.blocks.len)
+        {
+            return false;
+        }
+        const target_block = self.analysis.program.blocks[target.index()];
+        const source_block = self.analysis.program.blocks[reference.source.index()];
+        if (target_block.id != target or source_block.id != reference.source or
+            source_block.function != self.analysis.function.id or
+            target_block.function != source_block.function)
+        {
+            return false;
+        }
+        const edge = cfg_edge.value(self.analysis.program, reference) orelse return false;
+        if (edge.target != target or edge.arguments.len != target_block.parameters.len) return false;
+
+        // A raw proof must not consume an edge that a later replay pass owns.
+        for (self.analysis.program.edge_rewrites) |rewrite| {
+            if (rewrite.rule == .node_split and rewrite.source == reference.source and
+                rewrite.kind == reference.kind and rewrite.to.target == target)
+            {
+                return false;
+            }
+        }
+
+        var producer: ?ir.BlockId = null;
+        for (edge.arguments, 0..) |argument, index| {
+            if (argument.index() >= self.analysis.program.values.len) return false;
+            const value = self.analysis.program.values[argument.index()];
+            if (value.id != argument or value.function != target_block.function) return false;
+            const origin = switch (value.origin) {
+                .block_parameter => |parameter| parameter,
+                else => return false,
+            };
+            if (origin.index != index) return false;
+            if (producer) |selected| {
+                if (selected != origin.block) return false;
+            } else {
+                producer = origin.block;
+            }
+            if (origin.block.index() >= self.analysis.program.blocks.len or
+                self.analysis.program.blocks[origin.block.index()].id != origin.block)
+            {
+                return false;
+            }
+            const producer_block = self.analysis.program.blocks[origin.block.index()];
+            if (index >= producer_block.parameters.len or producer_block.parameters[index] != argument or
+                !structural_overlap.continuationParameterAcceptsValueType(
+                    self.analysis.program,
+                    target_block.parameters[index],
+                    argument,
+                ))
+            {
+                return false;
+            }
+        }
+
+        const selected_producer = producer orelse return false;
+        if (selected_producer == target or
+            selected_producer.index() >= self.analysis.program.blocks.len or
+            !self.analysis.isReachable(selected_producer) or
+            !self.analysis.isReachable(reference.source))
+        {
+            return false;
+        }
+        const producer_reaches_source = try self.analysis.canReach(selected_producer, reference.source);
+        const dominated_entry = self.analysis.dominates(selected_producer, reference.source) and
+            producer_reaches_source;
+        const loop_carried_entry = try self.analysis.canReach(target, selected_producer) and
+            producer_reaches_source and
+            try self.analysis.canReach(reference.source, target);
+        return dominated_entry or loop_carried_entry;
+    }
+
+    // Multiple owned entries are safe to project only when the structured
+    // branch itself contributes one authenticated anchor. Every other owned
+    // entry must carry the exact same complete tuple and independently prove
+    // that tuple through replay or the raw positional producer contract. A
+    // set of unrelated nested predecessors has no anchor and remains a
+    // collision, even when their value IDs happen to be equal.
+    fn authenticatedEquivalentOwnedParameterizedJoinEntry(
+        self: *Builder,
+        node: Node,
+        target: ir.BlockId,
+        incoming: []const ir.CfgEdgeRef,
+        expected_arguments: ?[]const ir.ValueId,
+    ) BuildError!?ir.CfgEdgeRef {
+        if (incoming.len < 2 or node != .branch or
+            !isParameterizedNumericTransitionHeader(self.analysis.program, target)) return null;
+
+        const anchor_source = node.blockId();
+        var anchor: ?ir.CfgEdgeRef = null;
+        for (incoming) |reference| {
+            if (reference.source != anchor_source) continue;
+            if (anchor != null) return null;
+            anchor = reference;
+        }
+        const selected = if (anchor) |reference| reference else blk: {
+            // A structured branch may converge through nested arms, leaving
+            // no direct edge from the branch header to the numeric target.
+            // Treat its common transition tuple as an anchor only when every
+            // owned edge carries the exact same tuple and independently
+            // authenticates that tuple against the prior owner entry.
+            const expected = expected_arguments orelse return null;
+            const replay_context = self.replay_context orelse return null;
+            const representative = incoming[0];
+            const representative_edge = cfg_edge.value(self.analysis.program, representative) orelse return null;
+            for (incoming) |reference_| {
+                const edge = cfg_edge.value(self.analysis.program, reference_) orelse return null;
+                if (edge.target != target or
+                    edge.arguments.len != representative_edge.arguments.len or
+                    !std.mem.eql(ir.ValueId, edge.arguments, representative_edge.arguments) or
+                    !try replay_context.hasAuthenticatedIterationContextualProjectionForEdge(
+                        self.analysis,
+                        reference_,
+                        expected,
+                    ))
+                {
+                    return null;
+                }
+            }
+            break :blk representative;
+        };
+        const selected_edge = cfg_edge.value(self.analysis.program, selected) orelse return null;
+        const target_block = self.analysis.program.blocks[target.index()];
+        if (selected_edge.target != target or
+            selected_edge.arguments.len != target_block.parameters.len)
+        {
+            return null;
+        }
+
+        for (incoming) |reference| {
+            const edge = cfg_edge.value(self.analysis.program, reference) orelse return null;
+            if (edge.target != target or
+                edge.arguments.len != target_block.parameters.len or
+                !std.mem.eql(ir.ValueId, edge.arguments, selected_edge.arguments))
+            {
+                return null;
+            }
+            if (!try self.hasAuthenticatedContinuationBridge(reference) and
+                !try self.hasAuthenticatedRawParameterizedJoinEdge(node, target, reference))
+            {
+                return null;
+            }
+        }
+        return selected;
+    }
+
+    // A structured branch join may retain the continuation projection while
+    // clearing its live edge and argument tuple. Numeric re-entry still needs
+    // that exact edge for contextual iteration proof; recover it only when
+    // the node has one incoming edge, or a branch-owned set of equivalent
+    // incoming edges, and the solver-neutral iteration witness authenticates
+    // the complete owner tuple.
+    fn authenticatedUniqueIncomingIterationEntry(
+        self: *Builder,
+        node: Node,
+        target: ir.BlockId,
+        expected_arguments: ?[]const ir.ValueId,
+    ) BuildError!?OwnedIncomingEntry {
+        const trace_entry = self.trace_iteration_entry_calls < 256;
+        if (trace_entry) self.trace_iteration_entry_calls += 1;
+        const node_kind = switch (node) {
+            .block => "block",
+            .branch => "branch",
+            .loop => "loop",
+            .latch_loop => "latch_loop",
+            .infinite_loop => "infinite_loop",
+            .loop_control => "loop_control",
+            .loop_boundary => "loop_boundary",
+            .loop_terminal => "loop_terminal",
+        };
+        if (trace_entry) {
+            structural_overlap.traceStructural("structural_phase iteration_entry_probe node_kind={s} node={} target={} expected_len={?}\n", .{
+                node_kind,
+                node.blockId().index(),
+                target.index(),
+                if (expected_arguments) |arguments| arguments.len else null,
+            });
+        }
+        const expected = expected_arguments orelse return null;
+        if (expected.len == 0 or !isParameterizedNumericTransitionHeader(self.analysis.program, target)) return null;
+        if (target.index() >= self.analysis.program.blocks.len) return null;
+        const target_block = self.analysis.program.blocks[target.index()];
+        if (target_block.id != target or target_block.parameters.len != expected.len or
+            !node_split.parametersAreCanonical(self.analysis.program.values, target_block))
+        {
+            return null;
+        }
+
+        const incoming = if (node == .block)
+            try self.allocator.dupe(ir.CfgEdgeRef, &.{directEdgeReference(
+                self.analysis.program,
+                node,
+                target,
+            ) orelse return null})
+        else
+            try nodeIncomingEdgesAlloc(self.allocator, self.analysis, node, target);
+        defer self.allocator.free(incoming);
+        if (trace_entry) {
+            structural_overlap.traceStructural("structural_phase iteration_entry_shape node_kind={s} node={} target={} owned_incoming={}\n", .{
+                node_kind,
+                node.blockId().index(),
+                target.index(),
+                incoming.len,
+            });
+            for (incoming) |reference| {
+                const edge = cfg_edge.value(self.analysis.program, reference);
+                structural_overlap.traceStructural("structural_phase iteration_entry_shape_edge source={} kind={s} target={} args={any} edge_present={}\n", .{
+                    reference.source.index(),
+                    @tagName(reference.kind),
+                    reference.target.index(),
+                    if (edge) |value| value.arguments else &.{},
+                    edge != null,
+                });
+            }
+        }
+        if (incoming.len == 0) return null;
+        const reference = if (incoming.len == 1)
+            incoming[0]
+        else
+            try self.authenticatedEquivalentOwnedParameterizedJoinEntry(
+                node,
+                target,
+                incoming,
+                expected_arguments,
+            ) orelse return null;
+        const edge = cfg_edge.value(self.analysis.program, reference) orelse return null;
+        if (edge.target != target or edge.arguments.len != target_block.parameters.len) return null;
+        const replay_context = self.replay_context orelse return null;
+        const authenticated = try replay_context.hasAuthenticatedIterationContextualProjectionForEdge(
+            self.analysis,
+            reference,
+            expected,
+        );
+        if (trace_entry) {
+            structural_overlap.traceStructural("structural_phase iteration_entry_recovery node_kind={s} node={} target={} source={} expected={any} actual={any} authenticated={}\n", .{
+                node_kind,
+                node.blockId().index(),
+                target.index(),
+                reference.source.index(),
+                expected,
+                edge.arguments,
+                authenticated,
+            });
+        }
+        if (!authenticated) return null;
+        return .{ .reference = reference, .arguments = edge.arguments };
     }
 
     fn isParameterizedNumericTransitionHeader(
@@ -1826,6 +2431,30 @@ fn collisionContextsMatch(
     return std.mem.eql(ir.ValueId, left_context.parameter_arguments.?, right_context.parameter_arguments.?);
 }
 
+fn narrowIncomingGroupByContextAlloc(
+    allocator: std.mem.Allocator,
+    builder: *const Builder,
+    group: []ir.CfgEdgeRef,
+    representative: ir.CfgEdgeRef,
+) std.mem.Allocator.Error![]ir.CfgEdgeRef {
+    const representative_context = builder.contextForBlock(representative.source) orelse return group;
+    var matching_count: usize = 0;
+    for (group) |reference| {
+        if (collisionContextsMatch(representative_context, builder.contextForBlock(reference.source))) matching_count += 1;
+    }
+    if (matching_count == group.len) return group;
+
+    const narrowed = try allocator.alloc(ir.CfgEdgeRef, matching_count);
+    var index: usize = 0;
+    for (group) |reference| {
+        if (!collisionContextsMatch(representative_context, builder.contextForBlock(reference.source))) continue;
+        narrowed[index] = reference;
+        index += 1;
+    }
+    allocator.free(group);
+    return narrowed;
+}
+
 test "collision group partitions distinct incoming argument tuples" {
     const allocator = std.testing.allocator;
     const function_id = ir.FunctionId.fromIndex(0);
@@ -1899,6 +2528,77 @@ test "collision context partition requires authenticated visit context" {
     try std.testing.expect(collisionContextsMatch(first, same));
     try std.testing.expect(!collisionContextsMatch(first, different));
     try std.testing.expect(collisionContextsMatch(first, null));
+}
+
+const StableNodeSplitBridge = struct {
+    source: ir.BlockId,
+    group: ir.NodeSplitGroupId,
+};
+
+fn stableNodeSplitBridgeForEdge(
+    program: *const ir.Program,
+    reference: ir.CfgEdgeRef,
+) ?StableNodeSplitBridge {
+    if (reference.source.index() >= program.blocks.len or reference.target.index() >= program.blocks.len) return null;
+    const current = cfg_edge.value(program, reference) orelse return null;
+    if (current.target != reference.target) return null;
+
+    var selected: ?StableNodeSplitBridge = null;
+    for (program.edge_rewrites) |rewrite| {
+        if (rewrite.rule != .node_split or rewrite.source != reference.source or
+            rewrite.kind != reference.kind or rewrite.from.target == rewrite.to.target or
+            rewrite.to.target != reference.target or rewrite.node_split_group == null or
+            rewrite.from.arguments.len != rewrite.to.arguments.len or
+            !std.mem.eql(ir.ValueId, rewrite.from.arguments, rewrite.to.arguments) or
+            !std.mem.eql(ir.ValueId, current.arguments, rewrite.to.arguments)) continue;
+        if (rewrite.from.target.index() >= program.blocks.len) return null;
+        const source = program.blocks[rewrite.from.target.index()];
+        const clone = program.blocks[rewrite.to.target.index()];
+        if (source.id != rewrite.from.target or clone.id != rewrite.to.target or
+            source.function != clone.function)
+        {
+            return null;
+        }
+        const candidate: StableNodeSplitBridge = .{
+            .source = rewrite.from.target,
+            .group = rewrite.node_split_group.?,
+        };
+        if (selected) |existing| {
+            if (existing.source != candidate.source or existing.group != candidate.group) return null;
+        } else {
+            selected = candidate;
+        }
+    }
+    return selected;
+}
+
+fn stableNodeSplitIncomingGroupAlloc(
+    allocator: std.mem.Allocator,
+    analysis: *const cfg.Analysis,
+    target: ir.BlockId,
+) std.mem.Allocator.Error!?[]ir.CfgEdgeRef {
+    var incoming: std.ArrayList(ir.CfgEdgeRef) = .empty;
+    defer incoming.deinit(allocator);
+    var bridge_source: ?ir.BlockId = null;
+    var bridge_group: ?ir.NodeSplitGroupId = null;
+
+    for (0..analysis.predecessorCount(target)) |predecessor_index| {
+        const predecessor = analysis.predecessorAt(target, predecessor_index) orelse return null;
+        if (!analysis.isReachable(predecessor)) return null;
+        const reference = directEdgeReference(analysis.program, .{ .block = predecessor }, target) orelse return null;
+        const bridge = stableNodeSplitBridgeForEdge(analysis.program, reference) orelse return null;
+        if (bridge_source) |existing| {
+            if (existing != bridge.source or bridge_group.? != bridge.group) return null;
+        } else {
+            bridge_source = bridge.source;
+            bridge_group = bridge.group;
+        }
+        try incoming.append(allocator, reference);
+    }
+
+    if (incoming.items.len < 2) return null;
+    const owned = try incoming.toOwnedSlice(allocator);
+    return owned;
 }
 
 fn nodeOwnsBlock(node: Node, target: ir.BlockId) bool {
@@ -1978,6 +2678,47 @@ fn directEdgeReference(program: *const ir.Program, node: Node, target: ir.BlockI
     };
 }
 
+fn hasStableNodeSplitBridgeFromNodeWithContext(
+    allocator: std.mem.Allocator,
+    analysis: *const cfg.Analysis,
+    node: Node,
+    target: ir.BlockId,
+    replay_context: ?*structural_overlap.ReplayProjectionContext,
+) std.mem.Allocator.Error!bool {
+    if (node == .block) {
+        const source = node.block;
+        const reference = directEdgeReference(analysis.program, .{ .block = source }, target) orelse return false;
+        return if (replay_context) |context|
+            context.hasAuthenticatedContinuationBridgeForEdge(analysis, reference)
+        else
+            structural_overlap.hasAuthenticatedContinuationBridgeForEdgeAlloc(
+                allocator,
+                analysis.program,
+                analysis,
+                reference,
+            );
+    }
+
+    // Structured nodes can own the real predecessor in a nested region. The
+    // node header is not necessarily the block that enters the continuation.
+    const incoming = try nodeIncomingEdgesAlloc(allocator, analysis, node, target);
+    defer allocator.free(incoming);
+    if (incoming.len == 0) return false;
+    for (incoming) |reference| {
+        const authenticated = if (replay_context) |context|
+            try context.hasAuthenticatedContinuationBridgeForEdge(analysis, reference)
+        else
+            try structural_overlap.hasAuthenticatedContinuationBridgeForEdgeAlloc(
+                allocator,
+                analysis.program,
+                analysis,
+                reference,
+            );
+        if (!authenticated) return false;
+    }
+    return true;
+}
+
 fn makeLoopControl(block: ir.BlockId, branch: ir.Branch, continue_target: ir.BlockId, exit_target: ir.BlockId) ?LoopControl {
     if (branch.then_edge.target == continue_target and branch.else_edge.target == exit_target) {
         return .{
@@ -2015,6 +2756,18 @@ const FinalContinueProjection = union(enum) {
     transferred,
 };
 
+const OwnedIncomingEntry = struct {
+    reference: ir.CfgEdgeRef,
+    arguments: []const ir.ValueId,
+};
+
+const VisitedEntryProjection = struct {
+    projection: FinalContinueProjection,
+    arguments: ?[]const ir.ValueId,
+    recovered_context_arguments: bool,
+    recovered_context_reference: ?ir.CfgEdgeRef,
+};
+
 fn finalContinueProjection(program: *const ir.Program, node: Node, target: ir.BlockId) ?FinalContinueProjection {
     return switch (node) {
         .block => |block_id| edge: {
@@ -2031,6 +2784,109 @@ fn finalContinueProjection(program: *const ir.Program, node: Node, target: ir.Bl
         .infinite_loop => |loop| if (loop.exit != null and loop.exit.? == target) .transferred else null,
         else => null,
     };
+}
+
+// A structured node may finish through a nested arm whose raw predecessor is
+// not the node header. Preserve that edge as the projection boundary only
+// when the builder still owns the predecessor and the live edge carries the
+// exact entry tuple being structured.
+fn continuationProjectionForVisitedEntry(
+    program: *const ir.Program,
+    node: Node,
+    target: ir.BlockId,
+    incoming: ?ir.CfgEdgeRef,
+    arguments: ?[]const ir.ValueId,
+) ?FinalContinueProjection {
+    if (finalContinueProjection(program, node, target)) |projection| return projection;
+
+    const reference = incoming orelse return null;
+    if (reference.target != target or !nodeOwnsBlock(node, reference.source)) return null;
+    const expected_arguments = arguments orelse return null;
+    const edge = cfg_edge.value(program, reference) orelse return null;
+    if (edge.target != target or !std.mem.eql(ir.ValueId, edge.arguments, expected_arguments)) return null;
+    return .{ .edge = edge };
+}
+
+test "nested structured continuation projection uses the owned incoming edge" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const owner = ir.BlockId.fromIndex(0);
+    const predecessor = ir.BlockId.fromIndex(1);
+    const target = ir.BlockId.fromIndex(2);
+    const stop = ir.BlockId.fromIndex(3);
+    const condition = ir.ValueId.fromIndex(0);
+    const first = ir.ValueId.fromIndex(1);
+    const second = ir.ValueId.fromIndex(2);
+    const target_first = ir.ValueId.fromIndex(3);
+    const target_second = ir.ValueId.fromIndex(4);
+    const arguments = [_]ir.ValueId{ first, second };
+    const wrong_arguments = [_]ir.ValueId{ second, first };
+    const blocks = [_]ir.Block{
+        .{ .id = owner, .function = function_id, .terminator = .{ .branch = .{
+            .condition = condition,
+            .then_edge = .{ .target = predecessor },
+            .else_edge = .{ .target = stop },
+        } } },
+        .{ .id = predecessor, .function = function_id, .terminator = .{ .jump = .{
+            .target = target,
+            .arguments = &arguments,
+        } } },
+        .{ .id = target, .function = function_id, .parameters = &.{ target_first, target_second }, .terminator = .{ .return_values = &.{} } },
+        .{ .id = stop, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &.{ condition, first, second },
+        .blocks = &.{ owner, predecessor, target, stop },
+        .entry_block = owner,
+    };
+    const values = [_]ir.Value{
+        .{ .id = condition, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = first, .function = function_id, .origin = .{ .parameter = 1 } },
+        .{ .id = second, .function = function_id, .origin = .{ .parameter = 2 } },
+        .{ .id = target_first, .function = function_id, .origin = .{ .block_parameter = .{ .block = target, .index = 0 } } },
+        .{ .id = target_second, .function = function_id, .origin = .{ .block_parameter = .{ .block = target, .index = 1 } } },
+    };
+    const program: ir.Program = .{
+        .program_id = "nested-structured-continuation-projection",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+    };
+    var nested_nodes = [_]Node{.{ .block = predecessor }};
+    var nested_region = Region{
+        .nodes = &nested_nodes,
+        .stop = target,
+        .loop_exit = null,
+    };
+    var empty_nodes = [_]Node{};
+    var empty_region = Region{
+        .nodes = &empty_nodes,
+        .stop = stop,
+        .loop_exit = null,
+    };
+    const node: Node = .{ .branch = .{
+        .block = owner,
+        .then_region = &nested_region,
+        .else_region = &empty_region,
+        .join = null,
+    } };
+    const incoming: ir.CfgEdgeRef = .{ .source = predecessor, .kind = .jump, .target = target };
+    try std.testing.expect(continuationProjectionForVisitedEntry(
+        &program,
+        node,
+        target,
+        incoming,
+        &arguments,
+    ) != null);
+    try std.testing.expect(continuationProjectionForVisitedEntry(
+        &program,
+        node,
+        target,
+        incoming,
+        &wrong_arguments,
+    ) == null);
 }
 
 fn regionFallsThroughTo(program: *const ir.Program, region: *const Region, target: ir.BlockId) bool {
