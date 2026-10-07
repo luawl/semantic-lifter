@@ -1021,6 +1021,32 @@ const Builder = struct {
         );
     }
 
+    fn hasAuthenticatedContinuationBridgeForExpectedParameters(
+        self: *Builder,
+        reference: ir.CfgEdgeRef,
+        expected: ?[]const ir.ValueId,
+    ) BuildError!bool {
+        if (try self.hasAuthenticatedContinuationBridge(reference)) return true;
+        const expected_arguments = expected orelse return false;
+        const context = self.replay_context orelse return false;
+        const result = try context.hasAuthenticatedIterationContextualProjectionForEdge(
+            self.analysis,
+            reference,
+            expected_arguments,
+        );
+        if (result) return true;
+        // A composed continuation may carry an arbitrary canonical tuple,
+        // not only the four values recognized by the iteration witness. Keep
+        // this proof at the builder boundary so ownership reuse cannot fall
+        // back to repeated collision cloning when replay has already
+        // authenticated the complete parameter projection.
+        return try context.hasAuthenticatedParameterizedContinuationProjectionForEdge(
+            self.analysis,
+            reference,
+            expected_arguments,
+        );
+    }
+
     const AuthenticatedBoundaryProjection = struct {
         target: ir.BlockId,
         edge: ir.Edge,
@@ -1301,6 +1327,41 @@ const Builder = struct {
         return dominated_entry or loop_carried_entry;
     }
 
+    fn authenticatedUniqueOwnedIncomingEntry(
+        self: *Builder,
+        node: Node,
+        target: ir.BlockId,
+        expected_arguments: ?[]const ir.ValueId,
+    ) BuildError!?OwnedIncomingEntry {
+        // A direct block predecessor can be the exact retained edge of a
+        // structured numeric continuation. It is safe to recover only
+        // through the same canonical tuple and authenticated iteration proof
+        // used for structured branch entries below.
+        if (target.index() >= self.analysis.program.blocks.len) return null;
+        const target_block = self.analysis.program.blocks[target.index()];
+        if (target_block.id != target) return null;
+
+        const incoming = try nodeIncomingEdgesAlloc(self.allocator, self.analysis, node, target);
+        defer self.allocator.free(incoming);
+        const reference = if (incoming.len == 1)
+            incoming[0]
+        else
+            try self.authenticatedEquivalentOwnedParameterizedJoinEntry(
+                node,
+                target,
+                incoming,
+                expected_arguments,
+            ) orelse return null;
+        const edge = cfg_edge.value(self.analysis.program, reference) orelse return null;
+        if (edge.target != target or edge.arguments.len != target_block.parameters.len) return null;
+        if (expected_arguments) |expected| {
+            if (!std.mem.eql(ir.ValueId, expected, edge.arguments)) return null;
+        }
+        if (!try self.hasAuthenticatedContinuationBridge(reference) and
+            !try self.hasAuthenticatedRawParameterizedJoinEdge(node, target, reference)) return null;
+        return .{ .reference = reference, .arguments = edge.arguments };
+    }
+
     // Multiple owned entries are safe to project only when the structured
     // branch itself contributes one authenticated anchor. Every other owned
     // entry must carry the exact same complete tuple and independently prove
@@ -1475,6 +1536,165 @@ const Builder = struct {
         }
         if (!authenticated) return null;
         return .{ .reference = reference, .arguments = edge.arguments };
+    }
+
+    fn visitedEntryContinuationProjection(
+        self: *Builder,
+        node: Node,
+        target: ir.BlockId,
+        incoming: ?ir.CfgEdgeRef,
+        arguments: ?[]const ir.ValueId,
+    ) BuildError!?VisitedEntryProjection {
+        self.trace_projection_calls += 1;
+        const trace_start = structural_overlap.structuralPhaseNow();
+        defer self.trace_projection_ms += structural_overlap.structuralPhaseMillis(trace_start);
+        if (continuationProjectionForVisitedEntry(
+            self.analysis.program,
+            node,
+            target,
+            incoming,
+            arguments,
+        )) |projection| {
+            // A structured join reports a transferred projection without
+            // retaining the live edge.  That is sufficient for a zero-
+            // parameter continuation, but it is not a parameter projection:
+            // a later owner comparison must not silently treat an unknown
+            // tuple as equivalent to the target's formals. Recover one
+            // authenticated owned edge before accepting the transfer.
+            if (projection == .transferred and target.index() < self.analysis.program.blocks.len) {
+                const target_block = self.analysis.program.blocks[target.index()];
+                const missing_parameters = target_block.parameters.len != 0 and
+                    (arguments == null or arguments.?.len != target_block.parameters.len);
+                if (missing_parameters) {
+                    if (try self.authenticatedUniqueOwnedIncomingEntry(node, target, null)) |entry| {
+                        return .{
+                            .projection = projection,
+                            .arguments = entry.arguments,
+                            .recovered_context_arguments = true,
+                            .recovered_context_reference = entry.reference,
+                        };
+                    }
+                    return null;
+                }
+            }
+            return .{
+                .projection = projection,
+                .arguments = arguments,
+                .recovered_context_arguments = false,
+                .recovered_context_reference = null,
+            };
+        }
+
+        // A branch join intentionally clears the live edge and tuple because
+        // its arms may have distinct incoming state. Reconstruct that state
+        // only for one owned predecessor whose clone/replay lineage is
+        // already authenticated. Ambiguous or unauthenticated joins remain
+        // collisions.
+        if (incoming != null) {
+            return null;
+        }
+        const recovered = try self.authenticatedUniqueOwnedIncomingEntry(node, target, arguments);
+        if (recovered) |entry| {
+            if (continuationProjectionForVisitedEntry(
+                self.analysis.program,
+                node,
+                target,
+                entry.reference,
+                entry.arguments,
+            )) |projection| {
+                return .{
+                    .projection = projection,
+                    .arguments = entry.arguments,
+                    .recovered_context_arguments = true,
+                    .recovered_context_reference = entry.reference,
+                };
+            }
+        }
+        return null;
+    }
+
+    // A loop-carried transition may reach an earlier block only by crossing
+    // the enclosing continuation boundary. Treat that backedge as the
+    // structured region boundary; a path that reaches the block without
+    // crossing it is still an ownership collision.
+    fn canReachWithoutContinuationBoundary(
+        self: *const Builder,
+        source: ir.BlockId,
+        target: ir.BlockId,
+        continuation: ?ir.BlockId,
+    ) BuildError!bool {
+        const mutable_self = @constCast(self);
+        mutable_self.trace_reach_calls += 1;
+        const trace_start = structural_overlap.structuralPhaseNow();
+        defer mutable_self.trace_reach_ms += structural_overlap.structuralPhaseMillis(trace_start);
+        if (!try self.analysis.canReach(source, target)) return false;
+        const boundary = continuation orelse return true;
+        if (boundary == source or boundary == target) return true;
+        return try self.analysis.canReachAvoiding(source, target, boundary);
+    }
+
+    // A zero-argument loop header may be entered again with a different
+    // nested stop boundary. Reuse it only when both visits retain the same
+    // loop controls and the header carries no block parameters or effects.
+    // Its outgoing edge may carry a canonical successor tuple because the
+    // empty header itself does not create or consume that state.
+    fn zeroArgumentLoopContinuationContextMatches(
+        self: *const Builder,
+        current: ir.BlockId,
+        start: ir.BlockId,
+        stop: ?ir.BlockId,
+        loop_exit: ?ir.BlockId,
+        continue_target: ?ir.BlockId,
+        context: VisitContext,
+        parameters_match: bool,
+    ) bool {
+        if (!parameters_match or current != start or context.start != start or
+            context.stop == stop or context.loop_exit != loop_exit or
+            context.continue_target != continue_target or stop == null or
+            context.stop == null or loop_exit == null or continue_target == null)
+        {
+            return false;
+        }
+        const local_index = self.analysis.blockIndex(current) orelse return false;
+        if (local_index >= self.loop_headers.len or !self.loop_headers[local_index]) return false;
+        const block = self.analysis.program.blocks[current.index()];
+        if (block.id != current or block.parameters.len != 0) return false;
+        if (block.instructions.len != 0) return false;
+        return switch (block.terminator) {
+            .branch => |branch| blk: {
+                if (branch.then_edge.arguments.len != 0 or branch.else_edge.arguments.len != 0) break :blk false;
+                const then_is_continue = branch.then_edge.target == continue_target.?;
+                const else_is_continue = branch.else_edge.target == continue_target.?;
+                const then_is_exit = branch.then_edge.target == loop_exit.?;
+                const else_is_exit = branch.else_edge.target == loop_exit.?;
+                break :blk (then_is_continue and else_is_exit) or (else_is_continue and then_is_exit);
+            },
+            .jump, .return_values, .return_pack, .return_expanded, .throw_error, .unreachable_block => self.transparentEmptyJumpWithCanonicalSuccessor(current),
+        };
+    }
+
+    // An empty block is a semantic identity even when its jump carries values
+    // into a parameterized successor. Keep the proof local to the admitted
+    // CFG: the successor must be in the same function, have canonical formals,
+    // and receive exactly one argument per formal.
+    fn transparentEmptyJumpWithCanonicalSuccessor(
+        self: *const Builder,
+        current: ir.BlockId,
+    ) bool {
+        if (current.index() >= self.analysis.program.blocks.len) return false;
+        const block = self.analysis.program.blocks[current.index()];
+        if (block.id != current or block.parameters.len != 0 or block.instructions.len != 0) return false;
+        const outgoing = switch (block.terminator) {
+            .jump => |edge| edge,
+            .branch, .return_values, .return_pack, .return_expanded, .throw_error, .unreachable_block => return false,
+        };
+        if (outgoing.target == current or outgoing.target.index() >= self.analysis.program.blocks.len) return false;
+        const successor = self.analysis.program.blocks[outgoing.target.index()];
+        return successor.id == outgoing.target and
+            successor.function == block.function and
+            outgoing.arguments.len == successor.parameters.len and
+            (successor.parameters.len == 0 or
+                node_split.parametersAreCanonical(self.analysis.program.values, successor));
     }
 
     fn isParameterizedNumericTransitionHeader(
@@ -2369,6 +2589,437 @@ test "owned loop header projection distinguishes preheaders from backedges" {
     try std.testing.expect(!try builder.isOutsideEntryToOwnedLoopHeader(header, latch));
 }
 
+test "transferred parameterized join recovers only one authenticated edge" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const owner = ir.BlockId.fromIndex(0);
+    const predecessor = ir.BlockId.fromIndex(1);
+    const target = ir.BlockId.fromIndex(2);
+    const owner_stop = ir.BlockId.fromIndex(3);
+    const target_stop = ir.BlockId.fromIndex(4);
+    const original = ir.BlockId.fromIndex(5);
+    const condition = ir.ValueId.fromIndex(0);
+    const first_argument = ir.ValueId.fromIndex(1);
+    const second_argument = ir.ValueId.fromIndex(2);
+    const first_parameter = ir.ValueId.fromIndex(3);
+    const second_parameter = ir.ValueId.fromIndex(4);
+    const original_first_parameter = ir.ValueId.fromIndex(5);
+    const original_second_parameter = ir.ValueId.fromIndex(6);
+    const arguments = [_]ir.ValueId{ first_argument, second_argument };
+
+    var blocks = [_]ir.Block{
+        .{ .id = owner, .function = function_id, .terminator = .{ .branch = .{
+            .condition = condition,
+            .then_edge = .{ .target = predecessor },
+            .else_edge = .{ .target = owner_stop },
+        } } },
+        .{ .id = predecessor, .function = function_id, .terminator = .{ .jump = .{
+            .target = target,
+            .arguments = &arguments,
+        } } },
+        .{ .id = target, .function = function_id, .parameters = &.{ first_parameter, second_parameter }, .terminator = .{ .branch = .{
+            .condition = condition,
+            .then_edge = .{ .target = target_stop },
+            .else_edge = .{ .target = owner_stop },
+        } } },
+        .{ .id = owner_stop, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = target_stop, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = original, .function = function_id, .parameters = &.{ original_first_parameter, original_second_parameter }, .terminator = .{ .branch = .{
+            .condition = condition,
+            .then_edge = .{ .target = target_stop },
+            .else_edge = .{ .target = owner_stop },
+        } } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &.{ condition, first_argument, second_argument },
+        .blocks = &.{ owner, predecessor, target, owner_stop, target_stop, original },
+        .entry_block = owner,
+    };
+    const values = [_]ir.Value{
+        .{ .id = condition, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = first_argument, .function = function_id, .origin = .{ .parameter = 1 } },
+        .{ .id = second_argument, .function = function_id, .origin = .{ .parameter = 2 } },
+        .{ .id = first_parameter, .function = function_id, .origin = .{ .block_parameter = .{ .block = target, .index = 0 } } },
+        .{ .id = second_parameter, .function = function_id, .origin = .{ .block_parameter = .{ .block = target, .index = 1 } } },
+        .{ .id = original_first_parameter, .function = function_id, .origin = .{ .block_parameter = .{ .block = original, .index = 0 } } },
+        .{ .id = original_second_parameter, .function = function_id, .origin = .{ .block_parameter = .{ .block = original, .index = 1 } } },
+    };
+    const rewrites = [_]ir.CfgEdgeRewrite{.{
+        .id = ir.EdgeRewriteId.fromIndex(0),
+        .source = predecessor,
+        .kind = .jump,
+        .from = .{ .target = original, .arguments = &arguments },
+        .to = .{ .target = target, .arguments = &arguments },
+        .rule = .node_split,
+        .node_split_group = ir.NodeSplitGroupId.fromIndex(0),
+    }};
+    var program = ir.Program{
+        .program_id = "transferred-parameterized-join",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+        .edge_rewrites = &rewrites,
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, function);
+    defer analysis.deinit();
+    const loop_headers = try natural_loop.headerCandidatesAlloc(std.testing.allocator, &analysis);
+    defer std.testing.allocator.free(loop_headers);
+
+    var nested_nodes = [_]Node{.{ .block = predecessor }};
+    var nested_region = Region{ .nodes = &nested_nodes, .stop = target, .loop_exit = null };
+    var empty_nodes = [_]Node{};
+    var empty_region = Region{ .nodes = &empty_nodes, .stop = owner_stop, .loop_exit = null };
+    const node: Node = .{ .branch = .{
+        .block = owner,
+        .then_region = &nested_region,
+        .else_region = &empty_region,
+        .join = target,
+    } };
+    var visited = [_]bool{ false, false, true, false, false, false };
+    var contexts = [_]?Builder.VisitContext{ null, null, .{
+        .start = target,
+        .stop = owner_stop,
+        .loop_exit = null,
+        .continue_target = null,
+        .parameter_arguments = &arguments,
+    }, null, null, null };
+    var builder: Builder = .{
+        .allocator = std.testing.allocator,
+        .analysis = &analysis,
+        .visited = &visited,
+        .visited_contexts = &contexts,
+        .loop_headers = loop_headers,
+    };
+
+    const incoming_reference = ir.CfgEdgeRef{ .source = predecessor, .kind = .jump, .target = target };
+    try std.testing.expect(try builder.hasAuthenticatedContinuationBridge(incoming_reference));
+    const projected = (try builder.visitedEntryContinuationProjection(
+        node,
+        target,
+        null,
+        null,
+    )).?;
+    try std.testing.expectEqualSlices(ir.ValueId, &arguments, projected.arguments.?);
+    try std.testing.expect(projected.projection == .transferred);
+
+    const alternate = ir.BlockId.fromIndex(6);
+    const alternate_parameter_first = ir.ValueId.fromIndex(7);
+    const alternate_parameter_second = ir.ValueId.fromIndex(8);
+    var ambiguous_blocks = blocks ++ [_]ir.Block{.{
+        .id = alternate,
+        .function = function_id,
+        .parameters = &.{ alternate_parameter_first, alternate_parameter_second },
+        .terminator = .{ .jump = .{ .target = target, .arguments = &arguments } },
+    }};
+    ambiguous_blocks[owner.index()].terminator = .{ .branch = .{
+        .condition = condition,
+        .then_edge = .{ .target = predecessor },
+        .else_edge = .{ .target = alternate },
+    } };
+    var ambiguous_function = function;
+    ambiguous_function.blocks = &.{ owner, predecessor, target, owner_stop, target_stop, original, alternate };
+    var ambiguous_program = program;
+    ambiguous_program.blocks = &ambiguous_blocks;
+    ambiguous_program.functions = &.{ambiguous_function};
+    var ambiguous_analysis = try cfg.Analysis.init(std.testing.allocator, &ambiguous_program, ambiguous_function);
+    defer ambiguous_analysis.deinit();
+    var ambiguous_builder = builder;
+    ambiguous_builder.analysis = &ambiguous_analysis;
+    var ambiguous_nodes = [_]Node{ .{ .block = predecessor }, .{ .block = alternate } };
+    var ambiguous_nested_region = Region{ .nodes = &ambiguous_nodes, .stop = target, .loop_exit = null };
+    var ambiguous_node = node;
+    ambiguous_node.branch.then_region = &ambiguous_nested_region;
+    try std.testing.expect((try ambiguous_builder.visitedEntryContinuationProjection(
+        ambiguous_node,
+        target,
+        null,
+        null,
+    )) == null);
+
+    var tampered_arguments = arguments;
+    tampered_arguments[1] = condition;
+    var tampered_blocks = blocks;
+    tampered_blocks[predecessor.index()].terminator = .{ .jump = .{
+        .target = target,
+        .arguments = &tampered_arguments,
+    } };
+    var tampered_program = program;
+    tampered_program.blocks = &tampered_blocks;
+    var tampered_analysis = try cfg.Analysis.init(std.testing.allocator, &tampered_program, function);
+    defer tampered_analysis.deinit();
+    var tampered_builder = builder;
+    tampered_builder.analysis = &tampered_analysis;
+    try std.testing.expect((try tampered_builder.visitedEntryContinuationProjection(
+        node,
+        target,
+        null,
+        null,
+    )) == null);
+}
+
+test "raw parameterized numeric join authenticates a dominating tuple" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const producer = ir.BlockId.fromIndex(1);
+    const owner = ir.BlockId.fromIndex(2);
+    const predecessor = ir.BlockId.fromIndex(3);
+    const target = ir.BlockId.fromIndex(4);
+    const body = ir.BlockId.fromIndex(5);
+    const exit = ir.BlockId.fromIndex(6);
+    const stop = ir.BlockId.fromIndex(7);
+    const alternate = ir.BlockId.fromIndex(8);
+    const input_first = ir.ValueId.fromIndex(0);
+    const input_second = ir.ValueId.fromIndex(1);
+    const input_third = ir.ValueId.fromIndex(2);
+    const condition = ir.ValueId.fromIndex(3);
+    const producer_first = ir.ValueId.fromIndex(4);
+    const producer_second = ir.ValueId.fromIndex(5);
+    const producer_third = ir.ValueId.fromIndex(6);
+    const producer_fourth = ir.ValueId.fromIndex(7);
+    const target_first = ir.ValueId.fromIndex(8);
+    const target_second = ir.ValueId.fromIndex(9);
+    const target_third = ir.ValueId.fromIndex(10);
+    const target_fourth = ir.ValueId.fromIndex(11);
+    const has_value = ir.ValueId.fromIndex(12);
+    const next_limit = ir.ValueId.fromIndex(13);
+    const next_step = ir.ValueId.fromIndex(14);
+    const next_control = ir.ValueId.fromIndex(15);
+    const effect_value = ir.ValueId.fromIndex(16);
+    const transition_id = ir.InstructionId.fromIndex(0);
+    const effect_constant_id = ir.InstructionId.fromIndex(1);
+    const effect_write_id = ir.InstructionId.fromIndex(2);
+    const place_id = ir.PlaceId.fromIndex(0);
+    const incoming_arguments = [_]ir.ValueId{
+        producer_first,
+        producer_second,
+        producer_third,
+        producer_fourth,
+    };
+
+    var blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .jump = .{
+            .target = producer,
+            .arguments = &.{ input_first, input_second, input_third, condition },
+        } } },
+        .{ .id = producer, .function = function_id, .parameters = &incoming_arguments, .terminator = .{ .jump = .{
+            .target = owner,
+        } } },
+        .{ .id = owner, .function = function_id, .terminator = .{ .branch = .{
+            .condition = condition,
+            .then_edge = .{ .target = predecessor },
+            .else_edge = .{ .target = stop },
+        } } },
+        .{ .id = predecessor, .function = function_id, .instructions = &.{ effect_constant_id, effect_write_id }, .terminator = .{ .jump = .{
+            .target = target,
+            .arguments = &incoming_arguments,
+        } } },
+        .{ .id = target, .function = function_id, .parameters = &.{
+            target_first,
+            target_second,
+            target_third,
+            target_fourth,
+        }, .instructions = &.{transition_id}, .terminator = .{ .branch = .{
+            .condition = has_value,
+            .then_edge = .{ .target = body },
+            .else_edge = .{ .target = exit },
+        } } },
+        .{ .id = body, .function = function_id, .terminator = .{ .jump = .{ .target = stop } } },
+        .{ .id = exit, .function = function_id, .terminator = .{ .jump = .{ .target = stop } } },
+        .{ .id = stop, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = alternate, .function = function_id, .terminator = .{ .jump = .{
+            .target = target,
+            .arguments = &incoming_arguments,
+        } } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &.{ input_first, input_second, input_third, condition },
+        .blocks = &.{ entry, producer, owner, predecessor, target, body, exit, stop },
+        .entry_block = entry,
+    };
+    const values = [_]ir.Value{
+        .{ .id = input_first, .function = function_id, .origin = .{ .parameter = 0 } },
+        .{ .id = input_second, .function = function_id, .origin = .{ .parameter = 1 } },
+        .{ .id = input_third, .function = function_id, .origin = .{ .parameter = 2 } },
+        .{ .id = condition, .function = function_id, .type = .boolean, .origin = .{ .parameter = 3 } },
+        .{ .id = producer_first, .function = function_id, .origin = .{ .block_parameter = .{ .block = producer, .index = 0 } } },
+        .{ .id = producer_second, .function = function_id, .origin = .{ .block_parameter = .{ .block = producer, .index = 1 } } },
+        .{ .id = producer_third, .function = function_id, .origin = .{ .block_parameter = .{ .block = producer, .index = 2 } } },
+        .{ .id = producer_fourth, .function = function_id, .type = .boolean, .origin = .{ .block_parameter = .{ .block = producer, .index = 3 } } },
+        .{ .id = target_first, .function = function_id, .origin = .{ .block_parameter = .{ .block = target, .index = 0 } } },
+        .{ .id = target_second, .function = function_id, .origin = .{ .block_parameter = .{ .block = target, .index = 1 } } },
+        .{ .id = target_third, .function = function_id, .origin = .{ .block_parameter = .{ .block = target, .index = 2 } } },
+        .{ .id = target_fourth, .function = function_id, .type = .boolean, .origin = .{ .block_parameter = .{ .block = target, .index = 3 } } },
+        .{ .id = has_value, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = transition_id, .index = 0 } } },
+        .{ .id = next_limit, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = transition_id, .index = 1 } } },
+        .{ .id = next_step, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = transition_id, .index = 2 } } },
+        .{ .id = next_control, .function = function_id, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = transition_id, .index = 3 } } },
+        .{ .id = effect_value, .function = function_id, .type = .integer, .origin = .{ .instruction_result = .{ .instruction = effect_constant_id, .index = 0 } } },
+    };
+    const instructions = [_]ir.Instruction{
+        .{ .id = transition_id, .block = target, .operation = .{ .numeric_for_next = .{
+            .control = target_first,
+            .limit = target_second,
+            .step = target_third,
+            .initial = target_fourth,
+        } }, .results = &.{ has_value, next_limit, next_step, next_control }, .effects = .numeric_for_next },
+        .{ .id = effect_constant_id, .block = predecessor, .operation = .{ .constant = .{ .integer = "1" } }, .results = &.{effect_value}, .effects = .pure },
+        .{ .id = effect_write_id, .block = predecessor, .operation = .{ .place_write = .{ .place = place_id, .value = effect_value } }, .results = &.{}, .effects = .place_write },
+    };
+    const places = [_]ir.Place{.{ .id = place_id, .function = function_id, .origin = .{ .local = 0 } }};
+    var program = ir.Program{
+        .program_id = "raw-parameterized-numeric-join",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+        .places = &places,
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, function);
+    defer analysis.deinit();
+    const loop_headers = try natural_loop.headerCandidatesAlloc(std.testing.allocator, &analysis);
+    defer std.testing.allocator.free(loop_headers);
+
+    var visited = [_]bool{ false, false, true, false, true, false, false, false, false };
+    var contexts = [_]?Builder.VisitContext{ null, null, .{
+        .start = target,
+        .stop = stop,
+        .loop_exit = null,
+        .continue_target = null,
+        .parameter_arguments = null,
+    }, null, .{
+        .start = target,
+        .stop = stop,
+        .loop_exit = null,
+        .continue_target = null,
+        .parameter_arguments = null,
+    }, null, null, null, null };
+    var builder: Builder = .{
+        .allocator = std.testing.allocator,
+        .analysis = &analysis,
+        .visited = &visited,
+        .visited_contexts = &contexts,
+        .loop_headers = loop_headers,
+    };
+    var nested_nodes = [_]Node{.{ .block = predecessor }};
+    var nested_region = Region{ .nodes = &nested_nodes, .stop = target, .loop_exit = null };
+    var empty_nodes = [_]Node{};
+    var empty_region = Region{ .nodes = &empty_nodes, .stop = stop, .loop_exit = null };
+    const node: Node = .{ .branch = .{
+        .block = owner,
+        .then_region = &nested_region,
+        .else_region = &empty_region,
+        .join = target,
+    } };
+
+    const projected = (try builder.visitedEntryContinuationProjection(
+        node,
+        target,
+        null,
+        null,
+    )).?;
+    try std.testing.expect(projected.projection == .transferred);
+    try std.testing.expect(projected.recovered_context_arguments);
+    try std.testing.expectEqualSlices(ir.ValueId, &incoming_arguments, projected.arguments.?);
+
+    var equivalent_owned_blocks = blocks;
+    equivalent_owned_blocks[owner.index()].terminator = .{ .branch = .{
+        .condition = condition,
+        .then_edge = .{ .target = predecessor },
+        .else_edge = .{ .target = target, .arguments = &incoming_arguments },
+    } };
+    var equivalent_owned_program = program;
+    equivalent_owned_program.blocks = &equivalent_owned_blocks;
+    var equivalent_owned_analysis = try cfg.Analysis.init(
+        std.testing.allocator,
+        &equivalent_owned_program,
+        function,
+    );
+    defer equivalent_owned_analysis.deinit();
+    var equivalent_owned_builder = builder;
+    equivalent_owned_builder.analysis = &equivalent_owned_analysis;
+    const equivalent_owned = (try equivalent_owned_builder.visitedEntryContinuationProjection(
+        node,
+        target,
+        null,
+        null,
+    )).?;
+    try std.testing.expect(equivalent_owned.projection == .transferred);
+    try std.testing.expect(equivalent_owned.recovered_context_arguments);
+    try std.testing.expectEqualSlices(ir.ValueId, &incoming_arguments, equivalent_owned.arguments.?);
+
+    var malformed_arguments = incoming_arguments[0..3].*;
+    var malformed_blocks = blocks;
+    malformed_blocks[predecessor.index()].terminator = .{ .jump = .{
+        .target = target,
+        .arguments = &malformed_arguments,
+    } };
+    var malformed_program = program;
+    malformed_program.blocks = &malformed_blocks;
+    var malformed_analysis = try cfg.Analysis.init(std.testing.allocator, &malformed_program, function);
+    defer malformed_analysis.deinit();
+    var malformed_builder = builder;
+    malformed_builder.analysis = &malformed_analysis;
+    try std.testing.expect((try malformed_builder.visitedEntryContinuationProjection(
+        node,
+        target,
+        null,
+        null,
+    )) == null);
+
+    var tampered_arguments = incoming_arguments;
+    tampered_arguments[1] = condition;
+    var tampered_blocks = blocks;
+    tampered_blocks[predecessor.index()].terminator = .{ .jump = .{
+        .target = target,
+        .arguments = &tampered_arguments,
+    } };
+    var tampered_program = program;
+    tampered_program.blocks = &tampered_blocks;
+    var tampered_analysis = try cfg.Analysis.init(std.testing.allocator, &tampered_program, function);
+    defer tampered_analysis.deinit();
+    var tampered_builder = builder;
+    tampered_builder.analysis = &tampered_analysis;
+    try std.testing.expect((try tampered_builder.visitedEntryContinuationProjection(
+        node,
+        target,
+        null,
+        null,
+    )) == null);
+
+    var ambiguous_blocks = blocks;
+    ambiguous_blocks[owner.index()].terminator = .{ .branch = .{
+        .condition = condition,
+        .then_edge = .{ .target = predecessor },
+        .else_edge = .{ .target = alternate },
+    } };
+    var ambiguous_function = function;
+    ambiguous_function.blocks = &.{ entry, producer, owner, predecessor, target, body, exit, stop, alternate };
+    var ambiguous_program = program;
+    ambiguous_program.functions = &.{ambiguous_function};
+    ambiguous_program.blocks = &ambiguous_blocks;
+    var ambiguous_analysis = try cfg.Analysis.init(std.testing.allocator, &ambiguous_program, ambiguous_function);
+    defer ambiguous_analysis.deinit();
+    var ambiguous_builder = builder;
+    ambiguous_builder.analysis = &ambiguous_analysis;
+    var ambiguous_nodes = [_]Node{ .{ .block = predecessor }, .{ .block = alternate } };
+    var ambiguous_then_region = Region{ .nodes = &ambiguous_nodes, .stop = target, .loop_exit = null };
+    var ambiguous_empty_nodes = [_]Node{};
+    var ambiguous_else_region = Region{ .nodes = &ambiguous_empty_nodes, .stop = target, .loop_exit = null };
+    var ambiguous_node = node;
+    ambiguous_node.branch.then_region = &ambiguous_then_region;
+    ambiguous_node.branch.else_region = &ambiguous_else_region;
+    try std.testing.expect((try ambiguous_builder.visitedEntryContinuationProjection(
+        ambiguous_node,
+        target,
+        null,
+        null,
+    )) == null);
+}
+
 fn nodeIncomingEdgesAlloc(
     allocator: std.mem.Allocator,
     analysis: *const cfg.Analysis,
@@ -2887,6 +3538,108 @@ test "nested structured continuation projection uses the owned incoming edge" {
         incoming,
         &wrong_arguments,
     ) == null);
+}
+
+test "builder consumes arbitrary parameterized continuation projection" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const target = ir.BlockId.fromIndex(1);
+    const reentry = ir.BlockId.fromIndex(2);
+    const owner_first = ir.ValueId.fromIndex(0);
+    const owner_second = ir.ValueId.fromIndex(1);
+    const formal_first = ir.ValueId.fromIndex(2);
+    const formal_second = ir.ValueId.fromIndex(3);
+    const condition = ir.ValueId.fromIndex(4);
+    const expected = [_]ir.ValueId{ owner_first, owner_second };
+    const actual = [_]ir.ValueId{ formal_first, formal_second };
+    const target_parameters = [_]ir.ValueId{ formal_first, formal_second };
+
+    const values = [_]ir.Value{
+        .{ .id = owner_first, .function = function_id, .type = .integer, .origin = .{ .parameter = 0 } },
+        .{ .id = owner_second, .function = function_id, .type = .integer, .origin = .{ .parameter = 1 } },
+        .{ .id = formal_first, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = target, .index = 0 } } },
+        .{ .id = formal_second, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = target, .index = 1 } } },
+        .{ .id = condition, .function = function_id, .type = .boolean, .origin = .{ .parameter = 2 } },
+    };
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = condition,
+            .then_edge = .{ .target = target, .arguments = expected[0..] },
+            .else_edge = .{ .target = reentry },
+        } } },
+        .{ .id = target, .function = function_id, .parameters = target_parameters[0..], .terminator = .{ .return_values = &.{} } },
+        .{ .id = reentry, .function = function_id, .terminator = .{ .jump = .{ .target = target, .arguments = actual[0..] } } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &.{ owner_first, owner_second, condition },
+        .blocks = &.{ entry, target, reentry },
+        .entry_block = entry,
+    };
+    const program = ir.Program{
+        .program_id = "builder-arbitrary-parameterized-projection",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+    };
+
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, function);
+    defer analysis.deinit();
+    const loop_headers = try natural_loop.headerCandidatesAlloc(std.testing.allocator, &analysis);
+    defer std.testing.allocator.free(loop_headers);
+    var replay_context = try structural_overlap.ReplayProjectionContext.initForFunction(
+        std.testing.allocator,
+        &program,
+        function_id,
+    );
+    defer replay_context.deinit();
+    var visited = [_]bool{ false, false, false };
+    var contexts = [_]?Builder.VisitContext{ null, null, null };
+    var builder: Builder = .{
+        .allocator = std.testing.allocator,
+        .analysis = &analysis,
+        .visited = &visited,
+        .visited_contexts = &contexts,
+        .loop_headers = loop_headers,
+        .replay_context = &replay_context,
+    };
+    const incoming = ir.CfgEdgeRef{ .source = reentry, .kind = .jump, .target = target };
+    try std.testing.expect(!try builder.hasAuthenticatedContinuationBridge(incoming));
+    try std.testing.expect(!try replay_context.hasAuthenticatedIterationContextualProjectionForEdge(
+        &analysis,
+        incoming,
+        expected[0..],
+    ));
+    try std.testing.expect(try builder.hasAuthenticatedContinuationBridgeForExpectedParameters(
+        incoming,
+        expected[0..],
+    ));
+
+    var tampered_blocks = blocks;
+    tampered_blocks[entry.index()].terminator = .{ .branch = .{
+        .condition = condition,
+        .then_edge = .{ .target = target, .arguments = actual[0..] },
+        .else_edge = .{ .target = reentry },
+    } };
+    var tampered_program = program;
+    tampered_program.blocks = &tampered_blocks;
+    var tampered_analysis = try cfg.Analysis.init(std.testing.allocator, &tampered_program, function);
+    defer tampered_analysis.deinit();
+    var tampered_replay_context = try structural_overlap.ReplayProjectionContext.initForFunction(
+        std.testing.allocator,
+        &tampered_program,
+        function_id,
+    );
+    defer tampered_replay_context.deinit();
+    var tampered_builder = builder;
+    tampered_builder.analysis = &tampered_analysis;
+    tampered_builder.replay_context = &tampered_replay_context;
+    try std.testing.expect(!try tampered_builder.hasAuthenticatedContinuationBridgeForExpectedParameters(
+        incoming,
+        expected[0..],
+    ));
 }
 
 fn regionFallsThroughTo(program: *const ir.Program, region: *const Region, target: ir.BlockId) bool {
