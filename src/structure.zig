@@ -1856,6 +1856,513 @@ const Builder = struct {
         return result;
     }
 
+    // A parameterized branch header can be revisited from its own region
+    // after an effectful nested path produces a distinct tuple.  This is a
+    // loop-carried state transfer, not ordinary parameter equality: require
+    // a canonical formal tuple, a genuine SCC backedge, one exact owner
+    // entry, and the existing solver-neutral replay proof for that edge.
+    fn authenticatedSameContextDistinctParameterizedReentry(
+        self: *Builder,
+        current: ir.BlockId,
+        start: ir.BlockId,
+        stop: ?ir.BlockId,
+        loop_exit: ?ir.BlockId,
+        continue_target: ?ir.BlockId,
+        context: VisitContext,
+        parameters_match: bool,
+        incoming: ?ir.CfgEdgeRef,
+    ) BuildError!bool {
+        if (parameters_match or current != start or context.start != current or
+            context.stop != stop or context.loop_exit != loop_exit or
+            context.continue_target != continue_target)
+        {
+            return false;
+        }
+
+        const reference = incoming orelse return false;
+        if (reference.target != current or
+            !try self.analysis.canReach(current, reference.source) or
+            !try self.analysis.canReach(reference.source, current))
+        {
+            return false;
+        }
+        if (current.index() >= self.analysis.program.blocks.len) return false;
+        const block = self.analysis.program.blocks[current.index()];
+        if (block.id != current or block.parameters.len == 0 or
+            !node_split.parametersAreCanonical(self.analysis.program.values, block))
+        {
+            return false;
+        }
+
+        const expected = context.parameter_arguments orelse return false;
+        if (expected.len != block.parameters.len) return false;
+        const incoming_edge = cfg_edge.value(self.analysis.program, reference) orelse return false;
+        if (incoming_edge.target != current or
+            incoming_edge.arguments.len != block.parameters.len or
+            std.mem.eql(ir.ValueId, expected, incoming_edge.arguments))
+        {
+            return false;
+        }
+
+        var owner_reference = context.entry_reference;
+        if (owner_reference == null) {
+            var recovered: ?ir.CfgEdgeRef = null;
+            for (0..self.analysis.predecessorCount(current)) |predecessor_index| {
+                const predecessor = self.analysis.predecessorAt(current, predecessor_index) orelse continue;
+                if (!self.analysis.isReachable(predecessor) or
+                    try self.analysis.canReach(current, predecessor)) continue;
+                const candidate = directEdgeReference(
+                    self.analysis.program,
+                    .{ .block = predecessor },
+                    current,
+                ) orelse continue;
+                const candidate_edge = cfg_edge.value(self.analysis.program, candidate) orelse continue;
+                if (!std.mem.eql(ir.ValueId, candidate_edge.arguments, expected)) continue;
+                if (recovered != null) return false;
+                recovered = candidate;
+            }
+            owner_reference = recovered;
+        }
+        const owner = owner_reference orelse return false;
+        if (owner.target != current or std.meta.eql(owner, reference)) return false;
+        const owner_edge = cfg_edge.value(self.analysis.program, owner) orelse return false;
+        if (owner_edge.target != current or
+            owner_edge.arguments.len != block.parameters.len or
+            !std.mem.eql(ir.ValueId, owner_edge.arguments, expected) or
+            std.mem.eql(ir.ValueId, owner_edge.arguments, incoming_edge.arguments))
+        {
+            return false;
+        }
+
+        const replay = self.replay_context orelse return false;
+        const result = try replay.hasAuthenticatedParameterizedContinuationProjectionForEdge(
+            self.analysis,
+            reference,
+            owner_edge.arguments,
+        );
+        structural_overlap.traceStructural(
+            "structural_phase same_context_parameterized_reentry current={} owner_source={} incoming_source={} result={} owner_arguments={any} incoming_arguments={any}\n",
+            .{
+                current.index(),
+                owner.source.index(),
+                reference.source.index(),
+                result,
+                owner_edge.arguments,
+                incoming_edge.arguments,
+            },
+        );
+        return result;
+    }
+
+    // A structured loop transfer can first visit a parameterized block after
+    // the original traversal edge was cleared. Recover the owner edge only
+    // when the live CFG has exactly one reachable predecessor outside the
+    // current SCC and its complete tuple differs from the incoming edge.
+    // Ambiguous or same-tuple predecessors remain unauthenticated.
+    fn recoverUniqueOwnerEntryReference(
+        self: *Builder,
+        current: ir.BlockId,
+        context: VisitContext,
+        incoming: ir.CfgEdgeRef,
+    ) BuildError!?ir.CfgEdgeRef {
+        if (incoming.target != current) return null;
+        if (isParameterizedNumericTransitionHeader(self.analysis.program, current) and
+            self.analysis.predecessorCount(current) > 1)
+        {
+            structural_overlap.traceStructural(
+                "structural_phase owner_edge_recovery_enter current={} context_start={} context_entry_source={?} incoming_source={}\n",
+                .{
+                    current.index(),
+                    context.start.index(),
+                    if (context.entry_reference) |reference| reference.source.index() else null,
+                    incoming.source.index(),
+                },
+            );
+        }
+        if (context.entry_reference) |reference| {
+            return if (reference.target == current) reference else null;
+        }
+        const current_block = if (current.index() < self.analysis.program.blocks.len)
+            self.analysis.program.blocks[current.index()]
+        else
+            return null;
+        if (current_block.id != current or current_block.parameters.len == 0) return null;
+        const incoming_edge = cfg_edge.value(self.analysis.program, incoming) orelse return null;
+        const trace_owner_candidates = isParameterizedNumericTransitionHeader(self.analysis.program, current) and
+            self.analysis.predecessorCount(current) > 1 and
+            try self.analysis.canReach(current, incoming.source) and
+            try self.analysis.canReach(incoming.source, current);
+        // A loop can leave a parameterized continuation through several
+        // authenticated arms after the structured traversal has cleared its
+        // transient entry tuple. Those arms are interchangeable only when
+        // they are direct rewrites of the same canonical target in one split
+        // group. Keep the ordinary unique-owner rule for every other shape.
+        const allow_shared_node_split_arms =
+            isParameterizedNumericTransitionHeader(self.analysis.program, current) and
+            context.parameter_arguments == null;
+        var shared_node_split_source: ?ir.BlockId = null;
+        var shared_node_split_group: ?ir.NodeSplitGroupId = null;
+        if (trace_owner_candidates) {
+            structural_overlap.traceStructural(
+                "structural_phase owner_edge_candidates current={} context_start={} incoming_source={} incoming_arguments={any}\n",
+                .{ current.index(), context.start.index(), incoming.source.index(), incoming_edge.arguments },
+            );
+        }
+
+        var recovered: ?ir.CfgEdgeRef = null;
+        for (0..self.analysis.predecessorCount(current)) |predecessor_index| {
+            const predecessor = self.analysis.predecessorAt(current, predecessor_index) orelse continue;
+            const reference = directEdgeReference(
+                self.analysis.program,
+                .{ .block = predecessor },
+                current,
+            ) orelse continue;
+            if (std.meta.eql(reference, incoming) or
+                !self.analysis.isReachable(predecessor) or
+                !try self.analysis.canReach(context.start, predecessor) or
+                (context.start != predecessor and
+                    !try self.analysis.canReachAvoiding(context.start, predecessor, current)) or
+                try self.analysis.canReach(current, predecessor))
+            {
+                if (trace_owner_candidates) {
+                    structural_overlap.traceStructural(
+                        "structural_phase owner_edge_candidate source={} accepted_by_reachability=false context_to_source={} source_to_current={} current_to_source={} arguments={any}\n",
+                        .{
+                            predecessor.index(),
+                            try self.analysis.canReach(context.start, predecessor),
+                            try self.analysis.canReach(predecessor, current),
+                            try self.analysis.canReach(current, predecessor),
+                            (cfg_edge.value(self.analysis.program, reference) orelse continue).arguments,
+                        },
+                    );
+                }
+                continue;
+            }
+            const owner_edge = cfg_edge.value(self.analysis.program, reference) orelse continue;
+            if (trace_owner_candidates) {
+                const iteration_projection = if (self.replay_context) |replay|
+                    try replay.hasAuthenticatedIterationContextualProjectionForEdge(
+                        self.analysis,
+                        incoming,
+                        owner_edge.arguments,
+                    )
+                else
+                    false;
+                const continuation_bridge = try self.hasAuthenticatedContinuationBridge(reference);
+                structural_overlap.traceStructural(
+                    "structural_phase owner_edge_candidate source={} accepted_by_reachability=true continuation_bridge={} iteration_projection={} arguments={any}\n",
+                    .{ predecessor.index(), continuation_bridge, iteration_projection, owner_edge.arguments },
+                );
+            }
+            if (owner_edge.target != current or
+                owner_edge.arguments.len != current_block.parameters.len or
+                owner_edge.arguments.len != incoming_edge.arguments.len or
+                std.mem.eql(ir.ValueId, owner_edge.arguments, incoming_edge.arguments))
+            {
+                continue;
+            }
+            if (allow_shared_node_split_arms) {
+                var found_split_arm = false;
+                var split_source: ?ir.BlockId = null;
+                var split_group: ?ir.NodeSplitGroupId = null;
+                for (self.analysis.program.edge_rewrites) |rewrite| {
+                    if (rewrite.rule != .node_split or
+                        rewrite.source != reference.source or
+                        rewrite.kind != reference.kind or
+                        rewrite.to.target != current or
+                        !std.mem.eql(ir.ValueId, rewrite.to.arguments, owner_edge.arguments) or
+                        rewrite.node_split_group == null)
+                    {
+                        continue;
+                    }
+                    if (found_split_arm) return null;
+                    found_split_arm = true;
+                    split_source = rewrite.from.target;
+                    split_group = rewrite.node_split_group;
+                }
+                if (!found_split_arm) return null;
+                if (shared_node_split_source) |source| {
+                    if (source != split_source.? or shared_node_split_group.? != split_group.?) return null;
+                } else {
+                    shared_node_split_source = split_source;
+                    shared_node_split_group = split_group;
+                }
+            }
+            if (recovered != null and !allow_shared_node_split_arms) return null;
+            recovered = reference;
+        }
+        if (recovered) |reference| {
+            structural_overlap.traceStructural(
+                "structural_phase recovered_unique_owner_edge current={} source={} target={}\\n",
+                .{ current.index(), reference.source.index(), reference.target.index() },
+            );
+        }
+        return recovered;
+    }
+
+    // An already-owned parameterized continuation can be reached as the
+    // empty remainder of a region whose start differs from the owner.  The
+    // ordinary empty projection only accepts a direct clone bridge.  Permit
+    // this loop-carried form when the incoming edge is in the same SCC and
+    // the complete owner tuple is authenticated by replay or iteration
+    // projection.  Reverse reachability is essential: without it, this
+    // would silently erase an acyclic effectful prefix.
+    fn authenticatedSameSccParameterizedReentry(
+        self: *Builder,
+        current: ir.BlockId,
+        start: ir.BlockId,
+        loop_exit: ?ir.BlockId,
+        continue_target: ?ir.BlockId,
+        context: VisitContext,
+        parameters_match: bool,
+        incoming: ?ir.CfgEdgeRef,
+    ) BuildError!bool {
+        if (context.start == start or
+            context.loop_exit != loop_exit or
+            context.continue_target != continue_target)
+        {
+            return false;
+        }
+        const reference = incoming orelse return false;
+        if (reference.target != current or
+            !try self.analysis.canReach(current, reference.source))
+        {
+            return false;
+        }
+        if (current.index() >= self.analysis.program.blocks.len) return false;
+        const block = self.analysis.program.blocks[current.index()];
+        if (block.id != current or block.parameters.len == 0 or
+            !node_split.parametersAreCanonical(self.analysis.program.values, block))
+        {
+            return false;
+        }
+        const owner_reference = (try self.recoverUniqueOwnerEntryReference(
+            current,
+            context,
+            reference,
+        )) orelse return false;
+        const owner_edge = cfg_edge.value(self.analysis.program, owner_reference) orelse return false;
+        const incoming_edge = cfg_edge.value(self.analysis.program, reference) orelse return false;
+        if (owner_edge.target != current or
+            owner_edge.arguments.len != block.parameters.len or
+            incoming_edge.target != current or
+            incoming_edge.arguments.len != block.parameters.len)
+        {
+            return false;
+        }
+        // A numeric transition has a stronger solver-neutral witness than a
+        // generic continuation bridge: its complete owner tuple is replayed
+        // through the transition's normalized result tuple. Reuse that proof
+        // for a distinct-tuple same-SCC reentry after the surrounding
+        // ownership and reverse-reachability checks above have authenticated
+        // the boundary.
+        if (!parameters_match and
+            try self.authenticatedDistinctNumericTuple(current, context, reference, parameters_match))
+        {
+            return true;
+        }
+        // A nested numeric loop can carry a fresh tuple through a
+        // parameterized carrier before returning to an already-owned outer
+        // header. The carrier proof is independent of the enclosing stop,
+        // but it must still agree with the owner context's exact entry tuple
+        // when that tuple survived the structured handoff. A shared split-arm
+        // handoff has no single owner tuple; the carrier proof authenticates
+        // the incoming state directly in that bounded case.
+        if (!parameters_match and isParameterizedNumericTransitionHeader(self.analysis.program, current)) {
+            if (context.parameter_arguments) |expected| {
+                if (std.mem.eql(ir.ValueId, expected, owner_edge.arguments)) {
+                    const replay = self.replay_context orelse return false;
+                    if (try replay.hasAuthenticatedNumericIterationCarrierReentryForEdge(
+                        self.analysis,
+                        current,
+                        reference,
+                    )) return true;
+                }
+            } else {
+                const replay = self.replay_context orelse return false;
+                if (try replay.hasAuthenticatedNumericIterationCarrierReentryForEdge(
+                    self.analysis,
+                    current,
+                    reference,
+                )) return true;
+            }
+        }
+        self.trace_bridge_calls += 1;
+        const bridge_start = structural_overlap.structuralPhaseNow();
+        const result = if (parameters_match)
+            try self.hasAuthenticatedContinuationBridgeForExpectedParameters(
+                reference,
+                context.parameter_arguments,
+            )
+        else if (isParameterizedNumericTransitionHeader(self.analysis.program, current)) blk: {
+            const replay = self.replay_context orelse break :blk false;
+            break :blk try replay.hasAuthenticatedIterationContextualProjectionForEdge(
+                self.analysis,
+                reference,
+                owner_edge.arguments,
+            );
+        } else if (!std.mem.eql(ir.ValueId, owner_edge.arguments, incoming_edge.arguments)) blk: {
+            // The owner region entered this parameterized block through an
+            // edge-local tuple even though its outer region had no formals.
+            // Require the live reentry to be an authenticated projection of
+            // that exact owner tuple; equality, reachability, and type shape
+            // alone are deliberately insufficient.
+            const replay = self.replay_context orelse break :blk false;
+            break :blk try replay.hasAuthenticatedParameterizedContinuationProjectionForEdge(
+                self.analysis,
+                reference,
+                owner_edge.arguments,
+            );
+        } else false;
+        self.trace_bridge_ms += structural_overlap.structuralPhaseMillis(bridge_start);
+        if (result) return true;
+        if (!parameters_match) return false;
+        const expected = context.parameter_arguments orelse return false;
+        const replay_context = self.replay_context orelse return false;
+        return try replay_context.hasAuthenticatedParameterizedContinuationProjectionForEdge(
+            self.analysis,
+            reference,
+            expected,
+        );
+    }
+
+    // A cloned effectful prefix can enter an already-owned parameterized
+    // header from outside that header's SCC. Preserve the prefix nodes and
+    // reuse only the authenticated header handoff; SCC reachability is not
+    // sufficient for this case.
+    fn authenticatedParameterizedCloneHandoffReentry(
+        self: *Builder,
+        current: ir.BlockId,
+        start: ir.BlockId,
+        stop: ?ir.BlockId,
+        loop_exit: ?ir.BlockId,
+        continue_target: ?ir.BlockId,
+        context: VisitContext,
+        parameters_match: bool,
+        direct_projection: bool,
+        incoming: ?ir.CfgEdgeRef,
+    ) BuildError!bool {
+        if (parameters_match or
+            !direct_projection or
+            current == start or
+            context.start == start or
+            context.start == current or
+            context.stop == stop or
+            context.loop_exit != loop_exit or
+            context.continue_target != continue_target)
+        {
+            return false;
+        }
+
+        const reference = incoming orelse return false;
+        if (reference.target != current) return false;
+        const owner_reference = (try self.recoverUniqueOwnerEntryReference(
+            current,
+            context,
+            reference,
+        )) orelse return false;
+        const owner_arguments = context.parameter_arguments orelse return false;
+        const owner_edge = cfg_edge.value(self.analysis.program, owner_reference) orelse return false;
+        if (!std.mem.eql(ir.ValueId, owner_arguments, owner_edge.arguments)) return false;
+        const replay_context = self.replay_context orelse return false;
+        return try replay_context.hasAuthenticatedParameterizedCloneHandoffForEdge(
+            self.analysis,
+            owner_reference,
+            reference,
+        );
+    }
+
+    // A parameterized numeric header can be revisited from a different
+    // region start while retaining the same enclosing stop. This is only a
+    // loop-carried state transfer: require a direct entry projection, a
+    // distinct tuple, a genuine SCC edge, and the owner/tuple proof above.
+    fn authenticatedSameStopDistinctNumericReentry(
+        self: *Builder,
+        current: ir.BlockId,
+        start: ir.BlockId,
+        stop: ?ir.BlockId,
+        loop_exit: ?ir.BlockId,
+        continue_target: ?ir.BlockId,
+        context: VisitContext,
+        parameters_match: bool,
+        direct_projection: bool,
+        incoming: ?ir.CfgEdgeRef,
+    ) BuildError!bool {
+        if (parameters_match or
+            !direct_projection or
+            current == start or
+            context.start == start or
+            context.start == current or
+            context.stop != stop or
+            context.loop_exit != loop_exit or
+            context.continue_target != continue_target or
+            !isParameterizedNumericTransitionHeader(self.analysis.program, current))
+        {
+            return false;
+        }
+
+        const reference = incoming orelse return false;
+        if (reference.target != current or
+            !try self.analysis.canReach(current, reference.source) or
+            !try self.analysis.canReach(reference.source, current))
+        {
+            return false;
+        }
+        return try self.authenticatedSameSccParameterizedReentry(
+            current,
+            start,
+            loop_exit,
+            continue_target,
+            context,
+            parameters_match,
+            reference,
+        );
+    }
+
+    // A nonempty region can revisit an already-owned numeric transition from
+    // the transition's own context without changing its enclosing boundary.
+    // Keep this exception narrower than the general same-SCC predicate: the
+    // current block must be a parameterized numeric header, the incoming edge
+    // must be in the same SCC, and the existing owner/tuple proof must pass.
+    fn authenticatedSameBoundaryNumericReentry(
+        self: *Builder,
+        current: ir.BlockId,
+        start: ir.BlockId,
+        stop: ?ir.BlockId,
+        loop_exit: ?ir.BlockId,
+        continue_target: ?ir.BlockId,
+        context: VisitContext,
+        parameters_match: bool,
+        incoming: ?ir.CfgEdgeRef,
+    ) BuildError!bool {
+        if (context.start != current or
+            start == current or
+            context.stop != stop or
+            context.loop_exit != loop_exit or
+            context.continue_target != continue_target or
+            !parameters_match or
+            !isParameterizedNumericTransitionHeader(self.analysis.program, current))
+        {
+            return false;
+        }
+        const reference = incoming orelse return false;
+        if (reference.target != current or
+            !try self.analysis.canReach(current, reference.source) or
+            !try self.analysis.canReach(reference.source, current))
+        {
+            return false;
+        }
+        return try self.authenticatedSameSccParameterizedReentry(
+            current,
+            start,
+            loop_exit,
+            continue_target,
+            context,
+            parameters_match,
+            reference,
+        );
+    }
+
     // A numeric header owned by the current region may be re-entered from a
     // distinct internal tuple without changing its enclosing boundary. The
     // reentry may be reached from another region start or from the header's
@@ -2090,6 +2597,179 @@ const Builder = struct {
         try std.testing.expect(!(try internalDistinctNumericReentryWitness(.acyclic)));
         try std.testing.expect(!(try internalDistinctNumericReentryWitness(.noncanonical_carrier)));
         try std.testing.expect(!(try internalDistinctNumericReentryWitness(.mismatched_carrier_tuple)));
+    }
+
+    // A parameterized numeric header can already be owned by the current
+    // region while an effectful prefix reaches it with a distinct SSA tuple.
+    // Reuse this entry only when the prefix is acyclic relative to the header
+    // and the existing replay proof authenticates the complete tuple.
+    fn authenticatedSameContextDistinctNumericReentry(
+        self: *Builder,
+        current: ir.BlockId,
+        start: ir.BlockId,
+        stop: ?ir.BlockId,
+        loop_exit: ?ir.BlockId,
+        continue_target: ?ir.BlockId,
+        context: VisitContext,
+        parameters_match: bool,
+        incoming: ?ir.CfgEdgeRef,
+    ) BuildError!bool {
+        if (!parameters_match or
+            current == start or
+            context.start != start or
+            context.stop != stop or
+            context.loop_exit != loop_exit or
+            context.continue_target != continue_target or
+            !isParameterizedNumericTransitionHeader(self.analysis.program, current))
+        {
+            return false;
+        }
+
+        const reference = incoming orelse return false;
+        if (reference.target != current or
+            !try self.analysis.canReach(start, reference.source) or
+            try self.analysis.canReach(current, reference.source))
+        {
+            return false;
+        }
+
+        if (current.index() >= self.analysis.program.blocks.len) return false;
+        const block = self.analysis.program.blocks[current.index()];
+        if (block.id != current or
+            block.function != self.analysis.function.id or
+            block.parameters.len == 0 or
+            !node_split.parametersAreCanonical(self.analysis.program.values, block))
+        {
+            return false;
+        }
+
+        const expected = context.parameter_arguments orelse return false;
+        if (expected.len != block.parameters.len) return false;
+        const edge = cfg_edge.value(self.analysis.program, reference) orelse return false;
+        if (edge.target != current or
+            edge.arguments.len != block.parameters.len or
+            std.mem.eql(ir.ValueId, expected, edge.arguments))
+        {
+            return false;
+        }
+
+        const replay_context = self.replay_context orelse return false;
+        return try replay_context.hasAuthenticatedParameterizedContinuationProjectionForEdge(
+            self.analysis,
+            reference,
+            expected,
+        );
+    }
+
+    // A numeric header can be reached again from an already-owned prefix in
+    // the same visit context with the same canonical entry tuple.  This is a
+    // projection of the existing loop, not a second execution of its header:
+    // require the prefix to be reachable from the region start and require
+    // the header to be unable to reach back into that prefix.
+    fn authenticatedSameContextNumericReentry(
+        self: *Builder,
+        current: ir.BlockId,
+        start: ir.BlockId,
+        stop: ?ir.BlockId,
+        loop_exit: ?ir.BlockId,
+        continue_target: ?ir.BlockId,
+        context: VisitContext,
+        parameters_match: bool,
+        direct_projection: bool,
+        incoming: ?ir.CfgEdgeRef,
+    ) BuildError!bool {
+        if (!direct_projection or
+            !parameters_match or
+            current == start or
+            context.start != start or
+            context.stop != stop or
+            context.loop_exit != loop_exit or
+            context.continue_target != continue_target or
+            !isParameterizedNumericTransitionHeader(self.analysis.program, current))
+        {
+            return false;
+        }
+
+        const reference = incoming orelse return false;
+        if (reference.target != current or
+            !try self.analysis.canReach(start, reference.source) or
+            try self.analysis.canReach(current, reference.source))
+        {
+            return false;
+        }
+
+        if (current.index() >= self.analysis.program.blocks.len) return false;
+        const block = self.analysis.program.blocks[current.index()];
+        if (block.id != current or
+            block.function != self.analysis.function.id or
+            block.parameters.len == 0 or
+            !node_split.parametersAreCanonical(self.analysis.program.values, block))
+        {
+            return false;
+        }
+
+        const expected = context.parameter_arguments orelse return false;
+        const edge = cfg_edge.value(self.analysis.program, reference) orelse return false;
+        return edge.target == current and
+            edge.arguments.len == block.parameters.len and
+            std.mem.eql(ir.ValueId, expected, edge.arguments);
+    }
+
+    // A numeric transition can be reached from a different region start
+    // inside the same enclosing boundary while remaining in the header's SCC.
+    // This is a loop-carried state projection, not ordinary same-context
+    // reuse: require a direct continuation edge and the complete contextual
+    // iteration proof before transferring ownership.
+    fn authenticatedSameSccNumericReentry(
+        self: *Builder,
+        current: ir.BlockId,
+        start: ir.BlockId,
+        stop: ?ir.BlockId,
+        loop_exit: ?ir.BlockId,
+        continue_target: ?ir.BlockId,
+        context: VisitContext,
+        parameters_match: bool,
+        direct_projection: bool,
+        incoming: ?ir.CfgEdgeRef,
+    ) BuildError!bool {
+        if (!direct_projection or
+            !parameters_match or
+            current == start or
+            context.start == start or
+            context.start == current or
+            context.stop != stop or
+            context.loop_exit != loop_exit or
+            context.continue_target != continue_target or
+            !isParameterizedNumericTransitionHeader(self.analysis.program, current))
+        {
+            return false;
+        }
+
+        const reference = incoming orelse return false;
+        if (reference.target != current or
+            !try self.analysis.canReach(current, reference.source) or
+            !try self.analysis.canReach(reference.source, current))
+        {
+            return false;
+        }
+
+        const expected = context.parameter_arguments orelse return false;
+        const replay_context = self.replay_context orelse return false;
+        if (!try replay_context.hasAuthenticatedIterationContextualProjectionForEdge(
+            self.analysis,
+            reference,
+            expected,
+        )) return false;
+
+        return try self.authenticatedSameSccParameterizedReentry(
+            current,
+            start,
+            loop_exit,
+            continue_target,
+            context,
+            parameters_match,
+            reference,
+        );
     }
 
     // A zero-parameter loop header may be reached again from an internal
@@ -2584,6 +3264,44 @@ const Builder = struct {
             true,
             incoming,
         );
+    }
+
+    // A parameterized empty block that forwards its exact formal tuple is a
+    // semantic identity. It may be reused across enclosing stop boundaries
+    // without a clone bridge because it performs no work and cannot alter the
+    // carried values. The successor still remains owned by the active region.
+    fn identityParameterizedContinuationContextMatches(
+        self: *const Builder,
+        current: ir.BlockId,
+        start: ir.BlockId,
+        stop: ?ir.BlockId,
+        loop_exit: ?ir.BlockId,
+        continue_target: ?ir.BlockId,
+        context: VisitContext,
+        parameters_match: bool,
+        arguments: ?[]const ir.ValueId,
+    ) bool {
+        if (!parameters_match or current != start or context.start != start or
+            stop == null or context.stop == stop or context.loop_exit != loop_exit or
+            context.continue_target != continue_target)
+        {
+            return false;
+        }
+        const current_arguments = arguments orelse return false;
+        if (current.index() >= self.analysis.program.blocks.len) return false;
+        const block = self.analysis.program.blocks[current.index()];
+        if (block.id != current or block.parameters.len == 0 or
+            current_arguments.len != block.parameters.len or
+            !node_split.parametersAreCanonical(self.analysis.program.values, block))
+        {
+            return false;
+        }
+        return switch (block.terminator) {
+            .jump => |edge| edge.target != current and
+                edge.arguments.len == block.parameters.len and
+                std.mem.eql(ir.ValueId, edge.arguments, block.parameters),
+            .branch, .return_values, .return_pack, .return_expanded, .throw_error, .unreachable_block => false,
+        };
     }
 
     // A branch join can clear the live incoming edge while retaining the
@@ -4199,6 +4917,97 @@ test "non-header parameterized continuation recovers one authenticated nested in
         null,
         null,
     )) == null);
+}
+
+test "same-entry identity parameterized forwarder projects without a clone bridge" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const owner = ir.BlockId.fromIndex(0);
+    const target = ir.BlockId.fromIndex(1);
+    const suffix = ir.BlockId.fromIndex(2);
+    const owner_stop = ir.BlockId.fromIndex(3);
+    const current_stop = ir.BlockId.fromIndex(4);
+    const condition = ir.ValueId.fromIndex(0);
+    const argument = ir.ValueId.fromIndex(1);
+    const target_parameter = ir.ValueId.fromIndex(2);
+    const arguments = [_]ir.ValueId{argument};
+    const target_arguments = [_]ir.ValueId{target_parameter};
+
+    var blocks = [_]ir.Block{
+        .{ .id = owner, .function = function_id, .terminator = .{ .branch = .{
+            .condition = condition,
+            .then_edge = .{ .target = target, .arguments = &arguments },
+            .else_edge = .{ .target = owner_stop },
+        } } },
+        .{ .id = target, .function = function_id, .parameters = &.{target_parameter}, .terminator = .{ .jump = .{
+            .target = suffix,
+            .arguments = &target_arguments,
+        } } },
+        .{ .id = suffix, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = owner_stop, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = current_stop, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &.{ condition, argument },
+        .blocks = &.{ owner, target, suffix, owner_stop, current_stop },
+        .entry_block = owner,
+    };
+    const values = [_]ir.Value{
+        .{ .id = condition, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = argument, .function = function_id, .origin = .{ .parameter = 1 } },
+        .{ .id = target_parameter, .function = function_id, .origin = .{ .block_parameter = .{ .block = target, .index = 0 } } },
+    };
+    var program = ir.Program{
+        .program_id = "identity-parameterized-forwarder",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, function);
+    defer analysis.deinit();
+    const loop_headers = try natural_loop.headerCandidatesAlloc(std.testing.allocator, &analysis);
+    defer std.testing.allocator.free(loop_headers);
+
+    var visited = [_]bool{ false, true, false, false, false };
+    var contexts = [_]?Builder.VisitContext{ null, .{
+        .start = target,
+        .stop = owner_stop,
+        .loop_exit = null,
+        .continue_target = null,
+        .parameter_arguments = &arguments,
+    }, null, null, null };
+    const context = contexts[target.index()].?;
+    var builder: Builder = .{
+        .allocator = std.testing.allocator,
+        .analysis = &analysis,
+        .visited = &visited,
+        .visited_contexts = &contexts,
+        .loop_headers = loop_headers,
+    };
+    try std.testing.expect(builder.identityParameterizedContinuationContextMatches(
+        target,
+        target,
+        current_stop,
+        null,
+        null,
+        context,
+        true,
+        &arguments,
+    ));
+
+    blocks[target.index()].terminator = .{ .jump = .{ .target = suffix, .arguments = &.{argument} } };
+    try std.testing.expect(!builder.identityParameterizedContinuationContextMatches(
+        target,
+        target,
+        current_stop,
+        null,
+        null,
+        context,
+        true,
+        &arguments,
+    ));
 }
 
 fn regionFallsThroughTo(program: *const ir.Program, region: *const Region, target: ir.BlockId) bool {
