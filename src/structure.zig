@@ -3348,6 +3348,217 @@ const Builder = struct {
         return selected != null;
     }
 
+    // A previously owned parameterized continuation may also be reached after
+    // a nonempty prefix. Reuse that entry only when the prefix already owns an
+    // exact incoming-edge projection and the edge is an authenticated clone
+    // bridge or complete iteration-context projection. This composes the
+    // prefix with the existing continuation without treating an effectful or
+    // value-carrying block as transparent.
+    fn authenticatedVisitedParameterizedContinuationProjection(
+        self: *Builder,
+        current: ir.BlockId,
+        start: ir.BlockId,
+        stop: ?ir.BlockId,
+        loop_exit: ?ir.BlockId,
+        continue_target: ?ir.BlockId,
+        context: VisitContext,
+        parameters_match: bool,
+        arguments: ?[]const ir.ValueId,
+        incoming: ?ir.CfgEdgeRef,
+        projection_available: bool,
+        entry_authenticated: bool,
+    ) BuildError!bool {
+        if (!projection_available or context.start == start or
+            context.loop_exit != loop_exit)
+        {
+            return false;
+        }
+        const authenticated_iteration_entry = entry_authenticated and
+            isParameterizedNumericTransitionHeader(self.analysis.program, current);
+        const distinct_numeric_tuple = try self.authenticatedDistinctNumericTuple(
+            current,
+            context,
+            incoming,
+            parameters_match,
+        );
+        if (!parameters_match and !distinct_numeric_tuple) return false;
+
+        if (context.start == current) {
+            if (context.stop == stop and context.continue_target == continue_target) return false;
+        } else {
+            const owner_arguments = context.parameter_arguments orelse return false;
+            if (owner_arguments.len == 0 or !try self.analysis.canReach(context.start, current)) return false;
+            if (!authenticated_iteration_entry and
+                (try self.canReachWithoutContinuationBoundary(current, context.start, continue_target) or
+                    try self.canReachWithoutContinuationBoundary(current, start, continue_target)))
+            {
+                return false;
+            }
+        }
+
+        const current_arguments = arguments orelse return false;
+        if (current.index() >= self.analysis.program.blocks.len) return false;
+        const block = self.analysis.program.blocks[current.index()];
+        if (block.id != current or block.parameters.len == 0 or
+            current_arguments.len != block.parameters.len or
+            !node_split.parametersAreCanonical(self.analysis.program.values, block))
+        {
+            return false;
+        }
+
+        const reference = incoming orelse return false;
+        if (reference.target != current) return false;
+        self.trace_bridge_calls += 1;
+        const bridge_start = structural_overlap.structuralPhaseNow();
+        const result = if (authenticated_iteration_entry or distinct_numeric_tuple)
+            true
+        else
+            try self.hasAuthenticatedContinuationBridgeForExpectedParameters(
+                reference,
+                context.parameter_arguments,
+            );
+        self.trace_bridge_ms += structural_overlap.structuralPhaseMillis(bridge_start);
+        return result;
+    }
+
+    // A same-entry region may be revisited with a different stop only when
+    // the entry contributes no values, effects, or control decision. A plain
+    // empty jump is a transparent ownership boundary; its outgoing edge may
+    // carry a canonical tuple into the successor. An empty branch or terminal
+    // block still changes control flow and must remain a collision.
+    fn transparentEmptyContinuationContextMatches(
+        self: *const Builder,
+        current: ir.BlockId,
+        start: ir.BlockId,
+        stop: ?ir.BlockId,
+        context: VisitContext,
+        parameters_match: bool,
+    ) bool {
+        if (!parameters_match or current != start or context.start != start or
+            stop == null or context.stop == null or context.stop == stop)
+        {
+            return false;
+        }
+        return self.transparentEmptyJumpWithCanonicalSuccessor(current);
+    }
+
+    // An empty forwarder may be the final boundary of an earlier ownership
+    // context. Reuse that boundary across a different loop context only when
+    // the owner had no loop controls and the forwarder lands exactly on the
+    // owner's stop. This keeps ordinary control-context mismatches as
+    // collisions while admitting a proof-backed empty stop crossing.
+    fn transparentEmptyOwnedStopContextMatches(
+        self: *const Builder,
+        current: ir.BlockId,
+        start: ir.BlockId,
+        stop: ?ir.BlockId,
+        context: VisitContext,
+        parameters_match: bool,
+    ) bool {
+        if (!parameters_match or current != start or context.start != start or
+            stop == null or context.stop == null or context.stop == stop or
+            context.stop == current or context.loop_exit != null or
+            context.continue_target != null)
+        {
+            return false;
+        }
+        if (!self.transparentEmptyJumpWithCanonicalSuccessor(current)) return false;
+        const block = self.analysis.program.blocks[current.index()];
+        const outgoing = switch (block.terminator) {
+            .jump => |edge| edge,
+            else => return false,
+        };
+        return outgoing.target == context.stop.?;
+    }
+
+    // The same owner-stop proof applies after a nonempty prefix has already
+    // been emitted.  The current block must be the previously owned empty
+    // entry itself; its owner had no loop controls, and its canonical jump
+    // must land exactly on the owner's stop.  The caller preserves the live
+    // edge into this block as the projection boundary.
+    fn transparentEmptyOwnedStopAfterPrefixContextMatches(
+        self: *const Builder,
+        current: ir.BlockId,
+        start: ir.BlockId,
+        stop: ?ir.BlockId,
+        context: VisitContext,
+        parameters_match: bool,
+    ) bool {
+        if (!parameters_match or current == start or context.start != current or
+            stop == null or context.stop == null or context.stop == stop or
+            context.stop == current or context.loop_exit != null or
+            context.continue_target != null)
+        {
+            return false;
+        }
+        if (!self.transparentEmptyJumpWithCanonicalSuccessor(current)) return false;
+        const block = self.analysis.program.blocks[current.index()];
+        const outgoing = switch (block.terminator) {
+            .jump => |edge| edge,
+            else => return false,
+        };
+        return outgoing.target == context.stop.?;
+    }
+
+    // An empty forwarder can be the owned entry of a parameterized numeric
+    // transition. Reusing that entry across a different incoming context is
+    // safe only when the forwarder has no state of its own, both contexts
+    // share the same stop, and the incoming path is in the same SCC as the
+    // canonical numeric successor. The direct predecessor projection remains
+    // the caller's additional proof.
+    fn authenticatedEmptyNumericForwarderReentry(
+        self: *const Builder,
+        current: ir.BlockId,
+        start: ir.BlockId,
+        stop: ?ir.BlockId,
+        context: VisitContext,
+        parameters_match: bool,
+        incoming: ?ir.CfgEdgeRef,
+    ) BuildError!bool {
+        if (!parameters_match or current == start or context.start != current or
+            context.stop == null or context.stop != stop or
+            context.loop_exit != null or context.continue_target != null)
+        {
+            return false;
+        }
+
+        const reference = incoming orelse return false;
+        if (reference.target != current or
+            !try self.analysis.canReach(current, reference.source) or
+            !try self.analysis.canReach(reference.source, current))
+        {
+            return false;
+        }
+        if (current.index() >= self.analysis.program.blocks.len) return false;
+        const block = self.analysis.program.blocks[current.index()];
+        if (block.id != current or block.function != self.analysis.function.id or
+            block.parameters.len != 0 or block.instructions.len != 0)
+        {
+            return false;
+        }
+        const incoming_edge = cfg_edge.value(self.analysis.program, reference) orelse return false;
+        if (incoming_edge.target != current or incoming_edge.arguments.len != 0) return false;
+
+        const outgoing = switch (block.terminator) {
+            .jump => |edge| edge,
+            .branch, .return_values, .return_pack, .return_expanded, .throw_error, .unreachable_block => return false,
+        };
+        if (outgoing.target == current or
+            outgoing.target.index() >= self.analysis.program.blocks.len)
+        {
+            return false;
+        }
+        const successor = self.analysis.program.blocks[outgoing.target.index()];
+        if (successor.id != outgoing.target or successor.function != block.function or
+            !isParameterizedNumericTransitionHeader(self.analysis.program, outgoing.target) or
+            !node_split.parametersAreCanonical(self.analysis.program.values, successor) or
+            outgoing.arguments.len != successor.parameters.len)
+        {
+            return false;
+        }
+        return try self.analysis.canReach(outgoing.target, current);
+    }
+
     fn reopenLoopHeader(self: *Builder, header_index: usize) BuildError!void {
         if (header_index >= self.visited.len or !self.visited[header_index] or self.visited_count == 0) return error.UnsupportedShape;
         if (self.validation_generation == std.math.maxInt(usize)) return error.UnsupportedShape;
@@ -4757,6 +4968,561 @@ test "builder consumes arbitrary parameterized continuation projection" {
     ));
 }
 
+test "same-entry numeric reentry accepts contextual state without a node split; same-SCC numeric reentry requires an authenticated loop-carried tuple" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const owner = ir.BlockId.fromIndex(1);
+    const candidate = ir.BlockId.fromIndex(2);
+    const target = ir.BlockId.fromIndex(3);
+    const exit = ir.BlockId.fromIndex(4);
+
+    const selector = ir.ValueId.fromIndex(0);
+    const owner_control = ir.ValueId.fromIndex(1);
+    const owner_limit = ir.ValueId.fromIndex(2);
+    const owner_step = ir.ValueId.fromIndex(3);
+    const owner_initial = ir.ValueId.fromIndex(4);
+    const candidate_control = ir.ValueId.fromIndex(5);
+    const candidate_limit = ir.ValueId.fromIndex(6);
+    const candidate_step = ir.ValueId.fromIndex(7);
+    const candidate_initial = ir.ValueId.fromIndex(8);
+    const target_control = ir.ValueId.fromIndex(9);
+    const target_limit = ir.ValueId.fromIndex(10);
+    const target_step = ir.ValueId.fromIndex(11);
+    const target_initial = ir.ValueId.fromIndex(12);
+    const false_value = ir.ValueId.fromIndex(13);
+    const candidate_has = ir.ValueId.fromIndex(14);
+    const candidate_result_limit = ir.ValueId.fromIndex(15);
+    const candidate_result_step = ir.ValueId.fromIndex(16);
+    const candidate_next = ir.ValueId.fromIndex(17);
+    const target_has = ir.ValueId.fromIndex(18);
+    const target_result_limit = ir.ValueId.fromIndex(19);
+    const target_result_step = ir.ValueId.fromIndex(20);
+    const target_next = ir.ValueId.fromIndex(21);
+    const false_instruction = ir.InstructionId.fromIndex(0);
+    const candidate_instruction = ir.InstructionId.fromIndex(1);
+    const target_instruction = ir.InstructionId.fromIndex(2);
+
+    const expected = [_]ir.ValueId{ owner_control, owner_limit, owner_step, owner_initial };
+    const actual = [_]ir.ValueId{ candidate_next, candidate_result_limit, candidate_result_step, false_value };
+    var blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .instructions = &.{false_instruction}, .terminator = .{ .branch = .{
+            .condition = selector,
+            .then_edge = .{ .target = owner },
+            .else_edge = .{ .target = candidate, .arguments = &expected },
+        } } },
+        .{ .id = owner, .function = function_id, .terminator = .{ .jump = .{
+            .target = target,
+            .arguments = &expected,
+        } } },
+        .{ .id = candidate, .function = function_id, .parameters = &.{ candidate_control, candidate_limit, candidate_step, candidate_initial }, .instructions = &.{candidate_instruction}, .terminator = .{ .branch = .{
+            .condition = candidate_has,
+            .then_edge = .{ .target = target, .arguments = &actual },
+            .else_edge = .{ .target = exit },
+        } } },
+        .{ .id = target, .function = function_id, .parameters = &.{ target_control, target_limit, target_step, target_initial }, .instructions = &.{target_instruction}, .terminator = .{ .branch = .{
+            .condition = target_has,
+            .then_edge = .{ .target = target, .arguments = &.{ target_next, target_result_limit, target_result_step, false_value } },
+            .else_edge = .{ .target = exit },
+        } } },
+        .{ .id = exit, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &.{ selector, owner_control, owner_limit, owner_step, owner_initial },
+        .blocks = &.{ entry, owner, candidate, target, exit },
+        .entry_block = entry,
+    };
+    const values = [_]ir.Value{
+        .{ .id = selector, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = owner_control, .function = function_id, .type = .number, .origin = .{ .parameter = 1 } },
+        .{ .id = owner_limit, .function = function_id, .type = .number, .origin = .{ .parameter = 2 } },
+        .{ .id = owner_step, .function = function_id, .type = .number, .origin = .{ .parameter = 3 } },
+        .{ .id = owner_initial, .function = function_id, .type = .boolean, .origin = .{ .parameter = 4 } },
+        .{ .id = candidate_control, .function = function_id, .origin = .{ .block_parameter = .{ .block = candidate, .index = 0 } } },
+        .{ .id = candidate_limit, .function = function_id, .origin = .{ .block_parameter = .{ .block = candidate, .index = 1 } } },
+        .{ .id = candidate_step, .function = function_id, .origin = .{ .block_parameter = .{ .block = candidate, .index = 2 } } },
+        .{ .id = candidate_initial, .function = function_id, .type = .boolean, .origin = .{ .block_parameter = .{ .block = candidate, .index = 3 } } },
+        .{ .id = target_control, .function = function_id, .origin = .{ .block_parameter = .{ .block = target, .index = 0 } } },
+        .{ .id = target_limit, .function = function_id, .origin = .{ .block_parameter = .{ .block = target, .index = 1 } } },
+        .{ .id = target_step, .function = function_id, .origin = .{ .block_parameter = .{ .block = target, .index = 2 } } },
+        .{ .id = target_initial, .function = function_id, .type = .boolean, .origin = .{ .block_parameter = .{ .block = target, .index = 3 } } },
+        .{ .id = false_value, .function = function_id, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = false_instruction, .index = 0 } } },
+        .{ .id = candidate_has, .function = function_id, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = candidate_instruction, .index = 0 } } },
+        .{ .id = candidate_result_limit, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = candidate_instruction, .index = 1 } } },
+        .{ .id = candidate_result_step, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = candidate_instruction, .index = 2 } } },
+        .{ .id = candidate_next, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = candidate_instruction, .index = 3 } } },
+        .{ .id = target_has, .function = function_id, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = target_instruction, .index = 0 } } },
+        .{ .id = target_result_limit, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = target_instruction, .index = 1 } } },
+        .{ .id = target_result_step, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = target_instruction, .index = 2 } } },
+        .{ .id = target_next, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = target_instruction, .index = 3 } } },
+    };
+    const instructions = [_]ir.Instruction{
+        .{ .id = false_instruction, .block = entry, .operation = .{ .constant = .{ .boolean = false } }, .results = &.{false_value}, .effects = .pure },
+        .{ .id = candidate_instruction, .block = candidate, .operation = .{ .numeric_for_next = .{
+            .control = candidate_control,
+            .limit = candidate_limit,
+            .step = candidate_step,
+            .initial = candidate_initial,
+            .mode = .semantic_normalized,
+        } }, .results = &.{ candidate_has, candidate_result_limit, candidate_result_step, candidate_next }, .effects = .numeric_for_next },
+        .{ .id = target_instruction, .block = target, .operation = .{ .numeric_for_next = .{
+            .control = target_control,
+            .limit = target_limit,
+            .step = target_step,
+            .initial = target_initial,
+            .mode = .semantic_normalized,
+        } }, .results = &.{ target_has, target_result_limit, target_result_step, target_next }, .effects = .numeric_for_next },
+    };
+    var program = ir.Program{
+        .program_id = "same-entry-contextual-numeric-reentry",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, function);
+    defer analysis.deinit();
+    const loop_headers = try natural_loop.headerCandidatesAlloc(std.testing.allocator, &analysis);
+    defer std.testing.allocator.free(loop_headers);
+    var replay_context = try structural_overlap.ReplayProjectionContext.initForFunction(
+        std.testing.allocator,
+        &program,
+        function_id,
+    );
+    defer replay_context.deinit();
+    var visited = [_]bool{ false, false, false, true, false };
+    var contexts = [_]?Builder.VisitContext{ null, null, null, .{
+        .start = target,
+        .stop = exit,
+        .loop_exit = null,
+        .continue_target = null,
+        .parameter_arguments = &expected,
+    }, null };
+    var builder: Builder = .{
+        .allocator = std.testing.allocator,
+        .analysis = &analysis,
+        .visited = &visited,
+        .visited_contexts = &contexts,
+        .loop_headers = loop_headers,
+        .replay_context = &replay_context,
+    };
+    const incoming = ir.CfgEdgeRef{ .source = candidate, .kind = .branch_then, .target = target };
+    // The caller supplies this only after its separate entry-projection proof.
+    // This fixture isolates the same-entry helper's contextual edge witness.
+    const parameters_match = true;
+    try std.testing.expect(!try builder.hasAuthenticatedContinuationBridge(incoming));
+    try std.testing.expect(try builder.hasAuthenticatedContinuationBridgeForExpectedParameters(incoming, &expected));
+    const context = contexts[target.index()].?;
+    try std.testing.expect(try builder.authenticatedSameEntryNumericReentry(
+        target,
+        target,
+        candidate,
+        null,
+        null,
+        context,
+        parameters_match,
+        incoming,
+    ));
+    try std.testing.expect(try builder.authenticatedSameEntryNumericReentry(
+        target,
+        target,
+        candidate,
+        null,
+        exit,
+        context,
+        false,
+        incoming,
+    ));
+
+    // A distinct tuple may enter the already-owned numeric header from an
+    // acyclic prefix of the same owner context.  The live owner edge and the
+    // replay projection authenticate this reuse without requiring a node
+    // split.
+    const distinct_context = Builder.VisitContext{
+        .start = entry,
+        .stop = exit,
+        .loop_exit = null,
+        .continue_target = null,
+        .parameter_arguments = &expected,
+    };
+    const distinct_formal_arguments = [_]ir.ValueId{
+        target_control,
+        target_limit,
+        target_step,
+        target_initial,
+    };
+    const target_to_candidate_arguments = [_]ir.ValueId{
+        target_next,
+        target_result_limit,
+        target_result_step,
+        false_value,
+    };
+    var parameterized_blocks = blocks;
+    parameterized_blocks[candidate.index()].terminator = .{ .branch = .{
+        .condition = candidate_has,
+        .then_edge = .{ .target = target, .arguments = &distinct_formal_arguments },
+        .else_edge = .{ .target = exit },
+    } };
+    var parameterized_values = values;
+    parameterized_values[target_control.index()].type = .number;
+    parameterized_values[target_limit.index()].type = .number;
+    parameterized_values[target_step.index()].type = .number;
+    var parameterized_program = program;
+    parameterized_program.blocks = &parameterized_blocks;
+    parameterized_program.values = &parameterized_values;
+    var parameterized_analysis = try cfg.Analysis.init(
+        std.testing.allocator,
+        &parameterized_program,
+        function,
+    );
+    defer parameterized_analysis.deinit();
+    var parameterized_replay_context = try structural_overlap.ReplayProjectionContext.initForFunction(
+        std.testing.allocator,
+        &parameterized_program,
+        function_id,
+    );
+    defer parameterized_replay_context.deinit();
+    var parameterized_builder = builder;
+    parameterized_builder.analysis = &parameterized_analysis;
+    parameterized_builder.replay_context = &parameterized_replay_context;
+    const parameterized_incoming = ir.CfgEdgeRef{
+        .source = candidate,
+        .kind = .branch_then,
+        .target = target,
+    };
+    try std.testing.expect(try parameterized_builder.authenticatedSameContextDistinctNumericReentry(
+        target,
+        entry,
+        exit,
+        null,
+        null,
+        distinct_context,
+        true,
+        parameterized_incoming,
+    ));
+
+    // Once the numeric header can reach the prefix source, the same replay
+    // witness is insufficient: accepting it would erase a live cycle.
+    var cyclic_blocks = parameterized_blocks;
+    cyclic_blocks[target.index()].terminator = .{ .branch = .{
+        .condition = target_has,
+        .then_edge = .{ .target = candidate, .arguments = &target_to_candidate_arguments },
+        .else_edge = .{ .target = exit },
+    } };
+    var cyclic_program = parameterized_program;
+    cyclic_program.blocks = &cyclic_blocks;
+    var cyclic_analysis = try cfg.Analysis.init(
+        std.testing.allocator,
+        &cyclic_program,
+        function,
+    );
+    defer cyclic_analysis.deinit();
+    var cyclic_replay_context = try structural_overlap.ReplayProjectionContext.initForFunction(
+        std.testing.allocator,
+        &cyclic_program,
+        function_id,
+    );
+    defer cyclic_replay_context.deinit();
+    var cyclic_builder = parameterized_builder;
+    cyclic_builder.analysis = &cyclic_analysis;
+    cyclic_builder.replay_context = &cyclic_replay_context;
+    try std.testing.expect(!(try cyclic_builder.authenticatedSameContextDistinctNumericReentry(
+        target,
+        entry,
+        exit,
+        null,
+        null,
+        distinct_context,
+        true,
+        incoming,
+    )));
+
+    // The owner context may begin at the current numeric header while a
+    // nonempty candidate region re-enters it. This is valid only when the
+    // candidate and header are in one SCC and the existing tuple proof still
+    // authenticates the incoming edge.
+    var same_boundary_blocks = blocks;
+    same_boundary_blocks[target.index()].terminator = .{ .branch = .{
+        .condition = target_has,
+        .then_edge = .{ .target = candidate, .arguments = &target_to_candidate_arguments },
+        .else_edge = .{ .target = exit },
+    } };
+    var same_boundary_program = program;
+    same_boundary_program.blocks = &same_boundary_blocks;
+    var same_boundary_analysis = try cfg.Analysis.init(
+        std.testing.allocator,
+        &same_boundary_program,
+        function,
+    );
+    defer same_boundary_analysis.deinit();
+    const same_boundary_loop_headers = try natural_loop.headerCandidatesAlloc(
+        std.testing.allocator,
+        &same_boundary_analysis,
+    );
+    defer std.testing.allocator.free(same_boundary_loop_headers);
+    var same_boundary_replay_context = try structural_overlap.ReplayProjectionContext.initForFunction(
+        std.testing.allocator,
+        &same_boundary_program,
+        function_id,
+    );
+    defer same_boundary_replay_context.deinit();
+    var same_boundary_visited = visited;
+    var same_boundary_contexts = contexts;
+    same_boundary_contexts[target.index()] = .{
+        .start = target,
+        .stop = exit,
+        .loop_exit = null,
+        .continue_target = null,
+        .parameter_arguments = &expected,
+        .entry_reference = .{ .source = owner, .kind = .jump, .target = target },
+    };
+    var same_boundary_builder = builder;
+    same_boundary_builder.analysis = &same_boundary_analysis;
+    same_boundary_builder.visited = &same_boundary_visited;
+    same_boundary_builder.visited_contexts = &same_boundary_contexts;
+    same_boundary_builder.loop_headers = same_boundary_loop_headers;
+    same_boundary_builder.replay_context = &same_boundary_replay_context;
+    const same_boundary_incoming = ir.CfgEdgeRef{
+        .source = candidate,
+        .kind = .branch_then,
+        .target = target,
+    };
+    try std.testing.expect(try same_boundary_builder.authenticatedSameBoundaryNumericReentry(
+        target,
+        candidate,
+        exit,
+        null,
+        null,
+        same_boundary_contexts[target.index()].?,
+        true,
+        same_boundary_incoming,
+    ));
+
+    // A different region start may re-enter the same numeric header while
+    // preserving the enclosing boundary. The SCC edge and contextual tuple
+    // proof are required in addition to the direct projection.
+    const same_scc_context = Builder.VisitContext{
+        .start = owner,
+        .stop = exit,
+        .loop_exit = null,
+        .continue_target = null,
+        .parameter_arguments = &expected,
+        .entry_reference = .{ .source = owner, .kind = .jump, .target = target },
+    };
+    try std.testing.expect(try same_boundary_builder.authenticatedSameSccNumericReentry(
+        target,
+        candidate,
+        exit,
+        null,
+        null,
+        same_scc_context,
+        true,
+        true,
+        same_boundary_incoming,
+    ));
+    try std.testing.expect(try same_boundary_builder.authenticatedSameStopDistinctNumericReentry(
+        target,
+        candidate,
+        exit,
+        null,
+        null,
+        same_scc_context,
+        false,
+        true,
+        same_boundary_incoming,
+    ));
+    try std.testing.expect(!(try builder.authenticatedSameStopDistinctNumericReentry(
+        target,
+        candidate,
+        exit,
+        null,
+        null,
+        same_scc_context,
+        true,
+        true,
+        same_boundary_incoming,
+    )));
+    try std.testing.expect(!(try builder.authenticatedSameStopDistinctNumericReentry(
+        target,
+        candidate,
+        exit,
+        null,
+        null,
+        same_scc_context,
+        false,
+        false,
+        same_boundary_incoming,
+    )));
+    try std.testing.expect(!(try builder.authenticatedSameStopDistinctNumericReentry(
+        target,
+        candidate,
+        exit,
+        null,
+        null,
+        same_scc_context,
+        false,
+        true,
+        incoming,
+    )));
+    try std.testing.expect(!(try same_boundary_builder.authenticatedSameStopDistinctNumericReentry(
+        target,
+        candidate,
+        exit,
+        null,
+        null,
+        same_boundary_contexts[target.index()].?,
+        false,
+        true,
+        same_boundary_incoming,
+    )));
+    try std.testing.expect(!(try same_boundary_builder.authenticatedSameSccNumericReentry(
+        target,
+        candidate,
+        owner,
+        null,
+        null,
+        same_scc_context,
+        true,
+        true,
+        same_boundary_incoming,
+    )));
+    try std.testing.expect(!(try same_boundary_builder.authenticatedSameSccNumericReentry(
+        target,
+        candidate,
+        exit,
+        null,
+        null,
+        same_scc_context,
+        true,
+        false,
+        same_boundary_incoming,
+    )));
+    var acyclic_same_scc_builder = builder;
+    acyclic_same_scc_builder.replay_context = &replay_context;
+    try std.testing.expect(!(try acyclic_same_scc_builder.authenticatedSameSccNumericReentry(
+        target,
+        candidate,
+        exit,
+        null,
+        null,
+        same_scc_context,
+        true,
+        true,
+        incoming,
+    )));
+
+    // The same owner context remains rejected when the incoming source is not
+    // in the header's SCC or when the enclosing stop differs.
+    var acyclic_boundary_builder = builder;
+    acyclic_boundary_builder.replay_context = &replay_context;
+    try std.testing.expect(!(try acyclic_boundary_builder.authenticatedSameBoundaryNumericReentry(
+        target,
+        candidate,
+        exit,
+        null,
+        null,
+        context,
+        true,
+        incoming,
+    )));
+    try std.testing.expect(!(try same_boundary_builder.authenticatedSameBoundaryNumericReentry(
+        target,
+        candidate,
+        owner,
+        null,
+        null,
+        same_boundary_contexts[target.index()].?,
+        true,
+        same_boundary_incoming,
+    )));
+
+    try std.testing.expect(try builder.authenticatedVisitedParameterizedContinuationProjection(
+        target,
+        candidate,
+        null,
+        null,
+        exit,
+        context,
+        false,
+        &actual,
+        incoming,
+        true,
+        true,
+    ));
+
+    var tampered_blocks = blocks;
+    tampered_blocks[candidate.index()].terminator = .{ .branch = .{
+        .condition = candidate_has,
+        .then_edge = .{ .target = target, .arguments = &.{ candidate_next, candidate_result_limit, candidate_result_step, selector } },
+        .else_edge = .{ .target = exit },
+    } };
+    var tampered_program = program;
+    tampered_program.blocks = &tampered_blocks;
+    var tampered_analysis = try cfg.Analysis.init(std.testing.allocator, &tampered_program, function);
+    defer tampered_analysis.deinit();
+    var tampered_replay_context = try structural_overlap.ReplayProjectionContext.initForFunction(
+        std.testing.allocator,
+        &tampered_program,
+        function_id,
+    );
+    defer tampered_replay_context.deinit();
+    var tampered_builder = builder;
+    tampered_builder.analysis = &tampered_analysis;
+    tampered_builder.replay_context = &tampered_replay_context;
+    const tampered_actual = [_]ir.ValueId{ candidate_next, candidate_result_limit, candidate_result_step, selector };
+    try std.testing.expect(!(try tampered_builder.authenticatedSameSccNumericReentry(
+        target,
+        candidate,
+        exit,
+        null,
+        null,
+        same_scc_context,
+        true,
+        true,
+        incoming,
+    )));
+    const tampered_parameters_match = try tampered_builder.parameterProjectionMatches(
+        target,
+        &expected,
+        &tampered_actual,
+    );
+    try std.testing.expect(!tampered_parameters_match);
+    try std.testing.expect(!(try tampered_builder.authenticatedSameEntryNumericReentry(
+        target,
+        target,
+        candidate,
+        null,
+        null,
+        context,
+        parameters_match,
+        incoming,
+    )));
+    try std.testing.expect(!(try tampered_builder.authenticatedSameEntryNumericReentry(
+        target,
+        target,
+        candidate,
+        null,
+        exit,
+        context,
+        false,
+        incoming,
+    )));
+    try std.testing.expect(!(try tampered_builder.authenticatedVisitedParameterizedContinuationProjection(
+        target,
+        candidate,
+        null,
+        null,
+        exit,
+        context,
+        false,
+        &tampered_actual,
+        incoming,
+        true,
+        true,
+    )));
+}
+
 test "non-header parameterized continuation recovers one authenticated nested incoming edge" {
     const function_id = ir.FunctionId.fromIndex(0);
     const owner = ir.BlockId.fromIndex(0);
@@ -5008,6 +5774,225 @@ test "same-entry identity parameterized forwarder projects without a clone bridg
         true,
         &arguments,
     ));
+}
+
+test "empty zero-parameter forwarder accepts canonical successor tuple" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const owner = ir.BlockId.fromIndex(0);
+    const forwarder = ir.BlockId.fromIndex(1);
+    const successor = ir.BlockId.fromIndex(2);
+    const owner_stop = ir.BlockId.fromIndex(3);
+    const current_stop = ir.BlockId.fromIndex(4);
+    const input = ir.ValueId.fromIndex(0);
+    const formal = ir.ValueId.fromIndex(1);
+    var forwarded = [_]ir.ValueId{input};
+    var blocks = [_]ir.Block{
+        .{ .id = owner, .function = function_id, .terminator = .{ .jump = .{ .target = forwarder } } },
+        .{ .id = forwarder, .function = function_id, .terminator = .{ .jump = .{
+            .target = successor,
+            .arguments = forwarded[0..],
+        } } },
+        .{
+            .id = successor,
+            .function = function_id,
+            .parameters = &.{formal},
+            .terminator = .{ .return_values = &.{formal} },
+        },
+        .{ .id = owner_stop, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = current_stop, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &.{input},
+        .blocks = &.{ owner, forwarder, successor, owner_stop, current_stop },
+        .entry_block = owner,
+    };
+    const values = [_]ir.Value{
+        .{ .id = input, .function = function_id, .origin = .{ .parameter = 0 } },
+        .{ .id = formal, .function = function_id, .origin = .{ .block_parameter = .{ .block = successor, .index = 0 } } },
+    };
+    var program = ir.Program{
+        .program_id = "empty-zero-parameter-forwarder",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, function);
+    defer analysis.deinit();
+    const loop_headers = try natural_loop.headerCandidatesAlloc(std.testing.allocator, &analysis);
+    defer std.testing.allocator.free(loop_headers);
+    var visited = [_]bool{ false, true, false, false, false };
+    var contexts = [_]?Builder.VisitContext{ null, null, null, null, null };
+    const context: Builder.VisitContext = .{
+        .start = forwarder,
+        .stop = owner_stop,
+        .loop_exit = null,
+        .continue_target = null,
+    };
+    var builder: Builder = .{
+        .allocator = std.testing.allocator,
+        .analysis = &analysis,
+        .visited = &visited,
+        .visited_contexts = &contexts,
+        .loop_headers = loop_headers,
+    };
+    try std.testing.expect(builder.transparentEmptyContinuationContextMatches(
+        forwarder,
+        forwarder,
+        current_stop,
+        context,
+        true,
+    ));
+
+    blocks[forwarder.index()].terminator = .{ .jump = .{ .target = successor, .arguments = &.{} } };
+    try std.testing.expect(!builder.transparentEmptyContinuationContextMatches(
+        forwarder,
+        forwarder,
+        current_stop,
+        context,
+        true,
+    ));
+}
+
+test "empty numeric forwarder reentry requires an authenticated SCC" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const forwarder = ir.BlockId.fromIndex(1);
+    const header = ir.BlockId.fromIndex(2);
+    const body = ir.BlockId.fromIndex(3);
+    const incoming = ir.BlockId.fromIndex(4);
+    const stop = ir.BlockId.fromIndex(5);
+    const control = ir.ValueId.fromIndex(0);
+    const limit = ir.ValueId.fromIndex(1);
+    const step = ir.ValueId.fromIndex(2);
+    const initial = ir.ValueId.fromIndex(3);
+    const has_value = ir.ValueId.fromIndex(4);
+    const normalized_limit = ir.ValueId.fromIndex(5);
+    const normalized_step = ir.ValueId.fromIndex(6);
+    const next_control = ir.ValueId.fromIndex(7);
+    const transition_id = ir.InstructionId.fromIndex(0);
+    const tuple = [_]ir.ValueId{ control, limit, step, initial };
+
+    var blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .jump = .{ .target = forwarder } } },
+        .{ .id = forwarder, .function = function_id, .terminator = .{ .jump = .{
+            .target = header,
+            .arguments = &tuple,
+        } } },
+        .{ .id = header, .function = function_id, .parameters = &.{
+            control,
+            limit,
+            step,
+            initial,
+        }, .instructions = &.{transition_id}, .terminator = .{ .branch = .{
+            .condition = has_value,
+            .then_edge = .{ .target = body },
+            .else_edge = .{ .target = stop },
+        } } },
+        .{ .id = body, .function = function_id, .terminator = .{ .jump = .{ .target = incoming } } },
+        .{ .id = incoming, .function = function_id, .terminator = .{ .jump = .{ .target = forwarder } } },
+        .{ .id = stop, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &.{},
+        .blocks = &.{ entry, forwarder, header, body, incoming, stop },
+        .entry_block = entry,
+    };
+    const values = [_]ir.Value{
+        .{ .id = control, .function = function_id, .origin = .{ .block_parameter = .{ .block = header, .index = 0 } } },
+        .{ .id = limit, .function = function_id, .origin = .{ .block_parameter = .{ .block = header, .index = 1 } } },
+        .{ .id = step, .function = function_id, .origin = .{ .block_parameter = .{ .block = header, .index = 2 } } },
+        .{ .id = initial, .function = function_id, .origin = .{ .block_parameter = .{ .block = header, .index = 3 } } },
+        .{ .id = has_value, .function = function_id, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = transition_id, .index = 0 } } },
+        .{ .id = normalized_limit, .function = function_id, .type = .number, .origin = .{ .instruction_result = .{ .instruction = transition_id, .index = 1 } } },
+        .{ .id = normalized_step, .function = function_id, .type = .number, .origin = .{ .instruction_result = .{ .instruction = transition_id, .index = 2 } } },
+        .{ .id = next_control, .function = function_id, .type = .number, .origin = .{ .instruction_result = .{ .instruction = transition_id, .index = 3 } } },
+    };
+    const instructions = [_]ir.Instruction{.{
+        .id = transition_id,
+        .block = header,
+        .operation = .{ .numeric_for_next = .{
+            .control = control,
+            .limit = limit,
+            .step = step,
+            .initial = initial,
+        } },
+        .results = &.{ has_value, normalized_limit, normalized_step, next_control },
+        .effects = .numeric_for_next,
+    }};
+    const program = ir.Program{
+        .program_id = "empty-numeric-forwarder-reentry",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, function);
+    defer analysis.deinit();
+    const loop_headers = try natural_loop.headerCandidatesAlloc(std.testing.allocator, &analysis);
+    defer std.testing.allocator.free(loop_headers);
+    var visited = [_]bool{ false, true, false, false, false, false };
+    var contexts = [_]?Builder.VisitContext{ null, null, null, null, null, null };
+    const context = Builder.VisitContext{
+        .start = forwarder,
+        .stop = stop,
+        .loop_exit = null,
+        .continue_target = null,
+        .parameter_arguments = &.{},
+    };
+    var builder: Builder = .{
+        .allocator = std.testing.allocator,
+        .analysis = &analysis,
+        .visited = &visited,
+        .visited_contexts = &contexts,
+        .loop_headers = loop_headers,
+    };
+    const edge = ir.CfgEdgeRef{ .source = incoming, .kind = .jump, .target = forwarder };
+
+    try std.testing.expect(try builder.authenticatedEmptyNumericForwarderReentry(
+        forwarder,
+        entry,
+        stop,
+        context,
+        true,
+        edge,
+    ));
+
+    blocks[incoming.index()].terminator = .{ .jump = .{ .target = stop } };
+    try std.testing.expect(!(try builder.authenticatedEmptyNumericForwarderReentry(
+        forwarder,
+        entry,
+        stop,
+        context,
+        true,
+        edge,
+    )));
+    blocks[incoming.index()].terminator = .{ .jump = .{ .target = forwarder } };
+
+    blocks[forwarder.index()].terminator = .{ .jump = .{ .target = stop, .arguments = &tuple } };
+    try std.testing.expect(!(try builder.authenticatedEmptyNumericForwarderReentry(
+        forwarder,
+        entry,
+        stop,
+        context,
+        true,
+        edge,
+    )));
+    blocks[forwarder.index()].terminator = .{ .jump = .{ .target = header, .arguments = &tuple } };
+
+    blocks[incoming.index()].terminator = .{ .jump = .{ .target = forwarder, .arguments = &.{control} } };
+    try std.testing.expect(!(try builder.authenticatedEmptyNumericForwarderReentry(
+        forwarder,
+        entry,
+        stop,
+        context,
+        true,
+        edge,
+    )));
 }
 
 fn regionFallsThroughTo(program: *const ir.Program, region: *const Region, target: ir.BlockId) bool {
