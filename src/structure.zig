@@ -1047,6 +1047,19 @@ const Builder = struct {
         );
     }
 
+    fn hasAuthenticatedEffectfulEntryBridge(
+        self: *const Builder,
+        reference: ir.CfgEdgeRef,
+        expected_arguments: []const ir.ValueId,
+    ) bool {
+        return structural_overlap.hasAuthenticatedEffectfulEntryBridgeForEdge(
+            self.analysis.program,
+            self.analysis,
+            reference,
+            expected_arguments,
+        );
+    }
+
     const AuthenticatedBoundaryProjection = struct {
         target: ir.BlockId,
         edge: ir.Edge,
@@ -3888,6 +3901,105 @@ const Builder = struct {
         );
     }
 
+    // A shared effectful suffix can be rebound to a distinct incoming tuple
+    // only when its instructions are parametric in the carried state.  The
+    // proof is intentionally narrower than value projection: it authenticates
+    // both live entries, rejects direct parameter reads, permits only a linear
+    // visited path, and requires the original canonical tuple at the terminal
+    // boundary.  This preserves the suffix's effects while making the carried
+    // state transfer explicit.
+    fn parameterizedEffectfulSuffixCanRebind(
+        self: *Builder,
+        current: ir.BlockId,
+        stop: ?ir.BlockId,
+        owner_arguments: []const ir.ValueId,
+        current_arguments: []const ir.ValueId,
+        incoming: ir.CfgEdgeRef,
+    ) BuildError!bool {
+        const stop_id = stop orelse return false;
+        if (incoming.target != current or current.index() >= self.analysis.program.blocks.len) return false;
+        const current_block = self.analysis.program.blocks[current.index()];
+        if (current_block.id != current or current_block.function != self.analysis.function.id or
+            current_block.parameters.len == 0 or
+            current_block.parameters.len != owner_arguments.len or
+            current_block.parameters.len != current_arguments.len or
+            !node_split.parametersAreCanonical(self.analysis.program.values, current_block) or
+            !self.analysis.isReachable(current) or
+            !self.hasLiveIncomingArguments(current, owner_arguments))
+        {
+            return false;
+        }
+
+        const incoming_edge = cfg_edge.value(self.analysis.program, incoming) orelse return false;
+        if (incoming_edge.target != current or
+            !std.mem.eql(ir.ValueId, incoming_edge.arguments, current_arguments)) return false;
+
+        for (current_block.parameters, owner_arguments, current_arguments) |formal, owner, actual| {
+            if (!structural_overlap.continuationParameterAcceptsValueType(
+                self.analysis.program,
+                formal,
+                owner,
+            ) or !structural_overlap.continuationParameterAcceptsValueType(
+                self.analysis.program,
+                formal,
+                actual,
+            )) return false;
+        }
+
+        const seen = try self.allocator.alloc(bool, self.analysis.function.blocks.len);
+        defer self.allocator.free(seen);
+        @memset(seen, false);
+
+        var cursor = current;
+        var effectful = false;
+        while (true) {
+            const local_index = self.analysis.blockIndex(cursor) orelse return false;
+            if (seen[local_index] or !self.visited[local_index]) return false;
+            seen[local_index] = true;
+
+            const block = self.analysis.program.blocks[cursor.index()];
+            if (block.id != cursor or block.function != self.analysis.function.id or
+                (block.parameters.len != 0 and
+                    !node_split.parametersAreCanonical(self.analysis.program.values, block))) return false;
+
+            for (block.instructions) |instruction_id| {
+                if (instruction_id.index() >= self.analysis.program.instructions.len) return false;
+                const instruction = self.analysis.program.instructions[instruction_id.index()];
+                if (instruction.id != instruction_id or instruction.block != cursor) return false;
+                var detector = ParameterUseDetector{ .parameters = block.parameters };
+                runtime_uses.visitOperationUses(instruction.operation, &detector);
+                if (detector.found) return false;
+                effectful = true;
+            }
+
+            switch (block.terminator) {
+                .jump => |edge| {
+                    if (edge.target.index() >= self.analysis.program.blocks.len or
+                        edge.target == cursor) return false;
+                    const target_block = self.analysis.program.blocks[edge.target.index()];
+                    if (target_block.id != edge.target or target_block.function != self.analysis.function.id or
+                        edge.arguments.len != target_block.parameters.len) return false;
+
+                    if (edge.target == stop_id) {
+                        if (!effectful or target_block.parameters.len != current_block.parameters.len or
+                            !std.mem.eql(ir.ValueId, edge.arguments, current_block.parameters)) return false;
+                        return true;
+                    }
+
+                    // A nonterminal parameterized hop is accepted only when
+                    // it forwards the current canonical tuple positionally.
+                    if (target_block.parameters.len != 0 and
+                        (!node_split.parametersAreCanonical(self.analysis.program.values, target_block) or
+                            !std.mem.eql(ir.ValueId, edge.arguments, block.parameters) and
+                                !std.mem.eql(ir.ValueId, edge.arguments, current_block.parameters))) return false;
+                    if (target_block.parameters.len == 0 and edge.arguments.len != 0) return false;
+                    cursor = edge.target;
+                },
+                .return_values, .return_pack, .return_expanded, .throw_error, .branch, .unreachable_block => return false,
+            }
+        }
+    }
+
     const AuthenticatedEffectfulPrefixReplay = struct {
         nodes: []Node,
         source: ir.BlockId,
@@ -4790,6 +4902,331 @@ const Builder = struct {
                 .next = edge.target,
                 .arguments = edge.arguments,
             };
+        }
+    }
+
+    // An authenticated bridge can re-enter an already-owned linear suffix
+    // from a different structured boundary. Emit the suffix in the current
+    // arm, preserving its effects, instead of cloning the IR again. A
+    // parameterized suffix additionally needs an exact remapped entry tuple,
+    // canonical formals, matching edge arities, and a proof-backed path to
+    // the current stop. Branches, loops, unvisited blocks, and terminal
+    // shortcuts remain rejected because they carry control or ownership state
+    // that this projection does not represent.
+    const AuthenticatedTerminalReplay = struct {
+        nodes: []Node,
+        terminal: ?TerminalProjection,
+    };
+
+    fn valueProducedByReplayNodes(
+        self: *const Builder,
+        value_id: ir.ValueId,
+        nodes: []const Node,
+    ) bool {
+        if (value_id.index() >= self.analysis.program.values.len) return false;
+        const value = self.analysis.program.values[value_id.index()];
+        const origin = switch (value.origin) {
+            .instruction_result => |result| result,
+            else => return false,
+        };
+        if (value.id != value_id or value.function != self.analysis.function.id or
+            origin.instruction.index() >= self.analysis.program.instructions.len)
+        {
+            return false;
+        }
+        const instruction = self.analysis.program.instructions[origin.instruction.index()];
+        if (instruction.id != origin.instruction or origin.index >= instruction.results.len or
+            instruction.results[origin.index] != value_id)
+        {
+            return false;
+        }
+        for (nodes) |node| {
+            if (node.blockId() == instruction.block) return true;
+        }
+        return false;
+    }
+
+    const AuthenticatedTerminalContinuationReplay = struct {
+        nodes: []Node,
+    };
+
+    // A visited zero-parameter terminal may be reached after an already
+    // emitted prefix through a different authenticated structural boundary.
+    // Replay only a linear, visited terminal closure.  Every returned value
+    // must be the exact result of an instruction in that closure; no value is
+    // recovered from the owner path or synthesized at the boundary.
+    fn authenticatedEffectfulTerminalContinuationReplay(
+        self: *Builder,
+        current: ir.BlockId,
+        start: ir.BlockId,
+        stop: ?ir.BlockId,
+        loop_exit: ?ir.BlockId,
+        continue_target: ?ir.BlockId,
+        arguments: ?[]const ir.ValueId,
+        incoming: ?ir.CfgEdgeRef,
+        previous: Node,
+    ) BuildError!?AuthenticatedTerminalContinuationReplay {
+        const reference = incoming orelse return null;
+        if (current == start or reference.target != current or
+            (stop != null and current == stop.?) or
+            (loop_exit != null and current == loop_exit.?) or
+            (continue_target != null and current == continue_target.?))
+        {
+            return null;
+        }
+
+        const local_index = self.analysis.blockIndex(current) orelse return null;
+        if (!self.visited[local_index] or !self.analysis.isReachable(current)) return null;
+        const owner_context = self.visited_contexts[local_index] orelse return null;
+        if (owner_context.start == start or owner_context.stop == stop or
+            owner_context.loop_exit != loop_exit or
+            owner_context.continue_target != continue_target or
+            (owner_context.parameter_arguments != null and
+                owner_context.parameter_arguments.?.len != 0) or
+            (arguments != null and arguments.?.len != 0))
+        {
+            return null;
+        }
+
+        const current_block = self.analysis.program.blocks[current.index()];
+        if (current_block.id != current or current_block.function != self.analysis.function.id or
+            current_block.parameters.len != 0)
+        {
+            return null;
+        }
+        const incoming_edge = cfg_edge.value(self.analysis.program, reference) orelse return null;
+        if (incoming_edge.target != current or incoming_edge.arguments.len != 0 or
+            !try self.hasAuthenticatedContinuationBridge(reference))
+        {
+            return null;
+        }
+        const transfer = continuationProjectionForVisitedEntry(
+            self.analysis.program,
+            previous,
+            current,
+            reference,
+            arguments,
+        ) orelse return null;
+        switch (transfer) {
+            .edge => |edge| {
+                if (edge.target != current or edge.arguments.len != 0) return null;
+            },
+            .transferred => return null,
+        }
+
+        const seen = try self.allocator.alloc(bool, self.analysis.function.blocks.len);
+        defer self.allocator.free(seen);
+        @memset(seen, false);
+
+        var replay: std.ArrayList(Node) = .empty;
+        defer replay.deinit(self.allocator);
+        var cursor = current;
+        var effectful = false;
+        while (true) {
+            const cursor_index = self.analysis.blockIndex(cursor) orelse return null;
+            if (seen[cursor_index] or !self.visited[cursor_index] or
+                !self.analysis.isReachable(cursor))
+            {
+                return null;
+            }
+            seen[cursor_index] = true;
+
+            const block = self.analysis.program.blocks[cursor.index()];
+            if (block.id != cursor or block.function != self.analysis.function.id or
+                block.parameters.len != 0)
+            {
+                return null;
+            }
+            for (block.instructions) |instruction_id| {
+                if (instruction_id.index() >= self.analysis.program.instructions.len) return null;
+                const instruction = self.analysis.program.instructions[instruction_id.index()];
+                if (instruction.id != instruction_id or instruction.block != cursor) return null;
+                if (proof_effect_closure.hasObservableEffects(instruction.effects)) effectful = true;
+            }
+            try replay.append(self.allocator, .{ .block = cursor });
+
+            switch (block.terminator) {
+                .return_values => |values| {
+                    if (!effectful or values.len == 0) return null;
+                    for (values) |value_id| {
+                        if (!self.valueProducedByReplayNodes(value_id, replay.items)) return null;
+                    }
+                    return .{ .nodes = try replay.toOwnedSlice(self.allocator) };
+                },
+                .jump => |edge| {
+                    if (edge.target == cursor or edge.target.index() >= self.analysis.program.blocks.len or
+                        edge.target == stop or edge.target == loop_exit or edge.target == continue_target)
+                    {
+                        return null;
+                    }
+                    const target = self.analysis.program.blocks[edge.target.index()];
+                    if (target.id != edge.target or target.function != self.analysis.function.id or
+                        target.parameters.len != 0 or edge.arguments.len != 0)
+                    {
+                        return null;
+                    }
+                    cursor = edge.target;
+                },
+                .return_pack, .return_expanded, .throw_error, .branch, .unreachable_block => return null,
+            }
+        }
+    }
+
+    fn authenticatedEffectfulTerminalReplay(
+        self: *Builder,
+        current: ir.BlockId,
+        start: ir.BlockId,
+        stop: ?ir.BlockId,
+        arguments: ?[]const ir.ValueId,
+        incoming: ?ir.CfgEdgeRef,
+    ) BuildError!?AuthenticatedTerminalReplay {
+        if (current != start) return null;
+        const reference = incoming orelse return null;
+        if (reference.target != current) return null;
+
+        const current_index = self.analysis.blockIndex(current) orelse return null;
+        const owner_context = self.visited_contexts[current_index] orelse return null;
+        if (owner_context.start != current or owner_context.stop == stop) return null;
+        const current_block = self.analysis.program.blocks[current.index()];
+        if (current_block.id != current or current_block.function != self.analysis.function.id) return null;
+        const parameterized = current_block.parameters.len != 0;
+        if (parameterized) {
+            const owner_arguments = owner_context.parameter_arguments orelse return null;
+            const current_arguments = arguments orelse return null;
+            const edge = cfg_edge.value(self.analysis.program, reference) orelse return null;
+            const tuple_match = owner_arguments.len != 0 and
+                current_arguments.len == current_block.parameters.len and
+                node_split.parametersAreCanonical(self.analysis.program.values, current_block) and
+                try self.parameterProjectionMatches(current, owner_arguments, current_arguments);
+            const edge_tuple_match = std.mem.eql(ir.ValueId, edge.arguments, current_arguments);
+            const parametric_rebind = if (!tuple_match and edge_tuple_match)
+                try self.parameterizedEffectfulSuffixCanRebind(
+                    current,
+                    stop,
+                    owner_arguments,
+                    current_arguments,
+                    reference,
+                )
+            else
+                false;
+            const bridge_authenticated = if (tuple_match and edge_tuple_match)
+                (try self.hasAuthenticatedContinuationBridgeForExpectedParameters(reference, owner_arguments)) or
+                    self.hasAuthenticatedEffectfulEntryBridge(reference, owner_arguments)
+            else
+                parametric_rebind;
+            structural_overlap.traceStructural("structural_phase parameterized_effectful_replay_candidate current={} owner_stop={?} incoming_stop={?} parameters={} owner_arguments={} current_arguments={} tuple_match={} edge_tuple_match={} parametric_rebind={} bridge_authenticated={}\n", .{
+                current.index(),
+                if (owner_context.stop) |value| value.index() else null,
+                if (stop) |value| value.index() else null,
+                current_block.parameters.len,
+                owner_arguments.len,
+                current_arguments.len,
+                tuple_match,
+                edge_tuple_match,
+                parametric_rebind,
+                bridge_authenticated,
+            });
+            if ((!tuple_match and !parametric_rebind) or !edge_tuple_match or !bridge_authenticated) {
+                return null;
+            }
+        } else {
+            if (arguments) |values| if (values.len != 0) return null;
+            if (owner_context.parameter_arguments) |values| if (values.len != 0) return null;
+            if (!try self.hasAuthenticatedContinuationBridge(reference)) return null;
+        }
+
+        const seen = try self.allocator.alloc(bool, self.analysis.function.blocks.len);
+        defer self.allocator.free(seen);
+        @memset(seen, false);
+
+        var replay: std.ArrayList(Node) = .empty;
+        defer replay.deinit(self.allocator);
+        var cursor = current;
+        var effectful = false;
+        while (true) {
+            const local_index = self.analysis.blockIndex(cursor) orelse return null;
+            if (seen[local_index] or !self.visited[local_index]) return null;
+            seen[local_index] = true;
+
+            const block = self.analysis.program.blocks[cursor.index()];
+            if (block.id != cursor or block.function != self.analysis.function.id) return null;
+            if (block.parameters.len != 0 and
+                (!parameterized or !node_split.parametersAreCanonical(self.analysis.program.values, block))) return null;
+            if (block.instructions.len != 0) effectful = true;
+            try replay.append(self.allocator, .{ .block = cursor });
+
+            switch (block.terminator) {
+                .jump => |edge| {
+                    if (edge.target.index() >= self.analysis.program.blocks.len) return null;
+                    const target_block = self.analysis.program.blocks[edge.target.index()];
+                    if (target_block.id != edge.target or target_block.function != self.analysis.function.id) return null;
+                    if (edge.target == cursor) return null;
+                    if (stop != null and edge.target == stop.?) {
+                        if (edge.arguments.len != target_block.parameters.len or
+                            (!parameterized and (edge.arguments.len != 0 or target_block.parameters.len != 0)) or
+                            !effectful)
+                        {
+                            return null;
+                        }
+                        if (parameterized and target_block.parameters.len != 0) {
+                            const canonical_stop_parameters =
+                                node_split.parametersAreCanonical(self.analysis.program.values, target_block);
+                            const continuation_closed = canonical_stop_parameters and
+                                try self.parameterizedStopBoundaryHasContextClosure(
+                                    edge.target,
+                                    target_block.parameters,
+                                );
+                            if (!continuation_closed) {
+                                structural_overlap.traceStructural("structural_phase parameterized_effectful_replay_reject start={} stop={} reason=stop_boundary canonical={} continuation_closed={} target_parameters={}\n", .{
+                                    start.index(),
+                                    stop.?.index(),
+                                    canonical_stop_parameters,
+                                    continuation_closed,
+                                    target_block.parameters.len,
+                                });
+                                return null;
+                            }
+                        }
+                        if (parameterized) {
+                            structural_overlap.traceStructural("structural_phase parameterized_effectful_replay start={} stop={} nodes={} incoming_source={} incoming_target={}\n", .{
+                                start.index(),
+                                stop.?.index(),
+                                replay.items.len,
+                                reference.source.index(),
+                                reference.target.index(),
+                            });
+                        }
+                        return .{
+                            .nodes = try replay.toOwnedSlice(self.allocator),
+                            .terminal = null,
+                        };
+                    }
+                    if (edge.arguments.len != target_block.parameters.len or
+                        (!parameterized and edge.arguments.len != 0)) return null;
+                    if (!self.visited[self.analysis.blockIndex(edge.target) orelse return null]) {
+                        if (parameterized) return null;
+                        switch (target_block.terminator) {
+                            .return_values => |values| {
+                                if (values.len != 0 or target_block.parameters.len != 0 or target_block.instructions.len != 0 or !effectful) return null;
+                                return .{
+                                    .nodes = try replay.toOwnedSlice(self.allocator),
+                                    .terminal = .{ .terminal = edge.target, .edge = edge },
+                                };
+                            },
+                            else => return null,
+                        }
+                    }
+                    cursor = edge.target;
+                },
+                .return_values => |values| {
+                    if (parameterized or values.len != 0 or !effectful) return null;
+                    return .{
+                        .nodes = try replay.toOwnedSlice(self.allocator),
+                        .terminal = null,
+                    };
+                },
+                .return_pack, .return_expanded, .throw_error, .branch, .unreachable_block => return null,
+            }
         }
     }
 
@@ -7238,6 +7675,586 @@ test "empty numeric forwarder reentry requires an authenticated SCC" {
         true,
         edge,
     )));
+}
+
+test "parameterized continuation composes across a prefixed four-value header pair" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const prefix = ir.BlockId.fromIndex(1);
+    const owner = ir.BlockId.fromIndex(2);
+    const bridge = ir.BlockId.fromIndex(3);
+    const original = ir.BlockId.fromIndex(4);
+    const current = ir.BlockId.fromIndex(5);
+    const suffix = ir.BlockId.fromIndex(6);
+    const continuation = ir.BlockId.fromIndex(7);
+    const terminal = ir.BlockId.fromIndex(8);
+
+    const selector = ir.ValueId.fromIndex(0);
+    const argument_1 = ir.ValueId.fromIndex(1);
+    const argument_2 = ir.ValueId.fromIndex(2);
+    const argument_3 = ir.ValueId.fromIndex(3);
+    const argument_4 = ir.ValueId.fromIndex(4);
+    const owner_parameter_1 = ir.ValueId.fromIndex(5);
+    const owner_parameter_2 = ir.ValueId.fromIndex(6);
+    const owner_parameter_3 = ir.ValueId.fromIndex(7);
+    const owner_parameter_4 = ir.ValueId.fromIndex(8);
+    const original_parameter_1 = ir.ValueId.fromIndex(9);
+    const original_parameter_2 = ir.ValueId.fromIndex(10);
+    const original_parameter_3 = ir.ValueId.fromIndex(11);
+    const original_parameter_4 = ir.ValueId.fromIndex(12);
+    const current_parameter_1 = ir.ValueId.fromIndex(13);
+    const current_parameter_2 = ir.ValueId.fromIndex(14);
+    const current_parameter_3 = ir.ValueId.fromIndex(15);
+    const current_parameter_4 = ir.ValueId.fromIndex(16);
+    const suffix_parameter_1 = ir.ValueId.fromIndex(17);
+    const suffix_parameter_2 = ir.ValueId.fromIndex(18);
+    const suffix_parameter_3 = ir.ValueId.fromIndex(19);
+    const suffix_parameter_4 = ir.ValueId.fromIndex(20);
+
+    const arguments = [_]ir.ValueId{ selector, argument_1, argument_2, argument_3 };
+    const owner_parameters = [_]ir.ValueId{
+        owner_parameter_1,
+        owner_parameter_2,
+        owner_parameter_3,
+        owner_parameter_4,
+    };
+    const original_parameters = [_]ir.ValueId{
+        original_parameter_1,
+        original_parameter_2,
+        original_parameter_3,
+        original_parameter_4,
+    };
+    const current_parameters = [_]ir.ValueId{
+        current_parameter_1,
+        current_parameter_2,
+        current_parameter_3,
+        current_parameter_4,
+    };
+    const suffix_parameters = [_]ir.ValueId{
+        suffix_parameter_1,
+        suffix_parameter_2,
+        suffix_parameter_3,
+        suffix_parameter_4,
+    };
+
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = selector,
+            .then_edge = .{ .target = prefix },
+            .else_edge = .{ .target = original, .arguments = &arguments },
+        } } },
+        .{ .id = prefix, .function = function_id, .terminator = .{ .jump = .{
+            .target = owner,
+            .arguments = &arguments,
+        } } },
+        .{ .id = owner, .function = function_id, .parameters = &owner_parameters, .terminator = .{ .jump = .{
+            .target = bridge,
+            .arguments = &owner_parameters,
+        } } },
+        .{ .id = bridge, .function = function_id, .terminator = .{ .jump = .{
+            .target = current,
+            .arguments = &arguments,
+        } } },
+        .{ .id = original, .function = function_id, .parameters = &original_parameters, .terminator = .{ .jump = .{
+            .target = suffix,
+            .arguments = &original_parameters,
+        } } },
+        .{ .id = current, .function = function_id, .parameters = &current_parameters, .terminator = .{ .jump = .{
+            .target = suffix,
+            .arguments = &current_parameters,
+        } } },
+        .{ .id = suffix, .function = function_id, .parameters = &suffix_parameters, .terminator = .{ .jump = .{
+            .target = continuation,
+            .arguments = &suffix_parameters,
+        } } },
+        .{ .id = continuation, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = terminal, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &.{ selector, argument_1, argument_2, argument_3, argument_4 },
+        .blocks = &.{ entry, prefix, owner, bridge, original, current, suffix, continuation, terminal },
+        .entry_block = entry,
+    };
+    const values = [_]ir.Value{
+        .{ .id = selector, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = argument_1, .function = function_id, .type = .integer, .origin = .{ .parameter = 1 } },
+        .{ .id = argument_2, .function = function_id, .type = .integer, .origin = .{ .parameter = 2 } },
+        .{ .id = argument_3, .function = function_id, .type = .integer, .origin = .{ .parameter = 3 } },
+        .{ .id = argument_4, .function = function_id, .type = .integer, .origin = .{ .parameter = 4 } },
+        .{ .id = owner_parameter_1, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = owner, .index = 0 } } },
+        .{ .id = owner_parameter_2, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = owner, .index = 1 } } },
+        .{ .id = owner_parameter_3, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = owner, .index = 2 } } },
+        .{ .id = owner_parameter_4, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = owner, .index = 3 } } },
+        .{ .id = original_parameter_1, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = original, .index = 0 } } },
+        .{ .id = original_parameter_2, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = original, .index = 1 } } },
+        .{ .id = original_parameter_3, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = original, .index = 2 } } },
+        .{ .id = original_parameter_4, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = original, .index = 3 } } },
+        .{ .id = current_parameter_1, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = current, .index = 0 } } },
+        .{ .id = current_parameter_2, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = current, .index = 1 } } },
+        .{ .id = current_parameter_3, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = current, .index = 2 } } },
+        .{ .id = current_parameter_4, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = current, .index = 3 } } },
+        .{ .id = suffix_parameter_1, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = suffix, .index = 0 } } },
+        .{ .id = suffix_parameter_2, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = suffix, .index = 1 } } },
+        .{ .id = suffix_parameter_3, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = suffix, .index = 2 } } },
+        .{ .id = suffix_parameter_4, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = suffix, .index = 3 } } },
+    };
+    var rewrites = [_]ir.CfgEdgeRewrite{.{
+        .id = ir.EdgeRewriteId.fromIndex(0),
+        .source = bridge,
+        .kind = .jump,
+        .from = .{ .target = original, .arguments = &arguments },
+        .to = .{ .target = current, .arguments = &arguments },
+        .rule = .node_split,
+        .node_split_group = ir.NodeSplitGroupId.fromIndex(0),
+    }};
+    var program = ir.Program{
+        .program_id = "prefixed-four-value-continuation-composition",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+        .edge_rewrites = &rewrites,
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, function);
+    defer analysis.deinit();
+    const loop_headers = try natural_loop.headerCandidatesAlloc(std.testing.allocator, &analysis);
+    defer std.testing.allocator.free(loop_headers);
+
+    var visited = [_]bool{ false, false, false, false, false, true, false, false, false };
+    var contexts = [_]?Builder.VisitContext{ null, null, null, null, null, .{
+        .start = owner,
+        .stop = suffix,
+        .loop_exit = null,
+        .continue_target = continuation,
+        .parameter_arguments = &arguments,
+    }, null, null, null };
+    var builder: Builder = .{
+        .allocator = std.testing.allocator,
+        .analysis = &analysis,
+        .visited = &visited,
+        .visited_contexts = &contexts,
+        .loop_headers = loop_headers,
+    };
+    const incoming = ir.CfgEdgeRef{ .source = bridge, .kind = .jump, .target = current };
+    try std.testing.expect(try builder.parameterProjectionMatches(current, &arguments, &arguments));
+    try std.testing.expect(try builder.hasAuthenticatedContinuationBridge(incoming));
+    try std.testing.expect(try builder.authenticatedVisitedParameterizedContinuationProjection(
+        current,
+        prefix,
+        suffix,
+        null,
+        continuation,
+        contexts[current.index()].?,
+        true,
+        &arguments,
+        incoming,
+        true,
+        true,
+    ));
+
+    var tampered_arguments = arguments;
+    tampered_arguments[2] = argument_4;
+    var tampered_blocks = blocks;
+    tampered_blocks[bridge.index()].terminator = .{ .jump = .{
+        .target = current,
+        .arguments = &tampered_arguments,
+    } };
+    var tampered_program = program;
+    tampered_program.blocks = &tampered_blocks;
+    var tampered_analysis = try cfg.Analysis.init(std.testing.allocator, &tampered_program, function);
+    defer tampered_analysis.deinit();
+    var tampered_builder = builder;
+    tampered_builder.analysis = &tampered_analysis;
+    try std.testing.expect(!(try tampered_builder.authenticatedVisitedParameterizedContinuationProjection(
+        current,
+        prefix,
+        suffix,
+        null,
+        continuation,
+        contexts[current.index()].?,
+        true,
+        &arguments,
+        incoming,
+        true,
+        true,
+    )));
+
+    var tampered_rewrite_arguments = arguments;
+    tampered_rewrite_arguments[1] = argument_4;
+    var tampered_rewrites = rewrites;
+    tampered_rewrites[0].from.arguments = &tampered_rewrite_arguments;
+    var tampered_rewrite_program = program;
+    tampered_rewrite_program.edge_rewrites = &tampered_rewrites;
+    var tampered_rewrite_analysis = try cfg.Analysis.init(
+        std.testing.allocator,
+        &tampered_rewrite_program,
+        function,
+    );
+    defer tampered_rewrite_analysis.deinit();
+    var tampered_rewrite_builder = builder;
+    tampered_rewrite_builder.analysis = &tampered_rewrite_analysis;
+    try std.testing.expect(!(try tampered_rewrite_builder.authenticatedVisitedParameterizedContinuationProjection(
+        current,
+        prefix,
+        suffix,
+        null,
+        continuation,
+        contexts[current.index()].?,
+        true,
+        &arguments,
+        incoming,
+        true,
+        true,
+    )));
+
+    var bypass_blocks = blocks;
+    bypass_blocks[current.index()].terminator = .{ .jump = .{
+        .target = owner,
+        .arguments = &current_parameters,
+    } };
+    var bypass_program = program;
+    bypass_program.blocks = &bypass_blocks;
+    var bypass_analysis = try cfg.Analysis.init(std.testing.allocator, &bypass_program, function);
+    defer bypass_analysis.deinit();
+    var bypass_builder = builder;
+    bypass_builder.analysis = &bypass_analysis;
+    try std.testing.expect(!(try bypass_builder.authenticatedVisitedParameterizedContinuationProjection(
+        current,
+        prefix,
+        suffix,
+        null,
+        continuation,
+        contexts[current.index()].?,
+        true,
+        &arguments,
+        incoming,
+        true,
+        true,
+    )));
+
+    {
+        const replay_constant = ir.InstructionId.fromIndex(0);
+        const replay_write = ir.InstructionId.fromIndex(1);
+        const effect_value = ir.ValueId.fromIndex(21);
+        const replay_place = ir.PlaceId.fromIndex(0);
+
+        const replay_instructions = [_]ir.Instruction{
+            .{ .id = replay_constant, .block = current, .operation = .{ .constant = .{ .integer = "1" } }, .results = &.{effect_value}, .effects = .pure },
+            .{ .id = replay_write, .block = current, .operation = .{ .place_write = .{ .place = replay_place, .value = effect_value } }, .results = &.{}, .effects = .place_write },
+        };
+        const replay_values = values ++ [_]ir.Value{
+            .{ .id = effect_value, .function = function_id, .type = .integer, .origin = .{ .instruction_result = .{ .instruction = replay_constant, .index = 0 } } },
+        };
+        var replay_blocks = blocks;
+        replay_blocks[current.index()].instructions = &.{ replay_constant, replay_write };
+        var replay_program = program;
+        replay_program.blocks = &replay_blocks;
+        replay_program.instructions = &replay_instructions;
+        replay_program.values = &replay_values;
+        replay_program.places = &.{.{ .id = replay_place, .function = function_id, .type = .integer, .origin = .{ .local = 0 } }};
+
+        var replay_analysis = try cfg.Analysis.init(std.testing.allocator, &replay_program, function);
+        defer replay_analysis.deinit();
+        var replay_visited = visited;
+        var replay_contexts = contexts;
+        replay_contexts[current.index()] = .{
+            .start = current,
+            .stop = continuation,
+            .loop_exit = null,
+            .continue_target = null,
+            .parameter_arguments = &arguments,
+        };
+        var replay_builder = builder;
+        replay_builder.analysis = &replay_analysis;
+        replay_builder.visited = &replay_visited;
+        replay_builder.visited_contexts = &replay_contexts;
+        const replay = (try replay_builder.authenticatedEffectfulTerminalReplay(
+            current,
+            current,
+            suffix,
+            &arguments,
+            incoming,
+        )) orelse return error.TestUnexpectedResult;
+        defer replay_builder.allocator.free(replay.nodes);
+        try std.testing.expectEqual(@as(usize, 1), replay.nodes.len);
+        try std.testing.expectEqual(current, replay.nodes[0].blockId());
+        try std.testing.expect(replay.terminal == null);
+
+        var replay_tampered_arguments = arguments;
+        replay_tampered_arguments[0] = argument_4;
+        var replay_tampered_blocks = replay_blocks;
+        replay_tampered_blocks[bridge.index()].terminator = .{ .jump = .{
+            .target = current,
+            .arguments = &replay_tampered_arguments,
+        } };
+        var replay_tampered_program = replay_program;
+        replay_tampered_program.blocks = &replay_tampered_blocks;
+        var replay_tampered_analysis = try cfg.Analysis.init(std.testing.allocator, &replay_tampered_program, function);
+        defer replay_tampered_analysis.deinit();
+        var replay_tampered_builder = replay_builder;
+        replay_tampered_builder.analysis = &replay_tampered_analysis;
+        try std.testing.expect((try replay_tampered_builder.authenticatedEffectfulTerminalReplay(
+            current,
+            current,
+            suffix,
+            &replay_tampered_arguments,
+            incoming,
+        )) == null);
+
+        var replay_unauthenticated_rewrites = rewrites;
+        replay_unauthenticated_rewrites[0].source = prefix;
+        var replay_unauthenticated_program = replay_program;
+        replay_unauthenticated_program.edge_rewrites = &replay_unauthenticated_rewrites;
+        var replay_unauthenticated_analysis = try cfg.Analysis.init(std.testing.allocator, &replay_unauthenticated_program, function);
+        defer replay_unauthenticated_analysis.deinit();
+        var replay_unauthenticated_builder = replay_builder;
+        replay_unauthenticated_builder.analysis = &replay_unauthenticated_analysis;
+        try std.testing.expect((try replay_unauthenticated_builder.authenticatedEffectfulTerminalReplay(
+            current,
+            current,
+            suffix,
+            &arguments,
+            incoming,
+        )) == null);
+    }
+}
+
+test "effectful parameterized replay rebinds distinct canonical incoming tuples" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const owner = ir.BlockId.fromIndex(1);
+    const incoming = ir.BlockId.fromIndex(2);
+    const current = ir.BlockId.fromIndex(3);
+    const suffix = ir.BlockId.fromIndex(4);
+    const stop = ir.BlockId.fromIndex(5);
+    const owner_stop = ir.BlockId.fromIndex(6);
+
+    const selector = ir.ValueId.fromIndex(0);
+    const owner_first = ir.ValueId.fromIndex(1);
+    const owner_second = ir.ValueId.fromIndex(2);
+    const owner_third = ir.ValueId.fromIndex(3);
+    const owner_fourth = ir.ValueId.fromIndex(4);
+    const incoming_first = ir.ValueId.fromIndex(5);
+    const incoming_second = ir.ValueId.fromIndex(6);
+    const incoming_third = ir.ValueId.fromIndex(7);
+    const incoming_fourth = ir.ValueId.fromIndex(8);
+    const formal_first = ir.ValueId.fromIndex(9);
+    const formal_second = ir.ValueId.fromIndex(10);
+    const formal_third = ir.ValueId.fromIndex(11);
+    const formal_fourth = ir.ValueId.fromIndex(12);
+    const stop_first = ir.ValueId.fromIndex(13);
+    const stop_second = ir.ValueId.fromIndex(14);
+    const stop_third = ir.ValueId.fromIndex(15);
+    const stop_fourth = ir.ValueId.fromIndex(16);
+    const effect_value = ir.ValueId.fromIndex(17);
+    const copied_formal = ir.ValueId.fromIndex(18);
+
+    const effect_constant = ir.InstructionId.fromIndex(0);
+    const effect_write = ir.InstructionId.fromIndex(1);
+    const copy_formal = ir.InstructionId.fromIndex(2);
+    const boundary_copy = ir.InstructionId.fromIndex(3);
+    const owner_arguments = [_]ir.ValueId{ owner_first, owner_second, owner_third, owner_fourth };
+    const incoming_arguments = [_]ir.ValueId{ incoming_first, incoming_second, incoming_third, incoming_fourth };
+    const current_parameters = [_]ir.ValueId{ formal_first, formal_second, formal_third, formal_fourth };
+    const stop_parameters = [_]ir.ValueId{ stop_first, stop_second, stop_third, stop_fourth };
+    const function_parameters = [_]ir.ValueId{
+        selector,
+        owner_first,
+        owner_second,
+        owner_third,
+        owner_fourth,
+        incoming_first,
+        incoming_second,
+        incoming_third,
+        incoming_fourth,
+    };
+
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = selector,
+            .then_edge = .{ .target = owner },
+            .else_edge = .{ .target = incoming },
+        } } },
+        .{ .id = owner, .function = function_id, .terminator = .{ .jump = .{
+            .target = current,
+            .arguments = &owner_arguments,
+        } } },
+        .{ .id = incoming, .function = function_id, .terminator = .{ .jump = .{
+            .target = current,
+            .arguments = &incoming_arguments,
+        } } },
+        .{ .id = current, .function = function_id, .parameters = &current_parameters, .instructions = &.{ effect_constant, effect_write }, .terminator = .{ .jump = .{
+            .target = suffix,
+        } } },
+        .{ .id = suffix, .function = function_id, .terminator = .{ .jump = .{
+            .target = stop,
+            .arguments = &current_parameters,
+        } } },
+        .{ .id = stop, .function = function_id, .parameters = &stop_parameters, .terminator = .{ .return_values = &.{} } },
+        .{ .id = owner_stop, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &function_parameters,
+        .blocks = &.{ entry, owner, incoming, current, suffix, stop, owner_stop },
+        .entry_block = entry,
+    };
+    const values = [_]ir.Value{
+        .{ .id = selector, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = owner_first, .function = function_id, .origin = .{ .parameter = 1 } },
+        .{ .id = owner_second, .function = function_id, .origin = .{ .parameter = 2 } },
+        .{ .id = owner_third, .function = function_id, .origin = .{ .parameter = 3 } },
+        .{ .id = owner_fourth, .function = function_id, .origin = .{ .parameter = 4 } },
+        .{ .id = incoming_first, .function = function_id, .origin = .{ .parameter = 5 } },
+        .{ .id = incoming_second, .function = function_id, .origin = .{ .parameter = 6 } },
+        .{ .id = incoming_third, .function = function_id, .origin = .{ .parameter = 7 } },
+        .{ .id = incoming_fourth, .function = function_id, .origin = .{ .parameter = 8 } },
+        .{ .id = formal_first, .function = function_id, .origin = .{ .block_parameter = .{ .block = current, .index = 0 } } },
+        .{ .id = formal_second, .function = function_id, .origin = .{ .block_parameter = .{ .block = current, .index = 1 } } },
+        .{ .id = formal_third, .function = function_id, .origin = .{ .block_parameter = .{ .block = current, .index = 2 } } },
+        .{ .id = formal_fourth, .function = function_id, .origin = .{ .block_parameter = .{ .block = current, .index = 3 } } },
+        .{ .id = stop_first, .function = function_id, .origin = .{ .block_parameter = .{ .block = stop, .index = 0 } } },
+        .{ .id = stop_second, .function = function_id, .origin = .{ .block_parameter = .{ .block = stop, .index = 1 } } },
+        .{ .id = stop_third, .function = function_id, .origin = .{ .block_parameter = .{ .block = stop, .index = 2 } } },
+        .{ .id = stop_fourth, .function = function_id, .origin = .{ .block_parameter = .{ .block = stop, .index = 3 } } },
+        .{ .id = effect_value, .function = function_id, .type = .integer, .origin = .{ .instruction_result = .{ .instruction = effect_constant, .index = 0 } } },
+        .{ .id = copied_formal, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = copy_formal, .index = 0 } } },
+    };
+    const instructions = [_]ir.Instruction{
+        .{ .id = effect_constant, .block = current, .operation = .{ .constant = .{ .integer = "1" } }, .results = &.{effect_value}, .effects = .pure },
+        .{ .id = effect_write, .block = current, .operation = .{ .place_write = .{ .place = ir.PlaceId.fromIndex(0), .value = effect_value } }, .results = &.{}, .effects = .place_write },
+        .{ .id = copy_formal, .block = current, .operation = .{ .copy = formal_first }, .results = &.{copied_formal}, .effects = .pure },
+    };
+    const places = [_]ir.Place{.{
+        .id = ir.PlaceId.fromIndex(0),
+        .function = function_id,
+        .origin = .{ .local = 0 },
+    }};
+    var program = ir.Program{
+        .program_id = "parameterized-effectful-rebind",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+        .places = &places,
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, function);
+    defer analysis.deinit();
+    const loop_headers = try natural_loop.headerCandidatesAlloc(std.testing.allocator, &analysis);
+    defer std.testing.allocator.free(loop_headers);
+    var visited = [_]bool{ false, false, false, true, true, false, false };
+    var contexts = [_]?Builder.VisitContext{ null, null, null, .{
+        .start = current,
+        .stop = owner_stop,
+        .loop_exit = null,
+        .continue_target = null,
+        .parameter_arguments = &owner_arguments,
+    }, null, null, null };
+    var builder: Builder = .{
+        .allocator = std.testing.allocator,
+        .analysis = &analysis,
+        .visited = &visited,
+        .visited_contexts = &contexts,
+        .loop_headers = loop_headers,
+    };
+    const incoming_reference = ir.CfgEdgeRef{ .source = incoming, .kind = .jump, .target = current };
+    const replay = (try builder.authenticatedEffectfulTerminalReplay(
+        current,
+        current,
+        stop,
+        &incoming_arguments,
+        incoming_reference,
+    )) orelse return error.TestUnexpectedResult;
+    defer builder.allocator.free(replay.nodes);
+    try std.testing.expectEqual(@as(usize, 2), replay.nodes.len);
+    try std.testing.expectEqual(current, replay.nodes[0].blockId());
+    try std.testing.expectEqual(suffix, replay.nodes[1].blockId());
+
+    const boundary_value = ir.ValueId.fromIndex(19);
+    var boundary_blocks = blocks;
+    boundary_blocks[stop.index()].instructions = &.{boundary_copy};
+    const boundary_instructions = instructions ++ [_]ir.Instruction{.{
+        .id = boundary_copy,
+        .block = stop,
+        .operation = .{ .copy = effect_value },
+        .results = &.{boundary_value},
+        .effects = .pure,
+    }};
+    const boundary_values = values ++ [_]ir.Value{.{
+        .id = boundary_value,
+        .function = function_id,
+        .type = .integer,
+        .origin = .{ .instruction_result = .{ .instruction = boundary_copy, .index = 0 } },
+    }};
+    var boundary_program = program;
+    boundary_program.blocks = &boundary_blocks;
+    boundary_program.instructions = &boundary_instructions;
+    boundary_program.values = &boundary_values;
+    var boundary_analysis = try cfg.Analysis.init(std.testing.allocator, &boundary_program, function);
+    defer boundary_analysis.deinit();
+    var boundary_builder = builder;
+    boundary_builder.analysis = &boundary_analysis;
+    try std.testing.expect((try boundary_builder.authenticatedEffectfulTerminalReplay(
+        current,
+        current,
+        stop,
+        &incoming_arguments,
+        incoming_reference,
+    )) == null);
+
+    var parameter_use_blocks = blocks;
+    parameter_use_blocks[current.index()].instructions = &.{copy_formal};
+    var parameter_use_program = program;
+    parameter_use_program.blocks = &parameter_use_blocks;
+    var parameter_use_analysis = try cfg.Analysis.init(std.testing.allocator, &parameter_use_program, function);
+    defer parameter_use_analysis.deinit();
+    var parameter_use_builder = builder;
+    parameter_use_builder.analysis = &parameter_use_analysis;
+    try std.testing.expect((try parameter_use_builder.authenticatedEffectfulTerminalReplay(
+        current,
+        current,
+        stop,
+        &incoming_arguments,
+        incoming_reference,
+    )) == null);
+
+    var wrong_terminal_blocks = blocks;
+    wrong_terminal_blocks[suffix.index()].terminator = .{ .jump = .{
+        .target = stop,
+        .arguments = &incoming_arguments,
+    } };
+    var wrong_terminal_program = program;
+    wrong_terminal_program.blocks = &wrong_terminal_blocks;
+    var wrong_terminal_analysis = try cfg.Analysis.init(std.testing.allocator, &wrong_terminal_program, function);
+    defer wrong_terminal_analysis.deinit();
+    var wrong_terminal_builder = builder;
+    wrong_terminal_builder.analysis = &wrong_terminal_analysis;
+    try std.testing.expect((try wrong_terminal_builder.authenticatedEffectfulTerminalReplay(
+        current,
+        current,
+        stop,
+        &incoming_arguments,
+        incoming_reference,
+    )) == null);
+
+    var missing_owner_blocks = blocks;
+    missing_owner_blocks[owner.index()].terminator = .{ .return_values = &.{} };
+    var missing_owner_program = program;
+    missing_owner_program.blocks = &missing_owner_blocks;
+    var missing_owner_analysis = try cfg.Analysis.init(std.testing.allocator, &missing_owner_program, function);
+    defer missing_owner_analysis.deinit();
+    var missing_owner_builder = builder;
+    missing_owner_builder.analysis = &missing_owner_analysis;
+    try std.testing.expect((try missing_owner_builder.authenticatedEffectfulTerminalReplay(
+        current,
+        current,
+        stop,
+        &incoming_arguments,
+        incoming_reference,
+    )) == null);
 }
 
 test "effectful parameterized prefix replay hands off before a branch" {
