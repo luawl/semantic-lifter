@@ -5230,6 +5230,538 @@ const Builder = struct {
         }
     }
 
+    fn buildLoopRegion(
+        self: *Builder,
+        start: ir.BlockId,
+        stop: ir.BlockId,
+        allowed: []const bool,
+        loop_exit: ?ir.BlockId,
+        escape_targets: ?*const EscapeTarget,
+        continue_targets: ?*const EscapeTarget,
+        entry_arguments: ?[]const ir.ValueId,
+        entry_reference: ?ir.CfgEdgeRef,
+    ) BuildError!*Region {
+        const continue_escape: EscapeTarget = .{ .block = stop, .parent = escape_targets };
+        const continue_target: EscapeTarget = .{ .block = stop, .parent = continue_targets };
+        return self.buildRegionImplWithEntryArgumentsAndEdge(
+            start,
+            stop,
+            allowed,
+            loop_exit,
+            &continue_escape,
+            &continue_target,
+            false,
+            stop,
+            entry_arguments,
+            entry_reference,
+        );
+    }
+
+    fn buildRegionIncludingStart(
+        self: *Builder,
+        start: ir.BlockId,
+        stop: ir.BlockId,
+        allowed: []const bool,
+        loop_exit: ?ir.BlockId,
+        escape_targets: ?*const EscapeTarget,
+        continue_targets: ?*const EscapeTarget,
+        continue_target: ir.BlockId,
+        entry_arguments: ?[]const ir.ValueId,
+        entry_reference: ?ir.CfgEdgeRef,
+    ) BuildError!*Region {
+        const forwarded_continue: EscapeTarget = .{ .block = continue_target, .parent = continue_targets };
+        return self.buildRegionImplWithEntryArgumentsAndEdge(
+            start,
+            stop,
+            allowed,
+            loop_exit,
+            escape_targets,
+            &forwarded_continue,
+            true,
+            continue_target,
+            entry_arguments,
+            entry_reference,
+        );
+    }
+
+    fn buildRegionImplWithEntryArguments(
+        self: *Builder,
+        start: ir.BlockId,
+        stop: ?ir.BlockId,
+        allowed: ?[]const bool,
+        loop_exit: ?ir.BlockId,
+        escape_targets: ?*const EscapeTarget,
+        continue_targets: ?*const EscapeTarget,
+        include_start_at_stop: bool,
+        continue_target: ?ir.BlockId,
+        entry_arguments: ?[]const ir.ValueId,
+    ) BuildError!*Region {
+        return self.buildRegionImplWithEntryArgumentsAndEdge(
+            start,
+            stop,
+            allowed,
+            loop_exit,
+            escape_targets,
+            continue_targets,
+            include_start_at_stop,
+            continue_target,
+            entry_arguments,
+            null,
+        );
+    }
+
+    fn buildRegionImplWithEntryArgumentsAndEdge(
+        self: *Builder,
+        start: ir.BlockId,
+        stop: ?ir.BlockId,
+        allowed: ?[]const bool,
+        loop_exit: ?ir.BlockId,
+        escape_targets: ?*const EscapeTarget,
+        continue_targets: ?*const EscapeTarget,
+        include_start_at_stop: bool,
+        continue_target: ?ir.BlockId,
+        entry_arguments: ?[]const ir.ValueId,
+        entry_reference: ?ir.CfgEdgeRef,
+    ) BuildError!*Region {
+        const checkpoint = self.beginMutation();
+        errdefer self.rollbackMutation(checkpoint);
+        const region = try self.buildRegionImplWithEntryArgumentsAndEdgeCore(
+            start,
+            stop,
+            allowed,
+            loop_exit,
+            escape_targets,
+            continue_targets,
+            include_start_at_stop,
+            continue_target,
+            entry_arguments,
+            entry_reference,
+        );
+        self.finishMutation(checkpoint);
+        return region;
+    }
+
+    fn forwardingContinueProjectionAlloc(
+        self: *const Builder,
+        final_node: Node,
+        shared_entry: ir.BlockId,
+        continue_target: ir.BlockId,
+        stop: ?ir.BlockId,
+        allowed: ?[]const bool,
+    ) BuildError!?control_flow.ForwardingPath {
+        const source = switch (final_node) {
+            .block => |block_id| block_id,
+            else => return null,
+        };
+        if (source.index() >= self.analysis.program.blocks.len) return error.UnsupportedShape;
+        const raw = switch (self.analysis.program.blocks[source.index()].terminator) {
+            .jump => |edge| edge,
+            else => return null,
+        };
+        if (raw.target != shared_entry) return error.UnsupportedShape;
+
+        var path = try control_flow.replayForwardingPathTo(
+            self.allocator,
+            self.analysis.program,
+            raw,
+            continue_target,
+        ) orelse return null;
+        var owns_path = true;
+        defer if (owns_path) path.deinit(self.allocator);
+        if (path.blocks.len == 0 or path.blocks[0] != shared_entry or path.edge.target != continue_target) {
+            return error.UnsupportedShape;
+        }
+        for (path.blocks) |block_id| {
+            if (stop != null and block_id == stop.?) return null;
+            const block_index = self.analysis.blockIndex(block_id) orelse return error.UnsupportedShape;
+            if (allowed) |membership| {
+                if (block_index >= membership.len or !membership[block_index]) return null;
+            }
+            if (!self.analysis.isReachable(block_id) or !self.visited[block_index]) return null;
+        }
+        owns_path = false;
+        return path;
+    }
+
+    fn canProjectTerminal(
+        self: *const Builder,
+        terminal_id: ir.BlockId,
+        stop_id: ir.BlockId,
+        allowed: ?[]const bool,
+    ) bool {
+        if (terminal_id == stop_id or terminal_id.index() >= self.analysis.program.blocks.len) return false;
+        const terminal_index = self.analysis.blockIndex(terminal_id) orelse return false;
+        if (allowed) |membership| {
+            if (terminal_index >= membership.len or !membership[terminal_index]) return false;
+        }
+        if (self.visited[terminal_index]) return false;
+        const terminal = self.analysis.program.blocks[terminal_id.index()];
+        return isTerminal(terminal.terminator) and
+            self.analysis.predecessorCount(terminal_id) > 1 and
+            self.analysis.postDominates(terminal_id, stop_id);
+    }
+
+    fn directSharedTerminalJoin(
+        self: *const Builder,
+        branch_block: ir.BlockId,
+        branch: ir.Branch,
+        allowed: ?[]const bool,
+    ) std.mem.Allocator.Error!?ir.BlockId {
+        const edges = [_]ir.Edge{ branch.then_edge, branch.else_edge };
+        for (edges, 0..) |edge, edge_index| {
+            const candidate_index = self.analysis.blockIndex(edge.target) orelse continue;
+            if (allowed) |membership| {
+                if (candidate_index >= membership.len or !membership[candidate_index]) continue;
+            }
+            const candidate = self.analysis.program.blocks[edge.target.index()];
+            if (!isTerminal(candidate.terminator) or self.visited[candidate_index] or
+                !self.analysis.dominates(branch_block, candidate.id)) continue;
+
+            // A direct shared-terminal claim transfers ownership of the
+            // terminal to this branch. Every reachable predecessor must
+            // therefore remain under the branch's dominance boundary. An
+            // external predecessor would make the terminal a shared suffix
+            // owned by another region, not this branch's join.
+            var owns_all_predecessors = true;
+            var predecessor_index: usize = 0;
+            while (self.analysis.predecessorAt(candidate.id, predecessor_index)) |predecessor| : (predecessor_index += 1) {
+                if (!self.analysis.dominates(branch_block, predecessor)) {
+                    owns_all_predecessors = false;
+                    break;
+                }
+            }
+            if (!owns_all_predecessors) continue;
+
+            const other = edges[1 - edge_index].target;
+            if (try self.analysis.canReachAvoiding(other, candidate.id, branch_block)) return candidate.id;
+        }
+        return null;
+    }
+
+    fn ownedTransparentStopEdge(
+        self: *const Builder,
+        start: ir.BlockId,
+        stop: ir.BlockId,
+        allowed: ?[]const bool,
+    ) ?ir.Edge {
+        var current = start;
+        var traversed: usize = 0;
+        while (current != stop) : (traversed += 1) {
+            if (traversed >= self.analysis.function.blocks.len) return null;
+            const local_index = self.analysis.blockIndex(current) orelse return null;
+            if (allowed) |membership| {
+                if (local_index >= membership.len or !membership[local_index]) return null;
+            }
+            if (!self.visited[local_index]) return null;
+
+            const block = self.analysis.program.blocks[current.index()];
+            if (block.parameters.len != 0 or block.instructions.len != 0) return null;
+            const edge = switch (block.terminator) {
+                .jump => |value| value,
+                else => return null,
+            };
+            if (edge.target == stop) {
+                const stop_block = self.analysis.program.blocks[stop.index()];
+                if (edge.arguments.len != stop_block.parameters.len) return null;
+                return edge;
+            }
+            if (edge.arguments.len != 0) return null;
+            current = edge.target;
+        }
+        return null;
+    }
+
+    fn buildLoop(
+        self: *Builder,
+        header: ir.BlockId,
+        branch: ir.Branch,
+        enclosing_allowed: ?[]const bool,
+        escape_targets: ?*const EscapeTarget,
+        continue_targets: ?*const EscapeTarget,
+        enclosing_loop_exit: ?ir.BlockId,
+    ) BuildError!?Loop {
+        const checkpoint = self.beginMutation();
+        errdefer self.rollbackMutation(checkpoint);
+        const result = try self.buildLoopCore(
+            header,
+            branch,
+            enclosing_allowed,
+            escape_targets,
+            continue_targets,
+            enclosing_loop_exit,
+        );
+        if (result == null) {
+            self.rollbackMutation(checkpoint);
+        } else {
+            self.finishMutation(checkpoint);
+        }
+        return result;
+    }
+
+    fn buildLoopCore(
+        self: *Builder,
+        header: ir.BlockId,
+        branch: ir.Branch,
+        enclosing_allowed: ?[]const bool,
+        escape_targets: ?*const EscapeTarget,
+        continue_targets: ?*const EscapeTarget,
+        enclosing_loop_exit: ?ir.BlockId,
+    ) BuildError!?Loop {
+        var membership = (try self.collectNaturalLoop(header, enclosing_allowed)) orelse return null;
+        defer membership.deinit();
+
+        const then_index = self.analysis.blockIndex(branch.then_edge.target) orelse return error.UnsupportedShape;
+        const else_index = self.analysis.blockIndex(branch.else_edge.target) orelse return error.UnsupportedShape;
+        const then_is_body = membership.bits[then_index];
+        const else_is_body = membership.bits[else_index];
+        if (then_is_body == else_is_body) return null;
+        const exit_shape = try natural_loop.classifyExit(self.analysis, membership.bits);
+        switch (exit_shape) {
+            .multiple => if (!try self.loopSecondaryExitsAreOwned(
+                membership.bits,
+                if (then_is_body) branch.else_edge.target else branch.then_edge.target,
+                escape_targets,
+                continue_targets,
+                enclosing_loop_exit,
+            )) return null,
+            .closed, .unique => {},
+        }
+
+        const body_edge = if (then_is_body) branch.then_edge else branch.else_edge;
+        const exit_edge = if (then_is_body) branch.else_edge else branch.then_edge;
+        if (try self.outsideTerminalPath(enclosing_allowed, exit_edge.target) and
+            (enclosing_loop_exit == null or exit_edge.target != enclosing_loop_exit.?)) return null;
+        const body_reference: ir.CfgEdgeRef = .{
+            .source = header,
+            .kind = if (then_is_body) .branch_then else .branch_else,
+            .target = body_edge.target,
+        };
+        const body_region = try self.buildLoopRegion(
+            body_edge.target,
+            header,
+            membership.bits,
+            exit_edge.target,
+            escape_targets,
+            continue_targets,
+            body_edge.arguments,
+            body_reference,
+        );
+        errdefer destroyRegion(self.allocator, body_region);
+
+        for (membership.bits, 0..) |is_member, local_index| {
+            if (is_member and local_index != membership.header_index and !self.visited[local_index]) return error.UnsupportedShape;
+        }
+        return .{
+            .header = header,
+            .body_region = body_region,
+            .body_edge = body_edge,
+            .exit_edge = exit_edge,
+            .exit_is_escape = isEscapeTarget(escape_targets, exit_edge.target) or
+                (enclosing_loop_exit != null and exit_edge.target == enclosing_loop_exit.?),
+            .continue_on_true = then_is_body,
+        };
+    }
+
+    fn outsideTerminalPath(
+        self: *const Builder,
+        membership: ?[]const bool,
+        target: ir.BlockId,
+    ) BuildError!bool {
+        const allowed = membership orelse return false;
+        const target_index = self.analysis.blockIndex(target) orelse return error.UnsupportedShape;
+        if (allowed[target_index]) return false;
+        return self.outsidePathMustTerminate(allowed, target);
+    }
+
+    // A node split can leave an empty clone just outside the active region.
+    // It is safe to own only the clone itself when its authenticated edge
+    // forwards directly to a boundary already owned by this structure.
+    fn authenticatedTransparentOutsideProjection(
+        self: *Builder,
+        start: ir.BlockId,
+        stop: ?ir.BlockId,
+        loop_exit: ?ir.BlockId,
+        escape_targets: ?*const EscapeTarget,
+        continue_targets: ?*const EscapeTarget,
+        entry_arguments: ?[]const ir.ValueId,
+        entry_reference: ?ir.CfgEdgeRef,
+        membership: []const bool,
+    ) BuildError!?ir.Edge {
+        const block_index = self.analysis.blockIndex(start) orelse return null;
+        if (block_index >= membership.len or membership[block_index]) return null;
+        if (!try self.parameterProjectionMatches(start, null, entry_arguments)) return null;
+        if (self.visited[block_index]) return null;
+
+        const block = self.analysis.program.blocks[start.index()];
+        if (block.id != start or block.parameters.len != 0 or block.instructions.len != 0) return null;
+        const edge = switch (block.terminator) {
+            .jump => |value| value,
+            else => return null,
+        };
+        if (edge.target == start or edge.target.index() >= self.analysis.program.blocks.len) return null;
+        const target_block = self.analysis.program.blocks[edge.target.index()];
+        if (edge.arguments.len != target_block.parameters.len) return null;
+
+        if ((stop == null or edge.target != stop.?) and
+            !isEscapeTarget(escape_targets, edge.target) and
+            !isEscapeTarget(continue_targets, edge.target) and
+            (loop_exit == null or edge.target != loop_exit.?))
+        {
+            return null;
+        }
+
+        const reference = entry_reference orelse try self.uniqueIncomingReference(start) orelse return null;
+        if (reference.target != start) return null;
+        const incoming = cfg_edge.value(self.analysis.program, reference) orelse return null;
+        if (incoming.arguments.len != block.parameters.len or incoming.arguments.len != 0) return null;
+        if (entry_arguments) |arguments| {
+            if (!std.mem.eql(ir.ValueId, incoming.arguments, arguments)) return null;
+        }
+        if (!try self.hasAuthenticatedContinuationBridge(reference)) return null;
+        return edge;
+    }
+
+    const TerminalOutsideResult = union(enum) {
+        none,
+        appended,
+        projected: TerminalProjection,
+    };
+
+    fn appendTerminalOutsideRegion(
+        self: *Builder,
+        nodes: *std.ArrayList(Node),
+        start: ir.BlockId,
+        stop: ?ir.BlockId,
+        loop_exit: ?ir.BlockId,
+        escape_targets: ?*const EscapeTarget,
+        continue_targets: ?*const EscapeTarget,
+        entry_arguments: ?[]const ir.ValueId,
+        entry_reference: ?ir.CfgEdgeRef,
+        membership: []const bool,
+    ) BuildError!TerminalOutsideResult {
+        if (!try self.outsidePathMustTerminate(membership, start)) return .none;
+        if (membership.len != self.analysis.function.blocks.len) return error.UnsupportedShape;
+        const authenticated_entry = entry_reference orelse try self.uniqueIncomingReference(start) orelse return .none;
+
+        const terminal_membership = try self.allocator.alloc(bool, membership.len);
+        defer self.allocator.free(terminal_membership);
+        @memset(terminal_membership, false);
+
+        var shared_terminal: ?ir.BlockId = null;
+
+        const pending = try self.allocator.alloc(ir.BlockId, membership.len);
+        defer self.allocator.free(pending);
+        const start_index = self.analysis.blockIndex(start) orelse return error.UnsupportedShape;
+        if (self.visited[start_index]) return .none;
+        terminal_membership[start_index] = true;
+        pending[0] = start;
+        var pending_index: usize = 0;
+        var pending_len: usize = 1;
+        while (pending_index < pending_len) : (pending_index += 1) {
+            const current = pending[pending_index];
+            for (0..self.analysis.successorCount(current)) |successor_index| {
+                const successor = self.analysis.successorAt(current, successor_index) orelse return error.UnsupportedShape;
+                const successor_local = self.analysis.blockIndex(successor) orelse return error.UnsupportedShape;
+                if (membership[successor_local] or
+                    successor == stop or
+                    successor == loop_exit or
+                    isEscapeTarget(escape_targets, successor) or
+                    isEscapeTarget(continue_targets, successor))
+                {
+                    return .none;
+                }
+                if (self.visited[successor_local]) {
+                    const successor_block = self.analysis.program.blocks[successor.index()];
+                    const authenticated = try self.hasAuthenticatedContinuationBridge(authenticated_entry);
+                    if (!isTerminal(successor_block.terminator) or
+                        !authenticated) return .none;
+                    if (shared_terminal) |existing| {
+                        if (existing != successor) return .none;
+                    } else {
+                        shared_terminal = successor;
+                    }
+                    continue;
+                }
+                if (terminal_membership[successor_local]) continue;
+                terminal_membership[successor_local] = true;
+                pending[pending_len] = successor;
+                pending_len += 1;
+            }
+        }
+
+        if (shared_terminal) |terminal| {
+            const terminal_index = self.analysis.blockIndex(terminal) orelse return error.UnsupportedShape;
+            for (terminal_membership, 0..) |is_member, local_index| {
+                if (!is_member) continue;
+                const candidate = self.analysis.function.blocks[local_index];
+                if (candidate == terminal) continue;
+                if (isTerminal(self.analysis.program.blocks[candidate.index()].terminator)) return .none;
+            }
+            terminal_membership[terminal_index] = false;
+            const terminal_region = try self.buildRegionImplWithEntryArgumentsAndEdge(
+                start,
+                terminal,
+                terminal_membership,
+                null,
+                null,
+                null,
+                false,
+                null,
+                entry_arguments,
+                authenticated_entry,
+            );
+            errdefer destroyRegion(self.allocator, terminal_region);
+            if (terminal_region.stop != terminal or
+                terminal_region.nodes.len == 0 or
+                terminal_region.terminal_projection != null or
+                terminal_region.continue_projection != null or
+                terminal_region.escape_projection != null or
+                terminal_region.stop_forwarding != null)
+            {
+                return .none;
+            }
+            const edge = switch (finalContinueProjection(
+                self.analysis.program,
+                terminal_region.nodes[terminal_region.nodes.len - 1],
+                terminal,
+            ) orelse return .appended) {
+                .edge => |value| value,
+                .transferred => null,
+            };
+            try nodes.appendSlice(self.allocator, terminal_region.nodes);
+            self.allocator.free(terminal_region.nodes);
+            self.allocator.destroy(terminal_region);
+            return .{ .projected = .{ .terminal = terminal, .edge = edge } };
+        }
+
+        const terminal_region = try self.buildRegionImplWithEntryArgumentsAndEdge(
+            start,
+            null,
+            terminal_membership,
+            null,
+            null,
+            null,
+            false,
+            null,
+            entry_arguments,
+            entry_reference,
+        );
+        errdefer destroyRegion(self.allocator, terminal_region);
+        if (terminal_region.nodes.len == 0 or
+            terminal_region.stop != null or
+            terminal_region.loop_exit != null or
+            terminal_region.continue_projection != null or
+            terminal_region.escape_projection != null or
+            terminal_region.terminal_projection != null)
+        {
+            return error.UnsupportedShape;
+        }
+        try nodes.appendSlice(self.allocator, terminal_region.nodes);
+        self.allocator.free(terminal_region.nodes);
+        self.allocator.destroy(terminal_region);
+        return .appended;
+    }
+
     fn uniqueIncomingReference(self: *const Builder, target: ir.BlockId) BuildError!?ir.CfgEdgeRef {
         if (target.index() >= self.analysis.program.blocks.len or
             self.analysis.predecessorCount(target) != 1)
@@ -5239,6 +5771,330 @@ const Builder = struct {
         const predecessor = self.analysis.predecessorAt(target, 0) orelse return null;
         if (!self.analysis.isReachable(predecessor)) return null;
         return directEdgeReference(self.analysis.program, .{ .block = predecessor }, target);
+    }
+
+    fn loopSecondaryExitsAreOwned(
+        self: *const Builder,
+        membership: []const bool,
+        primary_exit: ir.BlockId,
+        escape_targets: ?*const EscapeTarget,
+        continue_targets: ?*const EscapeTarget,
+        enclosing_loop_exit: ?ir.BlockId,
+    ) BuildError!bool {
+        if (membership.len != self.analysis.function.blocks.len) return error.UnsupportedShape;
+        for (membership, 0..) |is_member, local_index| {
+            if (!is_member) continue;
+            const block_id = self.analysis.function.blocks[local_index];
+            const terminator = self.analysis.program.blocks[block_id.index()].terminator;
+            switch (terminator) {
+                .jump => |edge| if (!try self.loopExitIsOwned(
+                    membership,
+                    edge.target,
+                    primary_exit,
+                    escape_targets,
+                    continue_targets,
+                    enclosing_loop_exit,
+                )) return false,
+                .branch => |candidate| {
+                    if (!try self.loopExitIsOwned(
+                        membership,
+                        candidate.then_edge.target,
+                        primary_exit,
+                        escape_targets,
+                        continue_targets,
+                        enclosing_loop_exit,
+                    )) return false;
+                    if (!try self.loopExitIsOwned(
+                        membership,
+                        candidate.else_edge.target,
+                        primary_exit,
+                        escape_targets,
+                        continue_targets,
+                        enclosing_loop_exit,
+                    )) return false;
+                },
+                .return_values, .return_pack, .return_expanded, .throw_error, .unreachable_block => return false,
+            }
+        }
+        return true;
+    }
+
+    fn loopExitIsOwned(
+        self: *const Builder,
+        membership: []const bool,
+        target: ir.BlockId,
+        primary_exit: ir.BlockId,
+        escape_targets: ?*const EscapeTarget,
+        continue_targets: ?*const EscapeTarget,
+        enclosing_loop_exit: ?ir.BlockId,
+    ) BuildError!bool {
+        const target_index = self.analysis.blockIndex(target) orelse return error.UnsupportedShape;
+        if (membership[target_index] or target == primary_exit or
+            isEscapeTarget(escape_targets, target) or isEscapeTarget(continue_targets, target) or
+            (enclosing_loop_exit != null and target == enclosing_loop_exit.?)) return true;
+        return self.outsidePathMustTerminate(membership, target);
+    }
+
+    fn outsidePathMustTerminate(
+        self: *const Builder,
+        membership: []const bool,
+        start: ir.BlockId,
+    ) BuildError!bool {
+        const mutable_self = @constCast(self);
+        const call_index = mutable_self.trace_outside_termination_calls;
+        mutable_self.trace_outside_termination_calls += 1;
+        const trace_call = call_index < 64;
+        if (trace_call) {
+            structural_overlap.traceStructural("structural_phase outside_termination_begin function={} call={} start={} membership={}\n", .{
+                self.analysis.function.id.index(),
+                call_index,
+                start.index(),
+                membership.len,
+            });
+        }
+        const trace_start = structural_overlap.structuralPhaseNow();
+        const result = natural_loop.outsidePathMustTerminateAlloc(self.allocator, self.analysis, membership, start);
+        if (trace_call) {
+            structural_overlap.traceStructural("structural_phase outside_termination_done function={} call={} start={} result={} ms={}\n", .{
+                self.analysis.function.id.index(),
+                call_index,
+                start.index(),
+                result catch false,
+                structural_overlap.structuralPhaseMillis(trace_start),
+            });
+        }
+        return result;
+    }
+
+    fn buildLoopRejoiningBranch(
+        self: *Builder,
+        block: ir.BlockId,
+        branch: ir.Branch,
+        membership: []const bool,
+        local_stop: ir.BlockId,
+        loop_continue: ir.BlockId,
+        loop_exit: ?ir.BlockId,
+        escape_targets: ?*const EscapeTarget,
+        continue_targets: ?*const EscapeTarget,
+    ) BuildError!?Branch {
+        const checkpoint = self.beginMutation();
+        errdefer self.rollbackMutation(checkpoint);
+        const result = try self.buildLoopRejoiningBranchCore(
+            block,
+            branch,
+            membership,
+            local_stop,
+            loop_continue,
+            loop_exit,
+            escape_targets,
+            continue_targets,
+        );
+        if (result == null) {
+            self.rollbackMutation(checkpoint);
+        } else {
+            self.finishMutation(checkpoint);
+        }
+        return result;
+    }
+
+    fn buildLoopRejoiningBranchCore(
+        self: *Builder,
+        block: ir.BlockId,
+        branch: ir.Branch,
+        membership: []const bool,
+        local_stop: ir.BlockId,
+        loop_continue: ir.BlockId,
+        loop_exit: ?ir.BlockId,
+        escape_targets: ?*const EscapeTarget,
+        continue_targets: ?*const EscapeTarget,
+    ) BuildError!?Branch {
+        const then_index = self.analysis.blockIndex(branch.then_edge.target) orelse return error.UnsupportedShape;
+        const else_index = self.analysis.blockIndex(branch.else_edge.target) orelse return error.UnsupportedShape;
+        if (loop_exit) |exit| {
+            if (branch.then_edge.target == exit or branch.else_edge.target == exit) return null;
+        }
+        const then_is_member = membership[then_index];
+        const else_is_member = membership[else_index];
+        if (then_is_member == else_is_member) return null;
+
+        const trace_rejoining = self.trace_region_step_calls < 256;
+        if (trace_rejoining) {
+            structural_overlap.traceStructural("structural_phase rejoining_phase function={} block={} then={} else={} phase=begin then_member={} else_member={}\\n", .{
+                self.analysis.function.id.index(),
+                block.index(),
+                branch.then_edge.target.index(),
+                branch.else_edge.target.index(),
+                then_is_member,
+                else_is_member,
+            });
+        }
+        const final_join_start = structural_overlap.structuralPhaseNow();
+        const direct_join = try self.analysis.immediateStructuralConvergenceBetween(
+            self.allocator,
+            branch.then_edge.target,
+            branch.else_edge.target,
+            null,
+        );
+        const postdom_join = if (direct_join == null) self.analysis.immediatePostDominator(block) else null;
+        const final_join = direct_join orelse postdom_join orelse {
+            if (trace_rejoining) {
+                structural_overlap.traceStructural("structural_phase rejoining_phase function={} block={} phase=final_join result=null ms={}\\n", .{
+                    self.analysis.function.id.index(),
+                    block.index(),
+                    structural_overlap.structuralPhaseMillis(final_join_start),
+                });
+            }
+            return null;
+        };
+        if (trace_rejoining) {
+            structural_overlap.traceStructural("structural_phase rejoining_phase function={} block={} phase=final_join result={} ms={}\\n", .{
+                self.analysis.function.id.index(),
+                block.index(),
+                final_join.index(),
+                structural_overlap.structuralPhaseMillis(final_join_start),
+            });
+        }
+        var convergence_boundaries: std.ArrayList(ir.BlockId) = .empty;
+        defer convergence_boundaries.deinit(self.allocator);
+        try appendBoundaryTarget(self.allocator, &convergence_boundaries, local_stop);
+        try appendBoundaryTarget(self.allocator, &convergence_boundaries, loop_continue);
+        if (loop_exit) |exit| try appendBoundaryTarget(self.allocator, &convergence_boundaries, exit);
+        try self.appendBoundaryTargets(&convergence_boundaries, escape_targets);
+        try self.appendBoundaryTargets(&convergence_boundaries, continue_targets);
+        const select_join_start = structural_overlap.structuralPhaseNow();
+        const selected_join = try shared_control_shape.selectConvergenceAlloc(
+            self.allocator,
+            self.analysis,
+            block,
+            final_join,
+            convergence_boundaries.items,
+            membership,
+        );
+        const join = selected_join orelse final_join;
+        if (trace_rejoining) {
+            structural_overlap.traceStructural("structural_phase rejoining_phase function={} block={} phase=select_join result={} selected={} ms={}\\n", .{
+                self.analysis.function.id.index(),
+                block.index(),
+                join.index(),
+                selected_join != null,
+                structural_overlap.structuralPhaseMillis(select_join_start),
+            });
+        }
+        const reach_start = structural_overlap.structuralPhaseNow();
+        const then_reaches_join = try self.analysis.canReachAvoiding(branch.then_edge.target, join, local_stop);
+        const else_reaches_join = try self.analysis.canReachAvoiding(branch.else_edge.target, join, local_stop);
+        if (trace_rejoining) {
+            structural_overlap.traceStructural("structural_phase rejoining_phase function={} block={} phase=reach_join then={} else={} ms={}\\n", .{
+                self.analysis.function.id.index(),
+                block.index(),
+                then_reaches_join,
+                else_reaches_join,
+                structural_overlap.structuralPhaseMillis(reach_start),
+            });
+        }
+        if (join != local_stop and !then_reaches_join and !else_reaches_join) {
+            return null;
+        }
+        const outside_target = if (then_is_member) branch.else_edge.target else branch.then_edge.target;
+        if (join == outside_target) return null;
+        const join_index = self.analysis.blockIndex(join) orelse return error.UnsupportedShape;
+        if (self.visited[join_index] or join == local_stop or join == loop_continue or
+            (loop_exit != null and join == loop_exit.?))
+        {
+            return null;
+        }
+        const outside = try self.allocator.alloc(bool, membership.len);
+        defer self.allocator.free(outside);
+        for (membership, 0..) |is_member, local_index| {
+            outside[local_index] = !is_member and self.analysis.isReachable(self.analysis.function.blocks[local_index]);
+        }
+
+        const join_is_continue = isEscapeTarget(continue_targets, join);
+        const final_join_escape: EscapeTarget = .{ .block = final_join, .parent = escape_targets };
+        const outer_escape_targets = if (join == final_join) escape_targets else &final_join_escape;
+        const join_escape: EscapeTarget = .{ .block = join, .parent = outer_escape_targets };
+        const join_continue: EscapeTarget = .{ .block = join, .parent = continue_targets };
+        const arm_escape_targets = if (join_is_continue) escape_targets else &join_escape;
+        const arm_continue_targets = if (join_is_continue) &join_continue else continue_targets;
+        const loop_exit_escape: EscapeTarget = .{ .block = loop_exit orelse join, .parent = arm_escape_targets };
+        const bounded_escape_targets = if (loop_exit != null) &loop_exit_escape else arm_escape_targets;
+        const then_allowed = if (then_is_member) membership else outside;
+        const else_allowed = if (else_is_member) membership else outside;
+        const then_region_start = structural_overlap.structuralPhaseNow();
+        const then_region = self.buildRegionImplWithEntryArgumentsAndEdge(
+            branch.then_edge.target,
+            join,
+            then_allowed,
+            loop_exit,
+            bounded_escape_targets,
+            arm_continue_targets,
+            false,
+            loop_continue,
+            branch.then_edge.arguments,
+            .{ .source = block, .kind = .branch_then, .target = branch.then_edge.target },
+        ) catch |err| {
+            if (trace_rejoining) {
+                structural_overlap.traceStructural("structural_phase rejoining_phase function={} block={} phase=then_region result=error ms={}\\n", .{
+                    self.analysis.function.id.index(),
+                    block.index(),
+                    structural_overlap.structuralPhaseMillis(then_region_start),
+                });
+            }
+            self.noteCollisionEdge(.{
+                .source = block,
+                .kind = .branch_then,
+                .target = branch.then_edge.target,
+            });
+            return err;
+        };
+        if (trace_rejoining) {
+            structural_overlap.traceStructural("structural_phase rejoining_phase function={} block={} phase=then_region result=ok ms={}\\n", .{
+                self.analysis.function.id.index(),
+                block.index(),
+                structural_overlap.structuralPhaseMillis(then_region_start),
+            });
+        }
+        const else_region_start = structural_overlap.structuralPhaseNow();
+        const else_region = self.buildRegionImplWithEntryArgumentsAndEdge(
+            branch.else_edge.target,
+            join,
+            else_allowed,
+            loop_exit,
+            bounded_escape_targets,
+            arm_continue_targets,
+            false,
+            loop_continue,
+            branch.else_edge.arguments,
+            .{ .source = block, .kind = .branch_else, .target = branch.else_edge.target },
+        ) catch |err| {
+            if (trace_rejoining) {
+                structural_overlap.traceStructural("structural_phase rejoining_phase function={} block={} phase=else_region result=error ms={}\\n", .{
+                    self.analysis.function.id.index(),
+                    block.index(),
+                    structural_overlap.structuralPhaseMillis(else_region_start),
+                });
+            }
+            self.noteCollisionEdge(.{
+                .source = block,
+                .kind = .branch_else,
+                .target = branch.else_edge.target,
+            });
+            destroyRegion(self.allocator, then_region);
+            return err;
+        };
+        if (trace_rejoining) {
+            structural_overlap.traceStructural("structural_phase rejoining_phase function={} block={} phase=else_region result=ok ms={}\\n", .{
+                self.analysis.function.id.index(),
+                block.index(),
+                structural_overlap.structuralPhaseMillis(else_region_start),
+            });
+        }
+        return .{
+            .block = block,
+            .then_region = then_region,
+            .else_region = else_region,
+            .join = join,
+        };
     }
 
     fn reopenLoopHeader(self: *Builder, header_index: usize) BuildError!void {
@@ -5295,6 +6151,37 @@ const Builder = struct {
         return self.loop_validation_outcomes.?[header_index];
     }
 
+    fn collectNaturalLoop(self: *Builder, header: ir.BlockId, enclosing_allowed: ?[]const bool) BuildError!?natural_loop.Membership {
+        const header_index = self.analysis.blockIndex(header) orelse return error.UnsupportedShape;
+        if (header_index >= self.loop_headers.len or !self.loop_headers[header_index]) return null;
+        if (self.loop_memberships) |cache| {
+            const bits = if (cache[header_index]) |cached| cached else blk: {
+                var collected = (try natural_loop.collect(self.allocator, self.analysis, header)) orelse return null;
+                errdefer collected.deinit();
+                const cached = try self.allocator.dupe(bool, collected.bits);
+                collected.deinit();
+                try self.installLoopMembership(header_index, cached);
+                break :blk cached;
+            };
+            const cached_validation = self.cachedLoopValidation(header_index, enclosing_allowed);
+            if (cached_validation == .invalid) return error.UnsupportedShape;
+            if (cached_validation == .uncomputed) {
+                try self.validateNaturalLoopMembership(header_index, bits, enclosing_allowed);
+            }
+            return .{
+                .allocator = self.allocator,
+                .bits = bits,
+                .header_index = header_index,
+                .owns_bits = false,
+            };
+        }
+
+        var membership = (try natural_loop.collect(self.allocator, self.analysis, header)) orelse return null;
+        errdefer membership.deinit();
+        try self.validateNaturalLoopMembership(header_index, membership.bits, enclosing_allowed);
+        return membership;
+    }
+
     fn isOutsideEntryToOwnedLoopHeader(
         self: *Builder,
         header: ir.BlockId,
@@ -5319,6 +6206,17 @@ const Builder = struct {
         var membership = (try natural_loop.collect(self.allocator, self.analysis, header)) orelse return false;
         defer membership.deinit();
         return !membership.bits[source_index];
+    }
+
+    fn appendBoundaryTargets(
+        self: *const Builder,
+        boundaries: *std.ArrayList(ir.BlockId),
+        targets: ?*const EscapeTarget,
+    ) std.mem.Allocator.Error!void {
+        var current = targets;
+        while (current) |target| : (current = target.parent) {
+            try appendBoundaryTarget(self.allocator, boundaries, target.block);
+        }
     }
 };
 
@@ -6257,6 +7155,169 @@ fn continuationProjectionForVisitedEntry(
     const edge = cfg_edge.value(program, reference) orelse return null;
     if (edge.target != target or !std.mem.eql(ir.ValueId, edge.arguments, expected_arguments)) return null;
     return .{ .edge = edge };
+}
+
+test "authenticated clone boundary projection covers an owned continuation clone" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const root = ir.BlockId.fromIndex(1);
+    const source = ir.BlockId.fromIndex(2);
+    const clone = ir.BlockId.fromIndex(3);
+    const selector = ir.ValueId.fromIndex(0);
+    const outer = ir.ValueId.fromIndex(1);
+    const root_parameter = ir.ValueId.fromIndex(2);
+    const clone_parameter = ir.ValueId.fromIndex(3);
+    const group = ir.NodeSplitGroupId.fromIndex(0);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = selector,
+            .then_edge = .{ .target = root, .arguments = &.{outer} },
+            .else_edge = .{ .target = source },
+        } } },
+        .{ .id = root, .function = function_id, .parameters = &.{root_parameter}, .terminator = .{ .return_values = &.{root_parameter} } },
+        .{ .id = source, .function = function_id, .terminator = .{ .jump = .{ .target = clone, .arguments = &.{outer} } } },
+        .{ .id = clone, .function = function_id, .parameters = &.{clone_parameter}, .terminator = .{ .return_values = &.{clone_parameter} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &.{ selector, outer },
+        .blocks = &.{ entry, root, source, clone },
+        .entry_block = entry,
+    };
+    const values = [_]ir.Value{
+        .{ .id = selector, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = outer, .function = function_id, .type = .integer, .origin = .{ .parameter = 1 } },
+        .{ .id = root_parameter, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = root, .index = 0 } } },
+        .{ .id = clone_parameter, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = clone, .index = 0 } } },
+    };
+    const rewrites = [_]ir.CfgEdgeRewrite{.{
+        .id = ir.EdgeRewriteId.fromIndex(0),
+        .source = source,
+        .kind = .jump,
+        .from = .{ .target = root, .arguments = &.{outer} },
+        .to = .{ .target = clone, .arguments = &.{outer} },
+        .rule = .node_split,
+        .node_split_group = group,
+    }};
+    var program = ir.Program{
+        .program_id = "authenticated-clone-boundary-projection",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+        .edge_rewrites = &rewrites,
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, function);
+    defer analysis.deinit();
+    var replay = try structural_overlap.ReplayProjectionContext.initForFunction(
+        std.testing.allocator,
+        &program,
+        function_id,
+    );
+    defer replay.deinit();
+
+    var visited = [_]bool{ true, true, true, false };
+    var visited_contexts = [_]?Builder.VisitContext{ null, .{
+        .start = entry,
+        .stop = null,
+        .loop_exit = null,
+        .continue_target = null,
+        .parameter_arguments = &.{outer},
+    }, null, null };
+    var loop_headers = [_]bool{ false, false, false, false };
+    var builder: Builder = .{
+        .allocator = std.testing.allocator,
+        .analysis = &analysis,
+        .visited = &visited,
+        .visited_contexts = &visited_contexts,
+        .loop_headers = &loop_headers,
+        .replay_context = &replay,
+        .visited_count = 3,
+    };
+    var escape_target: Builder.EscapeTarget = .{ .block = root, .parent = null };
+    const projection = (try builder.authenticatedUnvisitedBoundaryProjection(
+        clone,
+        root,
+        null,
+        null,
+        null,
+        &escape_target,
+        null,
+        &.{outer},
+        .{ .source = source, .kind = .jump, .target = clone },
+    )).?;
+    try std.testing.expectEqual(root, projection.target);
+    try std.testing.expectEqual(root, projection.edge.target);
+    try std.testing.expectEqualSlices(ir.ValueId, &.{outer}, projection.edge.arguments);
+    try std.testing.expect(!projection.continue_projection);
+    try std.testing.expect(visited[clone.index()]);
+    try std.testing.expectEqual(@as(usize, 4), builder.visited_count);
+
+    // Covered clone members intentionally have no independent visit context.
+    // A later authenticated entry may still revisit the member, so the
+    // boundary proof must remain usable after the group is marked visited.
+    visited = [_]bool{ true, true, true, true };
+    visited_contexts = [_]?Builder.VisitContext{ null, .{
+        .start = entry,
+        .stop = null,
+        .loop_exit = null,
+        .continue_target = null,
+        .parameter_arguments = &.{outer},
+    }, null, null };
+    builder.visited_count = 4;
+    const covered_member_projection = (try builder.authenticatedUnvisitedBoundaryProjection(
+        clone,
+        root,
+        null,
+        null,
+        null,
+        &escape_target,
+        null,
+        &.{outer},
+        .{ .source = source, .kind = .jump, .target = clone },
+    )).?;
+    try std.testing.expectEqual(root, covered_member_projection.target);
+    try std.testing.expectEqual(root, covered_member_projection.edge.target);
+    try std.testing.expectEqual(@as(usize, 4), builder.visited_count);
+
+    const allowed = [_]bool{ true, true, true, true };
+    const included_covered_member = try builder.buildRegionIncludingStart(
+        clone,
+        clone,
+        &allowed,
+        null,
+        &escape_target,
+        null,
+        clone,
+        &.{outer},
+        .{ .source = source, .kind = .jump, .target = clone },
+    );
+    defer destroyRegion(std.testing.allocator, included_covered_member);
+    try std.testing.expectEqual(@as(usize, 0), included_covered_member.nodes.len);
+    try std.testing.expectEqual(root, included_covered_member.escape_projection.?.target);
+
+    // A clone can enter a region whose canonical root is its stop boundary.
+    // The root is intentionally unvisited in that context; replay and the
+    // canonical parameter tuple still authenticate the projection.
+    visited = [_]bool{ true, false, true, false };
+    visited_contexts = [_]?Builder.VisitContext{ null, null, null, null };
+    builder.visited_count = 2;
+    const unvisited_boundary_projection = (try builder.authenticatedUnvisitedBoundaryProjection(
+        clone,
+        root,
+        null,
+        null,
+        null,
+        &escape_target,
+        null,
+        &.{outer},
+        .{ .source = source, .kind = .jump, .target = clone },
+    )).?;
+    try std.testing.expectEqual(root, unvisited_boundary_projection.target);
+    try std.testing.expectEqual(root, unvisited_boundary_projection.edge.target);
+    try std.testing.expectEqual(@as(usize, 3), builder.visited_count);
+    try std.testing.expect(!visited[root.index()]);
 }
 
 test "nested structured continuation projection uses the owned incoming edge" {
