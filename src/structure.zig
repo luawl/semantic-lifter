@@ -177,6 +177,11 @@ fn ownSharedSideRegions(
     return .{ .entries = entries };
 }
 
+fn containsBlockId(blocks: []const ir.BlockId, target: ir.BlockId) bool {
+    for (blocks) |block| if (block == target) return true;
+    return false;
+}
+
 test "shared side ownership rejects empty and mismatched regions" {
     const allocator = std.testing.allocator;
     const entry = ir.BlockId.fromIndex(0);
@@ -848,6 +853,50 @@ const Builder = struct {
         };
     }
 
+    fn filterTerminalEscapeTargetsAlloc(
+        self: *const Builder,
+        targets: ?*const EscapeTarget,
+    ) BuildError!EscapeTargetProjection {
+        var blocks: std.ArrayList(ir.BlockId) = .empty;
+        defer blocks.deinit(self.allocator);
+        var current = targets;
+        var removed = false;
+        while (current) |target| : (current = target.parent) {
+            const is_terminal = target.block.index() < self.analysis.program.blocks.len and
+                isTerminal(self.analysis.program.blocks[target.block.index()].terminator);
+            if (is_terminal) {
+                removed = true;
+            } else {
+                try blocks.append(self.allocator, target.block);
+            }
+        }
+        if (!removed) return .{ .targets = targets };
+
+        var owned_head: ?*EscapeTarget = null;
+        var index = blocks.items.len;
+        var owned_count: usize = 0;
+        errdefer {
+            var cleanup = EscapeTargetProjection{
+                .targets = null,
+                .owned_head = owned_head,
+                .owned_count = owned_count,
+            };
+            cleanup.deinit(self.allocator);
+        }
+        while (index != 0) {
+            index -= 1;
+            const clone = try self.allocator.create(EscapeTarget);
+            clone.* = .{ .block = blocks.items[index], .parent = owned_head };
+            owned_head = clone;
+            owned_count += 1;
+        }
+        return .{
+            .targets = owned_head,
+            .owned_head = owned_head,
+            .owned_count = owned_count,
+        };
+    }
+
     fn noteCollisionEdge(self: *Builder, reference: ir.CfgEdgeRef) void {
         const output = self.collision orelse return;
         if (output.*) |*collision| {
@@ -855,6 +904,26 @@ const Builder = struct {
                 collision.incoming = reference;
             }
         }
+    }
+
+    fn noteUnvisitedLoopMember(self: *Builder, membership: []const bool, local_index: usize) void {
+        const output = self.collision orelse return;
+        if (output.* != null or local_index >= self.analysis.function.blocks.len) return;
+        const block = self.analysis.function.blocks[local_index];
+        var incoming: ?ir.CfgEdgeRef = null;
+        for (0..self.analysis.predecessorCount(block)) |predecessor_index| {
+            const predecessor = self.analysis.predecessorAt(block, predecessor_index) orelse continue;
+            const predecessor_local = self.analysis.blockIndex(predecessor) orelse continue;
+            if (!membership[predecessor_local] or !self.visited[predecessor_local]) continue;
+            incoming = directEdgeReference(self.analysis.program, .{ .block = predecessor }, block);
+            if (incoming != null) break;
+        }
+        output.* = .{
+            .block = block,
+            .previous = if (incoming) |reference| reference.source else null,
+            .incoming = incoming,
+            .reason = .unvisited_loop_member,
+        };
     }
 
     fn noteCollisionNode(
@@ -6097,6 +6166,771 @@ const Builder = struct {
         };
     }
 
+    fn buildLatchLoop(
+        self: *Builder,
+        header: ir.BlockId,
+        enclosing_allowed: ?[]const bool,
+        escape_targets: ?*const EscapeTarget,
+        continue_targets: ?*const EscapeTarget,
+        enclosing_loop_exit: ?ir.BlockId,
+        entry_arguments: ?[]const ir.ValueId,
+        entry_reference: ?ir.CfgEdgeRef,
+    ) BuildError!?LatchLoop {
+        const checkpoint = self.beginMutation();
+        errdefer self.rollbackMutation(checkpoint);
+        const result = try self.buildLatchLoopCore(
+            header,
+            enclosing_allowed,
+            escape_targets,
+            continue_targets,
+            enclosing_loop_exit,
+            entry_arguments,
+            entry_reference,
+        );
+        if (result == null) {
+            self.rollbackMutation(checkpoint);
+        } else {
+            self.finishMutation(checkpoint);
+        }
+        return result;
+    }
+
+    fn buildLatchLoopCore(
+        self: *Builder,
+        header: ir.BlockId,
+        enclosing_allowed: ?[]const bool,
+        escape_targets: ?*const EscapeTarget,
+        continue_targets: ?*const EscapeTarget,
+        enclosing_loop_exit: ?ir.BlockId,
+        entry_arguments: ?[]const ir.ValueId,
+        entry_reference: ?ir.CfgEdgeRef,
+    ) BuildError!?LatchLoop {
+        var membership = (try self.collectNaturalLoop(header, enclosing_allowed)) orelse return null;
+        defer membership.deinit();
+        const shape = (try natural_loop.classifyPostTested(self.analysis, header, membership.bits)) orelse return null;
+        const exit = try self.promoteLatchLoopExit(membership.bits, shape.exit);
+        var shared_reentries: ?*loop_continue_shape.SharedPaths = null;
+        var owns_shared_reentries = true;
+        defer if (owns_shared_reentries) {
+            if (shared_reentries) |paths| paths.deinit(self.allocator);
+        };
+        var shared_exits: ?*loop_exit_shape.SharedPaths = null;
+        var owns_shared_exits = true;
+        defer if (owns_shared_exits) {
+            if (shared_exits) |paths| paths.deinit(self.allocator);
+        };
+        var exit_latches = try natural_loop.collectExitLatches(
+            self.allocator,
+            self.analysis,
+            header,
+            membership.bits,
+            exit,
+        );
+        defer exit_latches.deinit();
+        if (exit_latches.count != shape.latch_count) return null;
+
+        shared_exits = loop_exit_shape.auditSharedAlloc(
+            self.allocator,
+            self.analysis,
+            header,
+            membership.bits,
+            exit_latches.bits,
+            exit,
+        ) catch |err| switch (err) {
+            error.UnsupportedShape => null,
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        if (shared_exits) |paths| try self.consumeSharedExits(paths, membership.bits);
+        if (shape.has_non_latch_backedge) {
+            shared_reentries = loop_continue_shape.auditAlloc(
+                self.allocator,
+                self.analysis,
+                header,
+                membership.bits,
+                exit_latches.bits,
+            ) catch |err| switch (err) {
+                error.UnsupportedShape => null,
+                error.OutOfMemory => return error.OutOfMemory,
+            };
+            if (shared_reentries) |paths| try self.consumeSharedReentries(paths, membership.bits);
+        }
+
+        try self.reopenLoopHeader(membership.header_index);
+        const previous_shared_reentries = self.active_shared_reentries;
+        self.active_shared_reentries = shared_reentries;
+        defer self.active_shared_reentries = previous_shared_reentries;
+        const previous_shared_exits = self.active_shared_exits;
+        self.active_shared_exits = shared_exits;
+        defer self.active_shared_exits = previous_shared_exits;
+        const needs_latch_split = shape.single_latch != null and
+            !shape.has_non_latch_backedge and
+            self.analysis.immediatePostDominator(header) == exit;
+        const body_region = if (needs_latch_split) body: {
+            const latch = shape.single_latch.?;
+            const prefix = try self.buildRegionIncludingStart(
+                header,
+                latch,
+                membership.bits,
+                exit,
+                escape_targets,
+                continue_targets,
+                header,
+                entry_arguments,
+                entry_reference,
+            );
+            const suffix = self.buildRegionIncludingStart(
+                latch,
+                header,
+                membership.bits,
+                exit,
+                escape_targets,
+                continue_targets,
+                header,
+                null,
+                null,
+            ) catch |err| {
+                destroyRegion(self.allocator, prefix);
+                return err;
+            };
+            self.closePrefixAt(prefix, latch) catch |err| {
+                destroyRegion(self.allocator, prefix);
+                destroyRegion(self.allocator, suffix);
+                return err;
+            };
+            break :body self.mergeSequentialRegions(prefix, suffix, header, exit) catch |err| {
+                destroyRegion(self.allocator, prefix);
+                destroyRegion(self.allocator, suffix);
+                return err;
+            };
+        } else try self.buildRegionIncludingStart(
+            header,
+            header,
+            membership.bits,
+            exit,
+            escape_targets,
+            continue_targets,
+            header,
+            entry_arguments,
+            entry_reference,
+        );
+        errdefer destroyRegion(self.allocator, body_region);
+
+        for (membership.bits, 0..) |is_member, local_index| {
+            if (is_member and !self.visited[local_index]) return error.UnsupportedShape;
+        }
+
+        owns_shared_reentries = false;
+        owns_shared_exits = false;
+        return .{
+            .header = header,
+            .body_region = body_region,
+            .exit = exit,
+            .exit_is_escape = isEscapeTarget(escape_targets, exit) or
+                (enclosing_loop_exit != null and exit == enclosing_loop_exit.?),
+            .latch_count = shape.latch_count,
+            .shared_reentries = shared_reentries,
+            .shared_exits = shared_exits,
+        };
+    }
+
+    fn promoteLatchLoopExit(
+        self: *const Builder,
+        membership: []const bool,
+        immediate_exit: ir.BlockId,
+    ) BuildError!ir.BlockId {
+        if (membership.len != self.analysis.function.blocks.len) return error.UnsupportedShape;
+        const outside = try self.allocator.alloc(bool, membership.len);
+        defer self.allocator.free(outside);
+        for (membership, 0..) |is_member, index| outside[index] = !is_member;
+
+        var promoted: ?ir.BlockId = null;
+        for (self.analysis.function.blocks, 0..) |source, source_index| {
+            if (!membership[source_index]) continue;
+            for (0..self.analysis.successorCount(source)) |successor_index| {
+                const target = self.analysis.successorAt(source, successor_index) orelse return error.UnsupportedShape;
+                const target_index = self.analysis.blockIndex(target) orelse return error.UnsupportedShape;
+                if (membership[target_index] or try self.analysis.canReach(target, immediate_exit)) continue;
+                if (isTerminal(self.analysis.program.blocks[target.index()].terminator)) continue;
+
+                const resolved_convergence = (try self.analysis.immediateStructuralConvergenceBetween(
+                    self.allocator,
+                    immediate_exit,
+                    target,
+                    outside,
+                )) orelse return immediate_exit;
+                const convergence_index = self.analysis.blockIndex(resolved_convergence) orelse return error.UnsupportedShape;
+                if (membership[convergence_index] or
+                    !try self.analysis.canReach(immediate_exit, resolved_convergence) or
+                    !try self.analysis.canReach(target, resolved_convergence)) return immediate_exit;
+                if (promoted) |existing| {
+                    if (existing != resolved_convergence) return immediate_exit;
+                } else {
+                    promoted = resolved_convergence;
+                }
+            }
+        }
+        return promoted orelse immediate_exit;
+    }
+
+    fn closePrefixAt(_: *Builder, prefix: *Region, latch: ir.BlockId) BuildError!void {
+        if (prefix.nodes.len == 0) return error.UnsupportedShape;
+        const node = &prefix.nodes[prefix.nodes.len - 1];
+        if (node.* != .branch) return error.UnsupportedShape;
+        const branch = &node.branch;
+        if (branch.join != null or branch.then_region.stop != latch or branch.else_region.stop != latch) {
+            return error.UnsupportedShape;
+        }
+        branch.join = latch;
+    }
+
+    fn mergeSequentialRegions(
+        self: *Builder,
+        prefix: *Region,
+        suffix: *Region,
+        stop: ir.BlockId,
+        loop_exit: ir.BlockId,
+    ) BuildError!*Region {
+        const region = try self.allocator.create(Region);
+        errdefer self.allocator.destroy(region);
+        const nodes = try self.allocator.alloc(Node, prefix.nodes.len + suffix.nodes.len);
+        @memcpy(nodes[0..prefix.nodes.len], prefix.nodes);
+        @memcpy(nodes[prefix.nodes.len..], suffix.nodes);
+
+        self.allocator.free(prefix.nodes);
+        self.allocator.destroy(prefix);
+        self.allocator.free(suffix.nodes);
+        self.allocator.destroy(suffix);
+        region.* = .{
+            .nodes = nodes,
+            .stop = stop,
+            .loop_exit = loop_exit,
+            .continue_target = stop,
+        };
+        return region;
+    }
+
+    fn recordInfiniteSubphase(_: *Builder, calls: *usize, elapsed: *i64, start: i96) void {
+        calls.* += 1;
+        elapsed.* += structural_overlap.structuralPhaseMillis(start);
+    }
+
+    fn classifyInfiniteExitAtBoundary(
+        self: *Builder,
+        membership: []const bool,
+        boundary: ?ir.BlockId,
+    ) BuildError!natural_loop.ExitShape {
+        const start = structural_overlap.structuralPhaseNow();
+        const result = natural_loop.classifyExitAtBoundary(self.analysis, membership, boundary);
+        self.recordInfiniteSubphase(&self.trace_infinite_classify_calls, &self.trace_infinite_classify_ms, start);
+        return result;
+    }
+
+    fn selectInfiniteContinuation(
+        self: *Builder,
+        membership: []const bool,
+    ) BuildError!?ir.BlockId {
+        const start = structural_overlap.structuralPhaseNow();
+        const result = natural_loop.selectContinuingExitConvergenceAlloc(
+            self.allocator,
+            self.analysis,
+            membership,
+        );
+        self.recordInfiniteSubphase(
+            &self.trace_infinite_continuation_calls,
+            &self.trace_infinite_continuation_ms,
+            start,
+        );
+        return result;
+    }
+
+    fn resolveInfiniteMultipleExit(
+        self: *Builder,
+        membership: []const bool,
+        continuation: ir.BlockId,
+    ) BuildError!?ir.BlockId {
+        const start = structural_overlap.structuralPhaseNow();
+        const result = self.resolveMultipleLoopExit(membership, continuation);
+        self.recordInfiniteSubphase(&self.trace_infinite_resolve_calls, &self.trace_infinite_resolve_ms, start);
+        return result;
+    }
+
+    fn selectInfiniteSharedEntries(
+        self: *Builder,
+        membership: []const bool,
+        canonical_exit: ir.BlockId,
+    ) BuildError![]ir.BlockId {
+        const start = structural_overlap.structuralPhaseNow();
+        const result = loop_side_exit.selectSharedRegionEntriesAllocWithReplayContext(
+            self.allocator,
+            self.analysis,
+            membership,
+            canonical_exit,
+            self.replay_context,
+        ) catch |err| {
+            structural_overlap.traceStructural(
+                "structural_phase shared_entry_call function={} canonical_exit={} error={s}\n",
+                .{ self.analysis.function.id.index(), canonical_exit.index(), @errorName(err) },
+            );
+            return err;
+        };
+        structural_overlap.traceStructural(
+            "structural_phase shared_entry_call function={} canonical_exit={} selected_count={}\n",
+            .{ self.analysis.function.id.index(), canonical_exit.index(), result.len },
+        );
+        self.recordInfiniteSubphase(
+            &self.trace_infinite_shared_entry_calls,
+            &self.trace_infinite_shared_entry_ms,
+            start,
+        );
+        return result;
+    }
+
+    // A loop body cannot own an already-structured effectful or parameterized
+    // block outside its authenticated boundary. Detect that handoff before
+    // recursively building the body; transparent empty forwarding remains
+    // available to the normal projection logic below.
+    fn infiniteLoopHasOwnedOutsideTarget(
+        self: *const Builder,
+        membership: []const bool,
+        continuation: ?ir.BlockId,
+        exit: ?ir.BlockId,
+        shared_side_entries: []const ir.BlockId,
+        escape_targets: ?*const EscapeTarget,
+        continue_targets: ?*const EscapeTarget,
+        enclosing_loop_exit: ?ir.BlockId,
+    ) BuildError!bool {
+        for (membership, 0..) |is_member, local_index| {
+            if (!is_member) continue;
+            const block = self.analysis.function.blocks[local_index];
+            for (0..self.analysis.successorCount(block)) |successor_index| {
+                const target = self.analysis.successorAt(block, successor_index) orelse
+                    return error.UnsupportedShape;
+                const target_index = self.analysis.blockIndex(target) orelse
+                    return error.UnsupportedShape;
+                if (membership[target_index]) continue;
+                if (continuation != null and target == continuation.?) continue;
+                if (exit != null and target == exit.?) continue;
+                if (containsBlockId(shared_side_entries, target)) continue;
+                if (enclosing_loop_exit != null and target == enclosing_loop_exit.?) continue;
+                if (isEscapeTarget(escape_targets, target) or isEscapeTarget(continue_targets, target)) continue;
+                if (!self.visited[target_index]) continue;
+                const target_block = self.analysis.program.blocks[target.index()];
+                if (target_block.parameters.len != 0 or target_block.instructions.len != 0) return true;
+            }
+        }
+        return false;
+    }
+
+    fn buildInfiniteLoop(
+        self: *Builder,
+        header: ir.BlockId,
+        enclosing_allowed: ?[]const bool,
+        continuation: ?ir.BlockId,
+        escape_targets: ?*const EscapeTarget,
+        continue_targets: ?*const EscapeTarget,
+        enclosing_loop_exit: ?ir.BlockId,
+        entry_arguments: ?[]const ir.ValueId,
+        entry_reference: ?ir.CfgEdgeRef,
+    ) BuildError!?InfiniteLoop {
+        const checkpoint = self.beginMutation();
+        errdefer self.rollbackMutation(checkpoint);
+        const result = try self.buildInfiniteLoopCore(
+            header,
+            enclosing_allowed,
+            continuation,
+            escape_targets,
+            continue_targets,
+            enclosing_loop_exit,
+            entry_arguments,
+            entry_reference,
+        );
+        if (result == null) {
+            self.rollbackMutation(checkpoint);
+        } else {
+            self.finishMutation(checkpoint);
+        }
+        return result;
+    }
+
+    fn buildInfiniteLoopCore(
+        self: *Builder,
+        header: ir.BlockId,
+        enclosing_allowed: ?[]const bool,
+        continuation: ?ir.BlockId,
+        escape_targets: ?*const EscapeTarget,
+        continue_targets: ?*const EscapeTarget,
+        enclosing_loop_exit: ?ir.BlockId,
+        entry_arguments: ?[]const ir.ValueId,
+        entry_reference: ?ir.CfgEdgeRef,
+    ) BuildError!?InfiniteLoop {
+        const probe_index = self.trace_infinite_probe_calls;
+        self.trace_infinite_probe_calls += 1;
+        var membership = (try self.collectNaturalLoop(header, enclosing_allowed)) orelse return null;
+        defer membership.deinit();
+        if (probe_index < 32 or probe_index % 128 == 0) {
+            structural_overlap.traceStructural("structural_phase infinite_probe function={} probe={} header={} members={} visited={} continuation={?} enclosing_exit={?}\n", .{
+                self.analysis.function.id.index(),
+                probe_index,
+                header.index(),
+                std.mem.countScalar(bool, membership.bits, true),
+                self.visited_count,
+                continuation,
+                enclosing_loop_exit,
+            });
+        }
+        if (enclosing_loop_exit != null and probe_index >= 32 and probe_index % 128 != 0) {
+            structural_overlap.traceStructural("structural_phase infinite_probe_context function={} probe={} header={} members={} continuation={?} enclosing_exit={?}\n", .{
+                self.analysis.function.id.index(),
+                probe_index,
+                header.index(),
+                std.mem.countScalar(bool, membership.bits, true),
+                continuation,
+                enclosing_loop_exit,
+            });
+        }
+        var structural_continuation = continuation orelse try self.authenticatedInactiveBranchTarget(header);
+        if (structural_continuation == null) {
+            if (probe_index < 32 or probe_index % 128 == 0) {
+                structural_overlap.traceStructural("structural_phase infinite_probe_phase function={} probe={} header={} phase=select_continuation\n", .{
+                    self.analysis.function.id.index(),
+                    probe_index,
+                    header.index(),
+                });
+            }
+            switch (try self.classifyInfiniteExitAtBoundary(membership.bits, null)) {
+                .multiple => structural_continuation = try self.selectInfiniteContinuation(membership.bits),
+                .closed, .unique => {},
+            }
+        }
+        var exit: ?ir.BlockId = switch (try self.classifyInfiniteExitAtBoundary(membership.bits, structural_continuation)) {
+            .closed => null,
+            .unique => |target| target,
+            .multiple => multiple: {
+                if (structural_continuation) |target| {
+                    if (try self.resolveInfiniteMultipleExit(membership.bits, target)) |selected| {
+                        break :multiple selected;
+                    }
+                }
+                const fallback = try self.selectInfiniteContinuation(membership.bits) orelse return null;
+                if (structural_continuation == null or fallback != structural_continuation.?) {
+                    if (try self.resolveInfiniteMultipleExit(membership.bits, fallback)) |selected| {
+                        break :multiple selected;
+                    }
+                }
+                return null;
+            },
+        };
+        const exit_index = if (exit) |target| self.analysis.blockIndex(target) orelse return error.UnsupportedShape else null;
+        const exit_is_enclosing_continuation = if (exit) |target|
+            (continuation != null and target == continuation.?) or isEscapeTarget(continue_targets, target) or
+                (enclosing_loop_exit != null and target == enclosing_loop_exit.?)
+        else
+            false;
+        if (exit_index) |index| if (self.visited[index] and !exit_is_enclosing_continuation) return null;
+
+        var shared_side_entries: []ir.BlockId = &.{};
+        var owns_shared_side_entries = false;
+        defer if (owns_shared_side_entries) self.allocator.free(shared_side_entries);
+        if (exit) |canonical_exit| {
+            shared_side_entries = try self.selectInfiniteSharedEntries(membership.bits, canonical_exit);
+            owns_shared_side_entries = true;
+            for (shared_side_entries) |entry| {
+                const entry_index = self.analysis.blockIndex(entry) orelse return error.UnsupportedShape;
+                if (self.visited[entry_index]) {
+                    self.allocator.free(shared_side_entries);
+                    shared_side_entries = &.{};
+                    owns_shared_side_entries = false;
+                    break;
+                }
+            }
+        }
+        if (try self.infiniteLoopHasOwnedOutsideTarget(
+            membership.bits,
+            continuation,
+            exit,
+            shared_side_entries,
+            escape_targets,
+            continue_targets,
+            enclosing_loop_exit,
+        )) return null;
+        // A nested loop must pass its enclosing loop exit through the parent
+        // region.  Otherwise a child side-exit can claim the parent's
+        // effectful exit block, leaving the parent with a stale `.exit`
+        // boundary after ownership accounting observes that block as visited.
+        var enclosing_escape: EscapeTarget = undefined;
+        const parent_escape_targets = if (enclosing_loop_exit) |parent_exit| targets: {
+            break :targets prependEscapeTarget(&enclosing_escape, parent_exit, escape_targets);
+        } else escape_targets;
+        var shared_escapes: []EscapeTarget = &.{};
+        defer if (shared_escapes.len != 0) self.allocator.free(shared_escapes);
+        const body_escape_targets = if (shared_side_entries.len != 0) targets: {
+            shared_escapes = try self.allocator.alloc(EscapeTarget, shared_side_entries.len);
+            for (shared_escapes, 0..) |*target, index| {
+                target.* = .{
+                    .block = shared_side_entries[index],
+                    .parent = if (index + 1 < shared_escapes.len)
+                        &shared_escapes[index + 1]
+                    else
+                        parent_escape_targets,
+                };
+            }
+            break :targets &shared_escapes[0];
+        } else parent_escape_targets;
+
+        if (probe_index < 32 or probe_index % 128 == 0) {
+            structural_overlap.traceStructural("structural_phase infinite_probe_phase function={} probe={} header={} phase=body continuation={?} exit={?} shared_entries={}\n", .{
+                self.analysis.function.id.index(),
+                probe_index,
+                header.index(),
+                structural_continuation,
+                exit,
+                shared_side_entries.len,
+            });
+        }
+        try self.reopenLoopHeader(membership.header_index);
+        const body_region_start = structural_overlap.structuralPhaseNow();
+        const body_region_result = self.buildRegionIncludingStart(
+            header,
+            header,
+            membership.bits,
+            exit,
+            body_escape_targets,
+            continue_targets,
+            header,
+            entry_arguments,
+            entry_reference,
+        );
+        self.recordInfiniteSubphase(
+            &self.trace_infinite_body_calls,
+            &self.trace_infinite_body_ms,
+            body_region_start,
+        );
+        const body_region = body_region_result catch |err| {
+            structural_overlap.traceStructural("structural_phase infinite_body_failed header={} depth={} visited={} exit={?} continuation={?} shared_entries={} error={s}\n", .{
+                header.index(),
+                self.trace_region_depth,
+                self.visited_count,
+                exit,
+                continuation,
+                shared_side_entries.len,
+                @errorName(err),
+            });
+            return err;
+        };
+        errdefer destroyRegion(self.allocator, body_region);
+        for (membership.bits, 0..) |is_member, local_index| {
+            if (is_member and !self.visited[local_index]) {
+                structural_overlap.traceStructural("structural_phase infinite_body_unvisited header={} member={} members={} visited={} exit={?} continuation={?} shared_entries={}\n", .{
+                    header.index(),
+                    self.analysis.function.blocks[local_index].index(),
+                    std.mem.countScalar(bool, membership.bits, true),
+                    self.visited_count,
+                    exit,
+                    continuation,
+                    shared_side_entries.len,
+                });
+                self.noteUnvisitedLoopMember(membership.bits, local_index);
+                return error.UnsupportedShape;
+            }
+        }
+        if (shared_side_entries.len == 0) {
+            if (exit) |canonical_exit| {
+                const free_targets = try regionFreeTargetsAlloc(self.allocator, body_region);
+                defer self.allocator.free(free_targets);
+                var selected = std.ArrayList(ir.BlockId).empty;
+                defer selected.deinit(self.allocator);
+                for (free_targets) |target| {
+                    const target_index = self.analysis.blockIndex(target) orelse return error.UnsupportedShape;
+                    if (membership.bits[target_index] or self.visited[target_index] or target == canonical_exit or
+                        !try natural_loop.canReachOutsideLoopAlloc(
+                            self.allocator,
+                            self.analysis,
+                            membership.bits,
+                            target,
+                            canonical_exit,
+                        ))
+                    {
+                        continue;
+                    }
+                    try selected.append(self.allocator, target);
+                }
+                if (selected.items.len != 0) {
+                    shared_side_entries = try selected.toOwnedSlice(self.allocator);
+                    owns_shared_side_entries = true;
+                }
+            }
+        }
+        var shared_side_exit: ?SharedSideExit = null;
+        errdefer if (shared_side_exit) |side_exit| destroySharedSideExit(self.allocator, side_exit);
+        if (shared_side_entries.len != 0) {
+            const canonical_exit = exit orelse return error.UnsupportedShape;
+            const outside = try self.allocator.alloc(bool, membership.bits.len);
+            defer self.allocator.free(outside);
+            for (membership.bits, 0..) |is_member, index| {
+                outside[index] = !is_member and self.analysis.isReachable(self.analysis.function.blocks[index]);
+            }
+            shared_side_exit = try self.buildSharedSideExit(
+                shared_side_entries,
+                canonical_exit,
+                outside,
+                escape_targets,
+                continue_targets,
+            );
+        }
+        if (exit_index) |index| {
+            if (self.visited[index] and !exit_is_enclosing_continuation) {
+                body_region.loop_exit = null;
+                exit = null;
+            }
+        }
+        return .{
+            .header = header,
+            .body_region = body_region,
+            .exit = exit,
+            .exit_is_escape = if (exit) |target|
+                isEscapeTarget(escape_targets, target) or
+                    (enclosing_loop_exit != null and target == enclosing_loop_exit.?)
+            else
+                false,
+            .shared_side_exit = shared_side_exit,
+        };
+    }
+
+    fn buildSharedSideExit(
+        self: *Builder,
+        entries: []const ir.BlockId,
+        canonical_exit: ir.BlockId,
+        outside: []const bool,
+        escape_targets: ?*const EscapeTarget,
+        continue_targets: ?*const EscapeTarget,
+    ) BuildError!?SharedSideExit {
+        if (entries.len == 0) return null;
+        var owned = try self.allocator.alloc(SharedSideEntry, entries.len);
+        var built_count: usize = 0;
+        var transferred = false;
+        defer if (!transferred) {
+            for (owned[0..built_count]) |side| destroyRegion(self.allocator, side.region);
+            self.allocator.free(owned);
+        };
+
+        for (entries, 0..) |entry, index| {
+            var shadowed_escape_targets = try shadowEscapeTargetsAlloc(
+                self.allocator,
+                escape_targets,
+                entry,
+            );
+            defer shadowed_escape_targets.deinit(self.allocator);
+            var filtered_escape_targets = try self.filterTerminalEscapeTargetsAlloc(
+                shadowed_escape_targets.targets,
+            );
+            defer filtered_escape_targets.deinit(self.allocator);
+            const side_escape: EscapeTarget = .{
+                .block = canonical_exit,
+                .parent = filtered_escape_targets.targets,
+            };
+            const side_region = try self.buildRegionImplWithEntryArguments(
+                entry,
+                canonical_exit,
+                outside,
+                null,
+                &side_escape,
+                continue_targets,
+                false,
+                null,
+                null,
+            );
+            owned[index] = .{ .entry = entry, .region = side_region };
+            built_count += 1;
+        }
+
+        const result = ownSharedSideRegions(self.allocator, owned) catch |err| {
+            transferred = true;
+            return err;
+        };
+        transferred = true;
+        return result;
+    }
+
+    fn resolveMultipleLoopExit(
+        self: *const Builder,
+        membership: []const bool,
+        continuation: ir.BlockId,
+    ) BuildError!?ir.BlockId {
+        if (try natural_loop.selectExitReaching(self.analysis, membership, continuation)) |selected| return selected;
+        if (try natural_loop.allContinuingExitsReach(
+            self.allocator,
+            self.analysis,
+            membership,
+            continuation,
+        )) return continuation;
+        return null;
+    }
+
+    fn authenticatedInactiveBranchTarget(self: *const Builder, header: ir.BlockId) BuildError!?ir.BlockId {
+        if (header.index() >= self.analysis.program.blocks.len) return null;
+        const live = switch (self.analysis.program.blocks[header.index()].terminator) {
+            .jump => |edge| edge,
+            else => return null,
+        };
+        var selected: ?ir.BlockId = null;
+        for (self.analysis.program.obligations) |obligation| {
+            const subject = switch (obligation.subject) {
+                .control_branch => |value| value,
+                else => continue,
+            };
+            if (subject.block != header) continue;
+            const replay = control_flow.replayControlBranchObligation(self.analysis.program, obligation) orelse continue;
+            if (replay.subject.block != header or
+                replay.selected.target != live.target or
+                !std.mem.eql(ir.ValueId, replay.selected.arguments, live.arguments))
+            {
+                continue;
+            }
+            var inactive = if (replay.truth) replay.subject.branch.else_edge else replay.subject.branch.then_edge;
+            var owns_inactive = false;
+            defer if (owns_inactive and inactive.arguments.len != 0) self.allocator.free(inactive.arguments);
+            var remaining = self.analysis.function.blocks.len + 1;
+            while (remaining != 0 and !self.analysis.isReachable(inactive.target)) : (remaining -= 1) {
+                if (self.analysis.blockIndex(inactive.target) == null) break;
+                const forwarded = try control_flow.replayForwardingJump(
+                    self.allocator,
+                    self.analysis.program,
+                    inactive,
+                ) orelse break;
+                if (owns_inactive and inactive.arguments.len != 0) self.allocator.free(inactive.arguments);
+                inactive = forwarded;
+                owns_inactive = true;
+            }
+            if (!self.analysis.isReachable(inactive.target)) continue;
+            if (selected) |existing| {
+                if (existing != inactive.target) return null;
+            } else {
+                selected = inactive.target;
+            }
+        }
+        return selected;
+    }
+
+    fn structuralIterationConvergence(
+        self: *const Builder,
+        block: ir.BlockId,
+        allowed: ?[]const bool,
+    ) BuildError!?ir.BlockId {
+        const immediate = try self.analysis.immediateStructuralConvergence(self.allocator, block, allowed);
+        if (immediate) |candidate| {
+            if (structural_overlap.isIterationTransitionHeader(self.analysis.program, candidate) or
+                try self.authenticatedInactiveBranchTarget(candidate) != null) return candidate;
+        }
+
+        if (try structural_overlap.selectIterationConvergence(
+            self.allocator,
+            self.analysis,
+            block,
+            allowed,
+        )) |selection| return selection.join;
+        return null;
+    }
+
     fn reopenLoopHeader(self: *Builder, header_index: usize) BuildError!void {
         if (header_index >= self.visited.len or !self.visited[header_index] or self.visited_count == 0) return error.UnsupportedShape;
         if (self.validation_generation == std.math.maxInt(usize)) return error.UnsupportedShape;
@@ -6208,6 +7042,264 @@ const Builder = struct {
         return !membership.bits[source_index];
     }
 
+    fn consumeSharedReentries(
+        self: *Builder,
+        shared: *const loop_continue_shape.SharedPaths,
+        membership: []const bool,
+    ) BuildError!void {
+        if (shared.blocks.len == 0 or shared.entries.len < 2) return error.UnsupportedShape;
+        for (shared.blocks) |block_id| {
+            const block_index = self.analysis.blockIndex(block_id) orelse return error.UnsupportedShape;
+            if (!membership[block_index] or !self.analysis.isReachable(block_id) or self.visited[block_index]) {
+                return error.UnsupportedShape;
+            }
+            try self.markVisited(block_index);
+        }
+    }
+
+    fn consumeSharedExits(
+        self: *Builder,
+        shared: *const loop_exit_shape.SharedPaths,
+        membership: []const bool,
+    ) BuildError!void {
+        if (shared.blocks.len == 0 or shared.entries.len < 2) return error.UnsupportedShape;
+        for (shared.blocks) |block_id| {
+            const block_index = self.analysis.blockIndex(block_id) orelse return error.UnsupportedShape;
+            if (membership[block_index] or !self.analysis.isReachable(block_id) or self.visited[block_index]) {
+                return error.UnsupportedShape;
+            }
+            try self.markVisited(block_index);
+        }
+    }
+
+    fn consumeEdgeOverride(self: *Builder, raw: ir.Edge, edge_override: ?control_flow.ForwardingPath) BuildError!void {
+        const path = edge_override orelse return;
+        if (path.blocks.len == 0 or path.blocks[0] != raw.target) return error.UnsupportedShape;
+        for (path.blocks) |block_id| {
+            const block_index = self.analysis.blockIndex(block_id) orelse return error.UnsupportedShape;
+            if (!self.analysis.isReachable(block_id) or self.visited[block_index]) return error.UnsupportedShape;
+            try self.markVisited(block_index);
+        }
+    }
+
+    fn makeLoopTerminalControl(
+        self: *Builder,
+        block: ir.BlockId,
+        branch: ir.Branch,
+        continue_target: ir.BlockId,
+        allowed: ?[]const bool,
+    ) BuildError!?LoopTerminalControl {
+        const continue_on_true = if (branch.then_edge.target == continue_target)
+            true
+        else if (branch.else_edge.target == continue_target)
+            false
+        else
+            return null;
+        const continue_edge = if (continue_on_true) branch.then_edge else branch.else_edge;
+        const terminal_edge = if (continue_on_true) branch.else_edge else branch.then_edge;
+        const terminal_index = self.analysis.blockIndex(terminal_edge.target) orelse return error.UnsupportedShape;
+        if (allowed) |membership| if (membership[terminal_index]) return null;
+        const terminal = self.analysis.program.blocks[terminal_edge.target.index()];
+        if (!isTerminal(terminal.terminator)) return null;
+        if (!self.analysis.isReachable(terminal.id) or self.visited[terminal_index]) return error.UnsupportedShape;
+        try self.markVisited(terminal_index);
+        return .{
+            .block = block,
+            .continue_edge = continue_edge,
+            .terminal_edge = terminal_edge,
+            .terminal_block = terminal.id,
+            .continue_on_true = continue_on_true,
+        };
+    }
+
+    fn makeLoopBoundaryControl(
+        self: *Builder,
+        block: ir.BlockId,
+        branch: ir.Branch,
+        local_stop: ir.BlockId,
+        loop_continue: ir.BlockId,
+        exit_target: ?ir.BlockId,
+        escape_targets: ?*const EscapeTarget,
+        continue_targets: ?*const EscapeTarget,
+        allowed: ?[]const bool,
+    ) BuildError!?LoopBoundaryControl {
+        const membership = allowed orelse return null;
+        const then_index = self.analysis.blockIndex(branch.then_edge.target) orelse return error.UnsupportedShape;
+        const else_index = self.analysis.blockIndex(branch.else_edge.target) orelse return error.UnsupportedShape;
+        const then_is_body = membership[then_index];
+        const else_is_body = membership[else_index];
+        if (then_is_body == else_is_body) return null;
+        const body_on_true = then_is_body;
+        const body_edge = if (body_on_true) branch.then_edge else branch.else_edge;
+        const boundary_edge = if (body_on_true) branch.else_edge else branch.then_edge;
+        const body_reference: ir.CfgEdgeRef = .{
+            .source = block,
+            .kind = if (body_on_true) .branch_then else .branch_else,
+            .target = body_edge.target,
+        };
+        const continue_target = if (local_stop != loop_continue and
+            try self.analysis.canReachAvoiding(body_edge.target, local_stop, loop_continue))
+            local_stop
+        else
+            loop_continue;
+        const boundary_kind: ir.CfgEdgeKind = if (body_on_true) .branch_else else .branch_then;
+        const shared_exit = if (self.active_shared_exits) |shared|
+            shared.entryRef(.{ .source = block, .kind = boundary_kind, .target = boundary_edge.target })
+        else
+            null;
+
+        const boundary: LoopBoundary = if (shared_exit) |entry|
+            .{ .shared_exit = entry }
+        else if (isEscapeTarget(escape_targets, boundary_edge.target))
+            .{ .escape = boundary_edge }
+        else if (exit_target != null and boundary_edge.target == exit_target.?)
+            .{ .exit = boundary_edge }
+        else blk: {
+            const terminal_index = self.analysis.blockIndex(boundary_edge.target) orelse return error.UnsupportedShape;
+            const terminal = self.analysis.program.blocks[boundary_edge.target.index()];
+            if (isTerminal(terminal.terminator)) {
+                if (!self.analysis.isReachable(terminal.id) or self.visited[terminal_index]) return error.UnsupportedShape;
+                try self.markVisited(terminal_index);
+                break :blk .{ .terminal = .{ .edge = boundary_edge, .block = terminal.id } };
+            }
+            const outside = try self.allocator.alloc(bool, membership.len);
+            defer self.allocator.free(outside);
+            for (membership, 0..) |is_member, local_index| {
+                outside[local_index] = !is_member and self.analysis.isReachable(self.analysis.function.blocks[local_index]);
+            }
+            var filtered_escape_targets = try self.filterTerminalEscapeTargetsAlloc(escape_targets);
+            defer filtered_escape_targets.deinit(self.allocator);
+            if (try self.forwardedEscapeTarget(
+                boundary_edge.target,
+                continue_target,
+                exit_target,
+                filtered_escape_targets.targets,
+                continue_targets,
+                membership,
+            )) |target| {
+                const side_region = self.buildRegionImplWithEntryArgumentsAndEdge(
+                    boundary_edge.target,
+                    target,
+                    outside,
+                    null,
+                    filtered_escape_targets.targets,
+                    continue_targets,
+                    false,
+                    null,
+                    boundary_edge.arguments,
+                    .{ .source = block, .kind = boundary_kind, .target = boundary_edge.target },
+                ) catch |err| {
+                    self.noteCollisionEdge(.{ .source = block, .kind = boundary_kind, .target = boundary_edge.target });
+                    return err;
+                };
+                break :blk .{ .side_escape = .{
+                    .entry_edge = boundary_edge,
+                    .region = side_region,
+                    .target = target,
+                } };
+            }
+
+            const continuation = exit_target orelse return null;
+            const side_escape: EscapeTarget = .{ .block = continuation, .parent = filtered_escape_targets.targets };
+            const side_region = self.buildRegionImplWithEntryArgumentsAndEdge(
+                boundary_edge.target,
+                continuation,
+                outside,
+                null,
+                &side_escape,
+                continue_targets,
+                false,
+                null,
+                boundary_edge.arguments,
+                .{ .source = block, .kind = boundary_kind, .target = boundary_edge.target },
+            ) catch |err| {
+                self.noteCollisionEdge(.{ .source = block, .kind = boundary_kind, .target = boundary_edge.target });
+                return err;
+            };
+            break :blk .{ .side_exit = .{ .entry_edge = boundary_edge, .region = side_region } };
+        };
+        errdefer destroyLoopBoundary(self.allocator, boundary);
+
+        const body_region = try self.buildLoopRegion(
+            body_edge.target,
+            continue_target,
+            membership,
+            exit_target,
+            escape_targets,
+            continue_targets,
+            body_edge.arguments,
+            body_reference,
+        );
+        errdefer destroyRegion(self.allocator, body_region);
+        return .{
+            .block = block,
+            .body_edge = body_edge,
+            .body_region = body_region,
+            .boundary = boundary,
+            .body_on_true = body_on_true,
+        };
+    }
+
+    fn forwardedEscapeTarget(
+        self: *const Builder,
+        start: ir.BlockId,
+        current_continue: ir.BlockId,
+        current_exit: ?ir.BlockId,
+        escape_targets: ?*const EscapeTarget,
+        continue_targets: ?*const EscapeTarget,
+        membership: []const bool,
+    ) BuildError!?ir.BlockId {
+        const start_index = self.analysis.blockIndex(start) orelse return error.UnsupportedShape;
+        if (membership.len != self.analysis.function.blocks.len or
+            membership[start_index] or
+            !self.analysis.isReachable(start)) return null;
+
+        // Both target chains ask the same outside-loop reachability question.
+        // Build one forward closure, preserving the existing escape-chain
+        // ordering when selecting the first authenticated target.
+        const reachable = try self.allocator.alloc(bool, membership.len);
+        defer self.allocator.free(reachable);
+        const pending = try self.allocator.alloc(ir.BlockId, membership.len);
+        defer self.allocator.free(pending);
+        @memset(reachable, false);
+        reachable[start_index] = true;
+        pending[0] = start;
+        var pending_index: usize = 0;
+        var pending_len: usize = 1;
+        while (pending_index < pending_len) : (pending_index += 1) {
+            const current = pending[pending_index];
+            for (0..self.analysis.successorCount(current)) |successor_index| {
+                const successor = self.analysis.successorAt(current, successor_index) orelse
+                    return error.UnsupportedShape;
+                const successor_local = self.analysis.blockIndex(successor) orelse return error.UnsupportedShape;
+                if ((current_exit != null and successor == current_exit.?) or
+                    membership[successor_local] or
+                    reachable[successor_local]) continue;
+                reachable[successor_local] = true;
+                pending[pending_len] = successor;
+                pending_len += 1;
+            }
+        }
+
+        var current = escape_targets;
+        while (current) |candidate| : (current = candidate.parent) {
+            if (candidate.block == current_continue) continue;
+            if (current_exit != null and candidate.block == current_exit.?) continue;
+            const candidate_index = self.analysis.blockIndex(candidate.block) orelse return error.UnsupportedShape;
+            if (isTerminal(self.analysis.program.blocks[candidate.block.index()].terminator)) continue;
+            if (reachable[candidate_index]) return candidate.block;
+        }
+        current = continue_targets;
+        while (current) |candidate| : (current = candidate.parent) {
+            if (candidate.block == current_continue) continue;
+            if (current_exit != null and candidate.block == current_exit.?) continue;
+            const candidate_index = self.analysis.blockIndex(candidate.block) orelse return error.UnsupportedShape;
+            if (isTerminal(self.analysis.program.blocks[candidate.block.index()].terminator)) continue;
+            if (reachable[candidate_index]) return candidate.block;
+        }
+        return null;
+    }
+
     fn appendBoundaryTargets(
         self: *const Builder,
         boundaries: *std.ArrayList(ir.BlockId),
@@ -6216,6 +7308,37 @@ const Builder = struct {
         var current = targets;
         while (current) |target| : (current = target.parent) {
             try appendBoundaryTarget(self.allocator, boundaries, target.block);
+        }
+    }
+
+    fn appendOutsideBoundaryEntries(
+        self: *const Builder,
+        boundaries: *std.ArrayList(ir.BlockId),
+        membership: []const bool,
+    ) BuildError!void {
+        if (membership.len != self.analysis.function.blocks.len) return error.UnsupportedShape;
+        const semantic_boundary_count = boundaries.items.len;
+        for (self.analysis.function.blocks, 0..) |source, source_index| {
+            if (!membership[source_index]) continue;
+            for (0..self.analysis.successorCount(source)) |successor_index| {
+                const target = self.analysis.successorAt(source, successor_index) orelse return error.UnsupportedShape;
+                const target_index = self.analysis.blockIndex(target) orelse return error.UnsupportedShape;
+                if (membership[target_index]) continue;
+                for (boundaries.items[0..semantic_boundary_count]) |boundary| {
+                    const boundary_index = self.analysis.blockIndex(boundary) orelse return error.UnsupportedShape;
+                    if (membership[boundary_index]) continue;
+                    if (target == boundary or try natural_loop.canReachOutsideLoopAlloc(
+                        self.allocator,
+                        self.analysis,
+                        membership,
+                        target,
+                        boundary,
+                    )) {
+                        try appendBoundaryTarget(self.allocator, boundaries, target);
+                        break;
+                    }
+                }
+            }
         }
     }
 };
