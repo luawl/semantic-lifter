@@ -9348,6 +9348,692 @@ test "owned loop header projection distinguishes preheaders from backedges" {
     try std.testing.expect(!try builder.isOutsideEntryToOwnedLoopHeader(header, latch));
 }
 
+test "authenticated effectful terminal replay preserves an owned bridge" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const first_source = ir.BlockId.fromIndex(1);
+    const second_source = ir.BlockId.fromIndex(2);
+    const start = ir.BlockId.fromIndex(3);
+    const first_stop = ir.BlockId.fromIndex(4);
+    const second_stop = ir.BlockId.fromIndex(5);
+    const original = ir.BlockId.fromIndex(6);
+    const condition = ir.ValueId.fromIndex(0);
+    const result = ir.ValueId.fromIndex(1);
+    const original_result = ir.ValueId.fromIndex(2);
+    const constant_id = ir.InstructionId.fromIndex(0);
+    const original_constant_id = ir.InstructionId.fromIndex(1);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = condition,
+            .then_edge = .{ .target = first_source },
+            .else_edge = .{ .target = second_source },
+        } } },
+        .{ .id = first_source, .function = function_id, .terminator = .{ .jump = .{ .target = start } } },
+        .{ .id = second_source, .function = function_id, .terminator = .{ .jump = .{ .target = start } } },
+        .{ .id = start, .function = function_id, .instructions = &.{constant_id}, .terminator = .{ .jump = .{ .target = first_stop } } },
+        .{ .id = first_stop, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = second_stop, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = original, .function = function_id, .instructions = &.{original_constant_id}, .terminator = .{ .return_values = &.{} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &.{condition},
+        .blocks = &.{ entry, first_source, second_source, start, first_stop, second_stop, original },
+        .entry_block = entry,
+    };
+    const values = [_]ir.Value{
+        .{ .id = condition, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = result, .function = function_id, .type = .integer, .origin = .{ .instruction_result = .{ .instruction = constant_id, .index = 0 } } },
+        .{ .id = original_result, .function = function_id, .type = .integer, .origin = .{ .instruction_result = .{ .instruction = original_constant_id, .index = 0 } } },
+    };
+    const instructions = [_]ir.Instruction{
+        .{ .id = constant_id, .block = start, .operation = .{ .constant = .{ .integer = "1" } }, .results = &.{result}, .effects = .pure },
+        .{ .id = original_constant_id, .block = original, .operation = .{ .constant = .{ .integer = "1" } }, .results = &.{original_result}, .effects = .pure },
+    };
+    const rewrites = [_]ir.CfgEdgeRewrite{
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(0),
+            .source = first_source,
+            .kind = .jump,
+            .from = .{ .target = original },
+            .to = .{ .target = start },
+            .rule = .node_split,
+            .node_split_group = ir.NodeSplitGroupId.fromIndex(0),
+        },
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(1),
+            .source = second_source,
+            .kind = .jump,
+            .from = .{ .target = original },
+            .to = .{ .target = start },
+            .rule = .node_split,
+            .node_split_group = ir.NodeSplitGroupId.fromIndex(0),
+        },
+    };
+    const program: ir.Program = .{
+        .program_id = "authenticated-effectful-terminal-replay",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+        .edge_rewrites = &rewrites,
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, function);
+    defer analysis.deinit();
+    const loop_headers = try natural_loop.headerCandidatesAlloc(std.testing.allocator, &analysis);
+    defer std.testing.allocator.free(loop_headers);
+
+    var visited = [_]bool{ false, false, false, true, false, false, false };
+    var contexts = [_]?Builder.VisitContext{ null, null, null, .{
+        .start = start,
+        .stop = first_stop,
+        .loop_exit = null,
+        .continue_target = null,
+        .parameter_arguments = &.{},
+    }, null, null, null };
+    var collision: ?Collision = null;
+    defer if (collision) |*value| value.deinit(std.testing.allocator);
+    var builder: Builder = .{
+        .allocator = std.testing.allocator,
+        .analysis = &analysis,
+        .visited = &visited,
+        .visited_contexts = &contexts,
+        .loop_headers = loop_headers,
+        .collision = &collision,
+    };
+    const replayed = try builder.buildRegionImplWithEntryArgumentsAndEdge(
+        start,
+        second_stop,
+        null,
+        null,
+        null,
+        null,
+        false,
+        null,
+        &.{},
+        .{ .source = second_source, .kind = .jump, .target = start },
+    );
+    defer destroyRegion(std.testing.allocator, replayed);
+    try std.testing.expectEqual(@as(usize, 1), replayed.nodes.len);
+    try std.testing.expectEqual(start, replayed.nodes[0].block);
+    try std.testing.expectEqual(second_stop, replayed.stop.?);
+    try std.testing.expectEqual(first_stop, replayed.terminal_projection.?.terminal);
+    try std.testing.expect(replayed.terminal_projection.?.edge != null);
+    try std.testing.expect(collision == null);
+}
+
+test "mixed-lineage entry collision keeps only the supplied edge" {
+    const allocator = std.testing.allocator;
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const incoming_source = ir.BlockId.fromIndex(1);
+    const cloned_source = ir.BlockId.fromIndex(2);
+    const target = ir.BlockId.fromIndex(3);
+    const owner_stop = ir.BlockId.fromIndex(4);
+    const incoming_stop = ir.BlockId.fromIndex(5);
+    const original = ir.BlockId.fromIndex(6);
+    const condition = ir.ValueId.fromIndex(0);
+
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = condition,
+            .then_edge = .{ .target = incoming_source },
+            .else_edge = .{ .target = cloned_source },
+        } } },
+        .{ .id = incoming_source, .function = function_id, .terminator = .{ .jump = .{ .target = target } } },
+        .{ .id = cloned_source, .function = function_id, .terminator = .{ .jump = .{ .target = target } } },
+        .{ .id = target, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = owner_stop, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = incoming_stop, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = original, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &.{condition},
+        .blocks = &.{ entry, incoming_source, cloned_source, target, owner_stop, incoming_stop, original },
+        .entry_block = entry,
+    };
+    const values = [_]ir.Value{.{
+        .id = condition,
+        .function = function_id,
+        .type = .boolean,
+        .origin = .{ .parameter = 0 },
+    }};
+    const rewrites = [_]ir.CfgEdgeRewrite{.{
+        .id = ir.EdgeRewriteId.fromIndex(0),
+        .source = incoming_source,
+        .kind = .jump,
+        .from = .{ .target = original },
+        .to = .{ .target = target },
+        .rule = .node_split,
+        .node_split_group = ir.NodeSplitGroupId.fromIndex(0),
+    }};
+    const program = ir.Program{
+        .program_id = "mixed-lineage-entry-collision",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+        .edge_rewrites = &rewrites,
+    };
+    var analysis = cfg.Analysis.init(allocator, &program, function) catch |err| switch (err) {
+        error.InvalidCfg => return error.TestUnexpectedResult,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    defer analysis.deinit();
+    const loop_headers = try natural_loop.headerCandidatesAlloc(allocator, &analysis);
+    defer allocator.free(loop_headers);
+    const entry_reference: ir.CfgEdgeRef = .{
+        .source = incoming_source,
+        .kind = .jump,
+        .target = target,
+    };
+
+    var visited = [_]bool{ false, false, false, true, false, false, false };
+    var contexts = [_]?Builder.VisitContext{ null, null, null, .{
+        .start = target,
+        .stop = owner_stop,
+        .loop_exit = null,
+        .continue_target = null,
+        .parameter_arguments = &.{},
+    }, null, null, null };
+    var collision: ?Collision = null;
+    defer if (collision) |*value| value.deinit(allocator);
+    var builder: Builder = .{
+        .allocator = allocator,
+        .analysis = &analysis,
+        .visited = &visited,
+        .visited_contexts = &contexts,
+        .loop_headers = loop_headers,
+        .collision = &collision,
+    };
+    try std.testing.expect(try builder.hasAuthenticatedContinuationBridge(entry_reference));
+    try std.testing.expectError(
+        error.UnsupportedShape,
+        builder.buildRegionImplWithEntryArgumentsAndEdge(
+            target,
+            incoming_stop,
+            null,
+            null,
+            null,
+            null,
+            false,
+            null,
+            &.{},
+            entry_reference,
+        ),
+    );
+    const recorded = collision orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(target, recorded.block);
+    try std.testing.expectEqual(entry_reference.source, recorded.incoming.?.source);
+    try std.testing.expectEqual(entry_reference.kind, recorded.incoming.?.kind);
+    try std.testing.expectEqual(entry_reference.target, recorded.incoming.?.target);
+    try std.testing.expectEqual(@as(usize, 0), recorded.incoming_group.len);
+
+    var unauthenticated_visited = [_]bool{ false, false, false, true, false, false, false };
+    var unauthenticated_contexts = contexts;
+    var unauthenticated_collision: ?Collision = null;
+    defer if (unauthenticated_collision) |*value| value.deinit(allocator);
+    var unauthenticated_builder: Builder = .{
+        .allocator = allocator,
+        .analysis = &analysis,
+        .visited = &unauthenticated_visited,
+        .visited_contexts = &unauthenticated_contexts,
+        .loop_headers = loop_headers,
+        .collision = &unauthenticated_collision,
+    };
+    const unauthenticated_reference: ir.CfgEdgeRef = .{
+        .source = cloned_source,
+        .kind = .jump,
+        .target = target,
+    };
+    try std.testing.expect(!try unauthenticated_builder.hasAuthenticatedContinuationBridge(unauthenticated_reference));
+    try std.testing.expectError(
+        error.UnsupportedShape,
+        unauthenticated_builder.buildRegionImplWithEntryArgumentsAndEdge(
+            target,
+            incoming_stop,
+            null,
+            null,
+            null,
+            null,
+            false,
+            null,
+            &.{},
+            unauthenticated_reference,
+        ),
+    );
+    const unauthenticated_recorded = unauthenticated_collision orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(unauthenticated_reference.source, unauthenticated_recorded.incoming.?.source);
+    try std.testing.expectEqual(unauthenticated_reference.kind, unauthenticated_recorded.incoming.?.kind);
+    try std.testing.expectEqual(unauthenticated_reference.target, unauthenticated_recorded.incoming.?.target);
+    try std.testing.expectEqual(@as(usize, 0), unauthenticated_recorded.incoming_group.len);
+
+    var no_edge_visited = [_]bool{ false, false, false, true, false, false, false };
+    var no_edge_contexts = contexts;
+    var no_edge_collision: ?Collision = null;
+    defer if (no_edge_collision) |*value| value.deinit(allocator);
+    var no_edge_builder: Builder = .{
+        .allocator = allocator,
+        .analysis = &analysis,
+        .visited = &no_edge_visited,
+        .visited_contexts = &no_edge_contexts,
+        .loop_headers = loop_headers,
+        .collision = &no_edge_collision,
+    };
+    try std.testing.expectError(
+        error.UnsupportedShape,
+        no_edge_builder.buildRegionImplWithEntryArgumentsAndEdge(
+            target,
+            incoming_stop,
+            null,
+            null,
+            null,
+            null,
+            false,
+            null,
+            &.{},
+            null,
+        ),
+    );
+    const no_edge_recorded = no_edge_collision orelse return error.TestUnexpectedResult;
+    try std.testing.expect(no_edge_recorded.incoming == null);
+    try std.testing.expectEqual(@as(usize, 0), no_edge_recorded.incoming_group.len);
+}
+
+test "transparent empty owned stop crosses loop context with canonical tuple" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const start = ir.BlockId.fromIndex(1);
+    const owner_stop = ir.BlockId.fromIndex(2);
+    const current_stop = ir.BlockId.fromIndex(3);
+    const loop_exit = ir.BlockId.fromIndex(4);
+    const continue_target = ir.BlockId.fromIndex(5);
+    const incoming_value = ir.ValueId.fromIndex(0);
+    const owner_value = ir.ValueId.fromIndex(1);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .jump = .{ .target = start } } },
+        .{ .id = start, .function = function_id, .terminator = .{ .jump = .{
+            .target = owner_stop,
+            .arguments = &.{incoming_value},
+        } } },
+        .{ .id = owner_stop, .function = function_id, .parameters = &.{owner_value}, .terminator = .{ .return_values = &.{owner_value} } },
+        .{ .id = current_stop, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = loop_exit, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = continue_target, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &.{incoming_value},
+        .blocks = &.{ entry, start, owner_stop, current_stop, loop_exit, continue_target },
+        .entry_block = entry,
+    };
+    const values = [_]ir.Value{
+        .{ .id = incoming_value, .function = function_id, .type = .number, .origin = .{ .parameter = 0 } },
+        .{ .id = owner_value, .function = function_id, .type = .number, .origin = .{ .block_parameter = .{ .block = owner_stop, .index = 0 } } },
+    };
+    const program: ir.Program = .{
+        .program_id = "transparent-empty-owned-stop-loop-context",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, function);
+    defer analysis.deinit();
+    const loop_headers = try natural_loop.headerCandidatesAlloc(std.testing.allocator, &analysis);
+    defer std.testing.allocator.free(loop_headers);
+
+    var visited = [_]bool{ false, true, false, false, false, false };
+    var contexts = [_]?Builder.VisitContext{ null, .{
+        .start = start,
+        .stop = owner_stop,
+        .loop_exit = null,
+        .continue_target = null,
+        .parameter_arguments = &.{},
+    }, null, null, null, null };
+    var builder: Builder = .{
+        .allocator = std.testing.allocator,
+        .analysis = &analysis,
+        .visited = &visited,
+        .visited_contexts = &contexts,
+        .loop_headers = loop_headers,
+    };
+    const reused = try builder.buildRegionImplWithEntryArguments(
+        start,
+        current_stop,
+        null,
+        loop_exit,
+        null,
+        null,
+        false,
+        continue_target,
+        null,
+    );
+    defer destroyRegion(std.testing.allocator, reused);
+    try std.testing.expectEqual(@as(usize, 0), reused.nodes.len);
+    try std.testing.expect(reused.escape_projection != null);
+    try std.testing.expectEqual(start, reused.escape_projection.?.target);
+
+    var post_prefix_visited = [_]bool{ false, true, false, false, false, false };
+    var post_prefix_contexts = contexts;
+    var post_prefix_builder: Builder = .{
+        .allocator = std.testing.allocator,
+        .analysis = &analysis,
+        .visited = &post_prefix_visited,
+        .visited_contexts = &post_prefix_contexts,
+        .loop_headers = loop_headers,
+    };
+    const post_prefix = try post_prefix_builder.buildRegionImplWithEntryArguments(
+        entry,
+        current_stop,
+        null,
+        loop_exit,
+        null,
+        null,
+        false,
+        continue_target,
+        null,
+    );
+    defer destroyRegion(std.testing.allocator, post_prefix);
+    try std.testing.expectEqual(@as(usize, 1), post_prefix.nodes.len);
+    try std.testing.expectEqual(entry, post_prefix.nodes[0].blockId());
+    try std.testing.expect(post_prefix.escape_projection != null);
+    try std.testing.expectEqual(start, post_prefix.escape_projection.?.target);
+}
+
+test "parameterized continuation reuse requires the same incoming tuple" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const start = ir.BlockId.fromIndex(0);
+    const stop = ir.BlockId.fromIndex(1);
+    const parameter = ir.ValueId.fromIndex(0);
+    const first_argument = ir.ValueId.fromIndex(1);
+    const second_argument = ir.ValueId.fromIndex(2);
+    const blocks = [_]ir.Block{
+        .{
+            .id = start,
+            .function = function_id,
+            .parameters = &.{parameter},
+            .terminator = .{ .jump = .{ .target = stop } },
+        },
+        .{ .id = stop, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .blocks = &.{ start, stop },
+        .entry_block = start,
+    };
+    const values = [_]ir.Value{
+        .{ .id = parameter, .function = function_id, .type = .dynamic, .origin = .{ .parameter = 0 } },
+        .{ .id = first_argument, .function = function_id, .type = .dynamic, .origin = .{ .parameter = 1 } },
+        .{ .id = second_argument, .function = function_id, .type = .dynamic, .origin = .{ .parameter = 2 } },
+    };
+    const program: ir.Program = .{
+        .program_id = "parameterized-continuation-projection",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, function);
+    defer analysis.deinit();
+    const loop_headers = try natural_loop.headerCandidatesAlloc(std.testing.allocator, &analysis);
+    defer std.testing.allocator.free(loop_headers);
+
+    var visited = [_]bool{ true, false };
+    var contexts = [_]?Builder.VisitContext{ .{
+        .start = start,
+        .stop = stop,
+        .loop_exit = null,
+        .continue_target = null,
+        .parameter_arguments = &.{first_argument},
+    }, null };
+    var builder: Builder = .{
+        .allocator = std.testing.allocator,
+        .analysis = &analysis,
+        .visited = &visited,
+        .visited_contexts = &contexts,
+        .loop_headers = loop_headers,
+    };
+
+    const reused = try builder.buildRegionImplWithEntryArguments(
+        start,
+        stop,
+        null,
+        null,
+        null,
+        null,
+        false,
+        null,
+        &.{first_argument},
+    );
+    defer destroyRegion(std.testing.allocator, reused);
+    try std.testing.expectEqual(@as(usize, 0), reused.nodes.len);
+    try std.testing.expect(reused.escape_projection != null);
+    try std.testing.expectEqual(start, reused.escape_projection.?.target);
+
+    var rejected_builder: Builder = .{
+        .allocator = std.testing.allocator,
+        .analysis = &analysis,
+        .visited = &visited,
+        .visited_contexts = &contexts,
+        .loop_headers = loop_headers,
+    };
+    try std.testing.expectError(
+        error.UnsupportedShape,
+        rejected_builder.buildRegionImplWithEntryArguments(
+            start,
+            stop,
+            null,
+            null,
+            null,
+            null,
+            false,
+            null,
+            &.{second_argument},
+        ),
+    );
+}
+
+test "authenticated empty outside clone projects to loop exit" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const prefix = ir.BlockId.fromIndex(0);
+    const clone = ir.BlockId.fromIndex(1);
+    const loop_exit = ir.BlockId.fromIndex(2);
+    const original = ir.BlockId.fromIndex(3);
+    const blocks = [_]ir.Block{
+        .{ .id = prefix, .function = function_id, .terminator = .{ .jump = .{ .target = clone } } },
+        .{ .id = clone, .function = function_id, .terminator = .{ .jump = .{ .target = loop_exit } } },
+        .{ .id = loop_exit, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = original, .function = function_id, .terminator = .{ .jump = .{ .target = loop_exit } } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .blocks = &.{ prefix, clone, loop_exit, original },
+        .entry_block = prefix,
+    };
+    var rewrites = [_]ir.CfgEdgeRewrite{.{
+        .id = ir.EdgeRewriteId.fromIndex(0),
+        .source = prefix,
+        .kind = .jump,
+        .from = .{ .target = original },
+        .to = .{ .target = clone },
+        .rule = .node_split,
+        .node_split_group = ir.NodeSplitGroupId.fromIndex(0),
+    }};
+    var program = ir.Program{
+        .program_id = "authenticated-empty-outside-clone",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &.{},
+        .edge_rewrites = &rewrites,
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, function);
+    defer analysis.deinit();
+    const loop_headers = try natural_loop.headerCandidatesAlloc(std.testing.allocator, &analysis);
+    defer std.testing.allocator.free(loop_headers);
+    var visited = [_]bool{ false, false, false, false };
+    var contexts = [_]?Builder.VisitContext{ null, null, null, null };
+    const membership = [_]bool{ false, false, false, false };
+    const entry_reference: ir.CfgEdgeRef = .{ .source = prefix, .kind = .jump, .target = clone };
+    var builder: Builder = .{
+        .allocator = std.testing.allocator,
+        .analysis = &analysis,
+        .visited = &visited,
+        .visited_contexts = &contexts,
+        .loop_headers = loop_headers,
+    };
+    const region = try builder.buildRegionImplWithEntryArgumentsAndEdge(
+        clone,
+        null,
+        &membership,
+        loop_exit,
+        null,
+        null,
+        false,
+        null,
+        null,
+        entry_reference,
+    );
+    defer destroyRegion(std.testing.allocator, region);
+    try std.testing.expectEqual(@as(usize, 1), region.nodes.len);
+    try std.testing.expectEqual(clone, region.nodes[0].blockId());
+    try std.testing.expect(region.escape_projection != null);
+    try std.testing.expectEqual(loop_exit, region.escape_projection.?.target);
+    try std.testing.expect(region.escape_projection.?.edge != null);
+
+    rewrites[0].rule = .forwarding_jump;
+    program.edge_rewrites = &rewrites;
+    var rejected_analysis = try cfg.Analysis.init(std.testing.allocator, &program, function);
+    defer rejected_analysis.deinit();
+    var rejected_visited = [_]bool{ false, false, false, false };
+    var rejected_contexts = [_]?Builder.VisitContext{ null, null, null, null };
+    var rejected_builder: Builder = .{
+        .allocator = std.testing.allocator,
+        .analysis = &rejected_analysis,
+        .visited = &rejected_visited,
+        .visited_contexts = &rejected_contexts,
+        .loop_headers = loop_headers,
+    };
+    try std.testing.expectError(
+        error.UnsupportedShape,
+        rejected_builder.buildRegionImplWithEntryArgumentsAndEdge(
+            clone,
+            null,
+            &membership,
+            loop_exit,
+            null,
+            null,
+            false,
+            null,
+            null,
+            entry_reference,
+        ),
+    );
+}
+
+test "empty authenticated continuation reuses its canonical entry edge" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const prefix = ir.BlockId.fromIndex(0);
+    const target = ir.BlockId.fromIndex(1);
+    const stop = ir.BlockId.fromIndex(2);
+    const original = ir.BlockId.fromIndex(3);
+    const blocks = [_]ir.Block{
+        .{ .id = prefix, .function = function_id, .terminator = .{ .jump = .{ .target = target } } },
+        .{ .id = target, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = stop, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = original, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .blocks = &.{ prefix, target, stop, original },
+        .entry_block = prefix,
+    };
+    const rewrites = [_]ir.CfgEdgeRewrite{.{
+        .id = ir.EdgeRewriteId.fromIndex(0),
+        .source = prefix,
+        .kind = .jump,
+        .from = .{ .target = original },
+        .to = .{ .target = target },
+        .rule = .node_split,
+        .node_split_group = ir.NodeSplitGroupId.fromIndex(0),
+    }};
+    const program: ir.Program = .{
+        .program_id = "empty-authenticated-continuation-entry",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &.{},
+        .edge_rewrites = &rewrites,
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, function);
+    defer analysis.deinit();
+    const loop_headers = try natural_loop.headerCandidatesAlloc(std.testing.allocator, &analysis);
+    defer std.testing.allocator.free(loop_headers);
+
+    var visited = [_]bool{ false, true, false, false };
+    var contexts = [_]?Builder.VisitContext{ null, .{
+        .start = original,
+        .stop = stop,
+        .loop_exit = null,
+        .continue_target = null,
+    }, null, null };
+    const entry_reference: ir.CfgEdgeRef = .{ .source = prefix, .kind = .jump, .target = target };
+    var builder: Builder = .{
+        .allocator = std.testing.allocator,
+        .analysis = &analysis,
+        .visited = &visited,
+        .visited_contexts = &contexts,
+        .loop_headers = loop_headers,
+    };
+    const reused = try builder.buildRegionImplWithEntryArgumentsAndEdge(
+        target,
+        stop,
+        null,
+        null,
+        null,
+        null,
+        false,
+        null,
+        null,
+        entry_reference,
+    );
+    defer destroyRegion(std.testing.allocator, reused);
+    try std.testing.expectEqual(@as(usize, 0), reused.nodes.len);
+    try std.testing.expect(reused.escape_projection != null);
+    try std.testing.expectEqual(target, reused.escape_projection.?.target);
+
+    var rejected_builder: Builder = .{
+        .allocator = std.testing.allocator,
+        .analysis = &analysis,
+        .visited = &visited,
+        .visited_contexts = &contexts,
+        .loop_headers = loop_headers,
+    };
+    try std.testing.expectError(
+        error.UnsupportedShape,
+        rejected_builder.buildRegionImplWithEntryArgumentsAndEdge(
+            target,
+            stop,
+            null,
+            null,
+            null,
+            null,
+            false,
+            null,
+            null,
+            null,
+        ),
+    );
+}
+
 test "transferred parameterized join recovers only one authenticated edge" {
     const function_id = ir.FunctionId.fromIndex(0);
     const owner = ir.BlockId.fromIndex(0);
