@@ -878,3 +878,816 @@ test "solved loop header replays its authenticated inactive continuation" {
     }
     try std.testing.expectEqual(exit_block, plan.root.nodes[2].block);
 }
+
+test "conditional latch becomes a latch-tested natural loop" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const preheader = ir.BlockId.fromIndex(0);
+    const header = ir.BlockId.fromIndex(1);
+    const body = ir.BlockId.fromIndex(2);
+    const latch = ir.BlockId.fromIndex(3);
+    const exit_block = ir.BlockId.fromIndex(4);
+    const initial = [_]ir.ValueId{ir.ValueId.fromIndex(0)};
+    const body_arguments = [_]ir.ValueId{ir.ValueId.fromIndex(1)};
+    const latch_arguments = [_]ir.ValueId{ir.ValueId.fromIndex(2)};
+    const next_arguments = [_]ir.ValueId{ir.ValueId.fromIndex(3)};
+    const exit_arguments = [_]ir.ValueId{ir.ValueId.fromIndex(4)};
+    const blocks = [_]ir.Block{
+        .{ .id = preheader, .function = function_id, .terminator = .{ .jump = .{ .target = header, .arguments = &initial } } },
+        .{ .id = header, .function = function_id, .terminator = .{ .jump = .{ .target = body, .arguments = &body_arguments } } },
+        .{ .id = body, .function = function_id, .terminator = .{ .jump = .{ .target = latch, .arguments = &latch_arguments } } },
+        .{ .id = latch, .function = function_id, .terminator = .{ .branch = .{
+            .condition = ir.ValueId.fromIndex(5),
+            .then_edge = .{ .target = header, .arguments = &next_arguments },
+            .else_edge = .{ .target = exit_block, .arguments = &exit_arguments },
+        } } },
+        .{ .id = exit_block, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .blocks = &.{ exit_block, latch, body, preheader, header },
+        .entry_block = preheader,
+    }};
+    const program: ir.Program = .{
+        .program_id = "latch-loop-plan",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &.{},
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, functions[0]);
+    defer analysis.deinit();
+    var plan = try Plan.init(std.testing.allocator, &analysis);
+    defer plan.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), plan.root.nodes.len);
+    const loop = plan.root.nodes[1].latch_loop;
+    try std.testing.expectEqual(header, loop.header);
+    try std.testing.expectEqual(exit_block, loop.exit);
+    try std.testing.expectEqual(@as(usize, 1), loop.latch_count);
+    try std.testing.expectEqual(@as(usize, 3), loop.body_region.nodes.len);
+    try std.testing.expectEqual(header, loop.body_region.nodes[0].block);
+    try std.testing.expectEqual(body, loop.body_region.nodes[1].block);
+    const control = loop.body_region.nodes[2].loop_control;
+    try std.testing.expectEqual(latch, control.block);
+    try std.testing.expectEqualSlices(ir.ValueId, &next_arguments, control.continue_edge.arguments);
+    try std.testing.expectEqualSlices(ir.ValueId, &exit_arguments, control.exit_edge.arguments);
+}
+
+test "post-tested loop header may contain an internal diamond" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const preheader = ir.BlockId.fromIndex(0);
+    const header = ir.BlockId.fromIndex(1);
+    const left = ir.BlockId.fromIndex(2);
+    const right = ir.BlockId.fromIndex(3);
+    const join = ir.BlockId.fromIndex(4);
+    const latch = ir.BlockId.fromIndex(5);
+    const exit_block = ir.BlockId.fromIndex(6);
+    const blocks = [_]ir.Block{
+        .{ .id = preheader, .function = function_id, .terminator = .{ .jump = .{ .target = header } } },
+        .{ .id = header, .function = function_id, .terminator = .{ .branch = .{
+            .condition = ir.ValueId.fromIndex(0),
+            .then_edge = .{ .target = left },
+            .else_edge = .{ .target = right },
+        } } },
+        .{ .id = left, .function = function_id, .terminator = .{ .jump = .{ .target = join } } },
+        .{ .id = right, .function = function_id, .terminator = .{ .jump = .{ .target = join } } },
+        .{ .id = join, .function = function_id, .terminator = .{ .jump = .{ .target = latch } } },
+        .{ .id = latch, .function = function_id, .terminator = .{ .branch = .{
+            .condition = ir.ValueId.fromIndex(1),
+            .then_edge = .{ .target = exit_block },
+            .else_edge = .{ .target = header },
+        } } },
+        .{ .id = exit_block, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .blocks = &.{ exit_block, join, right, preheader, latch, header, left },
+        .entry_block = preheader,
+    }};
+    const program: ir.Program = .{
+        .program_id = "latch-loop-diamond-header",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &.{},
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, functions[0]);
+    defer analysis.deinit();
+    var plan = try Plan.init(std.testing.allocator, &analysis);
+    defer plan.deinit();
+
+    const loop = plan.root.nodes[1].latch_loop;
+    try std.testing.expectEqual(header, loop.header);
+    try std.testing.expectEqual(exit_block, loop.exit);
+    try std.testing.expectEqual(@as(usize, 1), loop.latch_count);
+    try std.testing.expectEqual(@as(usize, 3), loop.body_region.nodes.len);
+    const header_branch = loop.body_region.nodes[0].branch;
+    try std.testing.expectEqual(header, header_branch.block);
+    try std.testing.expectEqual(join, header_branch.join.?);
+    try std.testing.expectEqual(left, header_branch.then_region.nodes[0].block);
+    try std.testing.expectEqual(right, header_branch.else_region.nodes[0].block);
+    try std.testing.expectEqual(join, loop.body_region.nodes[1].block);
+    try std.testing.expectEqual(latch, loop.body_region.nodes[2].loop_control.block);
+}
+
+test "multiple conditional latches may share a canonical exit" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const header = ir.BlockId.fromIndex(0);
+    const split = ir.BlockId.fromIndex(1);
+    const first_latch = ir.BlockId.fromIndex(2);
+    const second_latch = ir.BlockId.fromIndex(3);
+    const exit_block = ir.BlockId.fromIndex(4);
+    const blocks = [_]ir.Block{
+        .{ .id = header, .function = function_id, .terminator = .{ .jump = .{ .target = split } } },
+        .{ .id = split, .function = function_id, .terminator = .{ .branch = .{
+            .condition = ir.ValueId.fromIndex(0),
+            .then_edge = .{ .target = first_latch },
+            .else_edge = .{ .target = second_latch },
+        } } },
+        .{ .id = first_latch, .function = function_id, .terminator = .{ .branch = .{
+            .condition = ir.ValueId.fromIndex(1),
+            .then_edge = .{ .target = header },
+            .else_edge = .{ .target = exit_block },
+        } } },
+        .{ .id = second_latch, .function = function_id, .terminator = .{ .branch = .{
+            .condition = ir.ValueId.fromIndex(2),
+            .then_edge = .{ .target = header },
+            .else_edge = .{ .target = exit_block },
+        } } },
+        .{ .id = exit_block, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .blocks = &.{ second_latch, exit_block, split, header, first_latch },
+        .entry_block = header,
+    }};
+    const program: ir.Program = .{
+        .program_id = "multiple-latch-loop-plan",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &.{},
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, functions[0]);
+    defer analysis.deinit();
+    var plan = try Plan.init(std.testing.allocator, &analysis);
+    defer plan.deinit();
+
+    const loop = plan.root.nodes[0].latch_loop;
+    try std.testing.expectEqual(exit_block, loop.exit);
+    try std.testing.expectEqual(@as(usize, 2), loop.latch_count);
+    try std.testing.expectEqual(header, loop.body_region.nodes[0].block);
+    const split_branch = loop.body_region.nodes[1].branch;
+    try std.testing.expect(split_branch.join == null);
+    try std.testing.expectEqual(first_latch, split_branch.then_region.nodes[0].loop_control.block);
+    try std.testing.expectEqual(second_latch, split_branch.else_region.nodes[0].loop_control.block);
+}
+
+test "post-tested loop may contain an early continue backedge" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const preheader = ir.BlockId.fromIndex(0);
+    const header = ir.BlockId.fromIndex(1);
+    const decision = ir.BlockId.fromIndex(2);
+    const latch = ir.BlockId.fromIndex(3);
+    const exit_block = ir.BlockId.fromIndex(4);
+    const initial_arguments = [_]ir.ValueId{ir.ValueId.fromIndex(0)};
+    const early_arguments = [_]ir.ValueId{ir.ValueId.fromIndex(1)};
+    const latch_arguments = [_]ir.ValueId{ir.ValueId.fromIndex(2)};
+    const blocks = [_]ir.Block{
+        .{ .id = preheader, .function = function_id, .terminator = .{ .jump = .{ .target = header, .arguments = &initial_arguments } } },
+        .{ .id = header, .function = function_id, .terminator = .{ .jump = .{ .target = decision } } },
+        .{ .id = decision, .function = function_id, .terminator = .{ .branch = .{
+            .condition = ir.ValueId.fromIndex(3),
+            .then_edge = .{ .target = header, .arguments = &early_arguments },
+            .else_edge = .{ .target = latch },
+        } } },
+        .{ .id = latch, .function = function_id, .terminator = .{ .branch = .{
+            .condition = ir.ValueId.fromIndex(4),
+            .then_edge = .{ .target = exit_block },
+            .else_edge = .{ .target = header, .arguments = &latch_arguments },
+        } } },
+        .{ .id = exit_block, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .blocks = &.{ exit_block, latch, decision, preheader, header },
+        .entry_block = preheader,
+    }};
+    const program: ir.Program = .{
+        .program_id = "post-tested-early-continue",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &.{},
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, functions[0]);
+    defer analysis.deinit();
+    var plan = try Plan.init(std.testing.allocator, &analysis);
+    defer plan.deinit();
+
+    const loop = plan.root.nodes[1].latch_loop;
+    try std.testing.expectEqual(@as(usize, 1), loop.latch_count);
+    const decision_branch = loop.body_region.nodes[1].branch;
+    try std.testing.expect(decision_branch.join == null);
+    try std.testing.expectEqual(@as(usize, 0), decision_branch.then_region.nodes.len);
+    try std.testing.expectEqual(header, decision_branch.then_region.stop.?);
+    try std.testing.expectEqual(latch, decision_branch.else_region.nodes[0].loop_control.block);
+
+    const forwarding_continue = ir.BlockId.fromIndex(blocks.len);
+    var forwarded_blocks = blocks ++ [_]ir.Block{.{
+        .id = forwarding_continue,
+        .function = function_id,
+        .terminator = .{ .jump = .{ .target = header, .arguments = &early_arguments } },
+    }};
+    forwarded_blocks[decision.index()].terminator.branch.then_edge = .{ .target = forwarding_continue };
+    var forwarded_functions = functions;
+    forwarded_functions[0].blocks = &.{ exit_block, latch, decision, forwarding_continue, preheader, header };
+    var forwarded_program = program;
+    forwarded_program.functions = &forwarded_functions;
+    forwarded_program.blocks = &forwarded_blocks;
+    var forwarded_analysis = try cfg.Analysis.init(std.testing.allocator, &forwarded_program, forwarded_functions[0]);
+    defer forwarded_analysis.deinit();
+    var forwarded_plan = try Plan.init(std.testing.allocator, &forwarded_analysis);
+    defer forwarded_plan.deinit();
+
+    const forwarded_loop = forwarded_plan.root.nodes[1].latch_loop;
+    const forwarded_decision = forwarded_loop.body_region.nodes[1].branch;
+    try std.testing.expect(forwarded_decision.join == null);
+    try std.testing.expectEqual(@as(usize, 1), forwarded_decision.then_region.nodes.len);
+    try std.testing.expectEqual(forwarding_continue, forwarded_decision.then_region.nodes[0].block);
+    try std.testing.expectEqual(header, forwarded_decision.then_region.stop.?);
+    try std.testing.expectEqual(latch, forwarded_decision.else_region.nodes[0].loop_control.block);
+
+    const header_parameter = ir.ValueId.fromIndex(5);
+    const forwarding_parameter = ir.ValueId.fromIndex(6);
+    const parameterized_values = [_]ir.Value{
+        .{ .id = initial_arguments[0], .function = function_id, .origin = .{ .parameter = 0 } },
+        .{ .id = early_arguments[0], .function = function_id, .origin = .{ .parameter = 1 } },
+        .{ .id = latch_arguments[0], .function = function_id, .origin = .{ .parameter = 2 } },
+        .{ .id = ir.ValueId.fromIndex(3), .function = function_id, .type = .boolean, .origin = .{ .parameter = 3 } },
+        .{ .id = ir.ValueId.fromIndex(4), .function = function_id, .type = .boolean, .origin = .{ .parameter = 4 } },
+        .{ .id = header_parameter, .function = function_id, .origin = .{ .block_parameter = .{ .block = header, .index = 0 } } },
+        .{ .id = forwarding_parameter, .function = function_id, .origin = .{ .block_parameter = .{ .block = forwarding_continue, .index = 0 } } },
+    };
+    var parameterized_blocks = forwarded_blocks;
+    parameterized_blocks[header.index()].parameters = &.{header_parameter};
+    parameterized_blocks[forwarding_continue.index()].parameters = &.{forwarding_parameter};
+    parameterized_blocks[decision.index()].terminator.branch.then_edge = .{
+        .target = forwarding_continue,
+        .arguments = &early_arguments,
+    };
+    parameterized_blocks[forwarding_continue.index()].terminator = .{ .jump = .{
+        .target = header,
+        .arguments = &.{forwarding_parameter},
+    } };
+    var parameterized_functions = forwarded_functions;
+    parameterized_functions[0].parameters = &.{
+        initial_arguments[0],
+        early_arguments[0],
+        latch_arguments[0],
+        ir.ValueId.fromIndex(3),
+        ir.ValueId.fromIndex(4),
+    };
+    var parameterized_program = forwarded_program;
+    parameterized_program.program_id = "post-tested-parameterized-forwarding-continue";
+    parameterized_program.functions = &parameterized_functions;
+    parameterized_program.blocks = &parameterized_blocks;
+    parameterized_program.values = &parameterized_values;
+
+    const replayed = (try lifter.control_flow.replayForwardingJump(
+        std.testing.allocator,
+        &parameterized_program,
+        parameterized_blocks[decision.index()].terminator.branch.then_edge,
+    )) orelse return error.TestUnexpectedResult;
+    defer if (replayed.arguments.len != 0) std.testing.allocator.free(replayed.arguments);
+    try std.testing.expectEqual(header, replayed.target);
+    try std.testing.expectEqualSlices(ir.ValueId, &early_arguments, replayed.arguments);
+
+    var parameterized_analysis = try cfg.Analysis.init(std.testing.allocator, &parameterized_program, parameterized_functions[0]);
+    defer parameterized_analysis.deinit();
+    var parameterized_plan = try Plan.init(std.testing.allocator, &parameterized_analysis);
+    defer parameterized_plan.deinit();
+
+    const parameterized_loop = parameterized_plan.root.nodes[1].latch_loop;
+    const parameterized_decision = parameterized_loop.body_region.nodes[1].branch;
+    try std.testing.expect(parameterized_decision.join == null);
+    try std.testing.expectEqual(@as(usize, 0), parameterized_decision.then_region.nodes.len);
+    try std.testing.expectEqual(header, parameterized_decision.then_region.stop.?);
+    const edge_override = parameterized_decision.then_edge_override.?;
+    try std.testing.expect(edge_override == .forwarding);
+    try std.testing.expectEqual(header, edge_override.forwarding.edge.target);
+    try std.testing.expectEqualSlices(ir.ValueId, &early_arguments, edge_override.forwarding.edge.arguments);
+    try std.testing.expectEqualSlices(ir.BlockId, &.{forwarding_continue}, edge_override.forwarding.blocks);
+    try std.testing.expect(parameterized_decision.else_edge_override == null);
+    try std.testing.expect(parameterized_decision.then_region.terminal_projection == null);
+
+    const first_copy_instruction = ir.InstructionId.fromIndex(0);
+    const second_copy_instruction = ir.InstructionId.fromIndex(1);
+    const first_copy_result = ir.ValueId.fromIndex(parameterized_values.len);
+    const second_copy_result = ir.ValueId.fromIndex(parameterized_values.len + 1);
+    const copy_values = parameterized_values ++ [_]ir.Value{
+        .{
+            .id = first_copy_result,
+            .function = function_id,
+            .origin = .{ .instruction_result = .{ .instruction = first_copy_instruction, .index = 0 } },
+        },
+        .{
+            .id = second_copy_result,
+            .function = function_id,
+            .origin = .{ .instruction_result = .{ .instruction = second_copy_instruction, .index = 0 } },
+        },
+    };
+    const copy_instructions = [_]ir.Instruction{
+        .{
+            .id = first_copy_instruction,
+            .block = forwarding_continue,
+            .operation = .{ .copy = forwarding_parameter },
+            .results = &.{first_copy_result},
+            .effects = .pure,
+        },
+        .{
+            .id = second_copy_instruction,
+            .block = forwarding_continue,
+            .operation = .{ .copy = first_copy_result },
+            .results = &.{second_copy_result},
+            .effects = .pure,
+        },
+    };
+    var copy_blocks = parameterized_blocks;
+    copy_blocks[forwarding_continue.index()].instructions = &.{ first_copy_instruction, second_copy_instruction };
+    copy_blocks[forwarding_continue.index()].terminator.jump.arguments = &.{second_copy_result};
+    var copy_program = parameterized_program;
+    copy_program.program_id = "post-tested-copy-forwarding-continue";
+    copy_program.blocks = &copy_blocks;
+    copy_program.instructions = &copy_instructions;
+    copy_program.values = &copy_values;
+
+    var copy_analysis = try cfg.Analysis.init(std.testing.allocator, &copy_program, parameterized_functions[0]);
+    defer copy_analysis.deinit();
+    var copy_plan = try Plan.init(std.testing.allocator, &copy_analysis);
+    defer copy_plan.deinit();
+
+    const copy_decision = copy_plan.root.nodes[1].latch_loop.body_region.nodes[1].branch;
+    try std.testing.expectEqual(@as(usize, 0), copy_decision.then_region.nodes.len);
+    const copy_edge_override = copy_decision.then_edge_override.?;
+    try std.testing.expect(copy_edge_override == .forwarding);
+    try std.testing.expectEqual(header, copy_edge_override.forwarding.edge.target);
+    try std.testing.expectEqualSlices(ir.ValueId, &early_arguments, copy_edge_override.forwarding.edge.arguments);
+    try std.testing.expectEqualSlices(ir.BlockId, &.{forwarding_continue}, copy_edge_override.forwarding.blocks);
+
+    const relay_continue = ir.BlockId.fromIndex(copy_blocks.len);
+    const relay_parameter = ir.ValueId.fromIndex(copy_values.len);
+    const relay_values = copy_values ++ [_]ir.Value{.{
+        .id = relay_parameter,
+        .function = function_id,
+        .origin = .{ .block_parameter = .{ .block = relay_continue, .index = 0 } },
+    }};
+    var relay_blocks = copy_blocks ++ [_]ir.Block{.{
+        .id = relay_continue,
+        .function = function_id,
+        .parameters = &.{relay_parameter},
+        .terminator = .{ .jump = .{ .target = header, .arguments = &.{relay_parameter} } },
+    }};
+    relay_blocks[forwarding_continue.index()].terminator.jump = .{
+        .target = relay_continue,
+        .arguments = &.{second_copy_result},
+    };
+    const relay_function_blocks = [_]ir.BlockId{
+        exit_block,
+        latch,
+        decision,
+        forwarding_continue,
+        relay_continue,
+        preheader,
+        header,
+    };
+    var relay_functions = parameterized_functions;
+    relay_functions[0].blocks = &relay_function_blocks;
+    var relay_program = copy_program;
+    relay_program.program_id = "post-tested-copy-forwarding-path-continue";
+    relay_program.functions = &relay_functions;
+    relay_program.blocks = &relay_blocks;
+    relay_program.values = &relay_values;
+
+    var relay_analysis = try cfg.Analysis.init(std.testing.allocator, &relay_program, relay_functions[0]);
+    defer relay_analysis.deinit();
+    var relay_plan = try Plan.init(std.testing.allocator, &relay_analysis);
+    defer relay_plan.deinit();
+
+    const relay_decision = relay_plan.root.nodes[1].latch_loop.body_region.nodes[1].branch;
+    try std.testing.expectEqual(@as(usize, 0), relay_decision.then_region.nodes.len);
+    const relay_override = relay_decision.then_edge_override.?;
+    try std.testing.expect(relay_override == .forwarding);
+    try std.testing.expectEqual(header, relay_override.forwarding.edge.target);
+    try std.testing.expectEqualSlices(ir.ValueId, &early_arguments, relay_override.forwarding.edge.arguments);
+    try std.testing.expectEqualSlices(
+        ir.BlockId,
+        &.{ forwarding_continue, relay_continue },
+        relay_override.forwarding.blocks,
+    );
+
+    var cyclic_blocks = relay_blocks;
+    cyclic_blocks[relay_continue.index()].terminator.jump.target = forwarding_continue;
+    var cyclic_program = relay_program;
+    cyclic_program.blocks = &cyclic_blocks;
+    try std.testing.expect((try lifter.control_flow.replayForwardingPathTo(
+        std.testing.allocator,
+        &cyclic_program,
+        cyclic_blocks[decision.index()].terminator.branch.then_edge,
+        header,
+    )) == null);
+}
+
+test "post-tested loop may break before its final latch" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const preheader = ir.BlockId.fromIndex(0);
+    const header = ir.BlockId.fromIndex(1);
+    const decision = ir.BlockId.fromIndex(2);
+    const latch = ir.BlockId.fromIndex(3);
+    const exit_block = ir.BlockId.fromIndex(4);
+    const break_arguments = [_]ir.ValueId{ir.ValueId.fromIndex(0)};
+    const latch_exit_arguments = [_]ir.ValueId{ir.ValueId.fromIndex(1)};
+    const blocks = [_]ir.Block{
+        .{ .id = preheader, .function = function_id, .terminator = .{ .jump = .{ .target = header } } },
+        .{ .id = header, .function = function_id, .terminator = .{ .jump = .{ .target = decision } } },
+        .{ .id = decision, .function = function_id, .terminator = .{ .branch = .{
+            .condition = ir.ValueId.fromIndex(2),
+            .then_edge = .{ .target = exit_block, .arguments = &break_arguments },
+            .else_edge = .{ .target = latch },
+        } } },
+        .{ .id = latch, .function = function_id, .terminator = .{ .branch = .{
+            .condition = ir.ValueId.fromIndex(3),
+            .then_edge = .{ .target = exit_block, .arguments = &latch_exit_arguments },
+            .else_edge = .{ .target = header },
+        } } },
+        .{ .id = exit_block, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .blocks = &.{ exit_block, latch, decision, preheader, header },
+        .entry_block = preheader,
+    }};
+    const program: ir.Program = .{
+        .program_id = "post-tested-early-break",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &.{},
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, functions[0]);
+    defer analysis.deinit();
+    var plan = try Plan.init(std.testing.allocator, &analysis);
+    defer plan.deinit();
+
+    const loop = plan.root.nodes[1].latch_loop;
+    const control = loop.body_region.nodes[1].loop_boundary;
+    try std.testing.expectEqual(decision, control.block);
+    try std.testing.expect(!control.body_on_true);
+    try std.testing.expectEqual(exit_block, control.boundary.exit.target);
+    try std.testing.expectEqualSlices(ir.ValueId, &break_arguments, control.boundary.exit.arguments);
+    try std.testing.expectEqual(latch, control.body_region.nodes[0].loop_control.block);
+}
+
+test "post-tested continue and break arms may share one final latch" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const preheader = ir.BlockId.fromIndex(0);
+    const header = ir.BlockId.fromIndex(1);
+    const continue_path = ir.BlockId.fromIndex(2);
+    const break_decision = ir.BlockId.fromIndex(3);
+    const break_path = ir.BlockId.fromIndex(4);
+    const normal_path = ir.BlockId.fromIndex(5);
+    const latch = ir.BlockId.fromIndex(6);
+    const exit_block = ir.BlockId.fromIndex(7);
+    const blocks = [_]ir.Block{
+        .{ .id = preheader, .function = function_id, .terminator = .{ .jump = .{ .target = header } } },
+        .{ .id = header, .function = function_id, .terminator = .{ .branch = .{
+            .condition = ir.ValueId.fromIndex(0),
+            .then_edge = .{ .target = continue_path },
+            .else_edge = .{ .target = break_decision },
+        } } },
+        .{ .id = continue_path, .function = function_id, .terminator = .{ .jump = .{ .target = latch } } },
+        .{ .id = break_decision, .function = function_id, .terminator = .{ .branch = .{
+            .condition = ir.ValueId.fromIndex(1),
+            .then_edge = .{ .target = break_path },
+            .else_edge = .{ .target = normal_path },
+        } } },
+        .{ .id = break_path, .function = function_id, .terminator = .{ .jump = .{ .target = exit_block } } },
+        .{ .id = normal_path, .function = function_id, .terminator = .{ .jump = .{ .target = latch } } },
+        .{ .id = latch, .function = function_id, .terminator = .{ .branch = .{
+            .condition = ir.ValueId.fromIndex(2),
+            .then_edge = .{ .target = exit_block },
+            .else_edge = .{ .target = header },
+        } } },
+        .{ .id = exit_block, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .blocks = &.{ normal_path, exit_block, continue_path, latch, preheader, break_path, header, break_decision },
+        .entry_block = preheader,
+    }};
+    const program: ir.Program = .{
+        .program_id = "post-tested-shared-latch-boundaries",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &.{},
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, functions[0]);
+    defer analysis.deinit();
+    var plan = try Plan.init(std.testing.allocator, &analysis);
+    defer plan.deinit();
+
+    const loop = plan.root.nodes[1].latch_loop;
+    try std.testing.expectEqual(@as(usize, 2), loop.body_region.nodes.len);
+    const split = loop.body_region.nodes[0].branch;
+    try std.testing.expectEqual(header, split.block);
+    try std.testing.expectEqual(continue_path, split.then_region.nodes[0].block);
+    try std.testing.expectEqual(break_decision, split.else_region.nodes[0].loop_boundary.block);
+    try std.testing.expectEqual(latch, loop.body_region.nodes[1].loop_control.block);
+}
+
+test "early loop boundary may own cleanup before breaking" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const preheader = ir.BlockId.fromIndex(0);
+    const header = ir.BlockId.fromIndex(1);
+    const decision = ir.BlockId.fromIndex(2);
+    const latch = ir.BlockId.fromIndex(3);
+    const cleanup_first = ir.BlockId.fromIndex(4);
+    const cleanup_second = ir.BlockId.fromIndex(5);
+    const exit_block = ir.BlockId.fromIndex(6);
+    const cleanup_arguments = [_]ir.ValueId{ir.ValueId.fromIndex(0)};
+    const blocks = [_]ir.Block{
+        .{ .id = preheader, .function = function_id, .terminator = .{ .jump = .{ .target = header } } },
+        .{ .id = header, .function = function_id, .terminator = .{ .jump = .{ .target = decision } } },
+        .{ .id = decision, .function = function_id, .terminator = .{ .branch = .{
+            .condition = ir.ValueId.fromIndex(1),
+            .then_edge = .{ .target = cleanup_first, .arguments = &cleanup_arguments },
+            .else_edge = .{ .target = latch },
+        } } },
+        .{ .id = latch, .function = function_id, .terminator = .{ .branch = .{
+            .condition = ir.ValueId.fromIndex(2),
+            .then_edge = .{ .target = exit_block },
+            .else_edge = .{ .target = header },
+        } } },
+        .{ .id = cleanup_first, .function = function_id, .terminator = .{ .jump = .{ .target = cleanup_second } } },
+        .{ .id = cleanup_second, .function = function_id, .terminator = .{ .jump = .{ .target = exit_block } } },
+        .{ .id = exit_block, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .blocks = &.{ cleanup_second, exit_block, latch, decision, preheader, cleanup_first, header },
+        .entry_block = preheader,
+    }};
+    const program: ir.Program = .{
+        .program_id = "post-tested-cleanup-break",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &.{},
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, functions[0]);
+    defer analysis.deinit();
+    var plan = try Plan.init(std.testing.allocator, &analysis);
+    defer plan.deinit();
+
+    const loop = plan.root.nodes[1].latch_loop;
+    const control = loop.body_region.nodes[1].loop_boundary;
+    try std.testing.expect(!control.body_on_true);
+    try std.testing.expectEqual(cleanup_first, control.boundary.side_exit.entry_edge.target);
+    try std.testing.expectEqualSlices(ir.ValueId, &cleanup_arguments, control.boundary.side_exit.entry_edge.arguments);
+    try std.testing.expectEqual(@as(usize, 2), control.boundary.side_exit.region.nodes.len);
+    try std.testing.expectEqual(cleanup_first, control.boundary.side_exit.region.nodes[0].block);
+    try std.testing.expectEqual(cleanup_second, control.boundary.side_exit.region.nodes[1].block);
+    try std.testing.expectEqual(exit_block, control.boundary.side_exit.region.stop.?);
+}
+
+test "post-tested loop promotes bypassing exits to their common convergence" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const preheader = ir.BlockId.fromIndex(0);
+    const header = ir.BlockId.fromIndex(1);
+    const decision = ir.BlockId.fromIndex(2);
+    const latch = ir.BlockId.fromIndex(3);
+    const side_cleanup = ir.BlockId.fromIndex(4);
+    const normal_cleanup = ir.BlockId.fromIndex(5);
+    const join = ir.BlockId.fromIndex(6);
+    const side_instruction = ir.InstructionId.fromIndex(0);
+    const normal_instruction = ir.InstructionId.fromIndex(1);
+    const blocks = [_]ir.Block{
+        .{ .id = preheader, .function = function_id, .terminator = .{ .jump = .{ .target = header } } },
+        .{ .id = header, .function = function_id, .terminator = .{ .jump = .{ .target = decision } } },
+        .{ .id = decision, .function = function_id, .terminator = .{ .branch = .{
+            .condition = ir.ValueId.fromIndex(0),
+            .then_edge = .{ .target = side_cleanup },
+            .else_edge = .{ .target = latch },
+        } } },
+        .{ .id = latch, .function = function_id, .terminator = .{ .branch = .{
+            .condition = ir.ValueId.fromIndex(1),
+            .then_edge = .{ .target = normal_cleanup },
+            .else_edge = .{ .target = header },
+        } } },
+        .{ .id = side_cleanup, .function = function_id, .instructions = &.{side_instruction}, .terminator = .{ .jump = .{ .target = join } } },
+        .{ .id = normal_cleanup, .function = function_id, .instructions = &.{normal_instruction}, .terminator = .{ .jump = .{ .target = join } } },
+        .{ .id = join, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const instructions = [_]ir.Instruction{
+        .{ .id = side_instruction, .block = side_cleanup, .operation = .{ .constant = .nil_value }, .results = &.{}, .effects = .pure },
+        .{ .id = normal_instruction, .block = normal_cleanup, .operation = .{ .constant = .nil_value }, .results = &.{}, .effects = .pure },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .blocks = &.{ preheader, header, decision, latch, side_cleanup, normal_cleanup, join },
+        .entry_block = preheader,
+    }};
+    const program: ir.Program = .{
+        .program_id = "post-tested-promoted-exit",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &.{},
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, functions[0]);
+    defer analysis.deinit();
+    var plan = try Plan.init(std.testing.allocator, &analysis);
+    defer plan.deinit();
+
+    const loop = plan.root.nodes[1].latch_loop;
+    try std.testing.expectEqual(join, loop.exit);
+    const early = loop.body_region.nodes[1].loop_boundary;
+    try std.testing.expectEqual(side_cleanup, early.boundary.side_exit.entry_edge.target);
+    try std.testing.expectEqual(join, early.boundary.side_exit.region.stop.?);
+    const final = early.body_region.nodes[0].loop_boundary;
+    try std.testing.expectEqual(normal_cleanup, final.boundary.side_exit.entry_edge.target);
+    try std.testing.expectEqual(join, final.boundary.side_exit.region.stop.?);
+}
+
+test "post-tested exit promotion permits a nonreturning continuation arm" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const preheader = ir.BlockId.fromIndex(0);
+    const header = ir.BlockId.fromIndex(1);
+    const decision = ir.BlockId.fromIndex(2);
+    const latch = ir.BlockId.fromIndex(3);
+    const side_cleanup = ir.BlockId.fromIndex(4);
+    const normal_cleanup = ir.BlockId.fromIndex(5);
+    const cycle = ir.BlockId.fromIndex(6);
+    const join = ir.BlockId.fromIndex(7);
+    const blocks = [_]ir.Block{
+        .{ .id = preheader, .function = function_id, .terminator = .{ .jump = .{ .target = header } } },
+        .{ .id = header, .function = function_id, .terminator = .{ .jump = .{ .target = decision } } },
+        .{ .id = decision, .function = function_id, .terminator = .{ .branch = .{
+            .condition = ir.ValueId.fromIndex(0),
+            .then_edge = .{ .target = side_cleanup },
+            .else_edge = .{ .target = latch },
+        } } },
+        .{ .id = latch, .function = function_id, .terminator = .{ .branch = .{
+            .condition = ir.ValueId.fromIndex(1),
+            .then_edge = .{ .target = normal_cleanup },
+            .else_edge = .{ .target = header },
+        } } },
+        .{ .id = side_cleanup, .function = function_id, .terminator = .{ .jump = .{ .target = join } } },
+        .{ .id = normal_cleanup, .function = function_id, .terminator = .{ .branch = .{
+            .condition = ir.ValueId.fromIndex(2),
+            .then_edge = .{ .target = join },
+            .else_edge = .{ .target = cycle },
+        } } },
+        .{ .id = cycle, .function = function_id, .terminator = .{ .jump = .{ .target = cycle } } },
+        .{ .id = join, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .blocks = &.{ cycle, normal_cleanup, preheader, header, decision, latch, side_cleanup, join },
+        .entry_block = preheader,
+    }};
+    const program: ir.Program = .{
+        .program_id = "post-tested-nonreturning-promoted-exit",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &.{},
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, functions[0]);
+    defer analysis.deinit();
+    try std.testing.expect((try analysis.immediateConvergenceBetween(
+        std.testing.allocator,
+        normal_cleanup,
+        side_cleanup,
+        null,
+    )) == null);
+    try std.testing.expectEqual(join, (try analysis.immediateStructuralConvergenceBetween(
+        std.testing.allocator,
+        normal_cleanup,
+        side_cleanup,
+        null,
+    )).?);
+
+    var plan = try Plan.init(std.testing.allocator, &analysis);
+    defer plan.deinit();
+    const loop = plan.root.nodes[1].latch_loop;
+    try std.testing.expectEqual(join, loop.exit);
+    try std.testing.expectEqual(join, plan.root.nodes[2].block);
+}
+
+test "post-tested loop may return before its final latch" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const preheader = ir.BlockId.fromIndex(0);
+    const header = ir.BlockId.fromIndex(1);
+    const decision = ir.BlockId.fromIndex(2);
+    const latch = ir.BlockId.fromIndex(3);
+    const terminal = ir.BlockId.fromIndex(4);
+    const exit_block = ir.BlockId.fromIndex(5);
+    const terminal_arguments = [_]ir.ValueId{ir.ValueId.fromIndex(0)};
+    const blocks = [_]ir.Block{
+        .{ .id = preheader, .function = function_id, .terminator = .{ .jump = .{ .target = header } } },
+        .{ .id = header, .function = function_id, .terminator = .{ .jump = .{ .target = decision } } },
+        .{ .id = decision, .function = function_id, .terminator = .{ .branch = .{
+            .condition = ir.ValueId.fromIndex(1),
+            .then_edge = .{ .target = terminal, .arguments = &terminal_arguments },
+            .else_edge = .{ .target = latch },
+        } } },
+        .{ .id = latch, .function = function_id, .terminator = .{ .branch = .{
+            .condition = ir.ValueId.fromIndex(2),
+            .then_edge = .{ .target = exit_block },
+            .else_edge = .{ .target = header },
+        } } },
+        .{ .id = terminal, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = exit_block, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .blocks = &.{ terminal, exit_block, latch, decision, preheader, header },
+        .entry_block = preheader,
+    }};
+    const program: ir.Program = .{
+        .program_id = "post-tested-early-terminal",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &.{},
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, functions[0]);
+    defer analysis.deinit();
+    var plan = try Plan.init(std.testing.allocator, &analysis);
+    defer plan.deinit();
+
+    const loop = plan.root.nodes[1].latch_loop;
+    const control = loop.body_region.nodes[1].loop_boundary;
+    try std.testing.expect(!control.body_on_true);
+    try std.testing.expectEqual(terminal, control.boundary.terminal.block);
+    try std.testing.expectEqualSlices(ir.ValueId, &terminal_arguments, control.boundary.terminal.edge.arguments);
+    try std.testing.expectEqual(latch, control.body_region.nodes[0].loop_control.block);
+}
+
+test "loop body branch to header or canonical exit becomes loop control" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const preheader = ir.BlockId.fromIndex(0);
+    const header = ir.BlockId.fromIndex(1);
+    const body = ir.BlockId.fromIndex(2);
+    const exit_block = ir.BlockId.fromIndex(3);
+    const blocks = [_]ir.Block{
+        .{ .id = preheader, .function = function_id, .terminator = .{ .jump = .{ .target = header } } },
+        .{ .id = header, .function = function_id, .terminator = .{ .branch = .{
+            .condition = ir.ValueId.fromIndex(0),
+            .then_edge = .{ .target = body },
+            .else_edge = .{ .target = exit_block },
+        } } },
+        .{ .id = body, .function = function_id, .terminator = .{ .branch = .{
+            .condition = ir.ValueId.fromIndex(1),
+            .then_edge = .{ .target = header },
+            .else_edge = .{ .target = exit_block },
+        } } },
+        .{ .id = exit_block, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .blocks = &.{ exit_block, body, preheader, header },
+        .entry_block = preheader,
+    }};
+    const program: ir.Program = .{
+        .program_id = "loop-control-plan",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &.{},
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, functions[0]);
+    defer analysis.deinit();
+    var plan = try Plan.init(std.testing.allocator, &analysis);
+    defer plan.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), plan.root.nodes[1].loop.body_region.nodes.len);
+    const control = plan.root.nodes[1].loop.body_region.nodes[0].loop_control;
+    try std.testing.expectEqual(body, control.block);
+    try std.testing.expectEqual(header, control.continue_edge.target);
+    try std.testing.expectEqual(exit_block, control.exit_edge.target);
+    try std.testing.expect(control.continue_on_true);
+}
