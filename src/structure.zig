@@ -375,6 +375,10 @@ pub const Node = union(enum) {
     }
 };
 
+fn lessArbitraryNode(_: void, left: Node, right: Node) bool {
+    return left.blockId().index() < right.blockId().index();
+}
+
 const LoopValidationOutcome = enum { uncomputed, valid, invalid };
 
 const FreeTargetCapture = struct {
@@ -472,6 +476,229 @@ test "loop-boundary exit targets are tracked separately from free targets" {
     defer allocator.free(free_targets);
     try std.testing.expectEqual(@as(usize, 0), free_targets.len);
 }
+
+pub const Plan = struct {
+    allocator: std.mem.Allocator,
+    root: *Region,
+
+    // Large authenticated rewrite graphs can be valid without having a
+    // useful reducible region decomposition. Keep recursive structuring
+    // bounded; the emitter preserves the complete reachable graph with its
+    // dispatcher, so the limit is on
+    // the function's admitted block budget rather than its live reachability.
+    pub const arbitrary_fallback_block_limit: usize = 1_024;
+
+    pub fn shouldUseArbitraryFallbackForFunction(program: *const ir.Program, function: ir.Function) bool {
+        if (program.edge_rewrites.len != 0 and function.blocks.len > arbitrary_fallback_block_limit) return true;
+        return false;
+    }
+
+    pub fn shouldUseArbitraryFallback(analysis: *const cfg.Analysis) bool {
+        return shouldUseArbitraryFallbackForFunction(analysis.program, analysis.function);
+    }
+
+    pub fn init(allocator: std.mem.Allocator, analysis: *const cfg.Analysis) BuildError!Plan {
+        var collision: ?Collision = null;
+        return initWithCollision(allocator, analysis, &collision) catch |err| {
+            if (collision) |*value| {
+                value.deinit(allocator);
+            }
+            return err;
+        };
+    }
+
+    /// Preserve a valid CFG when structured ownership cannot be proven.  The
+    /// fallback is intentionally a complete block list; emission owns the
+    /// control-state representation and still consumes the original edges.
+    pub fn initWithArbitraryFallback(allocator: std.mem.Allocator, analysis: *const cfg.Analysis) BuildError!Plan {
+        if (shouldUseArbitraryFallback(analysis)) return initArbitraryCfg(allocator, analysis);
+        return Plan.init(allocator, analysis) catch |err| {
+            if (err != error.UnsupportedShape) return err;
+            return initArbitraryCfg(allocator, analysis);
+        };
+    }
+
+    /// Construct the explicit dispatcher representation after a structured
+    /// attempt has already established that ownership cannot be proven.
+    pub fn initArbitrary(allocator: std.mem.Allocator, analysis: *const cfg.Analysis) BuildError!Plan {
+        return initArbitraryCfg(allocator, analysis);
+    }
+
+    fn initArbitraryCfg(allocator: std.mem.Allocator, analysis: *const cfg.Analysis) BuildError!Plan {
+        const reachable_count = analysis.reachableCount();
+        if (reachable_count == 0) return error.UnsupportedShape;
+        const nodes = try allocator.alloc(Node, reachable_count);
+        errdefer allocator.free(nodes);
+        var node_index: usize = 0;
+        for (analysis.function.blocks) |block| {
+            if (!analysis.isReachable(block)) continue;
+            if (node_index >= nodes.len) return error.UnsupportedShape;
+            nodes[node_index] = .{ .block = block };
+            node_index += 1;
+        }
+        if (node_index != nodes.len) return error.UnsupportedShape;
+        std.sort.heap(Node, nodes, {}, lessArbitraryNode);
+        const root = try allocator.create(Region);
+        errdefer allocator.destroy(root);
+        root.* = .{
+            .nodes = nodes,
+            .stop = null,
+            .loop_exit = null,
+            .arbitrary_cfg = true,
+        };
+        return .{ .allocator = allocator, .root = root };
+    }
+
+    pub fn initWithCollision(
+        allocator: std.mem.Allocator,
+        analysis: *const cfg.Analysis,
+        collision: ?*?Collision,
+    ) BuildError!Plan {
+        return initWithCollisionAndReplayContext(allocator, analysis, collision, null);
+    }
+
+    pub fn initWithCollisionAndReplayContext(
+        allocator: std.mem.Allocator,
+        analysis: *const cfg.Analysis,
+        collision: ?*?Collision,
+        replay_context: ?*structural_overlap.ReplayProjectionContext,
+    ) BuildError!Plan {
+        const visited = try allocator.alloc(bool, analysis.function.blocks.len);
+        defer allocator.free(visited);
+        @memset(visited, false);
+        const visited_contexts = try allocator.alloc(?Builder.VisitContext, analysis.function.blocks.len);
+        defer allocator.free(visited_contexts);
+        @memset(visited_contexts, null);
+        const loop_header_start = structural_overlap.structuralPhaseNow();
+        const loop_headers = try natural_loop.headerCandidatesAlloc(allocator, analysis);
+        defer allocator.free(loop_headers);
+        const loop_memberships = try allocator.alloc(?[]bool, analysis.function.blocks.len);
+        defer {
+            for (loop_memberships) |membership| {
+                if (membership) |bits| allocator.free(bits);
+            }
+            allocator.free(loop_memberships);
+        }
+        @memset(loop_memberships, null);
+        const loop_validation_epochs = try allocator.alloc(usize, analysis.function.blocks.len);
+        defer allocator.free(loop_validation_epochs);
+        @memset(loop_validation_epochs, std.math.maxInt(usize));
+        const loop_validation_generations = try allocator.alloc(usize, analysis.function.blocks.len);
+        defer allocator.free(loop_validation_generations);
+        @memset(loop_validation_generations, std.math.maxInt(usize));
+        const loop_validation_outcomes = try allocator.alloc(LoopValidationOutcome, analysis.function.blocks.len);
+        defer allocator.free(loop_validation_outcomes);
+        @memset(loop_validation_outcomes, .uncomputed);
+        const stop_boundary_closure = try allocator.alloc(?bool, analysis.function.blocks.len);
+        defer allocator.free(stop_boundary_closure);
+        @memset(stop_boundary_closure, null);
+        structural_overlap.traceStructural("structural_phase plan_loop_headers function={} count={} ms={}\n", .{
+            analysis.function.id.index(),
+            std.mem.countScalar(bool, loop_headers, true),
+            structural_overlap.structuralPhaseMillis(loop_header_start),
+        });
+        var owned_replay_context: ?structural_overlap.ReplayProjectionContext = null;
+        var active_replay_context = replay_context;
+        if (active_replay_context == null) {
+            const replay_start = structural_overlap.structuralPhaseNow();
+            owned_replay_context = try structural_overlap.ReplayProjectionContext.initForFunction(
+                allocator,
+                analysis.program,
+                analysis.function.id,
+            );
+            active_replay_context = &owned_replay_context.?;
+            structural_overlap.traceStructural("structural_phase plan_replay function={} ms={}\n", .{
+                analysis.function.id.index(),
+                structural_overlap.structuralPhaseMillis(replay_start),
+            });
+        }
+        defer if (owned_replay_context) |*value| value.deinit();
+
+        var builder: Builder = .{
+            .allocator = allocator,
+            .analysis = analysis,
+            .visited = visited,
+            .visited_contexts = visited_contexts,
+            .loop_headers = loop_headers,
+            .loop_memberships = loop_memberships,
+            .loop_validation_epochs = loop_validation_epochs,
+            .loop_validation_generations = loop_validation_generations,
+            .loop_validation_outcomes = loop_validation_outcomes,
+            .stop_boundary_closure = stop_boundary_closure,
+            .replay_context = active_replay_context.?,
+            .collision = collision,
+            .trace_join_calls = 0,
+            .trace_join_ms = 0,
+        };
+        const build_start = structural_overlap.structuralPhaseNow();
+        const root = builder.buildRegion(analysis.function.entry_block, null, null, null) catch |err| {
+            structural_overlap.traceStructural("structural_phase plan_build_failed function={} error={s} build_ms={} visited={} reachable={} join_calls={} join_ms={} loop_probe_calls={} loop_probe_ms={} build_loop_ms={} build_latch_ms={} build_infinite_ms={}\n", .{
+                analysis.function.id.index(),
+                @errorName(err),
+                structural_overlap.structuralPhaseMillis(build_start),
+                builder.visited_count,
+                analysis.reachableCount(),
+                builder.trace_join_calls,
+                builder.trace_join_ms,
+                builder.trace_loop_probe_calls,
+                builder.trace_loop_probe_ms,
+                builder.trace_build_loop_ms,
+                builder.trace_build_latch_ms,
+                builder.trace_build_infinite_ms,
+            });
+            structural_overlap.traceStructural("structural_phase plan_build_detail function={} infinite_classify_calls={} infinite_classify_ms={} infinite_continuation_calls={} infinite_continuation_ms={} infinite_resolve_calls={} infinite_resolve_ms={} infinite_shared_entry_calls={} infinite_shared_entry_ms={} infinite_body_calls={} infinite_body_ms={} projection_calls={} projection_ms={} parameter_calls={} parameter_ms={} reach_calls={} reach_ms={} bridge_calls={} bridge_ms={}\n", .{
+                analysis.function.id.index(),
+                builder.trace_infinite_classify_calls,
+                builder.trace_infinite_classify_ms,
+                builder.trace_infinite_continuation_calls,
+                builder.trace_infinite_continuation_ms,
+                builder.trace_infinite_resolve_calls,
+                builder.trace_infinite_resolve_ms,
+                builder.trace_infinite_shared_entry_calls,
+                builder.trace_infinite_shared_entry_ms,
+                builder.trace_infinite_body_calls,
+                builder.trace_infinite_body_ms,
+                builder.trace_projection_calls,
+                builder.trace_projection_ms,
+                builder.trace_parameter_calls,
+                builder.trace_parameter_ms,
+                builder.trace_reach_calls,
+                builder.trace_reach_ms,
+                builder.trace_bridge_calls,
+                builder.trace_bridge_ms,
+            });
+            return err;
+        };
+        structural_overlap.traceStructural("structural_phase plan_build function={} visited={} reachable={} ms={}\n", .{
+            analysis.function.id.index(),
+            builder.visited_count,
+            analysis.reachableCount(),
+            structural_overlap.structuralPhaseMillis(build_start),
+        });
+        structural_overlap.traceStructural("structural_phase plan_build_detail function={} projection_calls={} projection_ms={} parameter_calls={} parameter_ms={} reach_calls={} reach_ms={} bridge_calls={} bridge_ms={}\n", .{
+            analysis.function.id.index(),
+            builder.trace_projection_calls,
+            builder.trace_projection_ms,
+            builder.trace_parameter_calls,
+            builder.trace_parameter_ms,
+            builder.trace_reach_calls,
+            builder.trace_reach_ms,
+            builder.trace_bridge_calls,
+            builder.trace_bridge_ms,
+        });
+        errdefer destroyRegion(allocator, root);
+        if (builder.visited_count != analysis.reachableCount()) {
+            try builder.noteUnvisitedReachable();
+            return error.UnsupportedShape;
+        }
+        return .{ .allocator = allocator, .root = root };
+    }
+
+    pub fn deinit(self: *Plan) void {
+        destroyRegion(self.allocator, self.root);
+        self.* = undefined;
+    }
+};
 
 fn functionExceedsLocalRegisterBudget(program: *const ir.Program, function: ir.Function) bool {
     var potential_locals = function.parameters.len;
@@ -924,6 +1151,98 @@ const Builder = struct {
             .incoming = incoming,
             .reason = .unvisited_loop_member,
         };
+    }
+
+    fn noteUnvisitedReachable(self: *Builder) BuildError!void {
+        const output = self.collision orelse return;
+        if (output.* != null) return;
+        var fallback: ?ir.BlockId = null;
+        var frontiers: std.ArrayList(UnvisitedFrontier) = .empty;
+        errdefer {
+            for (frontiers.items) |frontier| {
+                self.allocator.free(frontier.incoming);
+                if (frontier.incoming_contexts.len != 0) self.allocator.free(frontier.incoming_contexts);
+                self.allocator.free(frontier.closure);
+            }
+            frontiers.deinit(self.allocator);
+        }
+        for (self.analysis.function.blocks, 0..) |block, local_index| {
+            if (self.visited[local_index] or !self.analysis.isReachable(block)) continue;
+            if (fallback == null) fallback = block;
+            var incoming: std.ArrayList(ir.CfgEdgeRef) = .empty;
+            var incoming_contexts: std.ArrayList(?CollisionContext) = .empty;
+            defer incoming.deinit(self.allocator);
+            defer incoming_contexts.deinit(self.allocator);
+            for (0..self.analysis.predecessorCount(block)) |predecessor_index| {
+                const predecessor = self.analysis.predecessorAt(block, predecessor_index) orelse continue;
+                const predecessor_local = self.analysis.blockIndex(predecessor) orelse continue;
+                if (!self.visited[predecessor_local]) continue;
+                const reference = directEdgeReference(self.analysis.program, .{ .block = predecessor }, block) orelse continue;
+                try incoming.append(self.allocator, reference);
+                try incoming_contexts.append(self.allocator, self.contextForBlock(predecessor));
+            }
+            if (incoming.items.len == 0) continue;
+            const owned_incoming = try incoming.toOwnedSlice(self.allocator);
+            const owned_incoming_contexts = try incoming_contexts.toOwnedSlice(self.allocator);
+            const closure = self.unvisitedReachableClosureAlloc(block) catch |err| {
+                self.allocator.free(owned_incoming);
+                self.allocator.free(owned_incoming_contexts);
+                return err;
+            };
+            frontiers.append(self.allocator, .{
+                .block = block,
+                .incoming = owned_incoming,
+                .incoming_contexts = owned_incoming_contexts,
+                .closure = closure,
+            }) catch |err| {
+                self.allocator.free(owned_incoming);
+                self.allocator.free(owned_incoming_contexts);
+                self.allocator.free(closure);
+                return err;
+            };
+        }
+        if (frontiers.items.len != 0) {
+            const owned = try frontiers.toOwnedSlice(self.allocator);
+            output.* = .{
+                .block = owned[0].block,
+                .previous = owned[0].incoming[0].source,
+                .incoming = owned[0].incoming[0],
+                .reason = .unvisited_reachable,
+                .incoming_context = self.contextForBlock(owned[0].incoming[0].source),
+                .unvisited_frontiers = owned,
+            };
+            return;
+        }
+        if (fallback) |block| {
+            output.* = .{
+                .block = block,
+                .previous = null,
+                .incoming = null,
+                .reason = .unvisited_reachable,
+            };
+        }
+    }
+
+    fn unvisitedReachableClosureAlloc(self: *const Builder, start: ir.BlockId) BuildError![]ir.BlockId {
+        const found = try self.allocator.alloc(bool, self.analysis.function.blocks.len);
+        defer self.allocator.free(found);
+        @memset(found, false);
+        var pending: std.ArrayList(ir.BlockId) = .empty;
+        defer pending.deinit(self.allocator);
+        var closure: std.ArrayList(ir.BlockId) = .empty;
+        errdefer closure.deinit(self.allocator);
+        try pending.append(self.allocator, start);
+        while (pending.pop()) |block| {
+            const local_index = self.analysis.blockIndex(block) orelse return error.UnsupportedShape;
+            if (found[local_index] or self.visited[local_index] or !self.analysis.isReachable(block)) continue;
+            found[local_index] = true;
+            try closure.append(self.allocator, block);
+            for (0..self.analysis.successorCount(block)) |successor_index| {
+                const successor = self.analysis.successorAt(block, successor_index) orelse return error.UnsupportedShape;
+                try pending.append(self.allocator, successor);
+            }
+        }
+        return closure.toOwnedSlice(self.allocator);
     }
 
     fn noteCollisionNode(
@@ -5297,6 +5616,20 @@ const Builder = struct {
                 .return_pack, .return_expanded, .throw_error, .branch, .unreachable_block => return null,
             }
         }
+    }
+
+    fn buildRegion(
+        self: *Builder,
+        start: ir.BlockId,
+        stop: ?ir.BlockId,
+        allowed: ?[]const bool,
+        loop_exit: ?ir.BlockId,
+    ) BuildError!*Region {
+        if (stop) |block| {
+            const escape_target: EscapeTarget = .{ .block = block, .parent = null };
+            return self.buildRegionImplWithEntryArguments(start, stop, allowed, loop_exit, &escape_target, null, false, null, null);
+        }
+        return self.buildRegionImplWithEntryArguments(start, stop, allowed, loop_exit, null, null, false, null, null);
     }
 
     fn buildLoopRegion(
@@ -9673,6 +10006,176 @@ test "authenticated effectful terminal replay preserves an owned bridge" {
     try std.testing.expect(collision == null);
 }
 
+const TerminalContinuationReplayWitness = enum {
+    valid,
+    missing_bridge,
+    pure_suffix,
+    wrong_return_origin,
+    matching_stop,
+    parameterized_suffix,
+};
+
+fn terminalContinuationReplayWitness(witness: TerminalContinuationReplayWitness) !bool {
+    const allocator = std.testing.allocator;
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const owner_source = ir.BlockId.fromIndex(1);
+    const incoming_source = ir.BlockId.fromIndex(2);
+    const current = ir.BlockId.fromIndex(3);
+    const terminal = ir.BlockId.fromIndex(4);
+    const owner_stop = ir.BlockId.fromIndex(5);
+    const incoming_stop = ir.BlockId.fromIndex(6);
+    const original = ir.BlockId.fromIndex(7);
+    const condition = ir.ValueId.fromIndex(0);
+    const current_result = ir.ValueId.fromIndex(1);
+    const original_result = ir.ValueId.fromIndex(2);
+    const current_parameter = ir.ValueId.fromIndex(3);
+    const current_get = ir.InstructionId.fromIndex(0);
+    const current_write = ir.InstructionId.fromIndex(1);
+    const original_get = ir.InstructionId.fromIndex(2);
+    const original_write = ir.InstructionId.fromIndex(3);
+    const place = ir.PlaceId.fromIndex(0);
+    const block_ids = [_]ir.BlockId{
+        entry,
+        owner_source,
+        incoming_source,
+        current,
+        terminal,
+        owner_stop,
+        incoming_stop,
+        original,
+    };
+    const function_parameters = [_]ir.ValueId{condition};
+    var current_parameters = [_]ir.ValueId{current_parameter};
+    const current_parameter_slice: []const ir.ValueId = if (witness == .parameterized_suffix)
+        current_parameters[0..]
+    else
+        &.{};
+    const current_return = [_]ir.ValueId{current_result};
+    const wrong_return = [_]ir.ValueId{original_result};
+    const terminal_return: []const ir.ValueId = if (witness == .wrong_return_origin)
+        wrong_return[0..]
+    else
+        current_return[0..];
+    const suffix_effects: ir.EffectSummary = if (witness == .pure_suffix)
+        .pure
+    else
+        .table_constructor;
+    const suffix_write_effects: ir.EffectSummary = if (witness == .pure_suffix)
+        .pure
+    else
+        .place_write;
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = condition,
+            .then_edge = .{ .target = owner_source },
+            .else_edge = .{ .target = incoming_source },
+        } } },
+        .{ .id = owner_source, .function = function_id, .terminator = .{ .jump = .{ .target = owner_stop } } },
+        .{ .id = incoming_source, .function = function_id, .terminator = .{ .jump = .{ .target = current } } },
+        .{ .id = current, .function = function_id, .parameters = current_parameter_slice, .instructions = &.{ current_get, current_write }, .terminator = .{ .return_values = terminal_return } },
+        .{ .id = terminal, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = owner_stop, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = incoming_stop, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = original, .function = function_id, .instructions = &.{ original_get, original_write }, .terminator = .{ .return_values = wrong_return[0..] } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = function_parameters[0..],
+        .local_places = &.{place},
+        .blocks = block_ids[0..],
+        .entry_block = entry,
+    };
+    const values = [_]ir.Value{
+        .{ .id = condition, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = current_result, .function = function_id, .type = .dynamic, .origin = .{ .instruction_result = .{ .instruction = current_get, .index = 0 } } },
+        .{ .id = original_result, .function = function_id, .type = .dynamic, .origin = .{ .instruction_result = .{ .instruction = original_get, .index = 0 } } },
+        .{ .id = current_parameter, .function = function_id, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = current, .index = 0 } } },
+    };
+    const places = [_]ir.Place{.{
+        .id = place,
+        .function = function_id,
+        .type = .dynamic,
+        .origin = .{ .local = 0 },
+    }};
+    const instructions = [_]ir.Instruction{
+        .{ .id = current_get, .block = current, .operation = .{ .make_table = {} }, .results = &.{current_result}, .effects = suffix_effects },
+        .{ .id = current_write, .block = current, .operation = .{ .place_write = .{ .place = place, .value = current_result } }, .results = &.{}, .effects = suffix_write_effects },
+        .{ .id = original_get, .block = original, .operation = .{ .make_table = {} }, .results = &.{original_result}, .effects = suffix_effects },
+        .{ .id = original_write, .block = original, .operation = .{ .place_write = .{ .place = place, .value = original_result } }, .results = &.{}, .effects = suffix_write_effects },
+    };
+    const rewrites = [_]ir.CfgEdgeRewrite{.{
+        .id = ir.EdgeRewriteId.fromIndex(0),
+        .source = incoming_source,
+        .kind = .jump,
+        .from = .{ .target = original },
+        .to = .{ .target = current },
+        .rule = .node_split,
+        .node_split_group = ir.NodeSplitGroupId.fromIndex(0),
+    }};
+    const edge_rewrites: []const ir.CfgEdgeRewrite = if (witness == .missing_bridge)
+        &.{}
+    else
+        rewrites[0..];
+    const functions = [_]ir.Function{function};
+    const program: ir.Program = .{
+        .program_id = "terminal-continuation-replay-witness",
+        .entry_function = function_id,
+        .functions = functions[0..],
+        .blocks = blocks[0..],
+        .instructions = instructions[0..],
+        .values = values[0..],
+        .places = places[0..],
+        .edge_rewrites = edge_rewrites,
+    };
+    var analysis = try cfg.Analysis.init(allocator, &program, function);
+    defer analysis.deinit();
+    const loop_headers = try natural_loop.headerCandidatesAlloc(allocator, &analysis);
+    defer allocator.free(loop_headers);
+
+    var visited = [_]bool{ false, false, false, true, false, false, false, false };
+    const owner_context_stop = if (witness == .matching_stop) incoming_stop else owner_stop;
+    var contexts = [_]?Builder.VisitContext{ null, null, null, .{
+        .start = owner_source,
+        .stop = owner_context_stop,
+        .loop_exit = null,
+        .continue_target = null,
+        .parameter_arguments = &.{},
+    }, null, null, null, null };
+    var builder: Builder = .{
+        .allocator = allocator,
+        .analysis = &analysis,
+        .visited = &visited,
+        .visited_contexts = &contexts,
+        .loop_headers = loop_headers,
+    };
+    const witness_reference = ir.CfgEdgeRef{ .source = incoming_source, .kind = .jump, .target = current };
+    const replay = try builder.authenticatedEffectfulTerminalContinuationReplay(
+        current,
+        incoming_source,
+        incoming_stop,
+        null,
+        null,
+        &.{},
+        witness_reference,
+        .{ .block = incoming_source },
+    );
+    if (replay) |value| {
+        allocator.free(value.nodes);
+        return true;
+    }
+    return false;
+}
+
+test "effectful terminal continuation replay requires complete authenticated witness" {
+    try std.testing.expect(try terminalContinuationReplayWitness(.valid));
+    try std.testing.expect(!(try terminalContinuationReplayWitness(.missing_bridge)));
+    try std.testing.expect(!(try terminalContinuationReplayWitness(.pure_suffix)));
+    try std.testing.expect(!(try terminalContinuationReplayWitness(.wrong_return_origin)));
+    try std.testing.expect(!(try terminalContinuationReplayWitness(.matching_stop)));
+    try std.testing.expect(!(try terminalContinuationReplayWitness(.parameterized_suffix)));
+}
+
 test "mixed-lineage entry collision keeps only the supplied edge" {
     const allocator = std.testing.allocator;
     const function_id = ir.FunctionId.fromIndex(0);
@@ -10610,6 +11113,67 @@ test "numeric iteration reentry accepts an authenticated forwarding prefix" {
     );
 }
 
+test "nested loop boundary owns an outside terminal path" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const header = ir.BlockId.fromIndex(1);
+    const body = ir.BlockId.fromIndex(2);
+    const prefix = ir.BlockId.fromIndex(3);
+    const branch = ir.BlockId.fromIndex(4);
+    const reentry = ir.BlockId.fromIndex(5);
+    const continue_path = ir.BlockId.fromIndex(6);
+    const terminal_path = ir.BlockId.fromIndex(7);
+    const terminal_relay = ir.BlockId.fromIndex(8);
+    const exit = ir.BlockId.fromIndex(9);
+    const condition = ir.ValueId.fromIndex(0);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .jump = .{ .target = header } } },
+        .{ .id = header, .function = function_id, .terminator = .{ .branch = .{
+            .condition = condition,
+            .then_edge = .{ .target = body },
+            .else_edge = .{ .target = exit },
+        } } },
+        .{ .id = body, .function = function_id, .terminator = .{ .jump = .{ .target = prefix } } },
+        .{ .id = prefix, .function = function_id, .terminator = .{ .jump = .{ .target = branch } } },
+        .{ .id = branch, .function = function_id, .terminator = .{ .branch = .{
+            .condition = condition,
+            .then_edge = .{ .target = reentry },
+            .else_edge = .{ .target = terminal_path },
+        } } },
+        .{ .id = reentry, .function = function_id, .terminator = .{ .jump = .{ .target = continue_path } } },
+        .{ .id = continue_path, .function = function_id, .terminator = .{ .jump = .{ .target = header } } },
+        .{ .id = terminal_path, .function = function_id, .terminator = .{ .jump = .{ .target = terminal_relay } } },
+        .{ .id = terminal_relay, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = exit, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &.{condition},
+        .blocks = &.{ entry, header, body, prefix, branch, reentry, continue_path, terminal_path, terminal_relay, exit },
+        .entry_block = entry,
+    };
+    const values = [_]ir.Value{.{
+        .id = condition,
+        .function = function_id,
+        .type = .boolean,
+        .origin = .{ .parameter = 0 },
+    }};
+    const program: ir.Program = .{
+        .program_id = "nested-loop-outside-terminal",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, function);
+    defer analysis.deinit();
+    var plan = try Plan.init(std.testing.allocator, &analysis);
+    defer plan.deinit();
+
+    try std.testing.expect(plan.root.nodes.len != 0);
+}
+
 test "terminal-only outside suffix is admitted without weakening boundaries" {
     const function_id = ir.FunctionId.fromIndex(0);
     const start = ir.BlockId.fromIndex(0);
@@ -10730,6 +11294,108 @@ test "nonterminal loop exit projects before an outside cyclic suffix" {
     try std.testing.expect(region.escape_projection != null);
     try std.testing.expectEqual(loop_exit, region.escape_projection.?.target);
     try std.testing.expect(region.escape_projection.?.edge != null);
+}
+
+test "stable node split bridge reuses a different owner context" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const prefix = ir.BlockId.fromIndex(0);
+    const target = ir.BlockId.fromIndex(1);
+    const stop = ir.BlockId.fromIndex(2);
+    const original = ir.BlockId.fromIndex(3);
+    var blocks = [_]ir.Block{
+        .{ .id = prefix, .function = function_id, .terminator = .{ .jump = .{ .target = target } } },
+        .{ .id = target, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = stop, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = original, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .blocks = &.{ prefix, target, stop, original },
+        .entry_block = prefix,
+    };
+    var rewrites = [_]ir.CfgEdgeRewrite{.{
+        .id = ir.EdgeRewriteId.fromIndex(0),
+        .source = prefix,
+        .kind = .jump,
+        .from = .{ .target = original },
+        .to = .{ .target = target },
+        .rule = .node_split,
+        .node_split_group = ir.NodeSplitGroupId.fromIndex(0),
+    }};
+    const program: ir.Program = .{
+        .program_id = "stable-bridge-continuation",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &.{},
+        .edge_rewrites = &rewrites,
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, function);
+    defer analysis.deinit();
+    const loop_headers = try natural_loop.headerCandidatesAlloc(std.testing.allocator, &analysis);
+    defer std.testing.allocator.free(loop_headers);
+
+    var visited = [_]bool{ false, true, false, false };
+    var contexts = [_]?Builder.VisitContext{ null, .{
+        .start = target,
+        .stop = stop,
+        .loop_exit = null,
+        .continue_target = null,
+    }, null, null };
+    var builder: Builder = .{
+        .allocator = std.testing.allocator,
+        .analysis = &analysis,
+        .visited = &visited,
+        .visited_contexts = &contexts,
+        .loop_headers = loop_headers,
+    };
+    const reused = try builder.buildRegionImpl(prefix, stop, null, null, null, null, false, null);
+    defer destroyRegion(std.testing.allocator, reused);
+    try std.testing.expectEqual(@as(usize, 1), reused.nodes.len);
+    try std.testing.expectEqual(prefix, reused.nodes[0].blockId());
+    try std.testing.expect(reused.escape_projection != null);
+    try std.testing.expectEqual(target, reused.escape_projection.?.target);
+
+    var membership_visited = [_]bool{ false, true, false, false };
+    var membership_contexts = contexts;
+    var membership_builder: Builder = .{
+        .allocator = std.testing.allocator,
+        .analysis = &analysis,
+        .visited = &membership_visited,
+        .visited_contexts = &membership_contexts,
+        .loop_headers = loop_headers,
+    };
+    const membership = [_]bool{ true, false, false, false };
+    const outside_projection = try membership_builder.buildRegionImpl(
+        prefix,
+        stop,
+        &membership,
+        null,
+        null,
+        null,
+        false,
+        null,
+    );
+    defer destroyRegion(std.testing.allocator, outside_projection);
+    try std.testing.expectEqual(@as(usize, 1), outside_projection.nodes.len);
+    try std.testing.expect(outside_projection.escape_projection != null);
+    try std.testing.expectEqual(target, outside_projection.escape_projection.?.target);
+
+    contexts[1].?.start = target;
+    rewrites[0].rule = .forwarding_jump;
+    visited[0] = false;
+    var rejected_builder: Builder = .{
+        .allocator = std.testing.allocator,
+        .analysis = &analysis,
+        .visited = &visited,
+        .visited_contexts = &contexts,
+        .loop_headers = loop_headers,
+    };
+    try std.testing.expectError(
+        error.UnsupportedShape,
+        rejected_builder.buildRegionImpl(prefix, stop, null, null, null, null, false, null),
+    );
 }
 
 test "authenticated empty outside clone projects to loop exit" {
@@ -11500,6 +12166,105 @@ test "raw parameterized numeric join authenticates a dominating tuple" {
         null,
         null,
     )) == null);
+}
+
+test "empty collision records one authenticated multi-entry clone group" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const first_source = ir.BlockId.fromIndex(1);
+    const second_source = ir.BlockId.fromIndex(2);
+    const original = ir.BlockId.fromIndex(3);
+    const target = ir.BlockId.fromIndex(4);
+    const condition = ir.ValueId.fromIndex(0);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = condition,
+            .then_edge = .{ .target = first_source },
+            .else_edge = .{ .target = second_source },
+        } } },
+        .{ .id = first_source, .function = function_id, .terminator = .{ .jump = .{ .target = target } } },
+        .{ .id = second_source, .function = function_id, .terminator = .{ .jump = .{ .target = target } } },
+        .{ .id = original, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = target, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &.{condition},
+        .blocks = &.{ entry, first_source, second_source, original, target },
+        .entry_block = entry,
+    };
+    const values = [_]ir.Value{.{
+        .id = condition,
+        .function = function_id,
+        .type = .boolean,
+        .origin = .{ .parameter = 0 },
+    }};
+    const rewrites = [_]ir.CfgEdgeRewrite{
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(0),
+            .source = first_source,
+            .kind = .jump,
+            .from = .{ .target = original },
+            .to = .{ .target = target },
+            .rule = .node_split,
+            .node_split_group = ir.NodeSplitGroupId.fromIndex(0),
+        },
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(1),
+            .source = second_source,
+            .kind = .jump,
+            .from = .{ .target = original },
+            .to = .{ .target = target },
+            .rule = .node_split,
+            .node_split_group = ir.NodeSplitGroupId.fromIndex(0),
+        },
+    };
+    const program: ir.Program = .{
+        .program_id = "empty-multi-entry-clone-group",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+        .edge_rewrites = &rewrites,
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, function);
+    defer analysis.deinit();
+    const loop_headers = try natural_loop.headerCandidatesAlloc(std.testing.allocator, &analysis);
+    defer std.testing.allocator.free(loop_headers);
+
+    var visited = [_]bool{ false, false, false, false, true };
+    var contexts = [_]?Builder.VisitContext{ null, null, null, null, .{
+        .start = original,
+        .stop = null,
+        .loop_exit = null,
+        .continue_target = null,
+    } };
+    var collision: ?Collision = null;
+    defer if (collision) |*value| value.deinit(std.testing.allocator);
+    var builder: Builder = .{
+        .allocator = std.testing.allocator,
+        .analysis = &analysis,
+        .visited = &visited,
+        .visited_contexts = &contexts,
+        .loop_headers = loop_headers,
+        .visited_count = 1,
+        .collision = &collision,
+    };
+
+    try std.testing.expectError(
+        error.UnsupportedShape,
+        builder.buildRegionImpl(target, null, null, null, null, null, false, null),
+    );
+    try std.testing.expect(collision != null);
+    const recorded = collision.?;
+    try std.testing.expectEqual(@as(usize, 2), recorded.incoming_group.len);
+    try std.testing.expect(recorded.incoming == null);
+    for (recorded.incoming_group) |reference| {
+        try std.testing.expectEqual(target, reference.target);
+        try std.testing.expectEqual(ir.CfgEdgeKind.jump, reference.kind);
+        try std.testing.expect(reference.source == first_source or reference.source == second_source);
+    }
 }
 
 fn nodeIncomingEdgesAlloc(
