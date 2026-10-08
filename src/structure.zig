@@ -11239,6 +11239,70 @@ test "terminal-only outside suffix is admitted without weakening boundaries" {
     try std.testing.expect(!try builder.outsidePathMustTerminate(&membership, suffix));
 }
 
+test "authenticated outside suffix may reuse an owned shared terminal" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const direct = ir.BlockId.fromIndex(1);
+    const header = ir.BlockId.fromIndex(2);
+    const body = ir.BlockId.fromIndex(3);
+    const latch = ir.BlockId.fromIndex(4);
+    const forwarding = ir.BlockId.fromIndex(5);
+    const terminal_path = ir.BlockId.fromIndex(6);
+    const terminal = ir.BlockId.fromIndex(7);
+    const exit = ir.BlockId.fromIndex(8);
+    const condition = ir.ValueId.fromIndex(0);
+    const body_condition = ir.ValueId.fromIndex(1);
+    const exit_condition = ir.ValueId.fromIndex(2);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = condition,
+            .then_edge = .{ .target = direct },
+            .else_edge = .{ .target = header },
+        } } },
+        .{ .id = direct, .function = function_id, .terminator = .{ .jump = .{ .target = terminal } } },
+        .{ .id = header, .function = function_id, .terminator = .{ .branch = .{
+            .condition = exit_condition,
+            .then_edge = .{ .target = body },
+            .else_edge = .{ .target = exit },
+        } } },
+        .{ .id = body, .function = function_id, .terminator = .{ .branch = .{
+            .condition = body_condition,
+            .then_edge = .{ .target = latch },
+            .else_edge = .{ .target = forwarding },
+        } } },
+        .{ .id = latch, .function = function_id, .terminator = .{ .jump = .{ .target = header } } },
+        .{ .id = forwarding, .function = function_id, .terminator = .{ .jump = .{ .target = terminal_path } } },
+        .{ .id = terminal_path, .function = function_id, .terminator = .{ .jump = .{ .target = terminal } } },
+        .{ .id = terminal, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = exit, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &.{ condition, body_condition, exit_condition },
+        .blocks = &.{ entry, direct, header, body, latch, forwarding, terminal_path, terminal, exit },
+        .entry_block = entry,
+    };
+    const values = [_]ir.Value{
+        .{ .id = condition, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = body_condition, .function = function_id, .type = .boolean, .origin = .{ .parameter = 1 } },
+        .{ .id = exit_condition, .function = function_id, .type = .boolean, .origin = .{ .parameter = 2 } },
+    };
+    const program: ir.Program = .{
+        .program_id = "owned-shared-terminal-outside-suffix",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, function);
+    defer analysis.deinit();
+    var plan = try Plan.init(std.testing.allocator, &analysis);
+    defer plan.deinit();
+
+    try std.testing.expect(plan.root.nodes.len != 0);
+}
+
 test "nonterminal loop exit projects before an outside cyclic suffix" {
     const function_id = ir.FunctionId.fromIndex(0);
     const start = ir.BlockId.fromIndex(0);
@@ -12168,6 +12232,76 @@ test "raw parameterized numeric join authenticates a dominating tuple" {
     )) == null);
 }
 
+test "structured node split bridge follows owned nested predecessor" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const owner = ir.BlockId.fromIndex(0);
+    const predecessor = ir.BlockId.fromIndex(1);
+    const target = ir.BlockId.fromIndex(2);
+    const stop = ir.BlockId.fromIndex(3);
+    const original = ir.BlockId.fromIndex(4);
+    const blocks = [_]ir.Block{
+        .{ .id = owner, .function = function_id, .terminator = .{ .branch = .{
+            .condition = ir.ValueId.fromIndex(0),
+            .then_edge = .{ .target = predecessor },
+            .else_edge = .{ .target = stop },
+        } } },
+        .{ .id = predecessor, .function = function_id, .terminator = .{ .jump = .{ .target = target } } },
+        .{ .id = target, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = stop, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = original, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &.{ir.ValueId.fromIndex(0)},
+        .blocks = &.{ owner, predecessor, target, stop, original },
+        .entry_block = owner,
+    };
+    const values = [_]ir.Value{.{
+        .id = ir.ValueId.fromIndex(0),
+        .function = function_id,
+        .type = .boolean,
+        .origin = .{ .parameter = 0 },
+    }};
+    const rewrites = [_]ir.CfgEdgeRewrite{.{
+        .id = ir.EdgeRewriteId.fromIndex(0),
+        .source = predecessor,
+        .kind = .jump,
+        .from = .{ .target = original },
+        .to = .{ .target = target },
+        .rule = .node_split,
+        .node_split_group = ir.NodeSplitGroupId.fromIndex(0),
+    }};
+    const program: ir.Program = .{
+        .program_id = "structured-stable-bridge-continuation",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+        .edge_rewrites = &rewrites,
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, function);
+    defer analysis.deinit();
+
+    var then_nodes = [_]Node{.{ .block = predecessor }};
+    var else_nodes = [_]Node{};
+    var then_region = Region{ .nodes = &then_nodes, .stop = target, .loop_exit = null };
+    var else_region = Region{ .nodes = &else_nodes, .stop = stop, .loop_exit = null };
+    const node: Node = .{ .branch = .{
+        .block = owner,
+        .then_region = &then_region,
+        .else_region = &else_region,
+        .join = target,
+    } };
+
+    try std.testing.expect(try hasStableNodeSplitBridgeFromNode(
+        std.testing.allocator,
+        &analysis,
+        node,
+        target,
+    ));
+}
+
 test "empty collision records one authenticated multi-entry clone group" {
     const function_id = ir.FunctionId.fromIndex(0);
     const entry = ir.BlockId.fromIndex(0);
@@ -12574,6 +12708,40 @@ fn directEdgeReference(program: *const ir.Program, node: Node, target: ir.BlockI
             null,
         else => null,
     };
+}
+
+fn hasStableNodeSplitBridge(
+    program: *const ir.Program,
+    source_id: ir.BlockId,
+    target: ir.BlockId,
+) bool {
+    for (program.edge_rewrites) |rewrite| {
+        if (rewrite.rule != .node_split or rewrite.source != source_id or
+            rewrite.source.index() >= program.blocks.len or
+            rewrite.to.target != target or rewrite.from.target == rewrite.to.target or
+            rewrite.from.arguments.len != rewrite.to.arguments.len or
+            !std.mem.eql(ir.ValueId, rewrite.from.arguments, rewrite.to.arguments)) continue;
+        const source = program.blocks[rewrite.source.index()];
+        const clone = program.blocks[rewrite.to.target.index()];
+        if (source.id != rewrite.source or clone.id != rewrite.to.target or
+            source.function != clone.function) continue;
+        const current = cfg_edge.value(program, .{
+            .source = rewrite.source,
+            .kind = rewrite.kind,
+            .target = rewrite.to.target,
+        }) orelse continue;
+        if (std.mem.eql(ir.ValueId, current.arguments, rewrite.to.arguments)) return true;
+    }
+    return false;
+}
+
+fn hasStableNodeSplitBridgeFromNode(
+    allocator: std.mem.Allocator,
+    analysis: *const cfg.Analysis,
+    node: Node,
+    target: ir.BlockId,
+) std.mem.Allocator.Error!bool {
+    return hasStableNodeSplitBridgeFromNodeWithContext(allocator, analysis, node, target, null);
 }
 
 fn hasStableNodeSplitBridgeFromNodeWithContext(
@@ -15349,6 +15517,467 @@ test "effectful parameterized prefix replay hands off before a branch" {
         &incoming_arguments,
         incoming_reference,
     )) == null);
+}
+
+const SameEntryParameterizedPrefixMutation = enum {
+    valid,
+    same_context,
+    parameter_use,
+    prefix_parameter_use,
+    no_effect,
+    non_iteration_handoff,
+    altered_forwarding,
+    noncanonical_prefix,
+    ambiguous_branch,
+    cyclic_prefix,
+    unvisited_prefix,
+};
+
+fn sameEntryParameterizedPrefixWitness(
+    mutation: SameEntryParameterizedPrefixMutation,
+) BuildError!bool {
+    const allocator = std.testing.allocator;
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const owner = ir.BlockId.fromIndex(1);
+    const incoming = ir.BlockId.fromIndex(2);
+    const current = ir.BlockId.fromIndex(3);
+    const prefix = ir.BlockId.fromIndex(4);
+    const header = ir.BlockId.fromIndex(5);
+    const body = ir.BlockId.fromIndex(6);
+    const exit = ir.BlockId.fromIndex(7);
+    const owner_stop = ir.BlockId.fromIndex(8);
+
+    const selector = ir.ValueId.fromIndex(0);
+    const owner_first = ir.ValueId.fromIndex(1);
+    const owner_second = ir.ValueId.fromIndex(2);
+    const owner_third = ir.ValueId.fromIndex(3);
+    const owner_fourth = ir.ValueId.fromIndex(4);
+    const incoming_first = ir.ValueId.fromIndex(5);
+    const incoming_second = ir.ValueId.fromIndex(6);
+    const incoming_third = ir.ValueId.fromIndex(7);
+    const incoming_fourth = ir.ValueId.fromIndex(8);
+    const formal_first = ir.ValueId.fromIndex(9);
+    const formal_second = ir.ValueId.fromIndex(10);
+    const formal_third = ir.ValueId.fromIndex(11);
+    const formal_fourth = ir.ValueId.fromIndex(12);
+    const header_control = ir.ValueId.fromIndex(13);
+    const header_limit = ir.ValueId.fromIndex(14);
+    const header_step = ir.ValueId.fromIndex(15);
+    const header_initial = ir.ValueId.fromIndex(16);
+    const has_value = ir.ValueId.fromIndex(17);
+    const next_limit = ir.ValueId.fromIndex(18);
+    const next_step = ir.ValueId.fromIndex(19);
+    const next_control = ir.ValueId.fromIndex(20);
+    const effect_value = ir.ValueId.fromIndex(21);
+    const prefix_value = ir.ValueId.fromIndex(22);
+    const copied_formal = ir.ValueId.fromIndex(23);
+    const prefix_first = ir.ValueId.fromIndex(24);
+    const prefix_second = ir.ValueId.fromIndex(25);
+    const prefix_third = ir.ValueId.fromIndex(26);
+    const prefix_fourth = ir.ValueId.fromIndex(27);
+    const copied_prefix = ir.ValueId.fromIndex(28);
+
+    const effect_constant = ir.InstructionId.fromIndex(0);
+    const effect_write = ir.InstructionId.fromIndex(1);
+    const prefix_constant = ir.InstructionId.fromIndex(2);
+    const prefix_write = ir.InstructionId.fromIndex(3);
+    const copy_formal = ir.InstructionId.fromIndex(4);
+    const transition = ir.InstructionId.fromIndex(5);
+    const copy_prefix_formal = ir.InstructionId.fromIndex(6);
+
+    const owner_arguments = [_]ir.ValueId{ owner_first, owner_second, owner_third, owner_fourth };
+    const incoming_arguments = [_]ir.ValueId{
+        incoming_first,
+        incoming_second,
+        incoming_third,
+        incoming_fourth,
+    };
+    const current_parameters = [_]ir.ValueId{ formal_first, formal_second, formal_third, formal_fourth };
+    const prefix_parameters = [_]ir.ValueId{ prefix_first, prefix_second, prefix_third, prefix_fourth };
+    var altered_prefix_arguments = prefix_parameters;
+
+    var blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = selector,
+            .then_edge = .{ .target = owner },
+            .else_edge = .{ .target = incoming },
+        } } },
+        .{ .id = owner, .function = function_id, .terminator = .{ .jump = .{
+            .target = current,
+            .arguments = &owner_arguments,
+        } } },
+        .{ .id = incoming, .function = function_id, .terminator = .{ .jump = .{
+            .target = current,
+            .arguments = &incoming_arguments,
+        } } },
+        .{ .id = current, .function = function_id, .parameters = &current_parameters, .instructions = &.{
+            effect_constant,
+            effect_write,
+        }, .terminator = .{ .jump = .{
+            .target = prefix,
+            .arguments = &current_parameters,
+        } } },
+        .{ .id = prefix, .function = function_id, .parameters = &prefix_parameters, .instructions = &.{
+            prefix_constant,
+            prefix_write,
+        }, .terminator = .{ .jump = .{
+            .target = header,
+            .arguments = &prefix_parameters,
+        } } },
+        .{ .id = header, .function = function_id, .parameters = &.{
+            header_control,
+            header_limit,
+            header_step,
+            header_initial,
+        }, .instructions = &.{transition}, .terminator = .{ .branch = .{
+            .condition = has_value,
+            .then_edge = .{ .target = body },
+            .else_edge = .{ .target = exit },
+        } } },
+        .{ .id = body, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = exit, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = owner_stop, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    if (mutation == .non_iteration_handoff) {
+        blocks[prefix.index()].terminator = .{ .jump = .{ .target = body } };
+    }
+    if (mutation == .parameter_use) {
+        blocks[current.index()].instructions = &.{ effect_constant, effect_write, copy_formal };
+    }
+    if (mutation == .prefix_parameter_use) {
+        blocks[prefix.index()].instructions = &.{ prefix_constant, prefix_write, copy_prefix_formal };
+    }
+    if (mutation == .no_effect) {
+        blocks[current.index()].instructions = &.{effect_constant};
+        blocks[prefix.index()].instructions = &.{prefix_constant};
+    }
+    if (mutation == .altered_forwarding) {
+        altered_prefix_arguments[0] = owner_first;
+        blocks[current.index()].terminator = .{ .jump = .{
+            .target = prefix,
+            .arguments = &altered_prefix_arguments,
+        } };
+    }
+    if (mutation == .ambiguous_branch) {
+        blocks[prefix.index()].terminator = .{ .branch = .{
+            .condition = prefix_fourth,
+            .then_edge = .{ .target = header, .arguments = &prefix_parameters },
+            .else_edge = .{ .target = exit },
+        } };
+    }
+    if (mutation == .cyclic_prefix) {
+        blocks[prefix.index()].terminator = .{ .jump = .{
+            .target = prefix,
+            .arguments = &prefix_parameters,
+        } };
+    }
+
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &.{
+            selector,
+            owner_first,
+            owner_second,
+            owner_third,
+            owner_fourth,
+            incoming_first,
+            incoming_second,
+            incoming_third,
+            incoming_fourth,
+        },
+        .blocks = &.{ entry, owner, incoming, current, prefix, header, body, exit, owner_stop },
+        .entry_block = entry,
+    };
+    var values = [_]ir.Value{
+        .{ .id = selector, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = owner_first, .function = function_id, .origin = .{ .parameter = 1 } },
+        .{ .id = owner_second, .function = function_id, .origin = .{ .parameter = 2 } },
+        .{ .id = owner_third, .function = function_id, .origin = .{ .parameter = 3 } },
+        .{ .id = owner_fourth, .function = function_id, .type = .boolean, .origin = .{ .parameter = 4 } },
+        .{ .id = incoming_first, .function = function_id, .origin = .{ .parameter = 5 } },
+        .{ .id = incoming_second, .function = function_id, .origin = .{ .parameter = 6 } },
+        .{ .id = incoming_third, .function = function_id, .origin = .{ .parameter = 7 } },
+        .{ .id = incoming_fourth, .function = function_id, .type = .boolean, .origin = .{ .parameter = 8 } },
+        .{ .id = formal_first, .function = function_id, .origin = .{ .block_parameter = .{ .block = current, .index = 0 } } },
+        .{ .id = formal_second, .function = function_id, .origin = .{ .block_parameter = .{ .block = current, .index = 1 } } },
+        .{ .id = formal_third, .function = function_id, .origin = .{ .block_parameter = .{ .block = current, .index = 2 } } },
+        .{ .id = formal_fourth, .function = function_id, .type = .boolean, .origin = .{ .block_parameter = .{ .block = current, .index = 3 } } },
+        .{ .id = header_control, .function = function_id, .origin = .{ .block_parameter = .{ .block = header, .index = 0 } } },
+        .{ .id = header_limit, .function = function_id, .origin = .{ .block_parameter = .{ .block = header, .index = 1 } } },
+        .{ .id = header_step, .function = function_id, .origin = .{ .block_parameter = .{ .block = header, .index = 2 } } },
+        .{ .id = header_initial, .function = function_id, .type = .boolean, .origin = .{ .block_parameter = .{ .block = header, .index = 3 } } },
+        .{ .id = has_value, .function = function_id, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = transition, .index = 0 } } },
+        .{ .id = next_limit, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = transition, .index = 1 } } },
+        .{ .id = next_step, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = transition, .index = 2 } } },
+        .{ .id = next_control, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = transition, .index = 3 } } },
+        .{ .id = effect_value, .function = function_id, .type = .integer, .origin = .{ .instruction_result = .{ .instruction = effect_constant, .index = 0 } } },
+        .{ .id = prefix_value, .function = function_id, .type = .integer, .origin = .{ .instruction_result = .{ .instruction = prefix_constant, .index = 0 } } },
+        .{ .id = copied_formal, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = copy_formal, .index = 0 } } },
+        .{ .id = prefix_first, .function = function_id, .origin = .{ .block_parameter = .{ .block = prefix, .index = 0 } } },
+        .{ .id = prefix_second, .function = function_id, .origin = .{ .block_parameter = .{ .block = prefix, .index = 1 } } },
+        .{ .id = prefix_third, .function = function_id, .origin = .{ .block_parameter = .{ .block = prefix, .index = 2 } } },
+        .{ .id = prefix_fourth, .function = function_id, .type = .boolean, .origin = .{ .block_parameter = .{ .block = prefix, .index = 3 } } },
+        .{ .id = copied_prefix, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = copy_prefix_formal, .index = 0 } } },
+    };
+    if (mutation == .noncanonical_prefix) {
+        values[prefix_first.index()].origin = .{ .parameter = 0 };
+    }
+    const instructions = [_]ir.Instruction{
+        .{ .id = effect_constant, .block = current, .operation = .{ .constant = .{ .integer = "1" } }, .results = &.{effect_value}, .effects = .pure },
+        .{ .id = effect_write, .block = current, .operation = .{ .place_write = .{ .place = ir.PlaceId.fromIndex(0), .value = effect_value } }, .results = &.{}, .effects = .place_write },
+        .{ .id = prefix_constant, .block = prefix, .operation = .{ .constant = .{ .integer = "2" } }, .results = &.{prefix_value}, .effects = .pure },
+        .{ .id = prefix_write, .block = prefix, .operation = .{ .place_write = .{ .place = ir.PlaceId.fromIndex(0), .value = prefix_value } }, .results = &.{}, .effects = .place_write },
+        .{ .id = copy_formal, .block = current, .operation = .{ .copy = formal_first }, .results = &.{copied_formal}, .effects = .pure },
+        .{ .id = transition, .block = header, .operation = .{ .numeric_for_next = .{
+            .control = header_control,
+            .limit = header_limit,
+            .step = header_step,
+            .initial = header_initial,
+        } }, .results = &.{ has_value, next_limit, next_step, next_control }, .effects = .numeric_for_next },
+        .{ .id = copy_prefix_formal, .block = prefix, .operation = .{ .copy = prefix_first }, .results = &.{copied_prefix}, .effects = .pure },
+    };
+    const places = [_]ir.Place{.{
+        .id = ir.PlaceId.fromIndex(0),
+        .function = function_id,
+        .type = .integer,
+        .origin = .{ .local = 0 },
+    }};
+    const program = ir.Program{
+        .program_id = "same-entry-parameterized-prefix-replay",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+        .places = &places,
+    };
+    var analysis = cfg.Analysis.init(allocator, &program, function) catch |err| switch (err) {
+        error.InvalidCfg => return false,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    defer analysis.deinit();
+    const loop_headers = try natural_loop.headerCandidatesAlloc(allocator, &analysis);
+    defer allocator.free(loop_headers);
+
+    var visited = [_]bool{ false, false, false, true, true, false, false, false, false };
+    if (mutation == .unvisited_prefix) visited[prefix.index()] = false;
+    var contexts = [_]?Builder.VisitContext{ null, null, null, .{
+        .start = current,
+        .stop = owner_stop,
+        .loop_exit = null,
+        .continue_target = null,
+        .parameter_arguments = &owner_arguments,
+    }, null, null, null, null, null };
+    var builder: Builder = .{
+        .allocator = allocator,
+        .analysis = &analysis,
+        .visited = &visited,
+        .visited_contexts = &contexts,
+        .loop_headers = loop_headers,
+    };
+    const incoming_reference = ir.CfgEdgeRef{ .source = incoming, .kind = .jump, .target = current };
+    const replay_stop = if (mutation == .same_context) owner_stop else exit;
+    const replay = try builder.authenticatedSameEntryParameterizedPrefixReplay(
+        current,
+        current,
+        replay_stop,
+        null,
+        null,
+        contexts[current.index()].?,
+        &incoming_arguments,
+        incoming_reference,
+    ) orelse return false;
+    defer allocator.free(replay.nodes);
+    if (mutation != .valid and mutation != .same_context) return false;
+    return replay.nodes.len == 2 and
+        replay.nodes[0].blockId() == current and
+        replay.nodes[1].blockId() == prefix and
+        replay.source == prefix and
+        replay.next == header and
+        std.mem.eql(ir.ValueId, replay.arguments, &prefix_parameters);
+}
+
+test "same-entry parameterized prefix replay requires a semantic handoff" {
+    try std.testing.expect(try sameEntryParameterizedPrefixWitness(.valid));
+    try std.testing.expect(try sameEntryParameterizedPrefixWitness(.same_context));
+    try std.testing.expect(!(try sameEntryParameterizedPrefixWitness(.parameter_use)));
+    try std.testing.expect(!(try sameEntryParameterizedPrefixWitness(.prefix_parameter_use)));
+    try std.testing.expect(!(try sameEntryParameterizedPrefixWitness(.no_effect)));
+    try std.testing.expect(!(try sameEntryParameterizedPrefixWitness(.non_iteration_handoff)));
+    try std.testing.expect(!(try sameEntryParameterizedPrefixWitness(.altered_forwarding)));
+    try std.testing.expect(!(try sameEntryParameterizedPrefixWitness(.noncanonical_prefix)));
+    try std.testing.expect(!(try sameEntryParameterizedPrefixWitness(.ambiguous_branch)));
+    try std.testing.expect(!(try sameEntryParameterizedPrefixWitness(.cyclic_prefix)));
+    try std.testing.expect(!(try sameEntryParameterizedPrefixWitness(.unvisited_prefix)));
+}
+
+const ZeroParameterPrefixReplayMutation = enum {
+    valid,
+    stop_boundary,
+    acyclic,
+    no_effect,
+    mismatched_stop,
+    unvisited,
+};
+
+fn zeroParameterPrefixReplayWitness(
+    mutation: ZeroParameterPrefixReplayMutation,
+) BuildError!bool {
+    const allocator = std.testing.allocator;
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const owner = ir.BlockId.fromIndex(1);
+    const incoming = ir.BlockId.fromIndex(2);
+    const current = ir.BlockId.fromIndex(3);
+    const prefix = ir.BlockId.fromIndex(4);
+    const branch = ir.BlockId.fromIndex(5);
+    const owner_stop = ir.BlockId.fromIndex(6);
+    const alternate_stop = ir.BlockId.fromIndex(7);
+
+    const selector = ir.ValueId.fromIndex(0);
+    const effect_value = ir.ValueId.fromIndex(1);
+    const prefix_value = ir.ValueId.fromIndex(2);
+    const effect_constant = ir.InstructionId.fromIndex(0);
+    const effect_write = ir.InstructionId.fromIndex(1);
+    const prefix_constant = ir.InstructionId.fromIndex(2);
+    const prefix_write = ir.InstructionId.fromIndex(3);
+
+    var blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = selector,
+            .then_edge = .{ .target = owner },
+            .else_edge = .{ .target = incoming },
+        } } },
+        .{ .id = owner, .function = function_id, .terminator = .{ .jump = .{ .target = current } } },
+        .{ .id = incoming, .function = function_id, .terminator = .{ .jump = .{ .target = current } } },
+        .{ .id = current, .function = function_id, .instructions = &.{ effect_constant, effect_write }, .terminator = .{ .jump = .{ .target = prefix } } },
+        .{ .id = prefix, .function = function_id, .instructions = &.{ prefix_constant, prefix_write }, .terminator = .{ .jump = .{ .target = branch } } },
+        .{ .id = branch, .function = function_id, .terminator = .{ .branch = .{
+            .condition = selector,
+            .then_edge = .{ .target = owner },
+            .else_edge = .{ .target = incoming },
+        } } },
+        .{ .id = owner_stop, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = alternate_stop, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    if (mutation == .acyclic) {
+        blocks[branch.index()].terminator = .{ .branch = .{
+            .condition = selector,
+            .then_edge = .{ .target = owner },
+            .else_edge = .{ .target = owner_stop },
+        } };
+    }
+    if (mutation == .stop_boundary) {
+        blocks[prefix.index()].terminator = .{ .jump = .{ .target = owner_stop } };
+        blocks[owner_stop.index()].terminator = .{ .branch = .{
+            .condition = selector,
+            .then_edge = .{ .target = owner },
+            .else_edge = .{ .target = incoming },
+        } };
+    }
+
+    var instructions = [_]ir.Instruction{
+        .{ .id = effect_constant, .block = current, .operation = .{ .constant = .{ .number = 1 } }, .results = &.{effect_value}, .effects = .pure },
+        .{ .id = effect_write, .block = current, .operation = .{ .place_write = .{ .place = ir.PlaceId.fromIndex(0), .value = effect_value } }, .results = &.{}, .effects = .place_write },
+        .{ .id = prefix_constant, .block = prefix, .operation = .{ .constant = .{ .number = 2 } }, .results = &.{prefix_value}, .effects = .pure },
+        .{ .id = prefix_write, .block = prefix, .operation = .{ .place_write = .{ .place = ir.PlaceId.fromIndex(0), .value = prefix_value } }, .results = &.{}, .effects = .place_write },
+    };
+    if (mutation == .no_effect) {
+        instructions[effect_write.index()].effects = .pure;
+        instructions[prefix_write.index()].effects = .pure;
+    }
+
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &.{selector},
+        .blocks = &.{ entry, owner, incoming, current, prefix, branch, owner_stop, alternate_stop },
+        .entry_block = entry,
+    };
+    const values = [_]ir.Value{
+        .{ .id = selector, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = effect_value, .function = function_id, .type = .number, .origin = .{ .instruction_result = .{ .instruction = effect_constant, .index = 0 } } },
+        .{ .id = prefix_value, .function = function_id, .type = .number, .origin = .{ .instruction_result = .{ .instruction = prefix_constant, .index = 0 } } },
+    };
+    const places = [_]ir.Place{.{
+        .id = ir.PlaceId.fromIndex(0),
+        .function = function_id,
+        .type = .number,
+        .origin = .{ .local = 0 },
+    }};
+    const program = ir.Program{
+        .program_id = "zero-parameter-effectful-prefix-replay",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+        .places = &places,
+    };
+    var analysis = cfg.Analysis.init(allocator, &program, function) catch |err| switch (err) {
+        error.InvalidCfg => return false,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    defer analysis.deinit();
+    const loop_headers = try natural_loop.headerCandidatesAlloc(allocator, &analysis);
+    defer allocator.free(loop_headers);
+
+    var visited = [_]bool{ false, false, true, true, false, false, false, false };
+    if (mutation == .unvisited) visited[current.index()] = false;
+    visited[prefix.index()] = true;
+    var contexts = [_]?Builder.VisitContext{ null, null, null, null, null, null, null, null };
+    var builder: Builder = .{
+        .allocator = allocator,
+        .analysis = &analysis,
+        .visited = &visited,
+        .visited_contexts = &contexts,
+        .loop_headers = loop_headers,
+    };
+    const owner_context: Builder.VisitContext = .{
+        .start = owner,
+        .stop = owner_stop,
+        .loop_exit = null,
+        .continue_target = null,
+    };
+    const current_arguments = [_]ir.ValueId{};
+    const incoming_reference = ir.CfgEdgeRef{ .source = incoming, .kind = .jump, .target = current };
+    const stop = if (mutation == .mismatched_stop) alternate_stop else owner_stop;
+    const replay = try builder.authenticatedEffectfulZeroParameterPrefixReplay(
+        current,
+        incoming,
+        stop,
+        null,
+        null,
+        owner_context,
+        &current_arguments,
+        incoming_reference,
+    );
+    if (mutation != .valid and mutation != .stop_boundary) return replay == null;
+    const result = replay orelse return false;
+    defer allocator.free(result.nodes);
+    if (mutation == .stop_boundary) {
+        return result.nodes.len == 2 and
+            result.nodes[0].blockId() == current and
+            result.nodes[1].blockId() == prefix and
+            result.source == prefix and
+            result.next == owner_stop and
+            result.arguments.len == 0;
+    }
+    return result.nodes.len == 2 and
+        result.nodes[0].blockId() == current and
+        result.nodes[1].blockId() == prefix and
+        result.source == prefix and
+        result.next == branch and
+        result.arguments.len == 0;
+}
+
+test "effectful zero-parameter prefix replay requires an authenticated SCC" {
+    try std.testing.expect(try zeroParameterPrefixReplayWitness(.valid));
+    try std.testing.expect(try zeroParameterPrefixReplayWitness(.stop_boundary));
+    try std.testing.expect(try zeroParameterPrefixReplayWitness(.acyclic));
+    try std.testing.expect(try zeroParameterPrefixReplayWitness(.no_effect));
+    try std.testing.expect(try zeroParameterPrefixReplayWitness(.mismatched_stop));
+    try std.testing.expect(try zeroParameterPrefixReplayWitness(.unvisited));
 }
 
 test "parameterized stop replay rejects non-carried continuation values" {
