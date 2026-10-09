@@ -50,6 +50,88 @@ test "generic semantic IR emits readable Luau without family knowledge" {
     , source);
 }
 
+test "forced dispatcher lowers generic iteration protocol" {
+    const proof = ir.EvidenceId.fromIndex(0);
+    const function_id = ir.FunctionId.fromIndex(0);
+    const block_id = ir.BlockId.fromIndex(0);
+    const instruction_id = ir.InstructionId.fromIndex(0);
+    const iterator = ir.ValueId.fromIndex(0);
+    const state = ir.ValueId.fromIndex(1);
+    const control = ir.ValueId.fromIndex(2);
+    const initial = ir.ValueId.fromIndex(3);
+    const has_value = ir.ValueId.fromIndex(4);
+    const prepared_iterator = ir.ValueId.fromIndex(5);
+    const prepared_state = ir.ValueId.fromIndex(6);
+    const first = ir.ValueId.fromIndex(7);
+    const second = ir.ValueId.fromIndex(8);
+    const values = [_]ir.Value{
+        .{ .id = iterator, .function = function_id, .type = .dynamic, .name_hint = "iterator", .origin = .{ .parameter = 0 } },
+        .{ .id = state, .function = function_id, .type = .dynamic, .name_hint = "state", .origin = .{ .parameter = 1 } },
+        .{ .id = control, .function = function_id, .type = .dynamic, .name_hint = "control", .origin = .{ .parameter = 2 } },
+        .{ .id = initial, .function = function_id, .type = .boolean, .name_hint = "initial", .origin = .{ .parameter = 3 } },
+        .{ .id = has_value, .function = function_id, .type = .boolean, .name_hint = "has_value", .origin = .{ .instruction_result = .{ .instruction = instruction_id, .index = 0 } } },
+        .{ .id = prepared_iterator, .function = function_id, .type = .dynamic, .name_hint = "prepared_iterator", .origin = .{ .instruction_result = .{ .instruction = instruction_id, .index = 1 } } },
+        .{ .id = prepared_state, .function = function_id, .type = .dynamic, .name_hint = "prepared_state", .origin = .{ .instruction_result = .{ .instruction = instruction_id, .index = 2 } } },
+        .{ .id = first, .function = function_id, .type = .dynamic, .name_hint = "first", .origin = .{ .instruction_result = .{ .instruction = instruction_id, .index = 3 } } },
+        .{ .id = second, .function = function_id, .type = .dynamic, .name_hint = "second", .origin = .{ .instruction_result = .{ .instruction = instruction_id, .index = 4 } } },
+    };
+    const instructions = [_]ir.Instruction{.{
+        .id = instruction_id,
+        .block = block_id,
+        .operation = .{ .generic_for_next = .{
+            .iterator = iterator,
+            .state = state,
+            .control = control,
+            .initial = initial,
+            .variable_count = 2,
+        } },
+        .results = &.{ has_value, prepared_iterator, prepared_state, first, second },
+        .effects = .generic_for_next,
+        .evidence = &.{proof},
+    }};
+    const blocks = [_]ir.Block{.{
+        .id = block_id,
+        .function = function_id,
+        .instructions = &.{ instruction_id },
+        .terminator = .{ .return_values = &.{ has_value, prepared_iterator, prepared_state, first, second } },
+        .evidence = &.{proof},
+    }};
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .parameters = &.{ iterator, state, control, initial },
+        .blocks = &.{ block_id },
+        .entry_block = block_id,
+        .evidence = &.{proof},
+    }};
+    const evidence = [_]ir.Evidence{.{ .id = proof, .kind = .dynamic_fixture, .locator = "fixture:generic-for-dispatch-emission" }};
+    const program: ir.Program = .{
+        .program_id = "generic-for-dispatch-emission",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+        .evidence = &evidence,
+    };
+
+    const source = try lifter.emit_luau.emitAdmittedAllocForTargetWithOptions(
+        std.testing.allocator,
+        &program,
+        .standard_luau,
+        .{ .force_dispatcher = true },
+    );
+    defer std.testing.allocator.free(source);
+    try std.testing.expect(std.mem.indexOf(u8, source, "__lifter_getmetatable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "__lifter_next") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "__lifter_type") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "__lifter_generic_method") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, " ~= nil then") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, " = __lifter_generic_iterator") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "__lifter_generic_iterator(__lifter_generic_state") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "has_value = first ~= nil") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "first, second =") != null);
+}
+
 test "repeated table reads preserve fixed result calls and nil positions" {
     const proof = ir.EvidenceId.fromIndex(0);
     const function_id = ir.FunctionId.fromIndex(0);
@@ -1603,4 +1685,758 @@ test "emission resolves live exact-pure copy aliases" {
     try std.testing.expect(std.mem.indexOf(u8, source, "factor") == null);
     try std.testing.expect(std.mem.indexOf(u8, source, "result") == null);
     try std.testing.expect(std.mem.indexOf(u8, source, "return left + right") != null);
+}
+
+test "inlined literals are parenthesized before postfix indexing" {
+    const proof = ir.EvidenceId.fromIndex(0);
+    const function_id = ir.FunctionId.fromIndex(0);
+    const block_id = ir.BlockId.fromIndex(0);
+    const nil_instruction = ir.InstructionId.fromIndex(0);
+    const key_instruction = ir.InstructionId.fromIndex(1);
+    const get_instruction = ir.InstructionId.fromIndex(2);
+    const nil_value = ir.ValueId.fromIndex(0);
+    const key_value = ir.ValueId.fromIndex(1);
+    const result_value = ir.ValueId.fromIndex(2);
+    const values = [_]ir.Value{
+        .{ .id = nil_value, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = nil_instruction, .index = 0 } } },
+        .{ .id = key_value, .function = function_id, .type = .integer, .origin = .{ .instruction_result = .{ .instruction = key_instruction, .index = 0 } } },
+        .{ .id = result_value, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = get_instruction, .index = 0 } } },
+    };
+    const instructions = [_]ir.Instruction{
+        .{ .id = nil_instruction, .block = block_id, .operation = .{ .constant = .{ .nil_value = {} } }, .results = &.{nil_value}, .effects = .pure, .evidence = &.{proof} },
+        .{ .id = key_instruction, .block = block_id, .operation = .{ .constant = .{ .integer = "1" } }, .results = &.{key_value}, .effects = .pure, .evidence = &.{proof} },
+        .{ .id = get_instruction, .block = block_id, .operation = .{ .table_get = .{ .table = nil_value, .key = key_value, .mode = .semantic } }, .results = &.{result_value}, .effects = .semantic_table_read, .evidence = &.{proof} },
+    };
+    const blocks = [_]ir.Block{.{
+        .id = block_id,
+        .function = function_id,
+        .instructions = &.{ nil_instruction, key_instruction, get_instruction },
+        .terminator = .{ .return_values = &.{result_value} },
+        .evidence = &.{proof},
+    }};
+    const functions = [_]ir.Function{.{ .id = function_id, .blocks = &.{block_id}, .entry_block = block_id, .evidence = &.{proof} }};
+    const evidence = [_]ir.Evidence{.{ .id = proof, .kind = .dynamic_fixture, .locator = "fixture:postfix-literal-index" }};
+    const program: ir.Program = .{
+        .program_id = "generic-postfix-literal-index",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+        .evidence = &evidence,
+    };
+
+    const source = try emitAlloc(std.testing.allocator, &program);
+    defer std.testing.allocator.free(source);
+    try std.testing.expect(std.mem.indexOf(u8, source, "(nil)[1]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "nil[1]") == null);
+}
+
+test "parenthesized statement calls receive an explicit separator" {
+    const proof = ir.EvidenceId.fromIndex(0);
+    const function_id = ir.FunctionId.fromIndex(0);
+    const block_id = ir.BlockId.fromIndex(0);
+    const nil_instruction = ir.InstructionId.fromIndex(0);
+    const call_instruction = ir.InstructionId.fromIndex(1);
+    const nil_value = ir.ValueId.fromIndex(0);
+    var values = [_]ir.Value{.{
+        .id = nil_value,
+        .function = function_id,
+        .origin = .{ .instruction_result = .{ .instruction = nil_instruction, .index = 0 } },
+    }};
+    var instructions = [_]ir.Instruction{
+        .{
+            .id = nil_instruction,
+            .block = block_id,
+            .operation = .{ .constant = .{ .nil_value = {} } },
+            .results = &.{nil_value},
+            .effects = .pure,
+            .evidence = &.{proof},
+        },
+        .{
+            .id = call_instruction,
+            .block = block_id,
+            .operation = .{ .call = .{ .callee = nil_value, .arguments = &.{}, .result_arity = .{ .fixed = 0 } } },
+            .results = &.{},
+            .effects = .dynamic_call,
+            .evidence = &.{proof},
+        },
+    };
+    const blocks = [_]ir.Block{.{
+        .id = block_id,
+        .function = function_id,
+        .instructions = &.{ nil_instruction, call_instruction },
+        .terminator = .{ .return_values = &.{} },
+        .evidence = &.{proof},
+    }};
+    const functions = [_]ir.Function{.{ .id = function_id, .blocks = &.{block_id}, .entry_block = block_id, .evidence = &.{proof} }};
+    const evidence = [_]ir.Evidence{.{ .id = proof, .kind = .dynamic_fixture, .locator = "fixture:parenthesized-statement" }};
+    var program: ir.Program = .{
+        .program_id = "generic-parenthesized-statement",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+        .evidence = &evidence,
+    };
+
+    const source = try emitAlloc(std.testing.allocator, &program);
+    defer std.testing.allocator.free(source);
+    try std.testing.expect(std.mem.indexOf(u8, source, "do\n  (nil)()\nend") != null);
+
+    values[0].type = .function;
+    instructions[0].operation = .{ .environment_get = .{ .target = .{ .ambient = {} }, .name = "observable" } };
+    instructions[0].effects = .semantic_environment_read;
+    program.values = &values;
+    program.instructions = &instructions;
+    const identifier_source = try emitAlloc(std.testing.allocator, &program);
+    defer std.testing.allocator.free(identifier_source);
+    try std.testing.expect(std.mem.indexOf(u8, identifier_source, "observable()\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, identifier_source, "do\n") == null);
+}
+
+test "instruction-scoped place emits its local declaration at allocation" {
+    const fixture = lifter.fixtures.shared_place_closure_module;
+    var places = fixture.places;
+    places[fixture.p_state.index()].origin = .{ .instruction = fixture.i_initialize };
+    var program = fixture.program;
+    program.places = &places;
+
+    const source = try emitAlloc(std.testing.allocator, &program);
+    defer std.testing.allocator.free(source);
+    try std.testing.expect(std.mem.indexOf(u8, source, "local state = start") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "local state\nstate =") == null);
+}
+
+test "dominating nested write coalesces while path-dependent writes stay predeclared" {
+    const proof = ir.EvidenceId.fromIndex(0);
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const then_block = ir.BlockId.fromIndex(1);
+    const else_block = ir.BlockId.fromIndex(2);
+    const join = ir.BlockId.fromIndex(3);
+    const make_condition = ir.InstructionId.fromIndex(0);
+    const make_initial = ir.InstructionId.fromIndex(1);
+    const write_then = ir.InstructionId.fromIndex(2);
+    const read_then = ir.InstructionId.fromIndex(3);
+    const write_else = ir.InstructionId.fromIndex(4);
+    const read_join = ir.InstructionId.fromIndex(5);
+    const condition = ir.ValueId.fromIndex(0);
+    const initial = ir.ValueId.fromIndex(1);
+    const then_snapshot = ir.ValueId.fromIndex(2);
+    const joined_snapshot = ir.ValueId.fromIndex(3);
+    const state = ir.PlaceId.fromIndex(0);
+
+    const values = [_]ir.Value{
+        .{ .id = condition, .function = function_id, .type = .boolean, .name_hint = "condition", .origin = .{ .instruction_result = .{ .instruction = make_condition, .index = 0 } } },
+        .{ .id = initial, .function = function_id, .type = .integer, .name_hint = "initial", .origin = .{ .instruction_result = .{ .instruction = make_initial, .index = 0 } } },
+        .{ .id = then_snapshot, .function = function_id, .type = .integer, .name_hint = "then_snapshot", .origin = .{ .instruction_result = .{ .instruction = read_then, .index = 0 } } },
+        .{ .id = joined_snapshot, .function = function_id, .type = .integer, .name_hint = "joined_snapshot", .origin = .{ .instruction_result = .{ .instruction = read_join, .index = 0 } } },
+    };
+    const places = [_]ir.Place{.{
+        .id = state,
+        .function = function_id,
+        .type = .integer,
+        .name_hint = "state",
+        .origin = .{ .local = 0 },
+        .evidence = &.{proof},
+    }};
+    const instructions = [_]ir.Instruction{
+        .{ .id = make_condition, .block = entry, .operation = .{ .constant = .{ .boolean = true } }, .results = &.{condition}, .effects = .pure, .evidence = &.{proof} },
+        .{ .id = make_initial, .block = entry, .operation = .{ .constant = .{ .integer = "1" } }, .results = &.{initial}, .effects = .pure, .evidence = &.{proof} },
+        .{ .id = write_then, .block = then_block, .operation = .{ .place_write = .{ .place = state, .value = initial } }, .results = &.{}, .effects = .place_write, .evidence = &.{proof} },
+        .{ .id = read_then, .block = then_block, .operation = .{ .place_read = state }, .results = &.{then_snapshot}, .effects = .place_read, .evidence = &.{proof} },
+        .{ .id = write_else, .block = else_block, .operation = .{ .place_write = .{ .place = state, .value = initial } }, .results = &.{}, .effects = .place_write, .evidence = &.{proof} },
+        .{ .id = read_join, .block = join, .operation = .{ .place_read = state }, .results = &.{joined_snapshot}, .effects = .place_read, .evidence = &.{proof} },
+    };
+    var blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .instructions = &.{ make_condition, make_initial }, .terminator = .{ .branch = .{ .condition = condition, .then_edge = .{ .target = then_block }, .else_edge = .{ .target = else_block } } }, .evidence = &.{proof} },
+        .{ .id = then_block, .function = function_id, .instructions = &.{ write_then, read_then }, .terminator = .{ .return_values = &.{then_snapshot} }, .evidence = &.{proof} },
+        .{ .id = else_block, .function = function_id, .terminator = .{ .return_values = &.{initial} }, .evidence = &.{proof} },
+        .{ .id = join, .function = function_id, .instructions = &.{read_join}, .terminator = .{ .return_values = &.{joined_snapshot} }, .evidence = &.{proof} },
+    };
+    var functions = [_]ir.Function{.{
+        .id = function_id,
+        .local_places = &.{state},
+        .blocks = &.{ entry, then_block, else_block },
+        .entry_block = entry,
+        .evidence = &.{proof},
+    }};
+    const evidence = [_]ir.Evidence{.{ .id = proof, .kind = .dynamic_fixture, .locator = "fixture:dominating-place-initializer" }};
+    var program: ir.Program = .{
+        .program_id = "generic-dominating-place-initializer",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = blocks[0..3],
+        .instructions = instructions[0..4],
+        .values = values[0..3],
+        .places = &places,
+        .evidence = &evidence,
+    };
+
+    const dominating = try emitAlloc(std.testing.allocator, &program);
+    defer std.testing.allocator.free(dominating);
+    try std.testing.expect(std.mem.indexOf(u8, dominating, "local state = initial") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dominating, "local state\n") == null);
+
+    blocks[then_block.index()].terminator = .{ .jump = .{ .target = join } };
+    blocks[else_block.index()].instructions = &.{write_else};
+    blocks[else_block.index()].terminator = .{ .jump = .{ .target = join } };
+    functions[0].blocks = &.{ entry, then_block, else_block, join };
+    program.blocks = &blocks;
+    program.instructions = &instructions;
+    program.values = &values;
+
+    const path_dependent = try emitAlloc(std.testing.allocator, &program);
+    defer std.testing.allocator.free(path_dependent);
+    try std.testing.expect(std.mem.indexOf(u8, path_dependent, "local state\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, path_dependent, "local state = initial") == null);
+}
+
+test "function-local place initialization stays outside an entry backedge" {
+    const proof = ir.EvidenceId.fromIndex(0);
+    const function_id = ir.FunctionId.fromIndex(0);
+    const block_id = ir.BlockId.fromIndex(0);
+    const constant_id = ir.InstructionId.fromIndex(0);
+    const write_id = ir.InstructionId.fromIndex(1);
+    const value_id = ir.ValueId.fromIndex(0);
+    const place_id = ir.PlaceId.fromIndex(0);
+    const values = [_]ir.Value{.{ .id = value_id, .function = function_id, .type = .integer, .origin = .{ .instruction_result = .{ .instruction = constant_id, .index = 0 } } }};
+    const places = [_]ir.Place{.{ .id = place_id, .function = function_id, .type = .integer, .name_hint = "state", .origin = .{ .local = 0 }, .evidence = &.{proof} }};
+    const instructions = [_]ir.Instruction{
+        .{ .id = constant_id, .block = block_id, .operation = .{ .constant = .{ .integer = "1" } }, .results = &.{value_id}, .effects = .pure, .evidence = &.{proof} },
+        .{ .id = write_id, .block = block_id, .operation = .{ .place_write = .{ .place = place_id, .value = value_id } }, .results = &.{}, .effects = .place_write, .evidence = &.{proof} },
+    };
+    const blocks = [_]ir.Block{.{ .id = block_id, .function = function_id, .instructions = &.{ constant_id, write_id }, .terminator = .{ .jump = .{ .target = block_id } }, .evidence = &.{proof} }};
+    const functions = [_]ir.Function{.{ .id = function_id, .blocks = &.{block_id}, .entry_block = block_id, .local_places = &.{place_id}, .evidence = &.{proof} }};
+    const evidence = [_]ir.Evidence{.{ .id = proof, .kind = .dynamic_fixture, .locator = "fixture:entry-backedge-place" }};
+    const program: ir.Program = .{
+        .program_id = "generic-entry-backedge-place",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+        .places = &places,
+        .evidence = &evidence,
+    };
+
+    const source = try emitAlloc(std.testing.allocator, &program);
+    defer std.testing.allocator.free(source);
+    const declaration = std.mem.indexOf(u8, source, "local state\n") orelse return error.TestUnexpectedResult;
+    const loop = std.mem.indexOf(u8, source, "while true do\n") orelse return error.TestUnexpectedResult;
+    const assignment = std.mem.lastIndexOf(u8, source, "state = 1") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(declaration < loop and loop < assignment);
+    try std.testing.expect(std.mem.indexOf(u8, source, "while true do\n  local state") == null);
+}
+
+test "unreachable entry predecessor does not force loop-style declarations" {
+    const proof = ir.EvidenceId.fromIndex(0);
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry_id = ir.BlockId.fromIndex(0);
+    const dead_id = ir.BlockId.fromIndex(1);
+    const constant_id = ir.InstructionId.fromIndex(0);
+    const write_id = ir.InstructionId.fromIndex(1);
+    const value_id = ir.ValueId.fromIndex(0);
+    const place_id = ir.PlaceId.fromIndex(0);
+    const values = [_]ir.Value{.{
+        .id = value_id,
+        .function = function_id,
+        .type = .integer,
+        .origin = .{ .instruction_result = .{ .instruction = constant_id, .index = 0 } },
+    }};
+    const places = [_]ir.Place{.{
+        .id = place_id,
+        .function = function_id,
+        .type = .integer,
+        .name_hint = "state",
+        .origin = .{ .local = 0 },
+        .evidence = &.{proof},
+    }};
+    const instructions = [_]ir.Instruction{
+        .{ .id = constant_id, .block = entry_id, .operation = .{ .constant = .{ .integer = "1" } }, .results = &.{value_id}, .effects = .pure, .evidence = &.{proof} },
+        .{ .id = write_id, .block = entry_id, .operation = .{ .place_write = .{ .place = place_id, .value = value_id } }, .results = &.{}, .effects = .place_write, .evidence = &.{proof} },
+    };
+    const blocks = [_]ir.Block{
+        .{ .id = entry_id, .function = function_id, .instructions = &.{ constant_id, write_id }, .terminator = .{ .return_values = &.{} }, .evidence = &.{proof} },
+        .{ .id = dead_id, .function = function_id, .terminator = .{ .jump = .{ .target = entry_id } }, .evidence = &.{proof} },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .entry_block = entry_id,
+        .blocks = &.{ entry_id, dead_id },
+        .local_places = &.{place_id},
+        .evidence = &.{proof},
+    }};
+    const evidence = [_]ir.Evidence{.{
+        .id = proof,
+        .kind = .dynamic_fixture,
+        .locator = "fixture:unreachable-entry-predecessor",
+    }};
+    const program: ir.Program = .{
+        .program_id = "unreachable-entry-predecessor",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+        .places = &places,
+        .evidence = &evidence,
+    };
+
+    const source = try emitAlloc(std.testing.allocator, &program);
+    defer std.testing.allocator.free(source);
+    try std.testing.expect(std.mem.indexOf(u8, source, "local state = 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "local state\n") == null);
+}
+
+test "dead symbol collisions do not change emitted Luau" {
+    const proof = ir.EvidenceId.fromIndex(0);
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry_id = ir.BlockId.fromIndex(0);
+    const dead_id = ir.BlockId.fromIndex(1);
+    const dead_global_id = ir.InstructionId.fromIndex(0);
+    const dead_shared_id = ir.InstructionId.fromIndex(1);
+    const dead_write_id = ir.InstructionId.fromIndex(2);
+    const live_name_id = ir.InstructionId.fromIndex(3);
+    const live_shared_id = ir.InstructionId.fromIndex(4);
+    const live_write_id = ir.InstructionId.fromIndex(5);
+    const dead_global_value = ir.ValueId.fromIndex(0);
+    const dead_shared_value = ir.ValueId.fromIndex(1);
+    const live_name_value = ir.ValueId.fromIndex(2);
+    const live_shared_value = ir.ValueId.fromIndex(3);
+    const dead_place = ir.PlaceId.fromIndex(0);
+    const live_place = ir.PlaceId.fromIndex(1);
+    var neutral_values = [_]ir.Value{
+        .{ .id = dead_global_value, .function = function_id, .name_hint = "dead_global", .origin = .{ .instruction_result = .{ .instruction = dead_global_id, .index = 0 } } },
+        .{ .id = dead_shared_value, .function = function_id, .type = .integer, .name_hint = "dead_shared", .origin = .{ .instruction_result = .{ .instruction = dead_shared_id, .index = 0 } } },
+        .{ .id = live_name_value, .function = function_id, .name_hint = "live_name", .origin = .{ .instruction_result = .{ .instruction = live_name_id, .index = 0 } } },
+        .{ .id = live_shared_value, .function = function_id, .type = .integer, .name_hint = "shared", .origin = .{ .instruction_result = .{ .instruction = live_shared_id, .index = 0 } } },
+    };
+    var neutral_places = [_]ir.Place{
+        .{ .id = dead_place, .function = function_id, .type = .integer, .name_hint = "dead_state", .origin = .{ .local = 0 }, .evidence = &.{proof} },
+        .{ .id = live_place, .function = function_id, .type = .integer, .name_hint = "state", .origin = .{ .local = 1 }, .evidence = &.{proof} },
+    };
+    var neutral_instructions = [_]ir.Instruction{
+        .{ .id = dead_global_id, .block = dead_id, .operation = .{ .environment_get = .{ .target = .{ .ambient = {} }, .name = "dead_global_api" } }, .results = &.{dead_global_value}, .effects = .semantic_environment_read, .evidence = &.{proof} },
+        .{ .id = dead_shared_id, .block = dead_id, .operation = .{ .constant = .{ .integer = "0" } }, .results = &.{dead_shared_value}, .effects = .pure, .evidence = &.{proof} },
+        .{ .id = dead_write_id, .block = dead_id, .operation = .{ .place_write = .{ .place = dead_place, .value = dead_shared_value } }, .results = &.{}, .effects = .place_write, .evidence = &.{proof} },
+        .{ .id = live_name_id, .block = entry_id, .operation = .{ .environment_get = .{ .target = .{ .ambient = {} }, .name = "actual_api" } }, .results = &.{live_name_value}, .effects = .semantic_environment_read, .evidence = &.{proof} },
+        .{ .id = live_shared_id, .block = entry_id, .operation = .{ .constant = .{ .integer = "2" } }, .results = &.{live_shared_value}, .effects = .pure, .evidence = &.{proof} },
+        .{ .id = live_write_id, .block = entry_id, .operation = .{ .place_write = .{ .place = live_place, .value = live_shared_value } }, .results = &.{}, .effects = .place_write, .evidence = &.{proof} },
+    };
+    const blocks = [_]ir.Block{
+        .{ .id = entry_id, .function = function_id, .instructions = &.{ live_name_id, live_shared_id, live_write_id }, .terminator = .{ .return_values = &.{ live_name_value, live_shared_value } }, .evidence = &.{proof} },
+        .{ .id = dead_id, .function = function_id, .instructions = &.{ dead_global_id, dead_shared_id, dead_write_id }, .terminator = .{ .return_values = &.{ dead_global_value, dead_shared_value } }, .evidence = &.{proof} },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .entry_block = entry_id,
+        .blocks = &.{ entry_id, dead_id },
+        .local_places = &.{ dead_place, live_place },
+        .evidence = &.{proof},
+    }};
+    const evidence = [_]ir.Evidence{.{
+        .id = proof,
+        .kind = .dynamic_fixture,
+        .locator = "fixture:dead-symbol-collisions",
+    }};
+    var neutral_program: ir.Program = .{
+        .program_id = "dead-symbol-collisions",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &neutral_instructions,
+        .values = &neutral_values,
+        .places = &neutral_places,
+        .evidence = &evidence,
+    };
+
+    const neutral = try emitAlloc(std.testing.allocator, &neutral_program);
+    defer std.testing.allocator.free(neutral);
+
+    var colliding_values = neutral_values;
+    colliding_values[dead_shared_value.index()].name_hint = "shared";
+    var colliding_places = neutral_places;
+    colliding_places[dead_place.index()].name_hint = "state";
+    var colliding_instructions = neutral_instructions;
+    colliding_instructions[dead_global_id.index()].operation.environment_get.name = "live_name";
+    var colliding_program = neutral_program;
+    colliding_program.instructions = &colliding_instructions;
+    colliding_program.values = &colliding_values;
+    colliding_program.places = &colliding_places;
+
+    const colliding = try emitAlloc(std.testing.allocator, &colliding_program);
+    defer std.testing.allocator.free(colliding);
+    try std.testing.expectEqualStrings(neutral, colliding);
+    try std.testing.expect(std.mem.indexOf(u8, colliding, "live_name") != null);
+    try std.testing.expect(std.mem.indexOf(u8, colliding, "state") != null);
+    try std.testing.expect(std.mem.indexOf(u8, colliding, "shared") != null);
+}
+
+test "loop-local escape uses a distinct carrier without collapsing closure snapshots" {
+    const proof = ir.EvidenceId.fromIndex(0);
+    const entry_function = ir.FunctionId.fromIndex(0);
+    const worker_function = ir.FunctionId.fromIndex(1);
+    const snapshot_function = ir.FunctionId.fromIndex(2);
+    const entry_block = ir.BlockId.fromIndex(0);
+    const worker_entry = ir.BlockId.fromIndex(1);
+    const loop_header = ir.BlockId.fromIndex(2);
+    const loop_body = ir.BlockId.fromIndex(3);
+    const loop_exit = ir.BlockId.fromIndex(4);
+    const snapshot_block = ir.BlockId.fromIndex(5);
+    const export_id = ir.InstructionId.fromIndex(0);
+    const next_id = ir.InstructionId.fromIndex(1);
+    const closure_id = ir.InstructionId.fromIndex(2);
+    const record_id = ir.InstructionId.fromIndex(3);
+    const exported_worker = ir.ValueId.fromIndex(0);
+    const next_callback = ir.ValueId.fromIndex(1);
+    const record_callback = ir.ValueId.fromIndex(2);
+    const continue_loop = ir.ValueId.fromIndex(3);
+    const iteration = ir.ValueId.fromIndex(4);
+    const snapshot = ir.ValueId.fromIndex(5);
+    const captured_iteration = ir.ValueId.fromIndex(6);
+    const capture = ir.CaptureId.fromIndex(0);
+
+    const values = [_]ir.Value{
+        .{ .id = exported_worker, .function = entry_function, .type = .function, .name_hint = "worker", .origin = .{ .instruction_result = .{ .instruction = export_id, .index = 0 } } },
+        .{ .id = next_callback, .function = worker_function, .type = .function, .name_hint = "next_value", .origin = .{ .parameter = 0 } },
+        .{ .id = record_callback, .function = worker_function, .type = .function, .name_hint = "record", .origin = .{ .parameter = 1 } },
+        .{ .id = continue_loop, .function = worker_function, .type = .boolean, .name_hint = "continue_loop", .origin = .{ .instruction_result = .{ .instruction = next_id, .index = 0 } } },
+        .{ .id = iteration, .function = worker_function, .type = .integer, .name_hint = "iteration", .origin = .{ .instruction_result = .{ .instruction = next_id, .index = 1 } } },
+        .{ .id = snapshot, .function = worker_function, .type = .function, .name_hint = "snapshot", .origin = .{ .instruction_result = .{ .instruction = closure_id, .index = 0 } } },
+        .{ .id = captured_iteration, .function = snapshot_function, .type = .integer, .name_hint = "captured_iteration", .origin = .{ .capture = capture } },
+    };
+    const captures = [_]ir.Capture{.{
+        .id = capture,
+        .function = snapshot_function,
+        .kind = .{ .immutable_value = captured_iteration },
+        .evidence = &.{proof},
+    }};
+    const instructions = [_]ir.Instruction{
+        .{ .id = export_id, .block = entry_block, .operation = .{ .function_ref = worker_function }, .results = &.{exported_worker}, .effects = .pure, .evidence = &.{proof} },
+        .{ .id = next_id, .block = loop_body, .operation = .{ .call = .{ .callee = next_callback, .arguments = &.{}, .result_arity = .{ .fixed = 2 } } }, .results = &.{ continue_loop, iteration }, .effects = .dynamic_call, .evidence = &.{proof} },
+        .{ .id = closure_id, .block = loop_body, .operation = .{ .make_closure = .{ .function = snapshot_function, .bindings = &.{.{ .value = iteration }} } }, .results = &.{snapshot}, .effects = .pure, .evidence = &.{proof} },
+        .{ .id = record_id, .block = loop_body, .operation = .{ .call = .{ .callee = record_callback, .arguments = &.{snapshot}, .result_arity = .{ .fixed = 0 } } }, .results = &.{}, .effects = .dynamic_call, .evidence = &.{proof} },
+    };
+    const blocks = [_]ir.Block{
+        .{ .id = entry_block, .function = entry_function, .instructions = &.{export_id}, .terminator = .{ .return_values = &.{exported_worker} }, .evidence = &.{proof} },
+        .{ .id = worker_entry, .function = worker_function, .terminator = .{ .jump = .{ .target = loop_header } }, .evidence = &.{proof} },
+        .{ .id = loop_header, .function = worker_function, .terminator = .{ .jump = .{ .target = loop_body } }, .evidence = &.{proof} },
+        .{ .id = loop_body, .function = worker_function, .instructions = &.{ next_id, closure_id, record_id }, .terminator = .{ .branch = .{
+            .condition = continue_loop,
+            .then_edge = .{ .target = loop_header },
+            .else_edge = .{ .target = loop_exit },
+        } }, .evidence = &.{proof} },
+        .{ .id = loop_exit, .function = worker_function, .terminator = .{ .return_values = &.{iteration} }, .evidence = &.{proof} },
+        .{ .id = snapshot_block, .function = snapshot_function, .terminator = .{ .return_values = &.{captured_iteration} }, .evidence = &.{proof} },
+    };
+    const functions = [_]ir.Function{
+        .{ .id = entry_function, .name_hint = "chunk", .blocks = &.{entry_block}, .entry_block = entry_block, .evidence = &.{proof} },
+        .{ .id = worker_function, .name_hint = "worker", .parameters = &.{ next_callback, record_callback }, .blocks = &.{ worker_entry, loop_header, loop_body, loop_exit }, .entry_block = worker_entry, .evidence = &.{proof} },
+        .{ .id = snapshot_function, .name_hint = "snapshot", .lexical_parent = worker_function, .captures = &.{capture}, .blocks = &.{snapshot_block}, .entry_block = snapshot_block, .evidence = &.{proof} },
+    };
+    const evidence = [_]ir.Evidence{.{
+        .id = proof,
+        .kind = .dynamic_fixture,
+        .locator = "fixture:loop-local-lexical-transfer",
+    }};
+    const program: ir.Program = .{
+        .program_id = "loop-local-lexical-transfer",
+        .entry_function = entry_function,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+        .captures = &captures,
+        .evidence = &evidence,
+    };
+
+    const source = try emitAlloc(std.testing.allocator, &program);
+    defer std.testing.allocator.free(source);
+    try std.testing.expect(std.mem.indexOf(u8, source, "local iteration\n") != null);
+    try std.testing.expect(std.mem.count(u8, source, "iteration_2") >= 3);
+    try std.testing.expect(std.mem.indexOf(u8, source, "iteration = iteration_2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "return iteration_2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "return iteration\n") != null);
+}
+
+test "table tail pack emits its adjacent invocation as native constructor syntax" {
+    const fixture = lifter.fixtures.open_pack_adjust_module;
+    var values = fixture.values;
+    values[fixture.v_first.index()].type = .{ .kind = .table };
+    var instructions = fixture.instructions;
+    instructions[fixture.i_adjust.index()].operation = .{ .make_table_literal = .{
+        .fields = &.{},
+        .tail_pack = fixture.p_results,
+    } };
+    instructions[fixture.i_adjust.index()].effects = .table_constructor;
+    var program = fixture.program;
+    program.values = &values;
+    program.instructions = &instructions;
+
+    const source = try emitAlloc(std.testing.allocator, &program);
+    defer std.testing.allocator.free(source);
+    try std.testing.expect(std.mem.indexOf(u8, source, "return { produce() }") != null);
+
+    var blocks = fixture.blocks;
+    blocks[fixture.b_entry.index()].terminator = .{ .return_values = &.{ fixture.v_first, fixture.v_first } };
+    program.blocks = &blocks;
+    const multi_use = try emitAlloc(std.testing.allocator, &program);
+    defer std.testing.allocator.free(multi_use);
+    try std.testing.expect(std.mem.indexOf(u8, multi_use, "local value_1 = {\n  produce()\n}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, multi_use, "return value_1, value_1") != null);
+}
+
+test "ordered table pack writes preserve a direct vararg pack" {
+    const source = try emitAlloc(std.testing.allocator, &lifter.fixtures.ordered_table_vararg_module.program);
+    defer std.testing.allocator.free(source);
+
+    try std.testing.expect(std.mem.indexOf(u8, source, "local __lifter_rawset = rawset") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "local __lifter_select = select") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "(function(__lifter_pack_table_1, __lifter_pack_first_1, ...)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "for __lifter_pack_offset_1 = 0, __lifter_select(\"#\", ...) - 1 do") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        source,
+        "__lifter_rawset(__lifter_pack_table_1, __lifter_pack_first_1 + __lifter_pack_offset_1, (__lifter_select(__lifter_pack_offset_1 + 1, ...)))",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, ", 2, ...)\n") != null);
+}
+
+test "bounded emission scopes prevent sequential temporaries from exhausting Luau registers" {
+    const allocator = std.testing.allocator;
+    const instruction_count = 240;
+    const proof = ir.EvidenceId.fromIndex(0);
+    const function_id = ir.FunctionId.fromIndex(0);
+    const block_id = ir.BlockId.fromIndex(0);
+
+    const values = try allocator.alloc(ir.Value, instruction_count);
+    defer allocator.free(values);
+    const instructions = try allocator.alloc(ir.Instruction, instruction_count);
+    defer allocator.free(instructions);
+    const instruction_ids = try allocator.alloc(ir.InstructionId, instruction_count);
+    defer allocator.free(instruction_ids);
+    const result_ids = try allocator.alloc([1]ir.ValueId, instruction_count);
+    defer allocator.free(result_ids);
+
+    for (0..instruction_count) |index| {
+        const instruction_id = ir.InstructionId.fromIndex(index);
+        const value_id = ir.ValueId.fromIndex(index);
+        instruction_ids[index] = instruction_id;
+        result_ids[index] = .{value_id};
+        values[index] = .{
+            .id = value_id,
+            .function = function_id,
+            .origin = .{ .instruction_result = .{ .instruction = instruction_id, .index = 0 } },
+        };
+        instructions[index] = .{
+            .id = instruction_id,
+            .block = block_id,
+            .operation = .{ .environment_get = .{ .target = .{ .ambient = {} }, .name = "observable" } },
+            .results = &result_ids[index],
+            .effects = .semantic_environment_read,
+            .evidence = &.{proof},
+        };
+    }
+
+    const returned = [_]ir.ValueId{ir.ValueId.fromIndex(0)};
+    const blocks = [_]ir.Block{.{
+        .id = block_id,
+        .function = function_id,
+        .instructions = instruction_ids,
+        .terminator = .{ .return_values = &returned },
+        .evidence = &.{proof},
+    }};
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .blocks = &.{block_id},
+        .entry_block = block_id,
+        .evidence = &.{proof},
+    }};
+    const evidence = [_]ir.Evidence{.{ .id = proof, .kind = .dynamic_fixture, .locator = "fixture:bounded-emission-scopes" }};
+    const program: ir.Program = .{
+        .program_id = "generic-bounded-emission-scopes",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = instructions,
+        .values = values,
+        .evidence = &evidence,
+    };
+
+    const source = try lifter.emit_luau.emitAllocForTarget(allocator, &program, .direct_locals_luau);
+    defer allocator.free(source);
+    try std.testing.expectEqual(instruction_count, std.mem.count(u8, source, "observable"));
+    try std.testing.expect(std.mem.count(u8, source, "do\n") >= 7);
+    try std.testing.expect(std.mem.indexOf(u8, source, "local value_0\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "value_0 = observable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "return value_0") != null);
+}
+
+test "infinite loop with a unique internal exit emits break and post-loop continuation" {
+    const proof = ir.EvidenceId.fromIndex(0);
+    const function_id = ir.FunctionId.fromIndex(0);
+    const header = ir.BlockId.fromIndex(0);
+    const decision = ir.BlockId.fromIndex(1);
+    const latch = ir.BlockId.fromIndex(2);
+    const exit_block = ir.BlockId.fromIndex(3);
+    const condition_instruction = ir.InstructionId.fromIndex(0);
+    const condition_value = ir.ValueId.fromIndex(0);
+    const values = [_]ir.Value{.{
+        .id = condition_value,
+        .function = function_id,
+        .type = .boolean,
+        .name_hint = "should_break",
+        .origin = .{ .instruction_result = .{ .instruction = condition_instruction, .index = 0 } },
+    }};
+    const instructions = [_]ir.Instruction{.{
+        .id = condition_instruction,
+        .block = decision,
+        .operation = .{ .constant = .{ .boolean = false } },
+        .results = &.{condition_value},
+        .effects = .pure,
+        .evidence = &.{proof},
+    }};
+    const blocks = [_]ir.Block{
+        .{ .id = header, .function = function_id, .terminator = .{ .jump = .{ .target = decision } }, .evidence = &.{proof} },
+        .{ .id = decision, .function = function_id, .instructions = &.{condition_instruction}, .terminator = .{ .branch = .{
+            .condition = condition_value,
+            .then_edge = .{ .target = exit_block },
+            .else_edge = .{ .target = latch },
+        } }, .evidence = &.{proof} },
+        .{ .id = latch, .function = function_id, .terminator = .{ .jump = .{ .target = header } }, .evidence = &.{proof} },
+        .{ .id = exit_block, .function = function_id, .terminator = .{ .return_values = &.{} }, .evidence = &.{proof} },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .blocks = &.{ header, decision, latch, exit_block },
+        .entry_block = header,
+        .evidence = &.{proof},
+    }};
+    const evidence = [_]ir.Evidence{.{ .id = proof, .kind = .dynamic_fixture, .locator = "fixture:infinite-loop-break" }};
+    const program: ir.Program = .{
+        .program_id = "generic-infinite-loop-break",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+        .evidence = &evidence,
+    };
+
+    const source = try emitAlloc(std.testing.allocator, &program);
+    defer std.testing.allocator.free(source);
+    try std.testing.expect(std.mem.indexOf(u8, source, "while true do\n") != null);
+    const loop_break = std.mem.indexOf(u8, source, "break\n") orelse return error.TestUnexpectedResult;
+    const loop_end = std.mem.lastIndexOf(u8, source, "end\n") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(loop_break < loop_end);
+    try std.testing.expect(std.mem.indexOf(u8, source, "return\n") == null);
+}
+
+test "loop terminal omits only a structurally empty natural continue arm" {
+    const proof = ir.EvidenceId.fromIndex(0);
+    const function_id = ir.FunctionId.fromIndex(0);
+    const preheader = ir.BlockId.fromIndex(0);
+    const header = ir.BlockId.fromIndex(1);
+    const body = ir.BlockId.fromIndex(2);
+    const terminal = ir.BlockId.fromIndex(3);
+    const exit_block = ir.BlockId.fromIndex(4);
+    const loop_instruction = ir.InstructionId.fromIndex(0);
+    const terminal_instruction = ir.InstructionId.fromIndex(1);
+    const loop_value = ir.ValueId.fromIndex(0);
+    const terminal_value = ir.ValueId.fromIndex(1);
+    const values = [_]ir.Value{
+        .{ .id = loop_value, .function = function_id, .type = .boolean, .name_hint = "loop", .origin = .{ .instruction_result = .{ .instruction = loop_instruction, .index = 0 } } },
+        .{ .id = terminal_value, .function = function_id, .type = .boolean, .name_hint = "terminal", .origin = .{ .instruction_result = .{ .instruction = terminal_instruction, .index = 0 } } },
+    };
+    const instructions = [_]ir.Instruction{
+        .{ .id = loop_instruction, .block = preheader, .operation = .{ .constant = .{ .boolean = true } }, .results = &.{loop_value}, .effects = .pure, .evidence = &.{proof} },
+        .{ .id = terminal_instruction, .block = body, .operation = .{ .constant = .{ .boolean = true } }, .results = &.{terminal_value}, .effects = .pure, .evidence = &.{proof} },
+    };
+    var blocks = [_]ir.Block{
+        .{ .id = preheader, .function = function_id, .instructions = &.{loop_instruction}, .terminator = .{ .jump = .{ .target = header } }, .evidence = &.{proof} },
+        .{ .id = header, .function = function_id, .terminator = .{ .branch = .{
+            .condition = loop_value,
+            .then_edge = .{ .target = body },
+            .else_edge = .{ .target = exit_block },
+        } }, .evidence = &.{proof} },
+        .{ .id = body, .function = function_id, .instructions = &.{terminal_instruction}, .terminator = .{ .branch = .{
+            .condition = terminal_value,
+            .then_edge = .{ .target = header },
+            .else_edge = .{ .target = terminal },
+        } }, .evidence = &.{proof} },
+        .{ .id = terminal, .function = function_id, .terminator = .{ .return_values = &.{} }, .evidence = &.{proof} },
+        .{ .id = exit_block, .function = function_id, .terminator = .{ .return_values = &.{} }, .evidence = &.{proof} },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .blocks = &.{ preheader, header, body, terminal, exit_block },
+        .entry_block = preheader,
+        .evidence = &.{proof},
+    }};
+    const evidence = [_]ir.Evidence{.{ .id = proof, .kind = .dynamic_fixture, .locator = "fixture:loop-terminal-natural-continue" }};
+    var program: ir.Program = .{
+        .program_id = "generic-loop-terminal-natural-continue",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+        .evidence = &evidence,
+    };
+
+    const continue_on_true = try emitAlloc(std.testing.allocator, &program);
+    defer std.testing.allocator.free(continue_on_true);
+    try std.testing.expect(std.mem.indexOf(u8, continue_on_true, "if not ") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, continue_on_true, "else\n"));
+    try std.testing.expect(std.mem.indexOf(u8, continue_on_true, " then\n    else\n") == null);
+
+    blocks[body.index()].terminator = .{ .branch = .{
+        .condition = terminal_value,
+        .then_edge = .{ .target = terminal },
+        .else_edge = .{ .target = header },
+    } };
+    const continue_on_false = try emitAlloc(std.testing.allocator, &program);
+    defer std.testing.allocator.free(continue_on_false);
+    try std.testing.expect(std.mem.indexOf(u8, continue_on_false, "if true then\n") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, continue_on_false, "else\n"));
+    try std.testing.expect(std.mem.indexOf(u8, continue_on_false, "\n    else\n    end\n") == null);
+
+    const seed_instruction = ir.InstructionId.fromIndex(2);
+    const next_instruction = ir.InstructionId.fromIndex(3);
+    const seed_value = ir.ValueId.fromIndex(2);
+    const next_value = ir.ValueId.fromIndex(3);
+    const carried_value = ir.ValueId.fromIndex(4);
+    const carried_values = [_]ir.Value{
+        values[0],
+        values[1],
+        .{ .id = seed_value, .function = function_id, .type = .integer, .name_hint = "seed", .origin = .{ .instruction_result = .{ .instruction = seed_instruction, .index = 0 } } },
+        .{ .id = next_value, .function = function_id, .type = .integer, .name_hint = "next", .origin = .{ .instruction_result = .{ .instruction = next_instruction, .index = 0 } } },
+        .{ .id = carried_value, .function = function_id, .type = .integer, .name_hint = "carried", .origin = .{ .block_parameter = .{ .block = header, .index = 0 } } },
+    };
+    const carried_instructions = [_]ir.Instruction{
+        instructions[0],
+        instructions[1],
+        .{ .id = seed_instruction, .block = preheader, .operation = .{ .constant = .{ .integer = "0" } }, .results = &.{seed_value}, .effects = .pure, .evidence = &.{proof} },
+        .{ .id = next_instruction, .block = body, .operation = .{ .constant = .{ .integer = "1" } }, .results = &.{next_value}, .effects = .pure, .evidence = &.{proof} },
+    };
+    blocks[preheader.index()].instructions = &.{ loop_instruction, seed_instruction };
+    blocks[preheader.index()].terminator = .{ .jump = .{ .target = header, .arguments = &.{seed_value} } };
+    blocks[header.index()].parameters = &.{carried_value};
+    blocks[body.index()].instructions = &.{ terminal_instruction, next_instruction };
+    blocks[body.index()].terminator = .{ .branch = .{
+        .condition = terminal_value,
+        .then_edge = .{ .target = header, .arguments = &.{next_value} },
+        .else_edge = .{ .target = terminal },
+    } };
+    blocks[terminal.index()].terminator = .{ .return_values = &.{carried_value} };
+    blocks[exit_block.index()].terminator = .{ .return_values = &.{carried_value} };
+    program.instructions = &carried_instructions;
+    program.values = &carried_values;
+
+    const parameterized = try emitAlloc(std.testing.allocator, &program);
+    defer std.testing.allocator.free(parameterized);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, parameterized, "else\n"));
 }
