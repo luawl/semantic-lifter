@@ -221,6 +221,215 @@ fn emitEntryValueBindings(
     }
 }
 
+fn emitFunctionBody(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    function: ir.Function,
+    indent: []const u8,
+    place_aliases: []const PlaceAlias,
+) (EmitError || std.mem.Allocator.Error)!void {
+    var analysis = cfg.Analysis.init(allocator, program, function) catch |err| {
+        std.debug.print("emit function={} stage=cfg error={s}\n", .{ function.id.index(), @errorName(err) });
+        return error.UnsupportedControlFlow;
+    };
+    defer analysis.deinit();
+    var plan = (if (emission_plan.force_dispatcher)
+        structure.Plan.initArbitrary(allocator, &analysis)
+    else
+        structure.Plan.initWithArbitraryFallback(allocator, &analysis)) catch |err| {
+        std.debug.print("emit function={} stage=structure error={s}\n", .{ function.id.index(), @errorName(err) });
+        return error.UnsupportedControlFlow;
+    };
+    defer plan.deinit();
+    var scopes = emission_scope.Plan.init(
+        allocator,
+        program,
+        function,
+        &analysis,
+        &plan,
+        &emission_plan.packs,
+        &emission_plan.dead,
+        &emission_plan.place_writes,
+        &emission_plan.place_reads,
+        &emission_plan.fused_values,
+        &emission_plan.closure_stores,
+    ) catch |err| {
+        std.debug.print("emit function={} stage=scopes error={s}\n", .{ function.id.index(), @errorName(err) });
+        return err;
+    };
+    defer scopes.deinit();
+    if (!plan.root.arbitrary_cfg) {
+        branch_expression.markDeclarations(program, emission_plan, &scopes, plan.root, true);
+    }
+    if (emission_plan.names.functionUsesValueStorage(program, function)) {
+        try output.appendSlice(allocator, indent);
+        try output.appendSlice(allocator, "local ");
+        try output.appendSlice(allocator, emission_plan.names.valueStorageName() orelse return error.UnsupportedOperation);
+        try output.appendSlice(allocator, " = {}\n");
+    }
+    if (emission_plan.names.functionUsesStorage(function)) {
+        try output.appendSlice(allocator, indent);
+        try output.appendSlice(allocator, "local ");
+        try output.appendSlice(allocator, emission_plan.names.placeStorageName() orelse return error.UnsupportedOperation);
+        try output.appendSlice(allocator, " = {}\n");
+    }
+    if (plan.root.arbitrary_cfg) {
+        try emitArbitraryCfgDeclarations(output, allocator, program, emission_plan, &scopes, function, indent);
+        emitArbitraryCfgBody(output, allocator, program, emission_plan, &scopes, plan.root, indent, place_aliases) catch |err| {
+            std.debug.print("emit function={} stage=arbitrary_cfg error={s}\n", .{ function.id.index(), @errorName(err) });
+            return err;
+        };
+        trimTrailingEmptyReturn(output, indent);
+        return;
+    }
+    const body_start = output.items.len;
+    const root_escape_targets = try structured_escape.regionFreeTargetsAlloc(allocator, plan.root);
+    defer allocator.free(root_escape_targets);
+    const loop_boundary_exit_targets = try structured_escape.loopBoundaryExitTargetsAlloc(allocator, plan.root);
+    defer allocator.free(loop_boundary_exit_targets);
+    for (root_escape_targets) |target| {
+        try emitEscapeFlagDeclaration(output, allocator, program, emission_plan, target, indent);
+    }
+    for (loop_boundary_exit_targets) |target| {
+        if (containsBlockId(root_escape_targets, target)) continue;
+        try emitEscapeFlagDeclaration(output, allocator, program, emission_plan, target, indent);
+    }
+    emitScopeDeclarations(output, allocator, program, emission_plan, &scopes, scopes.rootScope(), indent) catch |err| {
+        std.debug.print("emit function={} stage=root_declarations error={s}\n", .{ function.id.index(), @errorName(err) });
+        return err;
+    };
+    emitRegion(output, allocator, program, emission_plan, &scopes, plan.root, indent, place_aliases) catch |err| {
+        if (err == error.UnsupportedControlFlow) {
+            output.items.len = body_start;
+            plan.deinit();
+            plan = try structure.Plan.initArbitrary(allocator, &analysis);
+            scopes.deinit();
+            scopes = try emission_scope.Plan.init(
+                allocator,
+                program,
+                function,
+                &analysis,
+                &plan,
+                &emission_plan.packs,
+                &emission_plan.dead,
+                &emission_plan.place_writes,
+                &emission_plan.place_reads,
+                &emission_plan.fused_values,
+                &emission_plan.closure_stores,
+            );
+            try emitArbitraryCfgDeclarations(output, allocator, program, emission_plan, &scopes, function, indent);
+            try emitArbitraryCfgBody(output, allocator, program, emission_plan, &scopes, plan.root, indent, place_aliases);
+            trimTrailingEmptyReturn(output, indent);
+            return;
+        }
+        return err;
+    };
+    trimTrailingEmptyReturn(output, indent);
+}
+
+// A reducible region is preferred for readable output.  When the CFG remains
+// irreducible after authenticated normalization, preserve it with a balanced
+// dispatcher whose leaves execute the original blocks and edge transfers.
+fn emitArbitraryCfgBody(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    scopes: *const emission_scope.Plan,
+    region: *const structure.Region,
+    indent: []const u8,
+    place_aliases: []const PlaceAlias,
+) (EmitError || std.mem.Allocator.Error)!void {
+    if (!region.arbitrary_cfg or region.nodes.len == 0) return error.UnsupportedControlFlow;
+    const pc_name = try emission_plan.names.internalNameAlloc(allocator, program, "__lifter_pc");
+    defer allocator.free(pc_name);
+
+    const entry = scopes.function.entry_block;
+    if (entry.index() >= program.blocks.len) return error.UnsupportedControlFlow;
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "local ");
+    try output.appendSlice(allocator, pc_name);
+    try output.appendSlice(allocator, " = ");
+    try output.print(allocator, "{d}\n", .{entry.index()});
+
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "while true do\n");
+    const body_indent = try allocDeeperIndent(allocator, indent);
+    defer allocator.free(body_indent);
+    try emitArbitraryDispatch(
+        output,
+        allocator,
+        program,
+        emission_plan,
+        scopes,
+        region.nodes,
+        0,
+        region.nodes.len,
+        pc_name,
+        body_indent,
+        place_aliases,
+    );
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "end\n");
+}
+
+fn emitArbitraryDispatch(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    scopes: *const emission_scope.Plan,
+    nodes: []const structure.Node,
+    start: usize,
+    end: usize,
+    pc_name: []const u8,
+    indent: []const u8,
+    place_aliases: []const PlaceAlias,
+) (EmitError || std.mem.Allocator.Error)!void {
+    if (start >= end) return error.UnsupportedControlFlow;
+    if (end - start == 1) {
+        const block_id = nodes[start].blockId();
+        if (block_id.index() >= program.blocks.len) return error.UnsupportedControlFlow;
+        const block = program.blocks[block_id.index()];
+        try output.appendSlice(allocator, indent);
+        try output.appendSlice(allocator, "if ");
+        try output.appendSlice(allocator, pc_name);
+        try output.appendSlice(allocator, " == ");
+        try output.print(allocator, "{d} then\n", .{block_id.index()});
+        const leaf_indent = try allocDeeperIndent(allocator, indent);
+        defer allocator.free(leaf_indent);
+        try emitArbitraryBlockInstructions(output, allocator, program, emission_plan, scopes, block, leaf_indent, place_aliases);
+        try emitArbitraryTerminator(output, allocator, program, emission_plan, scopes, block, pc_name, leaf_indent, place_aliases);
+        try output.appendSlice(allocator, indent);
+        try output.appendSlice(allocator, "else\n");
+        const error_indent = try allocDeeperIndent(allocator, indent);
+        defer allocator.free(error_indent);
+        try output.appendSlice(allocator, error_indent);
+        try output.appendSlice(allocator, "error(\"invalid control state\")\n");
+        try output.appendSlice(allocator, indent);
+        try output.appendSlice(allocator, "end\n");
+        return;
+    }
+
+    const middle = start + (end - start) / 2;
+    const pivot = nodes[middle - 1].blockId().index();
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "if ");
+    try output.appendSlice(allocator, pc_name);
+    try output.appendSlice(allocator, " <= ");
+    try output.print(allocator, "{d} then\n", .{pivot});
+    const nested_indent = try allocDeeperIndent(allocator, indent);
+    defer allocator.free(nested_indent);
+    try emitArbitraryDispatch(output, allocator, program, emission_plan, scopes, nodes, start, middle, pc_name, nested_indent, place_aliases);
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "else\n");
+    try emitArbitraryDispatch(output, allocator, program, emission_plan, scopes, nodes, middle, end, pc_name, nested_indent, place_aliases);
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "end\n");
+}
+
 fn emitArbitraryCfgDeclarations(
     output: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
@@ -270,6 +479,42 @@ fn emitArbitraryCfgDeclarations(
         }
     }
     try flushBareDeclarations(output, allocator, &bare_count);
+}
+
+fn emitArbitraryBlockInstructions(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    scopes: *const emission_scope.Plan,
+    block: ir.Block,
+    indent: []const u8,
+    place_aliases: []const PlaceAlias,
+) (EmitError || std.mem.Allocator.Error)!void {
+    for (block.instructions) |instruction_id| {
+        if (instruction_id.index() >= program.instructions.len) return error.UnsupportedOperation;
+        emitInstruction(
+            output,
+            allocator,
+            program,
+            emission_plan,
+            scopes,
+            program.instructions[instruction_id.index()],
+            indent,
+            false,
+            false,
+            place_aliases,
+            null,
+        ) catch |err| {
+            std.debug.print("emit arbitrary instruction={} block={} operation={s} error={s}\n", .{
+                instruction_id.index(),
+                block.id.index(),
+                @tagName(program.instructions[instruction_id.index()].operation),
+                @errorName(err),
+            });
+            return err;
+        };
+    }
 }
 
 fn emitArbitraryTerminator(
@@ -337,6 +582,725 @@ fn trimTrailingEmptyReturn(output: *std.ArrayList(u8), indent: []const u8) void 
     output.items.len -= suffix_len;
 }
 
+fn emitBlockInstructions(output: *std.ArrayList(u8), allocator: std.mem.Allocator, program: *const ir.Program, emission_plan: *const EmissionPlan, scopes: *const emission_scope.Plan, block: ir.Block, indent: []const u8, place_aliases: []const PlaceAlias) !void {
+    try emitBlockInstructionsWithDeclaration(output, allocator, program, emission_plan, scopes, block, indent, true, place_aliases, null);
+}
+
+fn emitBlockInstructionsWithDeclaration(output: *std.ArrayList(u8), allocator: std.mem.Allocator, program: *const ir.Program, emission_plan: *const EmissionPlan, scopes: *const emission_scope.Plan, block: ir.Block, indent: []const u8, declare_results: bool, place_aliases: []const PlaceAlias, composition: ?*const branch_expression.Composition) !void {
+    _ = declare_results;
+    var index: usize = 0;
+    while (index < block.instructions.len) {
+        const first_id = block.instructions[index];
+        const scope = scopes.instructionScope(first_id) orelse return error.UnsupportedControlFlow;
+        var end = index + 1;
+        while (end < block.instructions.len and scopes.instructionScope(block.instructions[end]) == scope) : (end += 1) {}
+
+        var has_output = scopes.declarationCount(scope) != 0;
+        if (!has_output) {
+            for (block.instructions[index..end]) |instruction_id| {
+                if (composition) |value| {
+                    if (value.instructionIsAbsorbed(instruction_id)) continue;
+                }
+                if (scopes.instructionSuppressedByControl(instruction_id)) continue;
+                const instruction = program.instructions[instruction_id.index()];
+                if (emission_plan.instructionMayEmit(instruction) and !scopes.instructionIsMovedLiteralInitializer(instruction.id)) {
+                    has_output = true;
+                    break;
+                }
+            }
+        }
+        if (has_output) {
+            const block_scope = scopes.blockScope(block.id) orelse return error.UnsupportedControlFlow;
+            const wraps_segment = scope != block_scope;
+            var allocated_indent: ?[]u8 = null;
+            defer if (allocated_indent) |value| allocator.free(value);
+            if (wraps_segment) {
+                try output.appendSlice(allocator, indent);
+                try output.appendSlice(allocator, "do\n");
+                allocated_indent = try allocDeeperIndent(allocator, indent);
+                try emitScopeDeclarations(output, allocator, program, emission_plan, scopes, scope, allocated_indent.?);
+            }
+            const segment_indent = allocated_indent orelse indent;
+            for (block.instructions[index..end]) |instruction_id| {
+                if (scopes.instructionSuppressedByControl(instruction_id)) continue;
+                const instruction = program.instructions[instruction_id.index()];
+                const declares_place = switch (instruction.operation) {
+                    .place_write => |write| !emission_plan.names.placeUsesStorage(write.place) and
+                        scopes.instructionDeclaresPlace(instruction_id, write.place),
+                    else => false,
+                };
+                emitInstruction(
+                    output,
+                    allocator,
+                    program,
+                    emission_plan,
+                    scopes,
+                    instruction,
+                    segment_indent,
+                    scopes.instructionDeclaresResults(instruction_id),
+                    declares_place,
+                    place_aliases,
+                    composition,
+                ) catch |err| {
+                    std.debug.print("emit instruction={} block={} operation={s} error={s}\n", .{
+                        instruction.id.index(),
+                        block.id.index(),
+                        @tagName(instruction.operation),
+                        @errorName(err),
+                    });
+                    return err;
+                };
+            }
+            if (wraps_segment) {
+                try output.appendSlice(allocator, indent);
+                try output.appendSlice(allocator, "end\n");
+            }
+        }
+        index = end;
+    }
+}
+
+fn emitRegion(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    scopes: *const emission_scope.Plan,
+    region: *const structure.Region,
+    indent: []const u8,
+    place_aliases: []const PlaceAlias,
+) (EmitError || std.mem.Allocator.Error)!void {
+    emitRegionWithPredeclaredBlock(output, allocator, program, emission_plan, scopes, region, indent, place_aliases, null) catch |err| {
+        std.debug.print(
+            "emit region error={s} node={s} first={?d} last={?d} nodes={d} stop={?d} loop_exit={?d} continue_target={?d}\n",
+            .{
+                @errorName(err),
+                if (region.nodes.len == 0) "empty" else @tagName(region.nodes[0]),
+                if (region.nodes.len == 0) null else region.nodes[0].blockId().index(),
+                if (region.nodes.len == 0) null else region.nodes[region.nodes.len - 1].blockId().index(),
+                region.nodes.len,
+                if (region.stop) |block| block.index() else null,
+                if (region.loop_exit) |block| block.index() else null,
+                if (region.continue_target) |block| block.index() else null,
+            },
+        );
+        return err;
+    };
+}
+
+fn emitRegionWithPredeclaredBlock(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    scopes: *const emission_scope.Plan,
+    region: *const structure.Region,
+    region_indent: []const u8,
+    place_aliases: []const PlaceAlias,
+    predeclared_block: ?ir.BlockId,
+) (EmitError || std.mem.Allocator.Error)!void {
+    if (!structured_escape.regionOwnsEscape(region) and
+        !try structured_escape.regionNeedsTransferWrapper(allocator, region))
+    {
+        return emitRegionBodyWithPredeclaredBlock(
+            output,
+            allocator,
+            program,
+            emission_plan,
+            scopes,
+            region,
+            region_indent,
+            place_aliases,
+            predeclared_block,
+        );
+    }
+
+    const target = region.stop orelse return error.UnsupportedControlFlow;
+    const body_indent = try allocDeeperIndent(allocator, region_indent);
+    defer allocator.free(body_indent);
+
+    const has_predeclared_stop_flag = (predeclared_block != null and predeclared_block.? == target) or
+        structured_escape.regionHasLoopBoundaryExitTo(region, target);
+    if (!has_predeclared_stop_flag) {
+        try emitEscapeFlagDeclaration(output, allocator, program, emission_plan, target, region_indent);
+    }
+    try output.appendSlice(allocator, region_indent);
+    try output.appendSlice(allocator, "repeat\n");
+    try emitRegionBodyWithPredeclaredBlock(
+        output,
+        allocator,
+        program,
+        emission_plan,
+        scopes,
+        region,
+        body_indent,
+        place_aliases,
+        predeclared_block,
+    );
+    try output.appendSlice(allocator, region_indent);
+    try output.appendSlice(allocator, "until true\n");
+    if (region.loop_exit != null) {
+        try emitRegionEscapePropagation(output, allocator, program, emission_plan, region, region_indent);
+    }
+}
+
+fn emitRegionBodyWithPredeclaredBlock(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    scopes: *const emission_scope.Plan,
+    region: *const structure.Region,
+    region_indent: []const u8,
+    place_aliases: []const PlaceAlias,
+    predeclared_block: ?ir.BlockId,
+) (EmitError || std.mem.Allocator.Error)!void {
+    _ = predeclared_block;
+    var trace_stage: []const u8 = "begin";
+    errdefer std.debug.print(
+        "emit region body failure stage={s} first={?d} nodes={d} stop={?d} loop_exit={?d}\n",
+        .{
+            trace_stage,
+            if (region.nodes.len == 0) null else region.nodes[0].blockId().index(),
+            region.nodes.len,
+            if (region.stop) |block| block.index() else null,
+            if (region.loop_exit) |block| block.index() else null,
+        },
+    );
+    trace_stage = "stop_forwarding";
+    const forwarded_stop_edge = try validatedStopForwardingEdge(program, region);
+    trace_stage = "continue_projection";
+    const projected_continue = try validatedContinueProjectionAlloc(allocator, program, region);
+    if (forwarded_stop_edge != null and
+        (region.terminal_projection != null or region.continue_projection != null or region.escape_projection != null))
+    {
+        return error.UnsupportedControlFlow;
+    }
+    const projection_count = @intFromBool(region.terminal_projection != null) +
+        @intFromBool(region.continue_projection != null) +
+        @intFromBool(region.escape_projection != null);
+    if (projection_count > 1) {
+        return error.UnsupportedControlFlow;
+    }
+    if (region.terminal_projection) |projection| {
+        if (projection.edge) |edge| {
+            if (region.nodes.len == 0) return error.UnsupportedControlFlow;
+            const source_id = switch (region.nodes[region.nodes.len - 1]) {
+                .block => |block_id| block_id,
+                else => return error.UnsupportedControlFlow,
+            };
+            if (source_id.index() >= program.blocks.len) return error.UnsupportedControlFlow;
+            const source_edge = switch (program.blocks[source_id.index()].terminator) {
+                .jump => |jump| jump,
+                else => return error.UnsupportedControlFlow,
+            };
+            if (!sameEdge(source_edge, edge)) return error.UnsupportedControlFlow;
+        } else if (region.nodes.len == 0) {
+            return error.UnsupportedControlFlow;
+        }
+    }
+    var expression_composition = try branch_expression.Composition.init(allocator, program, emission_plan, scopes, region);
+    defer expression_composition.deinit();
+    const composition: *const branch_expression.Composition = &expression_composition;
+    var group_count: usize = 0;
+    var counted_group: emission_scope.ScopeId = emission_scope.invalid_scope;
+    for (region.nodes) |*node| {
+        trace_stage = "node_scope";
+        const group = scopes.nodeContainerScope(node) orelse return error.UnsupportedControlFlow;
+        if (group != counted_group) {
+            counted_group = group;
+            group_count += 1;
+        }
+    }
+    const wraps_groups = group_count > 1;
+    var active_group: emission_scope.ScopeId = emission_scope.invalid_scope;
+    var active_group_wrapper: ?ContainerGroupWrapper = null;
+    var allocated_group_indent: ?[]u8 = null;
+    defer if (allocated_group_indent) |value| allocator.free(value);
+    for (region.nodes, 0..) |*node, node_index| {
+        const group = scopes.nodeContainerScope(node) orelse return error.UnsupportedControlFlow;
+        if (group != active_group) {
+            if (active_group != emission_scope.invalid_scope and wraps_groups) {
+                try closeContainerGroupWrapper(output, allocator, region_indent, active_group_wrapper.?);
+                active_group_wrapper = null;
+                allocator.free(allocated_group_indent.?);
+                allocated_group_indent = null;
+            }
+            active_group = group;
+            if (wraps_groups) {
+                const output_start = output.items.len;
+                try output.appendSlice(allocator, region_indent);
+                try output.appendSlice(allocator, "do\n");
+                active_group_wrapper = .{
+                    .output_start = output_start,
+                    .body_start = output.items.len,
+                };
+                allocated_group_indent = try allocDeeperIndent(allocator, region_indent);
+            }
+            try emitScopeDeclarations(
+                output,
+                allocator,
+                program,
+                emission_plan,
+                scopes,
+                group,
+                allocated_group_indent orelse region_indent,
+            );
+        }
+        const node_scope = scopes.nodeScope(node) orelse return error.UnsupportedControlFlow;
+        const indent = allocated_group_indent orelse region_indent;
+        try emitScopeDeclarations(output, allocator, program, emission_plan, scopes, node_scope, indent);
+        trace_stage = "node_emit";
+        switch (node.*) {
+            .block => |block_id| {
+                const block = program.blocks[block_id.index()];
+                try emitBlockInstructionsWithDeclaration(output, allocator, program, emission_plan, scopes, block, indent, false, place_aliases, composition);
+                switch (block.terminator) {
+                    .jump => |edge| {
+                        if (forwarded_stop_edge) |forwarded_edge| {
+                            if (node_index + 1 == region.nodes.len and edge.target == region.stop_forwarding.?) {
+                                if (edge.arguments.len != 0 or program.blocks[edge.target.index()].parameters.len != 0) {
+                                    return error.UnsupportedControlFlow;
+                                }
+                                try emitEdgeParametersUnlessConsumed(
+                                    output,
+                                    allocator,
+                                    program,
+                                    emission_plan,
+                                    scopes,
+                                    program.blocks[forwarded_edge.target.index()],
+                                    forwarded_edge.arguments,
+                                    indent,
+                                    false,
+                                    place_aliases,
+                                );
+                                continue;
+                            }
+                        }
+                        if (region.terminal_projection) |projection| {
+                            if (projection.edge) |projected_edge| {
+                                if (node_index + 1 == region.nodes.len and sameEdge(edge, projected_edge)) {
+                                    try emitProjectedTerminal(
+                                        output,
+                                        allocator,
+                                        program,
+                                        emission_plan,
+                                        scopes,
+                                        projected_edge,
+                                        projection.terminal,
+                                        indent,
+                                        place_aliases,
+                                        composedValuePlan(emission_plan, place_aliases, composition),
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+                        if (projected_continue) |projection| {
+                            if (node_index + 1 == region.nodes.len and sameEdge(edge, projection.source_edge)) {
+                                try emitProjectedContinue(
+                                    output,
+                                    allocator,
+                                    program,
+                                    emission_plan,
+                                    scopes,
+                                    projection.target_edge,
+                                    region.continue_projection.?.target,
+                                    indent,
+                                    place_aliases,
+                                    projection.nonlocal,
+                                );
+                                continue;
+                            }
+                        }
+                        if (region.escape_projection) |projection| {
+                            if (projection.edge) |projected_edge| {
+                                if (node_index + 1 == region.nodes.len and sameEdge(edge, projected_edge)) {
+                                    try emitEdgeParametersUnlessConsumed(
+                                        output,
+                                        allocator,
+                                        program,
+                                        emission_plan,
+                                        scopes,
+                                        program.blocks[projected_edge.target.index()],
+                                        projected_edge.arguments,
+                                        indent,
+                                        false,
+                                        place_aliases,
+                                    );
+                                    try emitEscapeFlagSet(output, allocator, program, emission_plan, projection.target, indent);
+                                    if (region.loop_exit != null) {
+                                        try emitBreakStatement(output, allocator, indent);
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+                        const exits_region = region.stop != null and edge.target == region.stop.?;
+                        if (!exits_region) {
+                            if (node_index + 1 >= region.nodes.len or region.nodes[node_index + 1].blockId() != edge.target) {
+                                return error.UnsupportedControlFlow;
+                            }
+                        }
+                        try emitEdgeParametersUnlessConsumed(
+                            output,
+                            allocator,
+                            program,
+                            emission_plan,
+                            scopes,
+                            program.blocks[edge.target.index()],
+                            edge.arguments,
+                            indent,
+                            !exits_region,
+                            place_aliases,
+                        );
+                    },
+                    .return_values, .return_pack, .return_expanded, .throw_error, .unreachable_block => {
+                        if (node_index + 1 != region.nodes.len) return error.UnsupportedControlFlow;
+                        try call_emission.terminator(
+                            output,
+                            allocator,
+                            program,
+                            emission_plan,
+                            block,
+                            indent,
+                            composedValuePlan(emission_plan, place_aliases, composition),
+                        );
+                    },
+                    .branch => return error.UnsupportedControlFlow,
+                }
+            },
+            .branch => |branch_plan| {
+                trace_stage = "branch_edges";
+                if (scopes.nativeIterationConsumesParameters(branch_plan.block)) {
+                    if (try iteration_protocol.matchAcyclicBranch(allocator, program, branch_plan)) |acyclic| {
+                        try emitAcyclicNativeIteration(
+                            output,
+                            allocator,
+                            program,
+                            emission_plan,
+                            scopes,
+                            region,
+                            node_index,
+                            acyclic,
+                            indent,
+                            place_aliases,
+                        );
+                        continue;
+                    }
+                }
+                const block = program.blocks[branch_plan.block.index()];
+                const branch = switch (block.terminator) {
+                    .branch => |value| value,
+                    else => return error.UnsupportedControlFlow,
+                };
+                const then_edge = try branch_statement.validatedStructuredEdgeAlloc(
+                    allocator,
+                    program,
+                    .{ .source = block.id, .kind = .branch_then, .target = branch.then_edge.target },
+                    branch.then_edge,
+                    branch_plan.then_edge_override,
+                    branch_plan.then_shared_reentry,
+                );
+                const else_edge = try branch_statement.validatedStructuredEdgeAlloc(
+                    allocator,
+                    program,
+                    .{ .source = block.id, .kind = .branch_else, .target = branch.else_edge.target },
+                    branch.else_edge,
+                    branch_plan.else_edge_override,
+                    branch_plan.else_shared_reentry,
+                );
+                trace_stage = "branch_block";
+                try emitBlockInstructionsWithDeclaration(output, allocator, program, emission_plan, scopes, block, indent, false, place_aliases, composition);
+
+                if (branch_plan.join) |join_id| {
+                    const join_is_region_stop = region.stop != null and join_id == region.stop.?;
+                    const join_is_terminal_projection = if (region.terminal_projection) |projection|
+                        projection.edge == null and projection.terminal == join_id and node_index + 1 == region.nodes.len
+                    else
+                        false;
+                    const join_is_continue_projection = if (region.continue_projection) |projection|
+                        projection.edge == null and projection.forwarding == null and
+                            projection.target == join_id and node_index + 1 == region.nodes.len
+                    else
+                        false;
+                    const join_is_escape_projection = if (region.escape_projection) |projection|
+                        projection.edge == null and projection.target == join_id and node_index + 1 == region.nodes.len
+                    else
+                        false;
+                    const join_is_forwarded_stop = region.stop_forwarding != null and
+                        join_id == region.stop_forwarding.? and node_index + 1 == region.nodes.len;
+                    if (!join_is_region_stop and !join_is_terminal_projection and !join_is_continue_projection and
+                        !join_is_escape_projection and !join_is_forwarded_stop)
+                    {
+                        if (node_index + 1 >= region.nodes.len or region.nodes[node_index + 1].blockId() != join_id) {
+                            return error.UnsupportedControlFlow;
+                        }
+                    }
+                } else if (node_index + 1 != region.nodes.len) {
+                    return error.UnsupportedControlFlow;
+                }
+
+                branch_emission: {
+                    trace_stage = "branch_emission";
+                    std.debug.print(
+                        "emit branch block={} join={?d} then_target={} else_target={} then_nodes={} else_nodes={}\n",
+                        .{
+                            branch_plan.block.index(),
+                            if (branch_plan.join) |join| join.index() else null,
+                            then_edge.target.index(),
+                            else_edge.target.index(),
+                            branch_plan.then_region.nodes.len,
+                            branch_plan.else_region.nodes.len,
+                        },
+                    );
+                    if (branch_plan.join != null and branch_plan.then_edge_override == null and
+                        branch_plan.else_edge_override == null and branch_plan.then_shared_reentry == null and
+                        branch_plan.else_shared_reentry == null and emission_plan.branchEdgesAreIdentical(block))
+                    {
+                        if (emission_plan.discardedBranchConditionNeedsLocal(program, block)) {
+                            try output.appendSlice(allocator, indent);
+                            try output.appendSlice(allocator, "local _ = ");
+                            try branch_expression.emitCondition(
+                                output,
+                                allocator,
+                                program,
+                                emission_plan,
+                                branch.condition,
+                                composition,
+                                false,
+                                place_aliases,
+                            );
+                            try output.append(allocator, '\n');
+                        }
+                        try emitBranchArm(
+                            output,
+                            allocator,
+                            program,
+                            emission_plan,
+                            scopes,
+                            then_edge,
+                            branch_plan.then_region,
+                            branch_plan.join,
+                            indent,
+                            place_aliases,
+                        );
+                        break :branch_emission;
+                    }
+                    if (branch_expression.match(program, emission_plan, scopes, branch, branch_plan)) |expression_plan| {
+                        if (composition.isDeferred(expression_plan.target)) break :branch_emission;
+                        try branch_expression.emitAssignment(output, allocator, program, emission_plan, scopes, expression_plan, composition, indent, place_aliases);
+                        break :branch_emission;
+                    }
+
+                    if (branch_plan.join == null and
+                        regionAlwaysFunctionTerminates(program, branch_plan.then_region) and
+                        regionAlwaysFunctionTerminates(program, branch_plan.else_region))
+                    {
+                        const terminal_indent = try allocDeeperIndent(allocator, indent);
+                        defer allocator.free(terminal_indent);
+                        try output.appendSlice(allocator, indent);
+                        try output.appendSlice(allocator, "if ");
+                        try branch_expression.emitCondition(output, allocator, program, emission_plan, branch.condition, composition, false, place_aliases);
+                        try output.appendSlice(allocator, " then\n");
+                        try emitBranchArm(output, allocator, program, emission_plan, scopes, then_edge, branch_plan.then_region, null, terminal_indent, place_aliases);
+                        try output.appendSlice(allocator, indent);
+                        try output.appendSlice(allocator, "end\n");
+                        try emitBranchArm(output, allocator, program, emission_plan, scopes, else_edge, branch_plan.else_region, null, indent, place_aliases);
+                        break :branch_emission;
+                    }
+
+                    const arm_indent = try allocDeeperIndent(allocator, indent);
+                    defer allocator.free(arm_indent);
+
+                    const then_is_empty = branchArmIsStructurallyEmpty(program, then_edge, branch_plan.then_region, branch_plan.join);
+                    const else_is_empty = branchArmIsStructurallyEmpty(program, else_edge, branch_plan.else_region, branch_plan.join);
+                    if (then_is_empty and else_is_empty) {
+                        // The condition was already evaluated by the branch block.
+                    } else if (then_is_empty) {
+                        try output.appendSlice(allocator, indent);
+                        try output.appendSlice(allocator, "if not ");
+                        try branch_expression.emitCondition(output, allocator, program, emission_plan, branch.condition, composition, true, place_aliases);
+                        try output.appendSlice(allocator, " then\n");
+                        try emitBranchArm(output, allocator, program, emission_plan, scopes, else_edge, branch_plan.else_region, branch_plan.join, arm_indent, place_aliases);
+                    } else {
+                        try output.appendSlice(allocator, indent);
+                        try output.appendSlice(allocator, "if ");
+                        try branch_expression.emitCondition(output, allocator, program, emission_plan, branch.condition, composition, false, place_aliases);
+                        try output.appendSlice(allocator, " then\n");
+                        if (!then_is_empty) {
+                            try emitBranchArm(output, allocator, program, emission_plan, scopes, then_edge, branch_plan.then_region, branch_plan.join, arm_indent, place_aliases);
+                        }
+                        if (!else_is_empty) {
+                            if (branch_statement.matchElseIf(program, emission_plan, scopes, else_edge, branch_plan.else_region, branch_plan.join)) |else_if| {
+                                try emitElseIfChain(output, allocator, program, emission_plan, scopes, else_if, branch_plan.join.?, indent, arm_indent, place_aliases);
+                            } else {
+                                try output.appendSlice(allocator, indent);
+                                try output.appendSlice(allocator, "else\n");
+                                try emitBranchArm(output, allocator, program, emission_plan, scopes, else_edge, branch_plan.else_region, branch_plan.join, arm_indent, place_aliases);
+                            }
+                        }
+                    }
+
+                    if (!then_is_empty or !else_is_empty) {
+                        try output.appendSlice(allocator, indent);
+                        try output.appendSlice(allocator, "end\n");
+                    }
+                }
+            },
+            .loop => |loop_plan| {
+                try emitLoop(output, allocator, program, emission_plan, scopes, region, node_index, loop_plan, indent, place_aliases);
+                if (region.stop != null or region.loop_exit != null) {
+                    try emitLoopEscapePropagation(output, allocator, program, emission_plan, node.*, indent, false);
+                }
+                if (loop_plan.exit_is_escape) {
+                    try emitEscapeFlagSet(output, allocator, program, emission_plan, loop_plan.exit_edge.target, indent);
+                }
+            },
+            .latch_loop => |loop_plan| {
+                try emitLatchLoop(output, allocator, program, emission_plan, scopes, region, node_index, loop_plan, indent, place_aliases);
+                if (region.stop != null or region.loop_exit != null) {
+                    try emitLoopEscapePropagation(output, allocator, program, emission_plan, node.*, indent, false);
+                }
+                if (loop_plan.exit_is_escape) {
+                    try emitEscapeFlagSet(output, allocator, program, emission_plan, loop_plan.exit, indent);
+                }
+            },
+            .infinite_loop => |loop_plan| {
+                try emitInfiniteLoop(output, allocator, program, emission_plan, scopes, region, node_index, loop_plan, indent, place_aliases);
+                if (region.stop != null or region.loop_exit != null) {
+                    try emitLoopEscapePropagation(output, allocator, program, emission_plan, node.*, indent, false);
+                }
+                if (loop_plan.exit_is_escape) {
+                    try emitEscapeFlagSet(output, allocator, program, emission_plan, loop_plan.exit.?, indent);
+                }
+            },
+            .loop_control => |control| try emitLoopControl(
+                output,
+                allocator,
+                program,
+                emission_plan,
+                scopes,
+                region,
+                node_index,
+                control,
+                indent,
+                place_aliases,
+            ),
+            .loop_boundary => |control| {
+                try emitLoopBoundaryControl(
+                    output,
+                    allocator,
+                    program,
+                    emission_plan,
+                    scopes,
+                    region,
+                    node_index,
+                    control,
+                    indent,
+                    place_aliases,
+                );
+            },
+            .loop_terminal => |control| try emitLoopTerminalControl(
+                output,
+                allocator,
+                program,
+                emission_plan,
+                scopes,
+                region,
+                node_index,
+                control,
+                indent,
+                place_aliases,
+            ),
+        }
+        if (projected_continue) |projection| {
+            if (node_index + 1 == region.nodes.len and node.* == .loop) {
+                try emitProjectedContinueAfterTransferredEdge(
+                    output,
+                    allocator,
+                    program,
+                    projection.target_edge,
+                    region.continue_projection.?.target,
+                    indent,
+                );
+            }
+        } else if (region.continue_projection) |projection| {
+            if (projection.edge == null and projection.forwarding == null and
+                node_index + 1 == region.nodes.len and
+                (node.* == .branch or node.* == .latch_loop or node.* == .infinite_loop))
+            {
+                if (region.continue_target != null and projection.target == region.continue_target.?) {
+                    try emitContinueStatement(output, allocator, indent);
+                } else {
+                    try emitEscapeFlagSet(output, allocator, program, emission_plan, projection.target, indent);
+                }
+            }
+        }
+    }
+    if (forwarded_stop_edge) |edge| {
+        const joined_forwarded_stop = if (region.nodes.len == 0)
+            false
+        else switch (region.nodes[region.nodes.len - 1]) {
+            .branch => |branch| branch.join != null and branch.join.? == region.stop_forwarding.?,
+            else => false,
+        };
+        if (region.nodes.len == 0 or joined_forwarded_stop) {
+            try emitEdgeParametersUnlessConsumed(
+                output,
+                allocator,
+                program,
+                emission_plan,
+                scopes,
+                program.blocks[edge.target.index()],
+                edge.arguments,
+                region_indent,
+                false,
+                place_aliases,
+            );
+        }
+    }
+    if (region.terminal_projection) |projection| {
+        if (projection.edge == null and region.nodes.len != 0) {
+            const joined = switch (region.nodes[region.nodes.len - 1]) {
+                .branch => |branch| branch.join != null and branch.join.? == projection.terminal,
+                else => false,
+            };
+            if (!joined) return error.UnsupportedControlFlow;
+            try emitProjectedTerminalBody(
+                output,
+                allocator,
+                program,
+                emission_plan,
+                scopes,
+                projection.terminal,
+                allocated_group_indent orelse region_indent,
+                place_aliases,
+                composedValuePlan(emission_plan, place_aliases, composition),
+            );
+        }
+    }
+    if (region.escape_projection) |projection| {
+        const needs_trailing_projection = projection.edge == null or region.nodes.len == 0 or
+            region.nodes[region.nodes.len - 1] != .block;
+        if (needs_trailing_projection) {
+            try emitEscapeFlagSet(output, allocator, program, emission_plan, projection.target, allocated_group_indent orelse region_indent);
+            if (region.loop_exit != null) {
+                try emitBreakStatement(output, allocator, allocated_group_indent orelse region_indent);
+            }
+        }
+    }
+    if (active_group != emission_scope.invalid_scope and wraps_groups) {
+        try closeContainerGroupWrapper(output, allocator, region_indent, active_group_wrapper.?);
+        active_group_wrapper = null;
+        allocator.free(allocated_group_indent.?);
+        allocated_group_indent = null;
+    }
+    if (!expression_composition.allRenderedExactlyOnce()) {
+        return error.UnsupportedControlFlow;
+    }
+}
+
 fn closeContainerGroupWrapper(
     output: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
@@ -349,6 +1313,214 @@ fn closeContainerGroupWrapper(
     }
     try output.appendSlice(allocator, region_indent);
     try output.appendSlice(allocator, "end\n");
+}
+
+fn emitElseIfChain(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    scopes: *const emission_scope.Plan,
+    structured: structure.Branch,
+    chain_join: ir.BlockId,
+    indent: []const u8,
+    arm_indent: []const u8,
+    place_aliases: []const PlaceAlias,
+) (EmitError || std.mem.Allocator.Error)!void {
+    const block = program.blocks[structured.block.index()];
+    const branch = switch (block.terminator) {
+        .branch => |value| value,
+        else => return error.UnsupportedControlFlow,
+    };
+    const then_edge = try branch_statement.validatedStructuredEdgeAlloc(
+        allocator,
+        program,
+        .{ .source = block.id, .kind = .branch_then, .target = branch.then_edge.target },
+        branch.then_edge,
+        structured.then_edge_override,
+        structured.then_shared_reentry,
+    );
+    const else_edge = try branch_statement.validatedStructuredEdgeAlloc(
+        allocator,
+        program,
+        .{ .source = block.id, .kind = .branch_else, .target = branch.else_edge.target },
+        branch.else_edge,
+        structured.else_edge_override,
+        structured.else_shared_reentry,
+    );
+
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "elseif ");
+    try branch_expression.emitCondition(output, allocator, program, emission_plan, branch.condition, null, false, place_aliases);
+    try output.appendSlice(allocator, " then\n");
+    try emitBranchArm(output, allocator, program, emission_plan, scopes, then_edge, structured.then_region, structured.join, arm_indent, place_aliases);
+
+    if (branchArmIsStructurallyEmpty(program, else_edge, structured.else_region, structured.join)) return;
+    if (branch_statement.matchElseIf(program, emission_plan, scopes, else_edge, structured.else_region, chain_join)) |next| {
+        return emitElseIfChain(output, allocator, program, emission_plan, scopes, next, chain_join, indent, arm_indent, place_aliases);
+    }
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "else\n");
+    try emitBranchArm(output, allocator, program, emission_plan, scopes, else_edge, structured.else_region, structured.join, arm_indent, place_aliases);
+}
+
+fn emitBranchArmImpl(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    scopes: *const emission_scope.Plan,
+    edge: ir.Edge,
+    region: *const structure.Region,
+    join: ?ir.BlockId,
+    indent: []const u8,
+    place_aliases: []const PlaceAlias,
+) (EmitError || std.mem.Allocator.Error)!void {
+    var trace_stage: []const u8 = "begin";
+    errdefer std.debug.print(
+        "emit branch arm failure stage={s} target={} join={?d} nodes={d} stop={?d} continue_target={?d} stop_forwarding={?d} terminal={} continue={} escape={} edge_args={d}\n",
+        .{
+            trace_stage,
+            edge.target.index(),
+            if (join) |block| block.index() else null,
+            region.nodes.len,
+            if (region.stop) |block| block.index() else null,
+            if (region.continue_target) |block| block.index() else null,
+            if (region.stop_forwarding) |block| block.index() else null,
+            region.terminal_projection != null,
+            region.continue_projection != null,
+            region.escape_projection != null,
+            edge.arguments.len,
+        },
+    );
+    trace_stage = "stop_forwarding";
+    if (region.stop_forwarding) |entry| {
+        if (region.nodes.len == 0 and (edge.target != entry or edge.arguments.len != 0)) return error.UnsupportedControlFlow;
+    }
+    trace_stage = "terminal_projection";
+    if (region.terminal_projection) |projection| {
+        if (projection.edge == null) {
+            if (region.nodes.len == 0) {
+                if (edge.target != projection.terminal) return error.UnsupportedControlFlow;
+                return emitProjectedTerminal(
+                    output,
+                    allocator,
+                    program,
+                    emission_plan,
+                    scopes,
+                    edge,
+                    projection.terminal,
+                    indent,
+                    place_aliases,
+                    valuePlan(emission_plan, place_aliases),
+                );
+            }
+            if (edge.target != region.nodes[0].blockId()) return error.UnsupportedControlFlow;
+        }
+    }
+    trace_stage = "continue_projection";
+    if (region.continue_projection) |projection| {
+        if (try validateEmptyProjectedContinue(program, region, edge)) |projected_edge| {
+            const nonlocal = region.continue_target == null or
+                region.continue_target.? != projection.target;
+            try emitProjectedContinue(
+                output,
+                allocator,
+                program,
+                emission_plan,
+                scopes,
+                projected_edge,
+                projection.target,
+                indent,
+                place_aliases,
+                nonlocal,
+            );
+            return;
+        }
+        if (projection.edge == null and projection.forwarding == null) {
+            if (region.nodes.len == 0) {
+                return emitProjectedContinue(
+                    output,
+                    allocator,
+                    program,
+                    emission_plan,
+                    scopes,
+                    edge,
+                    projection.target,
+                    indent,
+                    place_aliases,
+                    false,
+                );
+            }
+            const owns_target = switch (region.nodes[region.nodes.len - 1]) {
+                .branch => |branch| branch.join != null and branch.join.? == projection.target,
+                .latch_loop => |loop| loop.exit == projection.target,
+                .infinite_loop => |loop| loop.exit != null and loop.exit.? == projection.target,
+                else => false,
+            };
+            if (!owns_target or edge.target != region.nodes[0].blockId()) {
+                return error.UnsupportedControlFlow;
+            }
+        }
+        if (region.nodes.len == 0 or edge.target != region.nodes[0].blockId()) return error.UnsupportedControlFlow;
+    }
+    trace_stage = "escape_projection";
+    if (region.escape_projection) |projection| {
+        if (projection.edge == null and region.nodes.len == 0) {
+            if (edge.target != projection.target) return error.UnsupportedControlFlow;
+        } else if (region.nodes.len == 0 or edge.target != region.nodes[0].blockId()) {
+            return error.UnsupportedControlFlow;
+        }
+    }
+    trace_stage = "edge_parameters";
+    const enters_join = join != null and edge.target == join.?;
+    const enters_region_stop = region.stop != null and edge.target == region.stop.?;
+    try emitEdgeParametersUnlessConsumed(output, allocator, program, emission_plan, scopes, program.blocks[edge.target.index()], edge.arguments, indent, !enters_join and !enters_region_stop, place_aliases);
+    trace_stage = "region";
+    try emitRegion(output, allocator, program, emission_plan, scopes, region, indent, place_aliases);
+}
+
+fn emitBranchArm(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    scopes: *const emission_scope.Plan,
+    edge: ir.Edge,
+    region: *const structure.Region,
+    join: ?ir.BlockId,
+    indent: []const u8,
+    place_aliases: []const PlaceAlias,
+) (EmitError || std.mem.Allocator.Error)!void {
+    emitBranchArmImpl(
+        output,
+        allocator,
+        program,
+        emission_plan,
+        scopes,
+        edge,
+        region,
+        join,
+        indent,
+        place_aliases,
+    ) catch |err| {
+        std.debug.print(
+            "emit branch arm error={s} target={} join={?d} region_first={?d} region_nodes={d} stop={?d} continue_target={?d} projection_target={?d} projection_edge={} projection_forwarding={}\n",
+            .{
+                @errorName(err),
+                edge.target.index(),
+                if (join) |block| block.index() else null,
+                if (region.nodes.len == 0) null else region.nodes[0].blockId().index(),
+                region.nodes.len,
+                if (region.stop) |block| block.index() else null,
+                if (region.continue_target) |block| block.index() else null,
+                if (region.continue_projection) |projection| projection.target.index() else null,
+                if (region.continue_projection) |projection| projection.edge != null else false,
+                if (region.continue_projection) |projection| projection.forwarding != null else false,
+            },
+        );
+        return err;
+    };
 }
 
 fn validatedStopForwardingEdge(program: *const ir.Program, region: *const structure.Region) EmitError!?ir.Edge {
@@ -477,6 +1649,82 @@ fn nodeAlwaysFunctionTerminates(program: *const ir.Program, node: structure.Node
     };
 }
 
+fn emitProjectedTerminal(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    scopes: *const emission_scope.Plan,
+    edge: ir.Edge,
+    terminal_id: ir.BlockId,
+    indent: []const u8,
+    place_aliases: []const PlaceAlias,
+    values: render.ValuePlan,
+) (EmitError || std.mem.Allocator.Error)!void {
+    if (edge.target != terminal_id or terminal_id.index() >= program.blocks.len) return error.UnsupportedControlFlow;
+    const terminal = program.blocks[terminal_id.index()];
+    if (edge.arguments.len != terminal.parameters.len) return error.UnsupportedControlFlow;
+    switch (terminal.terminator) {
+        .return_values, .return_pack, .return_expanded, .throw_error => {},
+        else => return error.UnsupportedControlFlow,
+    }
+    try emitEdgeParametersUnlessConsumed(
+        output,
+        allocator,
+        program,
+        emission_plan,
+        scopes,
+        terminal,
+        edge.arguments,
+        indent,
+        false,
+        place_aliases,
+    );
+    return emitProjectedTerminalBody(
+        output,
+        allocator,
+        program,
+        emission_plan,
+        scopes,
+        terminal_id,
+        indent,
+        place_aliases,
+        values,
+    );
+}
+
+fn emitProjectedTerminalBody(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    scopes: *const emission_scope.Plan,
+    terminal_id: ir.BlockId,
+    indent: []const u8,
+    place_aliases: []const PlaceAlias,
+    values: render.ValuePlan,
+) (EmitError || std.mem.Allocator.Error)!void {
+    if (terminal_id.index() >= program.blocks.len) return error.UnsupportedControlFlow;
+    const terminal = program.blocks[terminal_id.index()];
+    switch (terminal.terminator) {
+        .return_values, .return_pack, .return_expanded, .throw_error => {},
+        else => return error.UnsupportedControlFlow,
+    }
+    try emitBlockInstructionsWithDeclaration(
+        output,
+        allocator,
+        program,
+        emission_plan,
+        scopes,
+        terminal,
+        indent,
+        false,
+        place_aliases,
+        null,
+    );
+    try call_emission.terminator(output, allocator, program, emission_plan, terminal, indent, values);
+}
+
 fn sameEdge(left: ir.Edge, right: ir.Edge) bool {
     return left.target == right.target and std.mem.eql(ir.ValueId, left.arguments, right.arguments);
 }
@@ -488,6 +1736,466 @@ fn branchArmIsStructurallyEmpty(
     join: ?ir.BlockId,
 ) bool {
     return branch_statement.armIsStructurallyEmpty(program, edge, region, join);
+}
+
+fn emitLoop(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    scopes: *const emission_scope.Plan,
+    enclosing_region: *const structure.Region,
+    node_index: usize,
+    loop_plan: structure.Loop,
+    indent: []const u8,
+    place_aliases: []const PlaceAlias,
+) (EmitError || std.mem.Allocator.Error)!void {
+    if (loop_plan.body_region.stop == null or loop_plan.body_region.stop.? != loop_plan.header or
+        loop_plan.body_region.continue_target == null or loop_plan.body_region.continue_target.? != loop_plan.header)
+    {
+        return error.UnsupportedControlFlow;
+    }
+    if (scopes.nativeIterationConsumesParameters(loop_plan.header)) {
+        if (try iteration_protocol.matchLoop(allocator, program, loop_plan)) |protocol| switch (protocol) {
+            .numeric => |numeric| return emitNumericForLoop(
+                output,
+                allocator,
+                program,
+                emission_plan,
+                scopes,
+                enclosing_region,
+                node_index,
+                loop_plan.body_region,
+                loop_plan.exit_edge,
+                numeric,
+                false,
+                indent,
+                place_aliases,
+            ),
+            .generic => |generic| return emitGenericForLoop(
+                output,
+                allocator,
+                program,
+                emission_plan,
+                scopes,
+                enclosing_region,
+                node_index,
+                loop_plan.body_region,
+                loop_plan.exit_edge,
+                generic,
+                false,
+                indent,
+                place_aliases,
+            ),
+        };
+    }
+
+    const header = program.blocks[loop_plan.header.index()];
+    const branch = switch (header.terminator) {
+        .branch => |value| value,
+        else => return error.UnsupportedControlFlow,
+    };
+    const expected_body = if (loop_plan.continue_on_true) branch.then_edge else branch.else_edge;
+    const expected_exit = if (loop_plan.continue_on_true) branch.else_edge else branch.then_edge;
+    if (expected_body.target != loop_plan.body_edge.target or expected_exit.target != loop_plan.exit_edge.target) {
+        return error.UnsupportedControlFlow;
+    }
+
+    try prepareLoopExit(output, allocator, program, emission_plan, enclosing_region, node_index, loop_plan.exit_edge.target, indent);
+    const loop_indent = try allocDeeperIndent(allocator, indent);
+    defer allocator.free(loop_indent);
+    const arm_indent = try allocDeeperIndent(allocator, loop_indent);
+    defer allocator.free(arm_indent);
+
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "while true do\n");
+    const predeclared_header = if (structured_escape.regionHasNestedEscapeTo(loop_plan.body_region, loop_plan.header))
+        loop_plan.header
+    else
+        null;
+    if (predeclared_header) |header_flag| {
+        try emitEscapeFlagDeclaration(output, allocator, program, emission_plan, header_flag, loop_indent);
+    }
+    try emitBlockInstructionsWithDeclaration(output, allocator, program, emission_plan, scopes, header, loop_indent, false, place_aliases, null);
+    try output.appendSlice(allocator, loop_indent);
+    try output.appendSlice(allocator, "if ");
+    try render.valueUseScalar(output, allocator, program, valuePlan(emission_plan, place_aliases), branch.condition);
+    try output.appendSlice(allocator, " then\n");
+    if (loop_plan.continue_on_true) {
+        try emitLoopBody(output, allocator, program, emission_plan, scopes, loop_plan, arm_indent, place_aliases, predeclared_header);
+    } else {
+        try emitLoopExit(output, allocator, program, emission_plan, loop_plan.exit_edge, arm_indent, place_aliases);
+    }
+
+    try output.appendSlice(allocator, loop_indent);
+    try output.appendSlice(allocator, "else\n");
+    if (loop_plan.continue_on_true) {
+        try emitLoopExit(output, allocator, program, emission_plan, loop_plan.exit_edge, arm_indent, place_aliases);
+    } else {
+        try emitLoopBody(output, allocator, program, emission_plan, scopes, loop_plan, arm_indent, place_aliases, predeclared_header);
+    }
+    try emitLoopEscapePropagation(
+        output,
+        allocator,
+        program,
+        emission_plan,
+        .{ .loop = loop_plan },
+        loop_indent,
+        true,
+    );
+    try output.appendSlice(allocator, loop_indent);
+    try output.appendSlice(allocator, "end\n");
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "end\n");
+}
+
+fn emitAcyclicNativeIteration(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    scopes: *const emission_scope.Plan,
+    enclosing_region: *const structure.Region,
+    node_index: usize,
+    acyclic: iteration_protocol.Acyclic,
+    indent: []const u8,
+    place_aliases: []const PlaceAlias,
+) (EmitError || std.mem.Allocator.Error)!void {
+    return switch (acyclic.protocol) {
+        .numeric => |numeric| emitNumericForLoop(
+            output,
+            allocator,
+            program,
+            emission_plan,
+            scopes,
+            enclosing_region,
+            node_index,
+            acyclic.body_region,
+            acyclic.exit_edge,
+            numeric,
+            true,
+            indent,
+            place_aliases,
+        ),
+        .generic => |generic| emitGenericForLoop(
+            output,
+            allocator,
+            program,
+            emission_plan,
+            scopes,
+            enclosing_region,
+            node_index,
+            acyclic.body_region,
+            acyclic.exit_edge,
+            generic,
+            true,
+            indent,
+            place_aliases,
+        ),
+    };
+}
+
+fn emitNumericForLoop(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    scopes: *const emission_scope.Plan,
+    enclosing_region: *const structure.Region,
+    node_index: usize,
+    body_region: *const structure.Region,
+    exit_edge: ir.Edge,
+    numeric: iteration_protocol.NumericLoop,
+    break_after_body: bool,
+    indent: []const u8,
+    place_aliases: []const PlaceAlias,
+) (EmitError || std.mem.Allocator.Error)!void {
+    if (numeric.operation.mode == .semantic_normalized) {
+        return emitSemanticNormalizedNumericLoop(
+            output,
+            allocator,
+            program,
+            emission_plan,
+            scopes,
+            enclosing_region,
+            node_index,
+            body_region,
+            exit_edge,
+            numeric,
+            break_after_body,
+            indent,
+            place_aliases,
+        );
+    }
+    try prepareLoopExit(output, allocator, program, emission_plan, enclosing_region, node_index, exit_edge.target, indent);
+    const results = numeric.transition.results;
+    if (results.len != 4) return error.UnsupportedControlFlow;
+
+    if (break_after_body) {
+        try emitEdgeParametersUnlessConsumed(
+            output,
+            allocator,
+            program,
+            emission_plan,
+            scopes,
+            program.blocks[exit_edge.target.index()],
+            exit_edge.arguments,
+            indent,
+            false,
+            place_aliases,
+        );
+    }
+
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "for ");
+    try render.valueName(output, allocator, &emission_plan.names, numeric.body_parameter);
+    try output.appendSlice(allocator, " = ");
+    try render.valueUseScalar(output, allocator, program, valuePlan(emission_plan, place_aliases), numeric.initial_arguments[0]);
+    try output.appendSlice(allocator, ", ");
+    try render.valueUseScalar(output, allocator, program, valuePlan(emission_plan, place_aliases), numeric.initial_arguments[1]);
+    try output.appendSlice(allocator, ", ");
+    try render.valueUseScalar(output, allocator, program, valuePlan(emission_plan, place_aliases), numeric.initial_arguments[2]);
+    try output.appendSlice(allocator, " do\n");
+
+    const loop_indent = try allocDeeperIndent(allocator, indent);
+    defer allocator.free(loop_indent);
+    try emitRegion(output, allocator, program, emission_plan, scopes, body_region, loop_indent, place_aliases);
+    if (break_after_body) {
+        try emitBreakStatement(output, allocator, loop_indent);
+    }
+
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "end\n");
+    if (!break_after_body) {
+        try emitEdgeParametersUnlessConsumed(
+            output,
+            allocator,
+            program,
+            emission_plan,
+            scopes,
+            program.blocks[exit_edge.target.index()],
+            exit_edge.arguments,
+            indent,
+            false,
+            place_aliases,
+        );
+    }
+}
+
+fn emitSemanticNormalizedNumericLoop(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    scopes: *const emission_scope.Plan,
+    enclosing_region: *const structure.Region,
+    node_index: usize,
+    body_region: *const structure.Region,
+    exit_edge: ir.Edge,
+    numeric: iteration_protocol.NumericLoop,
+    break_after_body: bool,
+    indent: []const u8,
+    place_aliases: []const PlaceAlias,
+) (EmitError || std.mem.Allocator.Error)!void {
+    const results = numeric.transition.results;
+    if (results.len != 4 or numeric.initial_arguments.len != 4) return error.UnsupportedControlFlow;
+    try prepareLoopExit(output, allocator, program, emission_plan, enclosing_region, node_index, exit_edge.target, indent);
+
+    if (break_after_body) {
+        try emitEdgeParametersUnlessConsumed(
+            output,
+            allocator,
+            program,
+            emission_plan,
+            scopes,
+            program.blocks[exit_edge.target.index()],
+            exit_edge.arguments,
+            indent,
+            false,
+            place_aliases,
+        );
+    }
+
+    const state = [_]ir.ValueId{ numeric.operation.control, numeric.operation.limit, numeric.operation.step };
+    for (state, numeric.initial_arguments[0..3]) |parameter, initial| {
+        try output.appendSlice(allocator, indent);
+        if (!emission_plan.names.valueUsesStorage(parameter)) try output.appendSlice(allocator, "local ");
+        try render.valueName(output, allocator, &emission_plan.names, parameter);
+        try output.appendSlice(allocator, " = ");
+        try render.valueUseScalar(output, allocator, program, valuePlan(emission_plan, place_aliases), initial);
+        try output.appendSlice(allocator, "\n");
+    }
+
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "while true do\n");
+    const loop_indent = try allocDeeperIndent(allocator, indent);
+    defer allocator.free(loop_indent);
+    const branch_indent = try allocDeeperIndent(allocator, loop_indent);
+    defer allocator.free(branch_indent);
+
+    try output.appendSlice(allocator, loop_indent);
+    try render.valueName(output, allocator, &emission_plan.names, numeric.operation.control);
+    try output.appendSlice(allocator, " = ");
+    try render.valueName(output, allocator, &emission_plan.names, numeric.operation.control);
+    try output.appendSlice(allocator, " + ");
+    try render.valueName(output, allocator, &emission_plan.names, numeric.operation.step);
+    try output.appendSlice(allocator, "\n");
+
+    try output.appendSlice(allocator, loop_indent);
+    if (!emission_plan.names.valueUsesStorage(results[0])) try output.appendSlice(allocator, "local ");
+    try render.valueName(output, allocator, &emission_plan.names, results[0]);
+    try output.appendSlice(allocator, "\n");
+    try output.appendSlice(allocator, loop_indent);
+    try output.appendSlice(allocator, "if ");
+    try render.valueName(output, allocator, &emission_plan.names, numeric.operation.step);
+    try output.appendSlice(allocator, " <= 0 then\n");
+    try output.appendSlice(allocator, branch_indent);
+    try render.valueName(output, allocator, &emission_plan.names, results[0]);
+    try output.appendSlice(allocator, " = ");
+    try render.valueName(output, allocator, &emission_plan.names, numeric.operation.control);
+    try output.appendSlice(allocator, " >= ");
+    try render.valueName(output, allocator, &emission_plan.names, numeric.operation.limit);
+    try output.appendSlice(allocator, "\n");
+    try output.appendSlice(allocator, loop_indent);
+    try output.appendSlice(allocator, "else\n");
+    try output.appendSlice(allocator, branch_indent);
+    try render.valueName(output, allocator, &emission_plan.names, results[0]);
+    try output.appendSlice(allocator, " = ");
+    try render.valueName(output, allocator, &emission_plan.names, numeric.operation.control);
+    try output.appendSlice(allocator, " <= ");
+    try render.valueName(output, allocator, &emission_plan.names, numeric.operation.limit);
+    try output.appendSlice(allocator, "\n");
+    try output.appendSlice(allocator, loop_indent);
+    try output.appendSlice(allocator, "end\n");
+
+    try output.appendSlice(allocator, loop_indent);
+    try output.appendSlice(allocator, "if not ");
+    try render.valueName(output, allocator, &emission_plan.names, results[0]);
+    try output.appendSlice(allocator, " then\n");
+    try emitBreakStatement(output, allocator, branch_indent);
+    try output.appendSlice(allocator, loop_indent);
+    try output.appendSlice(allocator, "end\n");
+
+    try output.appendSlice(allocator, loop_indent);
+    if (!emission_plan.names.valueUsesStorage(numeric.body_parameter)) try output.appendSlice(allocator, "local ");
+    try render.valueName(output, allocator, &emission_plan.names, numeric.body_parameter);
+    try output.appendSlice(allocator, " = ");
+    try render.valueName(output, allocator, &emission_plan.names, numeric.operation.control);
+    try output.appendSlice(allocator, "\n");
+    try emitRegion(output, allocator, program, emission_plan, scopes, body_region, loop_indent, place_aliases);
+    if (break_after_body) {
+        try emitBreakStatement(output, allocator, loop_indent);
+    }
+
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "end\n");
+    if (!break_after_body) {
+        try emitEdgeParametersUnlessConsumed(
+            output,
+            allocator,
+            program,
+            emission_plan,
+            scopes,
+            program.blocks[exit_edge.target.index()],
+            exit_edge.arguments,
+            indent,
+            false,
+            place_aliases,
+        );
+    }
+}
+
+fn emitGenericForLoop(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    scopes: *const emission_scope.Plan,
+    enclosing_region: *const structure.Region,
+    node_index: usize,
+    body_region: *const structure.Region,
+    exit_edge: ir.Edge,
+    generic: iteration_protocol.GenericLoop,
+    break_after_body: bool,
+    indent: []const u8,
+    place_aliases: []const PlaceAlias,
+) (EmitError || std.mem.Allocator.Error)!void {
+    try prepareLoopExit(output, allocator, program, emission_plan, enclosing_region, node_index, exit_edge.target, indent);
+    const results = generic.transition.results;
+    if (results.len < 4 or results.len != @as(usize, generic.operation.variable_count) + 3) return error.UnsupportedControlFlow;
+
+    if (break_after_body) {
+        try emitEdgeParametersUnlessConsumed(
+            output,
+            allocator,
+            program,
+            emission_plan,
+            scopes,
+            program.blocks[exit_edge.target.index()],
+            exit_edge.arguments,
+            indent,
+            false,
+            place_aliases,
+        );
+    }
+
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "for ");
+    for (generic.body_parameters, 0..) |parameter, index| {
+        if (index != 0) try output.appendSlice(allocator, ", ");
+        try render.valueName(output, allocator, &emission_plan.names, parameter);
+    }
+    try output.appendSlice(allocator, " in ");
+    const initializer_count = genericInitializerCount(program, emission_plan, generic.initial_arguments[0..3]);
+    const initializer_fusion = if (initializer_count == 3)
+        scopes.genericInitializerFusion(generic.initial_arguments[0..3])
+    else
+        null;
+    if (initializer_fusion) |fusion| {
+        if (fusion.producer.index() >= program.instructions.len) return error.UnsupportedOperation;
+        try render.plannedInvocation(
+            output,
+            allocator,
+            program,
+            valuePlan(emission_plan, place_aliases),
+            &emission_plan.packs,
+            program.instructions[fusion.producer.index()],
+        );
+    } else {
+        for (generic.initial_arguments[0..initializer_count], 0..) |argument, index| {
+            if (index != 0) try output.appendSlice(allocator, ", ");
+            if (index + 1 == initializer_count) {
+                try render.valueUseRoot(output, allocator, program, valuePlan(emission_plan, place_aliases), argument);
+            } else {
+                try render.valueUseScalar(output, allocator, program, valuePlan(emission_plan, place_aliases), argument);
+            }
+        }
+    }
+    try output.appendSlice(allocator, " do\n");
+
+    const loop_indent = try allocDeeperIndent(allocator, indent);
+    defer allocator.free(loop_indent);
+    try emitRegion(output, allocator, program, emission_plan, scopes, body_region, loop_indent, place_aliases);
+    if (break_after_body) {
+        try emitBreakStatement(output, allocator, loop_indent);
+    }
+
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "end\n");
+    if (!break_after_body) {
+        try emitEdgeParametersUnlessConsumed(
+            output,
+            allocator,
+            program,
+            emission_plan,
+            scopes,
+            program.blocks[exit_edge.target.index()],
+            exit_edge.arguments,
+            indent,
+            false,
+            place_aliases,
+        );
+    }
 }
 
 fn genericInitializerCount(program: *const ir.Program, emission_plan: *const EmissionPlan, arguments: []const ir.ValueId) usize {
@@ -539,6 +2247,210 @@ fn prepareLoopExit(
     if (exit_is_projected_continue) return;
     if (node_index + 1 >= enclosing_region.nodes.len or enclosing_region.nodes[node_index + 1].blockId() != exit) {
         return error.UnsupportedControlFlow;
+    }
+}
+
+fn emitLoopBody(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    scopes: *const emission_scope.Plan,
+    loop_plan: structure.Loop,
+    indent: []const u8,
+    place_aliases: []const PlaceAlias,
+    predeclared_header: ?ir.BlockId,
+) (EmitError || std.mem.Allocator.Error)!void {
+    const enters_header = loop_plan.body_edge.target == loop_plan.header;
+    try emitEdgeParametersUnlessConsumed(
+        output,
+        allocator,
+        program,
+        emission_plan,
+        scopes,
+        program.blocks[loop_plan.body_edge.target.index()],
+        loop_plan.body_edge.arguments,
+        indent,
+        !enters_header,
+        place_aliases,
+    );
+    try emitRegionWithPredeclaredBlock(
+        output,
+        allocator,
+        program,
+        emission_plan,
+        scopes,
+        loop_plan.body_region,
+        indent,
+        place_aliases,
+        predeclared_header,
+    );
+}
+
+fn emitLatchLoop(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    scopes: *const emission_scope.Plan,
+    enclosing_region: *const structure.Region,
+    node_index: usize,
+    loop_plan: structure.LatchLoop,
+    indent: []const u8,
+    place_aliases: []const PlaceAlias,
+) (EmitError || std.mem.Allocator.Error)!void {
+    if (loop_plan.body_region.nodes.len == 0 or loop_plan.body_region.nodes[0].blockId() != loop_plan.header or
+        loop_plan.body_region.stop == null or loop_plan.body_region.stop.? != loop_plan.header or
+        loop_plan.body_region.continue_target == null or loop_plan.body_region.continue_target.? != loop_plan.header or
+        loop_plan.body_region.loop_exit == null or loop_plan.body_region.loop_exit.? != loop_plan.exit)
+    {
+        return error.UnsupportedControlFlow;
+    }
+    if (loop_plan.shared_reentries) |shared| {
+        try branch_statement.validateSharedPathsAlloc(allocator, program, shared);
+    }
+    if (loop_plan.shared_exits) |shared| {
+        try loop_exit_shape.validateAllAlloc(allocator, program, shared);
+    }
+
+    const exit_is_region_stop = enclosing_region.stop != null and loop_plan.exit == enclosing_region.stop.?;
+    const exit_is_enclosing_loop_exit = enclosing_region.loop_exit != null and loop_plan.exit == enclosing_region.loop_exit.?;
+    if (!exit_is_region_stop and !exit_is_enclosing_loop_exit and !loop_plan.exit_is_escape) {
+        if (node_index + 1 >= enclosing_region.nodes.len or enclosing_region.nodes[node_index + 1].blockId() != loop_plan.exit) {
+            return error.UnsupportedControlFlow;
+        }
+    }
+    const loop_indent = try allocDeeperIndent(allocator, indent);
+    defer allocator.free(loop_indent);
+    const predeclared_header = if (structured_escape.regionHasNestedEscapeTo(loop_plan.body_region, loop_plan.header))
+        loop_plan.header
+    else
+        null;
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "while true do\n");
+    if (predeclared_header) |header| {
+        try emitEscapeFlagDeclaration(output, allocator, program, emission_plan, header, loop_indent);
+    }
+    try emitRegionWithPredeclaredBlock(
+        output,
+        allocator,
+        program,
+        emission_plan,
+        scopes,
+        loop_plan.body_region,
+        loop_indent,
+        place_aliases,
+        predeclared_header,
+    );
+    try emitLoopEscapePropagation(
+        output,
+        allocator,
+        program,
+        emission_plan,
+        .{ .latch_loop = loop_plan },
+        loop_indent,
+        true,
+    );
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "end\n");
+}
+
+fn emitInfiniteLoop(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    scopes: *const emission_scope.Plan,
+    enclosing_region: *const structure.Region,
+    node_index: usize,
+    loop_plan: structure.InfiniteLoop,
+    indent: []const u8,
+    place_aliases: []const PlaceAlias,
+) (EmitError || std.mem.Allocator.Error)!void {
+    const body_projects_continue = loop_plan.body_region.continue_projection != null and
+        loop_plan.body_region.continue_projection.?.target == loop_plan.header;
+    const body_stop = loop_plan.body_region.stop orelse return error.UnsupportedControlFlow;
+    if (body_stop != loop_plan.header and !body_projects_continue) {
+        const forwarding = try transparent_stop.validateEdge(program, body_stop, loop_plan.header);
+        if (forwarding.arguments.len != 0) return error.UnsupportedControlFlow;
+    }
+    if (loop_plan.body_region.nodes.len == 0 or loop_plan.body_region.nodes[0].blockId() != loop_plan.header or
+        loop_plan.body_region.continue_target == null or loop_plan.body_region.continue_target.? != loop_plan.header)
+    {
+        return error.UnsupportedControlFlow;
+    }
+    if (loop_plan.exit) |exit| {
+        if (loop_plan.body_region.loop_exit == null or loop_plan.body_region.loop_exit.? != exit) return error.UnsupportedControlFlow;
+        try prepareLoopExit(output, allocator, program, emission_plan, enclosing_region, node_index, exit, indent);
+    } else {
+        if (loop_plan.shared_side_exit != null) return error.UnsupportedControlFlow;
+        if (node_index + 1 != enclosing_region.nodes.len or loop_plan.body_region.loop_exit != null) return error.UnsupportedControlFlow;
+    }
+    if (loop_plan.shared_side_exit) |side_exit| {
+        const exit = loop_plan.exit orelse return error.UnsupportedControlFlow;
+        if (side_exit.entries.len == 0) return error.UnsupportedControlFlow;
+        for (side_exit.entries) |entry| {
+            if (entry.entry.index() >= program.blocks.len or
+                entry.region.stop == null or entry.region.stop.? != exit or
+                entry.region.nodes.len == 0 or entry.region.nodes[0].blockId() != entry.entry)
+            {
+                return error.UnsupportedControlFlow;
+            }
+            const side_flag = try escapeFlagNameAlloc(allocator, program, emission_plan, entry.entry);
+            defer allocator.free(side_flag);
+            try output.appendSlice(allocator, indent);
+            try output.appendSlice(allocator, "local ");
+            try output.appendSlice(allocator, side_flag);
+            try output.appendSlice(allocator, " = false\n");
+        }
+    }
+    const loop_indent = try allocDeeperIndent(allocator, indent);
+    defer allocator.free(loop_indent);
+    const predeclared_header = if (structured_escape.regionHasNestedEscapeTo(loop_plan.body_region, loop_plan.header))
+        loop_plan.header
+    else
+        null;
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "while true do\n");
+    if (predeclared_header) |header| {
+        try emitEscapeFlagDeclaration(output, allocator, program, emission_plan, header, loop_indent);
+    }
+    try emitRegionWithPredeclaredBlock(
+        output,
+        allocator,
+        program,
+        emission_plan,
+        scopes,
+        loop_plan.body_region,
+        loop_indent,
+        place_aliases,
+        predeclared_header,
+    );
+    try emitLoopEscapePropagation(
+        output,
+        allocator,
+        program,
+        emission_plan,
+        .{ .infinite_loop = loop_plan },
+        loop_indent,
+        true,
+    );
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "end\n");
+    if (loop_plan.shared_side_exit) |side_exit| {
+        for (side_exit.entries) |entry| {
+            const side_flag = try escapeFlagNameAlloc(allocator, program, emission_plan, entry.entry);
+            defer allocator.free(side_flag);
+            const side_indent = try allocDeeperIndent(allocator, indent);
+            defer allocator.free(side_indent);
+            try output.appendSlice(allocator, indent);
+            try output.appendSlice(allocator, "if ");
+            try output.appendSlice(allocator, side_flag);
+            try output.appendSlice(allocator, " then\n");
+            try emitRegion(output, allocator, program, emission_plan, scopes, entry.region, side_indent, place_aliases);
+            try output.appendSlice(allocator, indent);
+            try output.appendSlice(allocator, "end\n");
+        }
     }
 }
 
@@ -730,6 +2642,65 @@ fn loopNodeBodyHasNestedHeaderEscape(node: structure.Node, header: ir.BlockId) b
     };
 }
 
+fn emitLoopControl(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    scopes: *const emission_scope.Plan,
+    region: *const structure.Region,
+    node_index: usize,
+    control: structure.LoopControl,
+    indent: []const u8,
+    place_aliases: []const PlaceAlias,
+) !void {
+    if (node_index + 1 != region.nodes.len or region.stop == null or region.loop_exit == null) return error.UnsupportedControlFlow;
+    const block = program.blocks[control.block.index()];
+    const branch = switch (block.terminator) {
+        .branch => |value| value,
+        else => return error.UnsupportedControlFlow,
+    };
+    const expected_continue = if (control.continue_on_true) branch.then_edge else branch.else_edge;
+    const expected_exit = if (control.continue_on_true) branch.else_edge else branch.then_edge;
+    if (expected_continue.target != region.stop.? or expected_exit.target != region.loop_exit.?) return error.UnsupportedControlFlow;
+    try emitBlockInstructions(output, allocator, program, emission_plan, scopes, block, indent, place_aliases);
+
+    const arm_indent = try allocDeeperIndent(allocator, indent);
+    defer allocator.free(arm_indent);
+    if (edgeTransferIsStructurallyEmpty(program, scopes, control.continue_edge)) {
+        try output.appendSlice(allocator, indent);
+        try output.appendSlice(allocator, if (control.continue_on_true) "if not " else "if ");
+        if (control.continue_on_true) {
+            try render.valueUseGroupedScalar(output, allocator, program, valuePlan(emission_plan, place_aliases), branch.condition);
+        } else {
+            try render.valueUseScalar(output, allocator, program, valuePlan(emission_plan, place_aliases), branch.condition);
+        }
+        try output.appendSlice(allocator, " then\n");
+        try emitLoopExit(output, allocator, program, emission_plan, control.exit_edge, arm_indent, place_aliases);
+        try output.appendSlice(allocator, indent);
+        try output.appendSlice(allocator, "end\n");
+        return;
+    }
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "if ");
+    try render.valueUseScalar(output, allocator, program, valuePlan(emission_plan, place_aliases), branch.condition);
+    try output.appendSlice(allocator, " then\n");
+    if (control.continue_on_true) {
+        try emitLoopContinue(output, allocator, program, emission_plan, scopes, control.continue_edge, arm_indent, place_aliases);
+    } else {
+        try emitLoopExit(output, allocator, program, emission_plan, control.exit_edge, arm_indent, place_aliases);
+    }
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "else\n");
+    if (control.continue_on_true) {
+        try emitLoopExit(output, allocator, program, emission_plan, control.exit_edge, arm_indent, place_aliases);
+    } else {
+        try emitLoopContinue(output, allocator, program, emission_plan, scopes, control.continue_edge, arm_indent, place_aliases);
+    }
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "end\n");
+}
+
 fn emitLoopContinue(
     output: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
@@ -815,6 +2786,125 @@ fn edgeTransferIsStructurallyEmpty(program: *const ir.Program, scopes: *const em
         (edge.arguments.len == 0 and program.blocks[edge.target.index()].parameters.len == 0);
 }
 
+fn emitLoopBoundaryControl(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    scopes: *const emission_scope.Plan,
+    region: *const structure.Region,
+    node_index: usize,
+    control: structure.LoopBoundaryControl,
+    indent: []const u8,
+    place_aliases: []const PlaceAlias,
+) !void {
+    if (node_index + 1 != region.nodes.len or region.stop == null) {
+        return error.UnsupportedControlFlow;
+    }
+    const body_exit = try transparent_stop.validateLoopBoundaryBody(
+        program,
+        region.stop,
+        region.loop_exit,
+        region.continue_target,
+        control.body_region.stop,
+        control.body_region.loop_exit,
+        control.body_region.continue_target,
+    );
+    const block = program.blocks[control.block.index()];
+    const branch = switch (block.terminator) {
+        .branch => |value| value,
+        else => return error.UnsupportedControlFlow,
+    };
+    const expected_body = if (control.body_on_true) branch.then_edge else branch.else_edge;
+    const expected_boundary = if (control.body_on_true) branch.else_edge else branch.then_edge;
+    if (expected_body.target != control.body_edge.target) return error.UnsupportedControlFlow;
+    switch (control.boundary) {
+        .exit => |edge| if (region.loop_exit == null or edge.target != expected_boundary.target or edge.target != region.loop_exit.?) return error.UnsupportedControlFlow,
+        .escape => |edge| if (edge.target != expected_boundary.target) return error.UnsupportedControlFlow,
+        .terminal => |terminal| if (terminal.edge.target != expected_boundary.target or terminal.edge.target != terminal.block) return error.UnsupportedControlFlow,
+        .side_exit => |side_exit| if (region.loop_exit == null or side_exit.entry_edge.target != expected_boundary.target or
+            side_exit.region.stop == null or side_exit.region.stop.? != region.loop_exit.?) return error.UnsupportedControlFlow,
+        .side_escape => |side_escape| if (side_escape.entry_edge.target != expected_boundary.target or
+            side_escape.region.stop == null or side_escape.region.stop.? != side_escape.target) return error.UnsupportedControlFlow,
+        .shared_exit => |shared_exit| {
+            if (region.loop_exit == null) return error.UnsupportedControlFlow;
+            const entry = shared_exit.value() orelse return error.UnsupportedControlFlow;
+            const expected_reference: ir.CfgEdgeRef = .{
+                .source = control.block,
+                .kind = if (control.body_on_true) .branch_else else .branch_then,
+                .target = expected_boundary.target,
+            };
+            if (shared_exit.owner.exit != region.loop_exit.? or
+                !std.meta.eql(entry.reference, expected_reference)) return error.UnsupportedControlFlow;
+            try loop_exit_shape.validateEntryAlloc(allocator, program, shared_exit);
+        },
+    }
+    try emitBlockInstructions(output, allocator, program, emission_plan, scopes, block, indent, place_aliases);
+
+    const arm_indent = try allocDeeperIndent(allocator, indent);
+    defer allocator.free(arm_indent);
+    if (body_exit == .parent_stop and branchArmIsStructurallyEmpty(program, control.body_edge, control.body_region, null)) {
+        try output.appendSlice(allocator, indent);
+        try output.appendSlice(allocator, if (control.body_on_true) "if not " else "if ");
+        if (control.body_on_true) {
+            try render.valueUseGroupedScalar(output, allocator, program, valuePlan(emission_plan, place_aliases), branch.condition);
+        } else {
+            try render.valueUseScalar(output, allocator, program, valuePlan(emission_plan, place_aliases), branch.condition);
+        }
+        try output.appendSlice(allocator, " then\n");
+        try emitLoopBoundaryArm(output, allocator, program, emission_plan, scopes, control.boundary, arm_indent, place_aliases);
+        try output.appendSlice(allocator, indent);
+        try output.appendSlice(allocator, "end\n");
+        return;
+    }
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "if ");
+    try render.valueUseScalar(output, allocator, program, valuePlan(emission_plan, place_aliases), branch.condition);
+    try output.appendSlice(allocator, " then\n");
+    if (control.body_on_true) {
+        try emitLoopBoundaryBody(output, allocator, program, emission_plan, scopes, control, body_exit, arm_indent, place_aliases);
+    } else {
+        try emitLoopBoundaryArm(output, allocator, program, emission_plan, scopes, control.boundary, arm_indent, place_aliases);
+    }
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "else\n");
+    if (control.body_on_true) {
+        try emitLoopBoundaryArm(output, allocator, program, emission_plan, scopes, control.boundary, arm_indent, place_aliases);
+    } else {
+        try emitLoopBoundaryBody(output, allocator, program, emission_plan, scopes, control, body_exit, arm_indent, place_aliases);
+    }
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "end\n");
+}
+
+fn emitLoopBoundaryBodyImpl(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    scopes: *const emission_scope.Plan,
+    control: structure.LoopBoundaryControl,
+    body_exit: transparent_stop.LoopBoundaryBodyExit,
+    indent: []const u8,
+    place_aliases: []const PlaceAlias,
+) !void {
+    const entry = program.blocks[control.body_edge.target.index()];
+    const enters_loop_header = control.body_region.stop != null and control.body_edge.target == control.body_region.stop.?;
+    try emitEdgeParametersUnlessConsumed(output, allocator, program, emission_plan, scopes, entry, control.body_edge.arguments, indent, !enters_loop_header, place_aliases);
+    if (try validateEmptyBoundaryContinue(program, control.body_region, control.body_edge)) |transfer| {
+        if (transfer.nonlocal) {
+            try emitEscapeFlagSet(output, allocator, program, emission_plan, transfer.target, indent);
+        } else {
+            try emitContinueStatement(output, allocator, indent);
+        }
+        return;
+    }
+    try emitRegion(output, allocator, program, emission_plan, scopes, control.body_region, indent, place_aliases);
+    if (body_exit == .continue_target and control.body_region.continue_projection == null) {
+        try emitContinueStatement(output, allocator, indent);
+    }
+}
+
 const EmptyBoundaryContinue = struct {
     target: ir.BlockId,
     nonlocal: bool,
@@ -833,6 +2923,215 @@ fn validateEmptyBoundaryContinue(
         .target = projection.target,
         .nonlocal = region.continue_target == null or region.continue_target.? != projection.target,
     };
+}
+
+fn emitLoopBoundaryBody(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    scopes: *const emission_scope.Plan,
+    control: structure.LoopBoundaryControl,
+    body_exit: transparent_stop.LoopBoundaryBodyExit,
+    indent: []const u8,
+    place_aliases: []const PlaceAlias,
+) !void {
+    try emitLoopBoundaryBodyImpl(
+        output,
+        allocator,
+        program,
+        emission_plan,
+        scopes,
+        control,
+        body_exit,
+        indent,
+        place_aliases,
+    );
+}
+
+fn emitLoopBoundaryArmImpl(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    scopes: *const emission_scope.Plan,
+    boundary: structure.LoopBoundary,
+    indent: []const u8,
+    place_aliases: []const PlaceAlias,
+) !void {
+    switch (boundary) {
+        .exit => |edge| {
+            try emitEdgeParameters(
+                output,
+                allocator,
+                program,
+                emission_plan,
+                program.blocks[edge.target.index()],
+                edge.arguments,
+                indent,
+                false,
+                place_aliases,
+            );
+            try emitEscapeFlagSet(output, allocator, program, emission_plan, edge.target, indent);
+            try emitBreakStatement(output, allocator, indent);
+        },
+        .escape => |edge| {
+            try emitEdgeParameters(output, allocator, program, emission_plan, program.blocks[edge.target.index()], edge.arguments, indent, false, place_aliases);
+            try emitEscapeFlagSet(output, allocator, program, emission_plan, edge.target, indent);
+            try emitBreakStatement(output, allocator, indent);
+        },
+        .terminal => |terminal| try emitOwnedTerminalArm(
+            output,
+            allocator,
+            program,
+            emission_plan,
+            scopes,
+            terminal.edge,
+            terminal.block,
+            indent,
+            place_aliases,
+        ),
+        .side_exit => |side_exit| {
+            const entry = program.blocks[side_exit.entry_edge.target.index()];
+            try emitEdgeParametersUnlessConsumed(output, allocator, program, emission_plan, scopes, entry, side_exit.entry_edge.arguments, indent, true, place_aliases);
+            try emitRegion(output, allocator, program, emission_plan, scopes, side_exit.region, indent, place_aliases);
+            if (!regionAlwaysFunctionTerminates(program, side_exit.region)) {
+                try emitBreakStatement(output, allocator, indent);
+            }
+        },
+        .side_escape => |side_escape| {
+            const entry = program.blocks[side_escape.entry_edge.target.index()];
+            try emitEdgeParametersUnlessConsumed(output, allocator, program, emission_plan, scopes, entry, side_escape.entry_edge.arguments, indent, true, place_aliases);
+            try emitRegion(output, allocator, program, emission_plan, scopes, side_escape.region, indent, place_aliases);
+            if (!regionAlwaysFunctionTerminates(program, side_escape.region)) {
+                const free_targets = try structured_escape.regionFreeTargetsAlloc(allocator, side_escape.region);
+                defer allocator.free(free_targets);
+                if (free_targets.len == 0) {
+                    try emitEscapeFlagSet(output, allocator, program, emission_plan, side_escape.target, indent);
+                    try emitBreakStatement(output, allocator, indent);
+                } else {
+                    const fallback_indent = try allocDeeperIndent(allocator, indent);
+                    defer allocator.free(fallback_indent);
+                    try output.appendSlice(allocator, indent);
+                    try output.appendSlice(allocator, "if ");
+                    for (free_targets, 0..) |target, index| {
+                        if (index != 0) try output.appendSlice(allocator, " and ");
+                        try output.appendSlice(allocator, "not ");
+                        const flag = try escapeFlagNameAlloc(allocator, program, emission_plan, target);
+                        defer allocator.free(flag);
+                        try output.appendSlice(allocator, flag);
+                    }
+                    try output.appendSlice(allocator, " then\n");
+                    try emitEscapeFlagSet(output, allocator, program, emission_plan, side_escape.target, fallback_indent);
+                    try emitBreakStatement(output, allocator, fallback_indent);
+                    try output.appendSlice(allocator, indent);
+                    try output.appendSlice(allocator, "end\n");
+                }
+            }
+        },
+        .shared_exit => |shared_exit| {
+            try loop_exit_shape.validateEntryAlloc(allocator, program, shared_exit);
+            try emitBreakStatement(output, allocator, indent);
+        },
+    }
+}
+
+fn emitLoopBoundaryArm(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    scopes: *const emission_scope.Plan,
+    boundary: structure.LoopBoundary,
+    indent: []const u8,
+    place_aliases: []const PlaceAlias,
+) !void {
+    try emitLoopBoundaryArmImpl(
+        output,
+        allocator,
+        program,
+        emission_plan,
+        scopes,
+        boundary,
+        indent,
+        place_aliases,
+    );
+}
+
+fn emitLoopTerminalControl(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    scopes: *const emission_scope.Plan,
+    region: *const structure.Region,
+    node_index: usize,
+    control: structure.LoopTerminalControl,
+    indent: []const u8,
+    place_aliases: []const PlaceAlias,
+) !void {
+    if (node_index + 1 != region.nodes.len or region.stop == null) return error.UnsupportedControlFlow;
+    const block = program.blocks[control.block.index()];
+    const branch = switch (block.terminator) {
+        .branch => |value| value,
+        else => return error.UnsupportedControlFlow,
+    };
+    const expected_continue = if (control.continue_on_true) branch.then_edge else branch.else_edge;
+    const expected_terminal = if (control.continue_on_true) branch.else_edge else branch.then_edge;
+    if (expected_continue.target != region.stop.? or expected_terminal.target != control.terminal_block) return error.UnsupportedControlFlow;
+    try emitBlockInstructions(output, allocator, program, emission_plan, scopes, block, indent, place_aliases);
+
+    const arm_indent = try allocDeeperIndent(allocator, indent);
+    defer allocator.free(arm_indent);
+    if (edgeTransferIsStructurallyEmpty(program, scopes, control.continue_edge)) {
+        try output.appendSlice(allocator, indent);
+        try output.appendSlice(allocator, if (control.continue_on_true) "if not " else "if ");
+        if (control.continue_on_true) {
+            try render.valueUseGroupedScalar(output, allocator, program, valuePlan(emission_plan, place_aliases), branch.condition);
+        } else {
+            try render.valueUseScalar(output, allocator, program, valuePlan(emission_plan, place_aliases), branch.condition);
+        }
+        try output.appendSlice(allocator, " then\n");
+        try emitOwnedTerminalArm(output, allocator, program, emission_plan, scopes, control.terminal_edge, control.terminal_block, arm_indent, place_aliases);
+        try output.appendSlice(allocator, indent);
+        try output.appendSlice(allocator, "end\n");
+        return;
+    }
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "if ");
+    try render.valueUseScalar(output, allocator, program, valuePlan(emission_plan, place_aliases), branch.condition);
+    try output.appendSlice(allocator, " then\n");
+    if (control.continue_on_true) {
+        try emitLoopContinue(output, allocator, program, emission_plan, scopes, control.continue_edge, arm_indent, place_aliases);
+    } else {
+        try emitOwnedTerminalArm(output, allocator, program, emission_plan, scopes, control.terminal_edge, control.terminal_block, arm_indent, place_aliases);
+    }
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "else\n");
+    if (control.continue_on_true) {
+        try emitOwnedTerminalArm(output, allocator, program, emission_plan, scopes, control.terminal_edge, control.terminal_block, arm_indent, place_aliases);
+    } else {
+        try emitLoopContinue(output, allocator, program, emission_plan, scopes, control.continue_edge, arm_indent, place_aliases);
+    }
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "end\n");
+}
+
+fn emitOwnedTerminalArm(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    scopes: *const emission_scope.Plan,
+    terminal_edge: ir.Edge,
+    terminal_block: ir.BlockId,
+    indent: []const u8,
+    place_aliases: []const PlaceAlias,
+) !void {
+    const terminal = program.blocks[terminal_block.index()];
+    try emitEdgeParameters(output, allocator, program, emission_plan, terminal, terminal_edge.arguments, indent, true, place_aliases);
+    try emitBlockInstructions(output, allocator, program, emission_plan, scopes, terminal, indent, place_aliases);
+    try call_emission.terminator(output, allocator, program, emission_plan, terminal, indent, valuePlan(emission_plan, place_aliases));
 }
 
 fn emitScopeDeclarations(
@@ -1157,6 +3456,298 @@ test "empty branch arm clone continuation authenticates its mapped edge" {
     );
 }
 
+fn emitInstruction(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    scopes: *const emission_scope.Plan,
+    instruction: ir.Instruction,
+    indent: []const u8,
+    declare_results: bool,
+    declare_place: bool,
+    place_aliases: []const PlaceAlias,
+    composition: ?*const branch_expression.Composition,
+) (EmitError || std.mem.Allocator.Error)!void {
+    if (composition) |value| {
+        if (value.instructionIsAbsorbed(instruction.id)) return;
+    }
+    if (emission_plan.dead.contains(instruction.id)) return;
+    if (scopes.instructionIsMovedLiteralInitializer(instruction.id)) return;
+    if (emission_plan.place_reads.contains(instruction.id)) return;
+    if (emission_plan.fused_values.contains(instruction.id)) return;
+    if (emission_plan.closure_stores.consumerForProducer(instruction.id) != null) return;
+    if (emission_plan.place_writes.consumerForProducer(instruction.id) != null) return;
+    const values = composedValuePlan(emission_plan, place_aliases, composition);
+    if (emission_plan.closure_stores.producerForConsumer(instruction.id)) |producer_id| {
+        return emitClosureStore(
+            output,
+            allocator,
+            program,
+            emission_plan,
+            scopes,
+            instruction,
+            producer_id,
+            indent,
+            place_aliases,
+            values,
+        );
+    }
+    switch (emission_plan.packs.role(instruction.id)) {
+        .ordinary => {},
+        .fused_invocation_producer => return,
+        .fused_return_producer => return,
+        .fused_pack_values_producer => return,
+        .materialized_pack_values_producer => return,
+        .fused_pack_values_return_producer => return,
+        .materialized_invocation_producer => |adjustment_id| {
+            if (adjustment_id.index() >= program.instructions.len) return error.UnsupportedOperation;
+            return call_emission.materializedAdjustment(
+                output,
+                allocator,
+                program,
+                emission_plan,
+                program.instructions[adjustment_id.index()],
+                instruction,
+                indent,
+                scopes.instructionDeclaresResults(adjustment_id),
+                values,
+            );
+        },
+        .materialized_adjustment => return,
+        .materialized_adjustment_copy => |primary_id| {
+            if (primary_id.index() >= program.instructions.len) return error.UnsupportedOperation;
+            return call_emission.materializedAdjustmentCopy(
+                output,
+                allocator,
+                emission_plan,
+                instruction,
+                program.instructions[primary_id.index()],
+                indent,
+                declare_results,
+            );
+        },
+        .stored_invocation_producer => return call_emission.storedPack(
+            output,
+            allocator,
+            program,
+            emission_plan,
+            instruction,
+            indent,
+            values,
+        ),
+        .stored_adjustment => |producer_id| {
+            if (producer_id.index() >= program.instructions.len) return error.UnsupportedOperation;
+            return call_emission.storedAdjustment(
+                output,
+                allocator,
+                program,
+                emission_plan,
+                instruction,
+                program.instructions[producer_id.index()],
+                indent,
+                declare_results,
+                values,
+            );
+        },
+        .fused_adjustment => |producer_id| return call_emission.fusedAdjustment(
+            output,
+            allocator,
+            program,
+            emission_plan,
+            instruction,
+            program.instructions[producer_id.index()],
+            indent,
+            declare_results,
+            values,
+        ),
+        .direct_vararg_adjustment => return call_emission.directVarargAdjustment(
+            output,
+            allocator,
+            program,
+            emission_plan,
+            instruction,
+            indent,
+            declare_results,
+            values,
+        ),
+        .fused_pack_values_adjustment => |producer_id| return call_emission.packValuesAdjustment(
+            output,
+            allocator,
+            program,
+            emission_plan,
+            instruction,
+            program.instructions[producer_id.index()],
+            indent,
+            declare_results,
+            values,
+        ),
+    }
+
+    switch (instruction.operation) {
+        .generic_for_next => |operation| return emitGenericForNextTransition(
+            output,
+            allocator,
+            program,
+            emission_plan,
+            instruction,
+            operation,
+            indent,
+            values,
+        ),
+        .numeric_for_next => |operation| return emitSemanticNormalizedTransition(
+            output,
+            allocator,
+            program,
+            emission_plan,
+            instruction,
+            operation,
+            indent,
+            declare_results,
+            values,
+        ),
+        .call_repeated_table_get => |operation| return emitCallRepeatedTableGetInstruction(
+            output,
+            allocator,
+            program,
+            emission_plan,
+            instruction,
+            operation,
+            indent,
+            declare_results,
+            place_aliases,
+            values,
+        ),
+        .call,
+        .namecall,
+        .protected_call,
+        .coroutine_create,
+        .coroutine_resume,
+        .coroutine_yield,
+        => return call_emission.instruction(
+            output,
+            allocator,
+            program,
+            emission_plan,
+            instruction,
+            indent,
+            declare_results,
+            values,
+        ),
+        .make_closure => |closure| return emitClosureInstruction(
+            output,
+            allocator,
+            program,
+            emission_plan,
+            scopes,
+            instruction,
+            closure,
+            indent,
+            declare_results,
+            place_aliases,
+            values,
+        ),
+        .place_read => |place_id| return lexical.emitRead(
+            output,
+            allocator,
+            program,
+            values,
+            instruction,
+            place_id,
+            indent,
+            declare_results,
+            place_aliases,
+        ),
+        .place_write => |operation| return emitPlaceWriteInstruction(
+            output,
+            allocator,
+            program,
+            emission_plan,
+            scopes,
+            instruction,
+            operation,
+            indent,
+            declare_place,
+            place_aliases,
+            values,
+        ),
+        .make_table_literal => |constructor| return emitTableConstructorInstruction(
+            output,
+            allocator,
+            program,
+            emission_plan,
+            instruction,
+            constructor,
+            indent,
+            declare_results,
+            values,
+        ),
+        .table_set_pack => |operation| return emitTableSetPackInstruction(
+            output,
+            allocator,
+            program,
+            emission_plan,
+            instruction,
+            operation,
+            indent,
+            values,
+        ),
+        .table_set => if (compound_update.matchTable(program, &emission_plan.dead, &emission_plan.fused_values, instruction)) |update| {
+            return emitCompoundMemoryUpdate(
+                output,
+                allocator,
+                program,
+                emission_plan,
+                instruction,
+                update,
+                indent,
+                values,
+            );
+        },
+        .environment_set => if (compound_update.matchEnvironment(program, &emission_plan.dead, &emission_plan.fused_values, instruction)) |update| {
+            return emitCompoundMemoryUpdate(
+                output,
+                allocator,
+                program,
+                emission_plan,
+                instruction,
+                update,
+                indent,
+                values,
+            );
+        },
+        else => {},
+    }
+
+    if (instruction.results.len == 0 and render.statementNeedsSeparator(program, values, instruction.operation)) {
+        try output.appendSlice(allocator, indent);
+        try output.appendSlice(allocator, "do\n");
+        const statement_indent = try allocDeeperIndent(allocator, indent);
+        defer allocator.free(statement_indent);
+        try output.appendSlice(allocator, statement_indent);
+        try render.statement(output, allocator, program, values, instruction.operation);
+        try output.append(allocator, '\n');
+        try output.appendSlice(allocator, indent);
+        try output.appendSlice(allocator, "end\n");
+        return;
+    }
+
+    try output.appendSlice(allocator, indent);
+    if (instruction.results.len != 0) {
+        const any_storage = for (instruction.results) |res| {
+            if (emission_plan.names.valueUsesStorage(res)) break true;
+        } else false;
+        if (declare_results and !any_storage) try output.appendSlice(allocator, "local ");
+        for (instruction.results, 0..) |result, index| {
+            if (index != 0) try output.appendSlice(allocator, ", ");
+            try render.valueName(output, allocator, &emission_plan.names, result);
+        }
+        try output.appendSlice(allocator, " = ");
+        try render.expressionRoot(output, allocator, program, values, instruction.operation);
+    } else try render.statement(output, allocator, program, values, instruction.operation);
+    try output.append(allocator, '\n');
+}
+
 fn emitSemanticNormalizedTransition(
     output: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
@@ -1233,6 +3824,157 @@ fn emitSemanticNormalizedTransition(
     try output.appendSlice(allocator, "end\n");
 }
 
+fn emitGenericForNextTransition(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    instruction: ir.Instruction,
+    operation: ir.GenericForNext,
+    indent: []const u8,
+    values: render.ValuePlan,
+) !void {
+    const variable_count = @as(usize, operation.variable_count);
+    if (variable_count == 0 or instruction.results.len != variable_count + 3) return error.UnsupportedOperation;
+
+    const iterator_name = try emission_plan.names.internalNameAlloc(allocator, program, "__lifter_generic_iterator");
+    defer allocator.free(iterator_name);
+    const state_name = try emission_plan.names.internalNameAlloc(allocator, program, "__lifter_generic_state");
+    defer allocator.free(state_name);
+    const control_name = try emission_plan.names.internalNameAlloc(allocator, program, "__lifter_generic_control");
+    defer allocator.free(control_name);
+    const metatable_name = try emission_plan.names.internalNameAlloc(allocator, program, "__lifter_generic_metatable");
+    defer allocator.free(metatable_name);
+    const iterator_method_name = try emission_plan.names.internalNameAlloc(allocator, program, "__lifter_generic_method");
+    defer allocator.free(iterator_method_name);
+    const inner_indent = try allocDeeperIndent(allocator, indent);
+    defer allocator.free(inner_indent);
+
+    // A generic-for transition is an SSA operation, so prepare private
+    // temporaries instead of overwriting its iterator/state/control operands.
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "do\n");
+    try output.appendSlice(allocator, inner_indent);
+    try output.appendSlice(allocator, "local ");
+    try output.appendSlice(allocator, iterator_name);
+    try output.appendSlice(allocator, " = ");
+    try render.valueUseScalar(output, allocator, program, values, operation.iterator);
+    try output.append(allocator, '\n');
+    try output.appendSlice(allocator, inner_indent);
+    try output.appendSlice(allocator, "local ");
+    try output.appendSlice(allocator, state_name);
+    try output.appendSlice(allocator, " = ");
+    try render.valueUseScalar(output, allocator, program, values, operation.state);
+    try output.append(allocator, '\n');
+    try output.appendSlice(allocator, inner_indent);
+    try output.appendSlice(allocator, "local ");
+    try output.appendSlice(allocator, control_name);
+    try output.appendSlice(allocator, " = ");
+    try render.valueUseScalar(output, allocator, program, values, operation.control);
+    try output.append(allocator, '\n');
+
+    try output.appendSlice(allocator, inner_indent);
+    try output.appendSlice(allocator, "if ");
+    try render.valueUseScalar(output, allocator, program, values, operation.initial);
+    try output.appendSlice(allocator, " then\n");
+    const preparation_indent = try allocDeeperIndent(allocator, inner_indent);
+    defer allocator.free(preparation_indent);
+
+    try output.appendSlice(allocator, preparation_indent);
+    try output.appendSlice(allocator, "local ");
+    try output.appendSlice(allocator, metatable_name);
+    try output.appendSlice(allocator, " = ");
+    try render.runtimeCallStart(output, allocator, values, .getmetatable);
+    try output.appendSlice(allocator, iterator_name);
+    try output.appendSlice(allocator, ")\n");
+    try output.appendSlice(allocator, preparation_indent);
+    try output.appendSlice(allocator, "local ");
+    try output.appendSlice(allocator, iterator_method_name);
+    try output.appendSlice(allocator, " = ");
+    try output.appendSlice(allocator, metatable_name);
+    try output.appendSlice(allocator, " and ");
+    try output.appendSlice(allocator, metatable_name);
+    try output.appendSlice(allocator, ".__iter\n");
+
+    try output.appendSlice(allocator, preparation_indent);
+    try output.appendSlice(allocator, "if ");
+    try output.appendSlice(allocator, iterator_method_name);
+    try output.appendSlice(allocator, " ~= nil then\n");
+    const method_indent = try allocDeeperIndent(allocator, preparation_indent);
+    defer allocator.free(method_indent);
+    try output.appendSlice(allocator, method_indent);
+    try output.appendSlice(allocator, iterator_name);
+    try output.appendSlice(allocator, ", ");
+    try output.appendSlice(allocator, state_name);
+    try output.appendSlice(allocator, ", ");
+    try output.appendSlice(allocator, control_name);
+    try output.appendSlice(allocator, " = ");
+    try output.appendSlice(allocator, iterator_method_name);
+    try output.append(allocator, '(');
+    try output.appendSlice(allocator, iterator_name);
+    try output.appendSlice(allocator, ")\n");
+    try output.appendSlice(allocator, preparation_indent);
+    try output.appendSlice(allocator, "elseif (" );
+    try output.appendSlice(allocator, metatable_name);
+    try output.appendSlice(allocator, " == nil or ");
+    try output.appendSlice(allocator, metatable_name);
+    try output.appendSlice(allocator, ".__call == nil) and ");
+    try render.runtimeCallStart(output, allocator, values, .type);
+    try output.appendSlice(allocator, iterator_name);
+    try output.appendSlice(allocator, ") == \"table\" then\n");
+    try output.appendSlice(allocator, method_indent);
+    try output.appendSlice(allocator, state_name);
+    try output.appendSlice(allocator, " = ");
+    try output.appendSlice(allocator, iterator_name);
+    try output.append(allocator, '\n');
+    try output.appendSlice(allocator, method_indent);
+    try output.appendSlice(allocator, iterator_name);
+    try output.appendSlice(allocator, " = ");
+    const next_name = emission_plan.names.runtimeCapability(.next) orelse return error.UnsupportedOperation;
+    try render.globalIdentifier(output, allocator, next_name);
+    try output.append(allocator, '\n');
+    try output.appendSlice(allocator, method_indent);
+    try output.appendSlice(allocator, control_name);
+    try output.appendSlice(allocator, " = nil\n");
+    try output.appendSlice(allocator, preparation_indent);
+    try output.appendSlice(allocator, "end\n");
+    try output.appendSlice(allocator, inner_indent);
+    try output.appendSlice(allocator, "end\n");
+
+    const prepared_iterator = instruction.results[1];
+    const prepared_state = instruction.results[2];
+    try output.appendSlice(allocator, inner_indent);
+    try render.valueName(output, allocator, &emission_plan.names, prepared_iterator);
+    try output.appendSlice(allocator, " = ");
+    try output.appendSlice(allocator, iterator_name);
+    try output.append(allocator, '\n');
+    try output.appendSlice(allocator, inner_indent);
+    try render.valueName(output, allocator, &emission_plan.names, prepared_state);
+    try output.appendSlice(allocator, " = ");
+    try output.appendSlice(allocator, state_name);
+    try output.append(allocator, '\n');
+
+    try output.appendSlice(allocator, inner_indent);
+    for (instruction.results[3..], 0..) |result, index| {
+        if (index != 0) try output.appendSlice(allocator, ", ");
+        try render.valueName(output, allocator, &emission_plan.names, result);
+    }
+    try output.appendSlice(allocator, " = ");
+    try output.appendSlice(allocator, iterator_name);
+    try output.append(allocator, '(');
+    try output.appendSlice(allocator, state_name);
+    try output.appendSlice(allocator, ", ");
+    try output.appendSlice(allocator, control_name);
+    try output.appendSlice(allocator, ")\n");
+    try output.appendSlice(allocator, inner_indent);
+    try render.valueName(output, allocator, &emission_plan.names, instruction.results[0]);
+    try output.appendSlice(allocator, " = ");
+    try render.valueName(output, allocator, &emission_plan.names, instruction.results[3]);
+    try output.appendSlice(allocator, " ~= nil\n");
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "end\n");
+}
+
 fn emitCompoundMemoryUpdate(
     output: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
@@ -1271,6 +4013,150 @@ fn emitCompoundMemoryUpdate(
         try output.appendSlice(allocator, indent);
         try output.appendSlice(allocator, "end\n");
     }
+}
+
+fn emitPlaceWriteInstruction(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    scopes: *const emission_scope.Plan,
+    instruction: ir.Instruction,
+    operation: ir.PlaceWrite,
+    indent: []const u8,
+    declare_place: bool,
+    place_aliases: []const PlaceAlias,
+    values: render.ValuePlan,
+) !void {
+    const producer_id = emission_plan.place_writes.producerForWrite(instruction.id) orelse {
+        return lexical.emitWrite(
+            output,
+            allocator,
+            program,
+            values,
+            instruction,
+            operation,
+            indent,
+            declare_place,
+            place_aliases,
+        ) catch |err| {
+            std.debug.print(
+                "emit place_write={} stage=lexical_write place={} value={} declare={} aliases={} error={s}\n",
+                .{ instruction.id.index(), operation.place.index(), operation.value.index(), declare_place, place_aliases.len, @errorName(err) },
+            );
+            return err;
+        };
+    };
+    if (producer_id.index() >= program.instructions.len) {
+        std.debug.print(
+            "emit place_write={} stage=producer_index producer={} error=UnsupportedOperation\n",
+            .{ instruction.id.index(), producer_id.index() },
+        );
+        return error.UnsupportedOperation;
+    }
+    const producer = program.instructions[producer_id.index()];
+    if (producer.operation == .make_closure) {
+        const role = emission_plan.packs.role(producer.id);
+        if (role != .ordinary) {
+            std.debug.print(
+                "emit place_write={} stage=closure_role producer={} role={s} error=UnsupportedOperation\n",
+                .{ instruction.id.index(), producer.id.index(), @tagName(role) },
+            );
+            return error.UnsupportedOperation;
+        }
+        return emitClosure(
+            output,
+            allocator,
+            program,
+            emission_plan,
+            scopes,
+            producer.operation.make_closure,
+            .{ .place = .{ .id = operation.place, .declare = declare_place } },
+            indent,
+            place_aliases,
+            values,
+        ) catch |err| {
+            std.debug.print(
+                "emit place_write={} stage=closure_emit producer={} error={s}\n",
+                .{ instruction.id.index(), producer.id.index(), @errorName(err) },
+            );
+            return err;
+        };
+    }
+
+    const resolved_target = place_render.resolve(operation.place, place_aliases) orelse {
+        std.debug.print(
+            "emit place_write={} stage=destination_alias place={} aliases={} error=UnsupportedOperation\n",
+            .{ instruction.id.index(), operation.place.index(), place_aliases.len },
+        );
+        return error.UnsupportedOperation;
+    };
+
+    if (!declare_place and resolved_target == .place) {
+        if (compound_update.matchPlace(program, &emission_plan.dead, &emission_plan.place_writes, &emission_plan.place_reads, producer, instruction)) |update| {
+            try output.appendSlice(allocator, indent);
+            try lexical.emitPlaceName(output, allocator, &emission_plan.names, program, operation.place, place_aliases);
+            try output.append(allocator, ' ');
+            try output.appendSlice(allocator, render.compoundOperator(update.operator) orelse return error.UnsupportedOperation);
+            try output.append(allocator, ' ');
+            try render.valueUseScalar(output, allocator, program, values, update.right);
+            try output.append(allocator, '\n');
+            return;
+        }
+    }
+
+    try output.appendSlice(allocator, indent);
+    const closes_external = switch (resolved_target) {
+        .place => blk: {
+            if (declare_place and !emission_plan.names.placeUsesStorage(resolved_target.place)) {
+                try output.appendSlice(allocator, "local ");
+            }
+            try lexical.emitPlaceName(output, allocator, &emission_plan.names, program, operation.place, place_aliases);
+            try output.appendSlice(allocator, " = ");
+            break :blk false;
+        },
+        .external_binding => |binding_id| blk: {
+            if (declare_place) return error.UnsupportedOperation;
+            try render.runtimeCallStart(output, allocator, values, .rawset);
+            try place_render.emitExternalBindingName(output, allocator, &emission_plan.names, binding_id);
+            try output.appendSlice(allocator, ", 1, ");
+            break :blk true;
+        },
+    };
+    switch (emission_plan.packs.role(producer.id)) {
+        .fused_adjustment => |invocation_id| {
+            if (invocation_id.index() >= program.instructions.len) return error.UnsupportedOperation;
+            try render.plannedInvocation(
+                output,
+                allocator,
+                program,
+                values,
+                &emission_plan.packs,
+                program.instructions[invocation_id.index()],
+            );
+        },
+        .ordinary => switch (producer.operation) {
+            .call,
+            .namecall,
+            .protected_call,
+            .coroutine_create,
+            .coroutine_resume,
+            .coroutine_yield,
+            => try render.plannedInvocation(output, allocator, program, values, &emission_plan.packs, producer),
+            .make_table_literal => |constructor| try render.plannedTableConstructor(
+                output,
+                allocator,
+                program,
+                values,
+                producer.id,
+                constructor,
+            ),
+            else => try render.expressionRoot(output, allocator, program, values, producer.operation),
+        },
+        else => return error.UnsupportedOperation,
+    }
+    if (closes_external) try output.append(allocator, ')');
+    try output.append(allocator, '\n');
 }
 
 fn emitTableConstructorInstruction(
@@ -1570,6 +4456,60 @@ fn emitRepeatedTableGetCounterIncrement(
     }
 }
 
+fn emitClosureInstruction(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    scopes: *const emission_scope.Plan,
+    instruction: ir.Instruction,
+    closure: ir.Closure,
+    indent: []const u8,
+    declare_result: bool,
+    parent_place_aliases: []const PlaceAlias,
+    parent_values: render.ValuePlan,
+) !void {
+    if (instruction.results.len != 1) return error.UnsupportedOperation;
+    return emitClosure(
+        output,
+        allocator,
+        program,
+        emission_plan,
+        scopes,
+        closure,
+        .{ .value = .{ .id = instruction.results[0], .declare = declare_result } },
+        indent,
+        parent_place_aliases,
+        parent_values,
+    );
+}
+
+fn emitClosureStore(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    scopes: *const emission_scope.Plan,
+    consumer: ir.Instruction,
+    producer_id: ir.InstructionId,
+    indent: []const u8,
+    place_aliases: []const PlaceAlias,
+    values: render.ValuePlan,
+) !void {
+    if (producer_id.index() >= program.instructions.len) return error.UnsupportedOperation;
+    const producer = program.instructions[producer_id.index()];
+    const closure = switch (producer.operation) {
+        .make_closure => |value| value,
+        else => return error.UnsupportedOperation,
+    };
+    const destination: ClosureDestination = switch (consumer.operation) {
+        .table_set => |store| .{ .table = store },
+        .environment_set => |store| .{ .environment = store },
+        else => return error.UnsupportedOperation,
+    };
+    return emitClosure(output, allocator, program, emission_plan, scopes, closure, destination, indent, place_aliases, values);
+}
+
 fn emitScopedClosureDestinationDeclaration(
     output: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
@@ -1600,6 +4540,157 @@ fn emitScopedClosureDestinationDeclaration(
             try output.append(allocator, '\n');
         },
         .table, .environment => {},
+    }
+}
+
+fn emitClosure(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    scopes: *const emission_scope.Plan,
+    closure: ir.Closure,
+    destination: ClosureDestination,
+    indent: []const u8,
+    parent_place_aliases: []const PlaceAlias,
+    parent_values: render.ValuePlan,
+) !void {
+    const target = program.functions[closure.function.index()];
+    var closure_plan = lexical.ClosurePlan.initWithStableValues(
+        allocator,
+        program,
+        target,
+        closure,
+        parent_place_aliases,
+        StableCaptureValues{ .scopes = scopes },
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidClosureBinding => {
+            std.debug.print(
+                "emit closure={} target={} stage=closure_plan error=InvalidClosureBinding\n",
+                .{ closure.function.index(), target.id.index() },
+            );
+            return error.UnsupportedOperation;
+        },
+    };
+    defer closure_plan.deinit();
+
+    const scopes_snapshots = closure_plan.value_bindings.len != 0;
+    var closure_indent = indent;
+    var scoped_indent: ?[]u8 = null;
+    defer if (scoped_indent) |value| allocator.free(value);
+    if (scopes_snapshots) {
+        emitScopedClosureDestinationDeclaration(
+            output,
+            allocator,
+            program,
+            emission_plan,
+            destination,
+            indent,
+            parent_place_aliases,
+        ) catch |err| {
+            std.debug.print(
+                "emit closure={} target={} stage=destination_declaration error={s}\n",
+                .{ closure.function.index(), target.id.index(), @errorName(err) },
+            );
+            return err;
+        };
+        try output.appendSlice(allocator, indent);
+        try output.appendSlice(allocator, "do\n");
+        scoped_indent = try allocDeeperIndent(allocator, indent);
+        closure_indent = scoped_indent.?;
+    }
+    for (closure_plan.value_bindings) |binding| {
+        try output.appendSlice(allocator, closure_indent);
+        try output.appendSlice(allocator, "local ");
+        try render.valueName(output, allocator, &emission_plan.names, binding.captured);
+        try output.appendSlice(allocator, " = ");
+        render.valueUseScalar(output, allocator, program, parent_values, binding.source) catch |err| {
+            std.debug.print(
+                "emit closure={} target={} stage=capture_value source={} captured={} error={s}\n",
+                .{ closure.function.index(), target.id.index(), binding.source.index(), binding.captured.index(), @errorName(err) },
+            );
+            return err;
+        };
+        try output.append(allocator, '\n');
+    }
+
+    try output.appendSlice(allocator, closure_indent);
+    var closes_external = false;
+    switch (destination) {
+        .value => |value| {
+            if (value.declare and !scopes_snapshots and !emission_plan.names.valueUsesStorage(value.id)) try output.appendSlice(allocator, "local ");
+            if (value.id.index() >= program.values.len) return error.UnsupportedOperation;
+            try render.valueName(output, allocator, &emission_plan.names, value.id);
+        },
+        .place => |place| {
+            const resolved = place_render.resolve(place.id, parent_place_aliases) orelse {
+                std.debug.print(
+                    "emit closure={} target={} stage=destination_alias place={} aliases={} error=UnsupportedOperation\n",
+                    .{ closure.function.index(), target.id.index(), place.id.index(), parent_place_aliases.len },
+                );
+                return error.UnsupportedOperation;
+            };
+            switch (resolved) {
+                .place => {
+                    if (place.declare and !scopes_snapshots and !emission_plan.names.placeUsesStorage(resolved.place)) {
+                        try output.appendSlice(allocator, "local ");
+                    }
+                    lexical.emitPlaceName(output, allocator, &emission_plan.names, program, place.id, parent_place_aliases) catch |err| {
+                        std.debug.print(
+                            "emit closure={} target={} stage=destination_name place={} resolved={} aliases={} error={s}\n",
+                            .{ closure.function.index(), target.id.index(), place.id.index(), resolved.place.index(), parent_place_aliases.len, @errorName(err) },
+                        );
+                        return err;
+                    };
+                },
+                .external_binding => |binding_id| {
+                    if (place.declare) return error.UnsupportedOperation;
+                    try render.runtimeCallStart(output, allocator, parent_values, .rawset);
+                    try place_render.emitExternalBindingName(output, allocator, &emission_plan.names, binding_id);
+                    try output.appendSlice(allocator, ", 1, ");
+                    closes_external = true;
+                },
+            }
+        },
+        .table => |store| {
+            if (store.mode != .semantic) return error.UnsupportedOperation;
+            try render.valueUsePostfix(output, allocator, program, parent_values, store.table);
+            try render.semanticValueIndexSuffix(output, allocator, program, parent_values, store.key);
+        },
+        .environment => |store| {
+            if (store.mode != .semantic) return error.UnsupportedOperation;
+            switch (store.target) {
+                .ambient => try render.globalIdentifier(output, allocator, store.name),
+                .value => |environment| {
+                    try render.valueUsePostfix(output, allocator, program, parent_values, environment);
+                    try render.semanticStringIndexSuffix(output, allocator, store.name);
+                },
+            }
+        },
+    }
+    if (!closes_external) try output.appendSlice(allocator, " = ");
+    try output.appendSlice(allocator, "function(");
+    try emitFunctionParameters(output, allocator, emission_plan, target);
+    try output.appendSlice(allocator, ")\n");
+
+    const body_indent = try allocDeeperIndent(allocator, closure_indent);
+    defer allocator.free(body_indent);
+    emitFunctionBody(output, allocator, program, emission_plan, target, body_indent, closure_plan.place_aliases) catch |err| {
+        std.debug.print(
+            "emit closure={} target={} stage=function_body error={s}\n",
+            .{ closure.function.index(), target.id.index(), @errorName(err) },
+        );
+        return err;
+    };
+
+    try output.appendSlice(allocator, closure_indent);
+    try output.appendSlice(allocator, "end");
+    if (closes_external) try output.append(allocator, ')');
+    try output.append(allocator, '\n');
+    if (scopes_snapshots) {
+        try output.appendSlice(allocator, indent);
+        try output.appendSlice(allocator, "end\n");
     }
 }
 
