@@ -77,6 +77,139 @@ fn composedValuePlan(
     return values;
 }
 
+/// Convenience entry point for focused tests and embedders that explicitly
+/// operate on the standard-Luau runtime contract.
+pub fn emitStandardLuauAlloc(allocator: std.mem.Allocator, program: *const ir.Program) (EmitError || std.mem.Allocator.Error)![]u8 {
+    return emitAllocForTarget(allocator, program, .standard_luau);
+}
+
+pub fn emitAllocForTarget(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    target: Target,
+) (EmitError || std.mem.Allocator.Error)![]u8 {
+    return emitAllocForTargetWithOptions(allocator, program, target, .{});
+}
+
+pub fn emitAllocForTargetWithOptions(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    target: Target,
+    options: Options,
+) (EmitError || std.mem.Allocator.Error)![]u8 {
+    var report = try validation.validateForTarget(allocator, program, .readable_luau, target);
+    defer report.deinit();
+    if (!report.isClean()) return error.InvalidIr;
+    return emitAdmittedAllocForTargetWithOptions(allocator, program, target, options);
+}
+
+/// Emit an IR program after its readable-Luau admission has already been
+/// checked by the caller. The public entry point above remains self-validating
+/// for direct embedders; the pipeline uses this boundary to avoid validating
+/// a large admitted program twice.
+pub fn emitAdmittedAllocForTarget(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    target: Target,
+) (EmitError || std.mem.Allocator.Error)![]u8 {
+    return emitAdmittedAllocForTargetWithOptions(allocator, program, target, .{});
+}
+
+pub fn emitAdmittedAllocForTargetWithOptions(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    target: Target,
+    options: Options,
+) (EmitError || std.mem.Allocator.Error)![]u8 {
+    var transfer_arena = std.heap.ArenaAllocator.init(allocator);
+    defer transfer_arena.deinit();
+    const prepared = lexical_transfer.prepareInArena(transfer_arena.allocator(), program) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.UnsupportedControlFlow => return error.UnsupportedControlFlow,
+        error.UnsupportedTransfer => return error.UnsupportedOperation,
+    };
+    const emission_program = &prepared;
+    var emission_plan = try EmissionPlan.init(allocator, emission_program, target);
+    defer emission_plan.deinit();
+    var entry_plan = lexical.EntryPlan.init(allocator, emission_program) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidEntryBinding => return error.UnsupportedOperation,
+    };
+    defer entry_plan.deinit();
+
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(allocator);
+
+    try emitRuntimePrelude(&output, allocator, &emission_plan, emission_program);
+
+    for (emission_program.functions) |function| {
+        if (function.id == emission_program.entry_function or function.lexical_parent != null) continue;
+        try output.appendSlice(allocator, "local ");
+        try render.functionName(&output, allocator, &emission_plan.names, function.id);
+        try output.append(allocator, '\n');
+    }
+
+    var wrote_function = false;
+    for (emission_program.functions) |function| {
+        if (function.id == emission_program.entry_function or function.lexical_parent != null) continue;
+        if (wrote_function) try output.append(allocator, '\n');
+        emission_plan.force_dispatcher = options.force_dispatcher or try functionNeedsArbitraryFallback(
+            allocator,
+            program,
+            function.id,
+        );
+        emitFunction(&output, allocator, emission_program, &emission_plan, function) catch |err| {
+            std.debug.print("emit function={} error={s}\n", .{ function.id.index(), @errorName(err) });
+            return err;
+        };
+        wrote_function = true;
+    }
+
+    if (wrote_function) try output.append(allocator, '\n');
+    const entry = emission_program.functions[emission_program.entry_function.index()];
+    emission_plan.force_dispatcher = options.force_dispatcher or try functionNeedsArbitraryFallback(
+        allocator,
+        program,
+        entry.id,
+    );
+    try emitEntryParameters(&output, allocator, emission_program, &emission_plan, entry);
+    try emitEntryValueBindings(&output, allocator, &emission_plan, entry_plan.value_bindings);
+    emitFunctionBody(&output, allocator, emission_program, &emission_plan, entry, "", entry_plan.place_aliases) catch |err| {
+        std.debug.print("emit entry_function={} error={s}\n", .{ entry.id.index(), @errorName(err) });
+        return err;
+    };
+
+    return output.toOwnedSlice(allocator);
+}
+
+/// Bounded backend probe for an already-admitted function. This uses the same
+/// prepared program and emission plan as full publication while avoiding a
+/// whole-program traversal during renderer diagnosis.
+pub fn emitAdmittedFunctionAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    target: Target,
+    function_id: ir.FunctionId,
+) (EmitError || std.mem.Allocator.Error)![]u8 {
+    var transfer_arena = std.heap.ArenaAllocator.init(allocator);
+    defer transfer_arena.deinit();
+    const prepared = lexical_transfer.prepareInArena(transfer_arena.allocator(), program) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.UnsupportedControlFlow => return error.UnsupportedControlFlow,
+        error.UnsupportedTransfer => return error.UnsupportedOperation,
+    };
+    if (function_id.index() >= prepared.functions.len) return error.UnsupportedOperation;
+    var emission_plan = try EmissionPlan.init(allocator, &prepared, target);
+    defer emission_plan.deinit();
+    emission_plan.force_dispatcher = try functionNeedsArbitraryFallback(allocator, program, function_id);
+
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(allocator);
+    try emitRuntimePrelude(&output, allocator, &emission_plan, &prepared);
+    try emitFunction(&output, allocator, &prepared, &emission_plan, prepared.functions[function_id.index()]);
+    return output.toOwnedSlice(allocator);
+}
+
 fn functionNeedsArbitraryFallback(
     allocator: std.mem.Allocator,
     program: *const ir.Program,
@@ -169,6 +302,15 @@ fn emitRuntimePrelude(
                 "end\n\n",
         );
     }
+}
+
+fn emitFunction(output: *std.ArrayList(u8), allocator: std.mem.Allocator, program: *const ir.Program, emission_plan: *const EmissionPlan, function: ir.Function) !void {
+    try render.functionName(output, allocator, &emission_plan.names, function.id);
+    try output.appendSlice(allocator, " = function(");
+    try emitFunctionParameters(output, allocator, emission_plan, function);
+    try output.appendSlice(allocator, ")\n");
+    try emitFunctionBody(output, allocator, program, emission_plan, function, "  ", &.{});
+    try output.appendSlice(allocator, "end\n");
 }
 
 fn emitFunctionParameters(output: *std.ArrayList(u8), allocator: std.mem.Allocator, emission_plan: *const EmissionPlan, function: ir.Function) !void {
@@ -3454,6 +3596,72 @@ test "empty branch arm clone continuation authenticates its mapped edge" {
         error.UnsupportedControlFlow,
         validateEmptyProjectedContinue(&program, &region, wrong_entry),
     );
+}
+
+test "unstructured semantic numeric transition emits its explicit dynamic sequence" {
+    const proof = ir.EvidenceId.fromIndex(0);
+    const function_id = ir.FunctionId.fromIndex(0);
+    const block_id = ir.BlockId.fromIndex(0);
+    const instruction_id = ir.InstructionId.fromIndex(0);
+    const values = [_]ir.Value{
+        .{ .id = ir.ValueId.fromIndex(0), .function = function_id, .name_hint = "control", .origin = .{ .parameter = 0 } },
+        .{ .id = ir.ValueId.fromIndex(1), .function = function_id, .name_hint = "limit", .origin = .{ .parameter = 1 } },
+        .{ .id = ir.ValueId.fromIndex(2), .function = function_id, .name_hint = "step", .origin = .{ .parameter = 2 } },
+        .{ .id = ir.ValueId.fromIndex(3), .function = function_id, .type = .boolean, .name_hint = "initial", .origin = .{ .parameter = 3 } },
+        .{ .id = ir.ValueId.fromIndex(4), .function = function_id, .type = .boolean, .name_hint = "has_value", .origin = .{ .instruction_result = .{ .instruction = instruction_id, .index = 0 } } },
+        .{ .id = ir.ValueId.fromIndex(5), .function = function_id, .name_hint = "next_limit", .origin = .{ .instruction_result = .{ .instruction = instruction_id, .index = 1 } } },
+        .{ .id = ir.ValueId.fromIndex(6), .function = function_id, .name_hint = "next_step", .origin = .{ .instruction_result = .{ .instruction = instruction_id, .index = 2 } } },
+        .{ .id = ir.ValueId.fromIndex(7), .function = function_id, .name_hint = "next_control", .origin = .{ .instruction_result = .{ .instruction = instruction_id, .index = 3 } } },
+    };
+    const instructions = [_]ir.Instruction{.{
+        .id = instruction_id,
+        .block = block_id,
+        .operation = .{ .numeric_for_next = .{
+            .control = ir.ValueId.fromIndex(0),
+            .limit = ir.ValueId.fromIndex(1),
+            .step = ir.ValueId.fromIndex(2),
+            .initial = ir.ValueId.fromIndex(3),
+            .mode = .semantic_normalized,
+        } },
+        .results = &.{ ir.ValueId.fromIndex(4), ir.ValueId.fromIndex(5), ir.ValueId.fromIndex(6), ir.ValueId.fromIndex(7) },
+        .effects = .dynamic_call,
+        .evidence = &.{proof},
+    }};
+    const blocks = [_]ir.Block{.{
+        .id = block_id,
+        .function = function_id,
+        .instructions = &.{instruction_id},
+        .terminator = .{ .return_values = &.{ ir.ValueId.fromIndex(4), ir.ValueId.fromIndex(5), ir.ValueId.fromIndex(6), ir.ValueId.fromIndex(7) } },
+        .evidence = &.{proof},
+    }};
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .parameters = &.{ ir.ValueId.fromIndex(0), ir.ValueId.fromIndex(1), ir.ValueId.fromIndex(2), ir.ValueId.fromIndex(3) },
+        .blocks = &.{block_id},
+        .entry_block = block_id,
+        .evidence = &.{proof},
+    }};
+    const evidence = [_]ir.Evidence{.{
+        .id = proof,
+        .kind = .dynamic_fixture,
+        .locator = "fixture:semantic-numeric-transition",
+    }};
+    const program: ir.Program = .{
+        .program_id = "semantic-numeric-transition",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+        .evidence = &evidence,
+    };
+
+    const source = try emitStandardLuauAlloc(std.testing.allocator, &program);
+    defer std.testing.allocator.free(source);
+    try std.testing.expect(std.mem.indexOf(u8, source, "next_control = control + next_step") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "if next_step <= 0 then") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "has_value = next_control >= next_limit") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "has_value = next_control <= next_limit") != null);
 }
 
 fn emitInstruction(
