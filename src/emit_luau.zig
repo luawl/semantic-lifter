@@ -457,6 +457,30 @@ fn validatedContinueProjectionAlloc(
     return .{ .source_edge = edge, .target_edge = edge, .nonlocal = false };
 }
 
+fn regionAlwaysFunctionTerminates(program: *const ir.Program, region: *const structure.Region) bool {
+    if (region.terminal_projection != null) return true;
+    if (region.escape_projection != null) return false;
+    if (region.nodes.len == 0) return false;
+    return nodeAlwaysFunctionTerminates(program, region.nodes[region.nodes.len - 1]);
+}
+
+fn nodeAlwaysFunctionTerminates(program: *const ir.Program, node: structure.Node) bool {
+    return switch (node) {
+        .block => |block_id| switch (program.blocks[block_id.index()].terminator) {
+            .return_values, .return_pack, .return_expanded, .throw_error, .unreachable_block => true,
+            else => false,
+        },
+        .branch => |branch| branch.join == null and
+            regionAlwaysFunctionTerminates(program, branch.then_region) and
+            regionAlwaysFunctionTerminates(program, branch.else_region),
+        else => false,
+    };
+}
+
+fn sameEdge(left: ir.Edge, right: ir.Edge) bool {
+    return left.target == right.target and std.mem.eql(ir.ValueId, left.arguments, right.arguments);
+}
+
 fn branchArmIsStructurallyEmpty(
     program: *const ir.Program,
     edge: ir.Edge,
@@ -464,6 +488,26 @@ fn branchArmIsStructurallyEmpty(
     join: ?ir.BlockId,
 ) bool {
     return branch_statement.armIsStructurallyEmpty(program, edge, region, join);
+}
+
+fn genericInitializerCount(program: *const ir.Program, emission_plan: *const EmissionPlan, arguments: []const ir.ValueId) usize {
+    var count = arguments.len;
+    while (count > 1 and valueIsExactNil(program, emission_plan, arguments[count - 1])) count -= 1;
+    return count;
+}
+
+fn valueIsExactNil(program: *const ir.Program, emission_plan: *const EmissionPlan, value_id: ir.ValueId) bool {
+    const resolved = emission_plan.dead.resolveValue(value_id);
+    if (resolved.index() >= program.values.len) return false;
+    const origin = switch (program.values[resolved.index()].origin) {
+        .instruction_result => |value| value,
+        else => return false,
+    };
+    if (origin.index != 0 or origin.instruction.index() >= program.instructions.len) return false;
+    return switch (program.instructions[origin.instruction.index()].operation) {
+        .constant => |literal| literal == .nil_value,
+        else => false,
+    };
 }
 
 fn prepareLoopExit(
@@ -498,14 +542,277 @@ fn prepareLoopExit(
     }
 }
 
+fn emitLoopExit(output: *std.ArrayList(u8), allocator: std.mem.Allocator, program: *const ir.Program, emission_plan: *const EmissionPlan, edge: ir.Edge, indent: []const u8, place_aliases: []const PlaceAlias) !void {
+    try emitEdgeParameters(output, allocator, program, emission_plan, program.blocks[edge.target.index()], edge.arguments, indent, false, place_aliases);
+    try emitBreakStatement(output, allocator, indent);
+}
+
+fn emitBreakStatement(output: *std.ArrayList(u8), allocator: std.mem.Allocator, indent: []const u8) std.mem.Allocator.Error!void {
+    const transfer_indent = try allocDeeperIndent(allocator, indent);
+    defer allocator.free(transfer_indent);
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "do\n");
+    try output.appendSlice(allocator, transfer_indent);
+    try output.appendSlice(allocator, "break\n");
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "end\n");
+}
+
+fn escapeFlagNameAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    target: ir.BlockId,
+) std.mem.Allocator.Error![]const u8 {
+    const base = try std.fmt.allocPrint(allocator, "__lifter_escape_{d}", .{target.index()});
+    defer allocator.free(base);
+    return emission_plan.names.internalNameAlloc(allocator, program, base);
+}
+
+fn emitEscapeFlagDeclaration(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    target: ir.BlockId,
+    indent: []const u8,
+) std.mem.Allocator.Error!void {
+    const flag = try escapeFlagNameAlloc(allocator, program, emission_plan, target);
+    defer allocator.free(flag);
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "local ");
+    try output.appendSlice(allocator, flag);
+    try output.appendSlice(allocator, " = false\n");
+}
+
+fn emitEscapeFlagSet(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    target: ir.BlockId,
+    indent: []const u8,
+) std.mem.Allocator.Error!void {
+    const flag = try escapeFlagNameAlloc(allocator, program, emission_plan, target);
+    defer allocator.free(flag);
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, flag);
+    try output.appendSlice(allocator, " = true\n");
+}
+
+fn emitEscapePropagation(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    targets: []const ir.BlockId,
+    indent: []const u8,
+    loop_header: ?ir.BlockId,
+) std.mem.Allocator.Error!void {
+    if (targets.len == 0) return;
+    const break_indent = try allocDeeperIndent(allocator, indent);
+    defer allocator.free(break_indent);
+    for (targets) |target| {
+        const flag = try escapeFlagNameAlloc(allocator, program, emission_plan, target);
+        defer allocator.free(flag);
+        try output.appendSlice(allocator, indent);
+        try output.appendSlice(allocator, "if ");
+        try output.appendSlice(allocator, flag);
+        try output.appendSlice(allocator, " then\n");
+        try output.appendSlice(allocator, break_indent);
+        if (escapePropagationIsLoopContinue(target, loop_header)) {
+            try output.appendSlice(allocator, "continue\n");
+        } else {
+            try output.appendSlice(allocator, "break\n");
+        }
+        try output.appendSlice(allocator, indent);
+        try output.appendSlice(allocator, "end\n");
+    }
+}
+
+fn emitEscapeContinueIfSet(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    target: ir.BlockId,
+    indent: []const u8,
+) std.mem.Allocator.Error!void {
+    const flag = try escapeFlagNameAlloc(allocator, program, emission_plan, target);
+    defer allocator.free(flag);
+    const body_indent = try allocDeeperIndent(allocator, indent);
+    defer allocator.free(body_indent);
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "if ");
+    try output.appendSlice(allocator, flag);
+    try output.appendSlice(allocator, " then\n");
+    try emitContinueStatement(output, allocator, body_indent);
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "end\n");
+}
+
 fn escapePropagationIsLoopContinue(target: ir.BlockId, loop_header: ?ir.BlockId) bool {
     return loop_header != null and target == loop_header.?;
+}
+
+fn emitLoopEscapePropagation(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    node: structure.Node,
+    indent: []const u8,
+    consume_header_continue: bool,
+) std.mem.Allocator.Error!void {
+    const targets = try structured_escape.loopFreeTargetsAlloc(allocator, node);
+    defer allocator.free(targets);
+    const loop_header = if (consume_header_continue) node.blockId() else null;
+    try emitEscapePropagation(output, allocator, program, emission_plan, targets, indent, loop_header);
+    if (consume_header_continue and
+        !containsBlockId(targets, node.blockId()) and
+        loopNodeBodyHasNestedHeaderEscape(node, node.blockId()))
+    {
+        try emitEscapeContinueIfSet(output, allocator, program, emission_plan, node.blockId(), indent);
+    }
+}
+
+fn emitRegionEscapePropagation(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    region: *const structure.Region,
+    indent: []const u8,
+) std.mem.Allocator.Error!void {
+    const targets = try structured_escape.regionFreeTargetsAlloc(allocator, region);
+    defer allocator.free(targets);
+    const loop_header = regionOwnedContinueHeader(region);
+    try emitEscapePropagation(output, allocator, program, emission_plan, targets, indent, loop_header);
+    if (region.loop_exit) |loop_exit| {
+        if (!containsBlockId(targets, loop_exit) and
+            structured_escape.regionHasLoopBoundaryExitTo(region, loop_exit))
+        {
+            // A loop-boundary exit is owned by the surrounding loop and thus
+            // intentionally absent from free-target accounting. If a lexical
+            // transfer wrapper intercepted its break, forward the saved exit
+            // signal now that the temporary repeat has closed.
+            const exit_target = [_]ir.BlockId{loop_exit};
+            try emitEscapePropagation(output, allocator, program, emission_plan, &exit_target, indent, null);
+        }
+    }
+    if (loop_header != null and
+        !containsBlockId(targets, loop_header.?) and
+        structured_escape.regionHasNestedEscapeTo(region, loop_header.?))
+    {
+        // The target is the region's owning loop stop, so consume a nested
+        // transfer after the temporary wrapper has closed as a loop continue.
+        try emitEscapeContinueIfSet(output, allocator, program, emission_plan, loop_header.?, indent);
+    }
 }
 
 fn regionOwnedContinueHeader(region: *const structure.Region) ?ir.BlockId {
     const stop = region.stop orelse return null;
     if (region.continue_target == null or region.continue_target.? != stop) return null;
     return stop;
+}
+
+fn containsBlockId(targets: []const ir.BlockId, target: ir.BlockId) bool {
+    for (targets) |candidate| if (candidate == target) return true;
+    return false;
+}
+
+fn loopNodeBodyHasNestedHeaderEscape(node: structure.Node, header: ir.BlockId) bool {
+    return switch (node) {
+        .loop => |loop| structured_escape.regionHasNestedEscapeTo(loop.body_region, header),
+        .latch_loop => |loop| structured_escape.regionHasNestedEscapeTo(loop.body_region, header),
+        .infinite_loop => |loop| structured_escape.regionHasNestedEscapeTo(loop.body_region, header),
+        else => false,
+    };
+}
+
+fn emitLoopContinue(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    scopes: *const emission_scope.Plan,
+    edge: ir.Edge,
+    indent: []const u8,
+    place_aliases: []const PlaceAlias,
+) !void {
+    try emitEdgeParametersUnlessConsumed(output, allocator, program, emission_plan, scopes, program.blocks[edge.target.index()], edge.arguments, indent, false, place_aliases);
+}
+
+fn emitProjectedContinue(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    scopes: *const emission_scope.Plan,
+    edge: ir.Edge,
+    target: ir.BlockId,
+    indent: []const u8,
+    place_aliases: []const PlaceAlias,
+    nonlocal: bool,
+) (EmitError || std.mem.Allocator.Error)!void {
+    const validated = try loop_continue_projection.validateEntry(program, target, edge);
+    if (nonlocal) {
+        try emitEdgeParametersUnlessConsumed(
+            output,
+            allocator,
+            program,
+            emission_plan,
+            scopes,
+            program.blocks[target.index()],
+            validated.arguments,
+            indent,
+            false,
+            place_aliases,
+        );
+        try emitEscapeFlagSet(output, allocator, program, emission_plan, target, indent);
+        return;
+    }
+    try emitEdgeParametersUnlessConsumed(
+        output,
+        allocator,
+        program,
+        emission_plan,
+        scopes,
+        program.blocks[target.index()],
+        validated.arguments,
+        indent,
+        false,
+        place_aliases,
+    );
+    try emitContinueStatement(output, allocator, indent);
+}
+
+fn emitProjectedContinueAfterTransferredEdge(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    edge: ir.Edge,
+    target: ir.BlockId,
+    indent: []const u8,
+) (EmitError || std.mem.Allocator.Error)!void {
+    _ = try loop_continue_projection.validateEntry(program, target, edge);
+    try emitContinueStatement(output, allocator, indent);
+}
+
+fn emitContinueStatement(output: *std.ArrayList(u8), allocator: std.mem.Allocator, indent: []const u8) std.mem.Allocator.Error!void {
+    const transfer_indent = try allocDeeperIndent(allocator, indent);
+    defer allocator.free(transfer_indent);
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "do\n");
+    try output.appendSlice(allocator, transfer_indent);
+    try output.appendSlice(allocator, "continue\n");
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "end\n");
+}
+
+fn edgeTransferIsStructurallyEmpty(program: *const ir.Program, scopes: *const emission_scope.Plan, edge: ir.Edge) bool {
+    return scopes.nativeIterationConsumesParameters(edge.target) or
+        (edge.arguments.len == 0 and program.blocks[edge.target.index()].parameters.len == 0);
 }
 
 const EmptyBoundaryContinue = struct {
@@ -526,6 +833,68 @@ fn validateEmptyBoundaryContinue(
         .target = projection.target,
         .nonlocal = region.continue_target == null or region.continue_target.? != projection.target,
     };
+}
+
+fn emitScopeDeclarations(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    scopes: *const emission_scope.Plan,
+    scope: emission_scope.ScopeId,
+    indent: []const u8,
+) !void {
+    var bare_count: usize = 0;
+    for (scopes.function.local_places) |place_id| {
+        if (emission_plan.names.placeUsesStorage(place_id)) {
+            if (scopes.placeScope(place_id) != scope or scopes.placeDeclaredAtInstruction(place_id)) continue;
+            try flushBareDeclarations(output, allocator, &bare_count);
+            try output.appendSlice(allocator, indent);
+            try place_render.emitName(output, allocator, &emission_plan.names, program, place_id, &.{});
+            try output.appendSlice(allocator, " = ");
+            if (scopes.placeMovedLiteralInitializer(place_id)) |literal| {
+                try render.literal(output, allocator, literal);
+            } else {
+                try output.appendSlice(allocator, "nil");
+            }
+            try output.append(allocator, '\n');
+            continue;
+        }
+        if (scopes.placeScope(place_id) != scope or scopes.placeDeclaredAtInstruction(place_id)) continue;
+        if (scopes.placeMovedLiteralInitializer(place_id)) |literal| {
+            if (literal == .nil_value) {
+                const name = emission_plan.names.place(place_id) orelse return error.UnsupportedOperation;
+                try appendBareDeclaration(output, allocator, indent, name, &bare_count);
+                continue;
+            }
+            try flushBareDeclarations(output, allocator, &bare_count);
+            try output.appendSlice(allocator, indent);
+            try output.appendSlice(allocator, "local ");
+            try render.placeName(output, allocator, &emission_plan.names, place_id);
+            try output.appendSlice(allocator, " = ");
+            try render.literal(output, allocator, literal);
+            try output.append(allocator, '\n');
+        } else {
+            const name = emission_plan.names.place(place_id) orelse return error.UnsupportedOperation;
+            try appendBareDeclaration(output, allocator, indent, name, &bare_count);
+        }
+    }
+    for (program.values) |value| {
+        if (value.function != scopes.function.id or
+            emission_plan.names.valueUsesStorage(value.id) or
+            scopes.valueScope(value.id) != scope or
+            scopes.valueDeclaredAtInstruction(value.id) or
+            scopes.valueDeclaredAtSyntheticSite(value.id) or
+            scopes.valueSuppressedByControl(value.id)) continue;
+        const name = emission_plan.names.value(value.id) orelse return error.UnsupportedOperation;
+        try appendBareDeclaration(output, allocator, indent, name, &bare_count);
+    }
+    for (program.value_packs) |pack| {
+        if (pack.function != scopes.function.id or scopes.packScope(pack.id) != scope) continue;
+        const name = emission_plan.names.valuePack(pack.id) orelse return error.UnsupportedOperation;
+        try appendBareDeclaration(output, allocator, indent, name, &bare_count);
+    }
+    try flushBareDeclarations(output, allocator, &bare_count);
 }
 
 fn appendBareDeclaration(
@@ -786,6 +1155,452 @@ test "empty branch arm clone continuation authenticates its mapped edge" {
         error.UnsupportedControlFlow,
         validateEmptyProjectedContinue(&program, &region, wrong_entry),
     );
+}
+
+fn emitSemanticNormalizedTransition(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    instruction: ir.Instruction,
+    operation: ir.NumericForNext,
+    indent: []const u8,
+    declare_results: bool,
+    values: render.ValuePlan,
+) !void {
+    if (operation.mode != .semantic_normalized or instruction.results.len != 4) return error.UnsupportedOperation;
+    const has_value = instruction.results[0];
+    const normalized_limit = instruction.results[1];
+    const normalized_step = instruction.results[2];
+    const next_control = instruction.results[3];
+
+    const any_storage = for (instruction.results) |res| {
+        if (emission_plan.names.valueUsesStorage(res)) break true;
+    } else false;
+    if (declare_results and !any_storage) {
+        try output.appendSlice(allocator, indent);
+        try output.appendSlice(allocator, "local ");
+        for (instruction.results, 0..) |result, index| {
+            if (index != 0) try output.appendSlice(allocator, ", ");
+            try render.valueName(output, allocator, &emission_plan.names, result);
+        }
+        try output.append(allocator, '\n');
+    }
+
+    try output.appendSlice(allocator, indent);
+    try render.valueName(output, allocator, &emission_plan.names, normalized_limit);
+    try output.appendSlice(allocator, " = ");
+    try render.valueUseScalar(output, allocator, program, values, operation.limit);
+    try output.append(allocator, '\n');
+
+    try output.appendSlice(allocator, indent);
+    try render.valueName(output, allocator, &emission_plan.names, normalized_step);
+    try output.appendSlice(allocator, " = ");
+    try render.valueUseScalar(output, allocator, program, values, operation.step);
+    try output.append(allocator, '\n');
+
+    try output.appendSlice(allocator, indent);
+    try render.valueName(output, allocator, &emission_plan.names, next_control);
+    try output.appendSlice(allocator, " = ");
+    try render.valueUseScalar(output, allocator, program, values, operation.control);
+    try output.appendSlice(allocator, " + ");
+    try render.valueName(output, allocator, &emission_plan.names, normalized_step);
+    try output.append(allocator, '\n');
+
+    const arm_indent = try allocDeeperIndent(allocator, indent);
+    defer allocator.free(arm_indent);
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "if ");
+    try render.valueName(output, allocator, &emission_plan.names, normalized_step);
+    try output.appendSlice(allocator, " <= 0 then\n");
+    try output.appendSlice(allocator, arm_indent);
+    try render.valueName(output, allocator, &emission_plan.names, has_value);
+    try output.appendSlice(allocator, " = ");
+    try render.valueName(output, allocator, &emission_plan.names, next_control);
+    try output.appendSlice(allocator, " >= ");
+    try render.valueName(output, allocator, &emission_plan.names, normalized_limit);
+    try output.append(allocator, '\n');
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "else\n");
+    try output.appendSlice(allocator, arm_indent);
+    try render.valueName(output, allocator, &emission_plan.names, has_value);
+    try output.appendSlice(allocator, " = ");
+    try render.valueName(output, allocator, &emission_plan.names, next_control);
+    try output.appendSlice(allocator, " <= ");
+    try render.valueName(output, allocator, &emission_plan.names, normalized_limit);
+    try output.append(allocator, '\n');
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "end\n");
+}
+
+fn emitCompoundMemoryUpdate(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    instruction: ir.Instruction,
+    update: compound_update.MemoryUpdate,
+    indent: []const u8,
+    values: render.ValuePlan,
+) !void {
+    _ = emission_plan;
+    const needs_separator = render.statementNeedsSeparator(program, values, instruction.operation);
+    var statement_indent = indent;
+    var allocated_indent: ?[]u8 = null;
+    defer if (allocated_indent) |value| allocator.free(value);
+
+    if (needs_separator) {
+        try output.appendSlice(allocator, indent);
+        try output.appendSlice(allocator, "do\n");
+        allocated_indent = try allocDeeperIndent(allocator, indent);
+        statement_indent = allocated_indent.?;
+    }
+
+    try output.appendSlice(allocator, statement_indent);
+    switch (update.address) {
+        .table => |address| try render.semanticTableAddress(output, allocator, program, values, address.table, address.key),
+        .environment => |address| try render.semanticEnvironmentAddress(output, allocator, program, values, address.target, address.name),
+    }
+    try output.append(allocator, ' ');
+    try output.appendSlice(allocator, render.compoundOperator(update.operator) orelse return error.UnsupportedOperation);
+    try output.append(allocator, ' ');
+    try render.valueUseScalar(output, allocator, program, values, update.right);
+    try output.append(allocator, '\n');
+
+    if (needs_separator) {
+        try output.appendSlice(allocator, indent);
+        try output.appendSlice(allocator, "end\n");
+    }
+}
+
+fn emitTableConstructorInstruction(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    instruction: ir.Instruction,
+    constructor: ir.TableConstructor,
+    indent: []const u8,
+    declare_result: bool,
+    values: render.ValuePlan,
+) !void {
+    if (instruction.results.len != 1 or instruction.results[0].index() >= program.values.len) return error.UnsupportedOperation;
+    try output.appendSlice(allocator, indent);
+    if (declare_result and !emission_plan.names.valueUsesStorage(instruction.results[0])) try output.appendSlice(allocator, "local ");
+    try render.valueName(output, allocator, &emission_plan.names, instruction.results[0]);
+    try output.appendSlice(allocator, " = {");
+
+    const item_count = constructor.fields.len + @intFromBool(constructor.tail_pack != null);
+    if (item_count == 0) {
+        try output.appendSlice(allocator, "}\n");
+        return;
+    }
+
+    const field_indent = try allocDeeperIndent(allocator, indent);
+    defer allocator.free(field_indent);
+    try output.append(allocator, '\n');
+    var item_index: usize = 0;
+    for (constructor.fields, 0..) |field, field_index| {
+        try output.appendSlice(allocator, field_indent);
+        switch (field) {
+            .list => |value| if (field_index + 1 < constructor.fields.len or constructor.tail_pack != null)
+                try render.valueUseScalar(output, allocator, program, values, value)
+            else
+                try render.valueUseRoot(output, allocator, program, values, value),
+            .keyed => |keyed| {
+                try render.semanticConstructorKey(output, allocator, program, values, keyed.key);
+                try output.appendSlice(allocator, " = ");
+                try render.valueUseScalar(output, allocator, program, values, keyed.value);
+            },
+        }
+        item_index += 1;
+        if (item_index != item_count) try output.append(allocator, ',');
+        try output.append(allocator, '\n');
+    }
+    if (constructor.tail_pack) |pack_id| {
+        try output.appendSlice(allocator, field_indent);
+        try emitTableConstructorTail(output, allocator, program, emission_plan, instruction.id, pack_id, values);
+        try output.append(allocator, '\n');
+    }
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "}\n");
+}
+
+fn emitTableConstructorTail(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    consumer: ir.InstructionId,
+    pack_id: ir.ValuePackId,
+    values: render.ValuePlan,
+) !void {
+    if (pack_id.index() >= program.value_packs.len) return error.UnsupportedOperation;
+    switch (program.value_packs[pack_id.index()].origin) {
+        .varargs => try render.directVarargPackExpression(output, allocator, program, values, pack_id),
+        .instruction_result => |producer_id| {
+            if (producer_id.index() >= program.instructions.len) return error.UnsupportedOperation;
+            const producer = program.instructions[producer_id.index()];
+            switch (producer.operation) {
+                .pack_values => {
+                    if (!emission_plan.packs.packValuesServesInstruction(producer_id, consumer)) return error.UnsupportedOperation;
+                    try render.plannedPackValues(output, allocator, program, values, producer);
+                },
+                else => {
+                    if (emission_plan.packs.storedPackServesInstruction(producer_id, consumer)) {
+                        try render.storedPackExpansion(output, allocator, values, pack_id);
+                        return;
+                    }
+                    const fused_consumer = switch (emission_plan.packs.role(producer_id)) {
+                        .fused_invocation_producer => |value| value,
+                        else => return error.UnsupportedOperation,
+                    };
+                    if (fused_consumer != consumer) return error.UnsupportedOperation;
+                    try render.plannedInvocation(output, allocator, program, values, &emission_plan.packs, producer);
+                },
+            }
+        },
+    }
+}
+
+fn emitTableSetPackInstruction(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    instruction: ir.Instruction,
+    operation: ir.TableSetPack,
+    indent: []const u8,
+    values: render.ValuePlan,
+) !void {
+    const statement_indent = try allocDeeperIndent(allocator, indent);
+    defer allocator.free(statement_indent);
+    const loop_indent = try allocDeeperIndent(allocator, statement_indent);
+    defer allocator.free(loop_indent);
+    const body_indent = try allocDeeperIndent(allocator, loop_indent);
+    defer allocator.free(body_indent);
+
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "do\n");
+    try output.appendSlice(allocator, statement_indent);
+    try output.appendSlice(allocator, "(function(__lifter_pack_table_");
+    try output.print(allocator, "{d}", .{instruction.id.index()});
+    try output.appendSlice(allocator, ", __lifter_pack_first_");
+    try output.print(allocator, "{d}", .{instruction.id.index()});
+    try output.appendSlice(allocator, ", ...)\n");
+
+    try output.appendSlice(allocator, loop_indent);
+    try output.appendSlice(allocator, "for __lifter_pack_offset_");
+    try output.print(allocator, "{d}", .{instruction.id.index()});
+    try output.appendSlice(allocator, " = 0, ");
+    try render.runtimeCallStart(output, allocator, values, .select);
+    try output.appendSlice(allocator, "\"#\", ...) - 1 do\n");
+
+    try output.appendSlice(allocator, body_indent);
+    try render.runtimeCallStart(output, allocator, values, .rawset);
+    try output.appendSlice(allocator, "__lifter_pack_table_");
+    try output.print(allocator, "{d}", .{instruction.id.index()});
+    try output.appendSlice(allocator, ", __lifter_pack_first_");
+    try output.print(allocator, "{d}", .{instruction.id.index()});
+    try output.appendSlice(allocator, " + __lifter_pack_offset_");
+    try output.print(allocator, "{d}", .{instruction.id.index()});
+    try output.appendSlice(allocator, ", (");
+    try render.runtimeCallStart(output, allocator, values, .select);
+    try output.appendSlice(allocator, "__lifter_pack_offset_");
+    try output.print(allocator, "{d}", .{instruction.id.index()});
+    try output.appendSlice(allocator, " + 1, ...)))\n");
+
+    try output.appendSlice(allocator, loop_indent);
+    try output.appendSlice(allocator, "end\n");
+    try output.appendSlice(allocator, statement_indent);
+    try output.appendSlice(allocator, "end)(");
+    try render.valueUseScalar(output, allocator, program, values, operation.table);
+    try output.print(allocator, ", {d}, ", .{operation.first_index});
+    try emitTableConstructorTail(output, allocator, program, emission_plan, instruction.id, operation.pack, values);
+    try output.appendSlice(allocator, ")\n");
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "end\n");
+}
+
+fn emitCallRepeatedTableGetInstruction(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    instruction: ir.Instruction,
+    operation: ir.CallRepeatedTableGet,
+    indent: []const u8,
+    declare_results: bool,
+    place_aliases: []const PlaceAlias,
+    values: render.ValuePlan,
+) !void {
+    const result_count = switch (operation.result_arity) {
+        .fixed => |count| @as(usize, count),
+        .variadic => return error.UnsupportedOperation,
+    };
+    if (result_count != instruction.results.len or instruction.pack_result != null) return error.UnsupportedOperation;
+
+    const statement_indent = try allocDeeperIndent(allocator, indent);
+    defer allocator.free(statement_indent);
+    const loop_indent = try allocDeeperIndent(allocator, statement_indent);
+    defer allocator.free(loop_indent);
+    const body_indent = try allocDeeperIndent(allocator, loop_indent);
+    defer allocator.free(body_indent);
+
+    try output.appendSlice(allocator, indent);
+    if (instruction.results.len != 0) {
+        const any_storage = for (instruction.results) |res| {
+            if (emission_plan.names.valueUsesStorage(res)) break true;
+        } else false;
+        if (declare_results and !any_storage) try output.appendSlice(allocator, "local ");
+        for (instruction.results, 0..) |result, index| {
+            if (index != 0) try output.appendSlice(allocator, ", ");
+            try render.valueName(output, allocator, &emission_plan.names, result);
+        }
+        try output.appendSlice(allocator, " = ");
+    }
+    try output.appendSlice(allocator, "(function(__lifter_repeated_callee_");
+    try output.print(allocator, "{d}", .{instruction.id.index()});
+    for (operation.prefix_arguments, 0..) |_, index| {
+        try output.appendSlice(allocator, ", __lifter_repeated_prefix_");
+        try output.print(allocator, "{d}_{d}", .{ instruction.id.index(), index });
+    }
+    try output.appendSlice(allocator, ", __lifter_repeated_table_");
+    try output.print(allocator, "{d}, __lifter_repeated_key_", .{instruction.id.index()});
+    try output.print(allocator, "{d}, __lifter_repeated_from_", .{instruction.id.index()});
+    try output.print(allocator, "{d}, __lifter_repeated_to_", .{instruction.id.index()});
+    try output.print(allocator, "{d}, __lifter_repeated_step_", .{instruction.id.index()});
+    try output.print(allocator, "{d})\n", .{instruction.id.index()});
+
+    try output.appendSlice(allocator, loop_indent);
+    try output.appendSlice(allocator, "local __lifter_repeated_values_");
+    try output.print(allocator, "{d} = {{}}\n", .{instruction.id.index()});
+    try output.appendSlice(allocator, loop_indent);
+    try output.appendSlice(allocator, "local __lifter_repeated_count_");
+    try output.print(allocator, "{d} = 0\n", .{instruction.id.index()});
+
+    try output.appendSlice(allocator, loop_indent);
+    try output.appendSlice(allocator, "for __lifter_repeated_cursor_");
+    try output.print(allocator, "{d} = __lifter_repeated_from_", .{instruction.id.index()});
+    try output.print(allocator, "{d}, __lifter_repeated_to_", .{instruction.id.index()});
+    try output.print(allocator, "{d}, __lifter_repeated_step_", .{instruction.id.index()});
+    try output.print(allocator, "{d} do\n", .{instruction.id.index()});
+
+    try output.appendSlice(allocator, body_indent);
+    try output.appendSlice(allocator, "__lifter_repeated_values_");
+    try output.print(allocator, "{d}[__lifter_repeated_count_", .{instruction.id.index()});
+    try output.print(allocator, "{d} + 1] = __lifter_repeated_table_", .{instruction.id.index()});
+    try output.print(allocator, "{d}[__lifter_repeated_key_", .{instruction.id.index()});
+    try output.print(allocator, "{d}]\n", .{instruction.id.index()});
+    try output.appendSlice(allocator, body_indent);
+    try output.appendSlice(allocator, "__lifter_repeated_count_");
+    try output.print(allocator, "{d} = __lifter_repeated_count_", .{instruction.id.index()});
+    try output.print(allocator, "{d} + 1\n", .{instruction.id.index()});
+    if (operation.counter) |counter| {
+        try emitRepeatedTableGetCounterIncrement(
+            output,
+            allocator,
+            program,
+            emission_plan,
+            values,
+            counter,
+            body_indent,
+            place_aliases,
+        );
+    }
+    try output.appendSlice(allocator, loop_indent);
+    try output.appendSlice(allocator, "end\n");
+
+    try output.appendSlice(allocator, loop_indent);
+    try output.appendSlice(allocator, "return __lifter_repeated_callee_");
+    try output.print(allocator, "{d}(", .{instruction.id.index()});
+    for (operation.prefix_arguments, 0..) |_, index| {
+        if (index != 0) try output.appendSlice(allocator, ", ");
+        try output.appendSlice(allocator, "__lifter_repeated_prefix_");
+        try output.print(allocator, "{d}_{d}", .{ instruction.id.index(), index });
+    }
+    if (operation.prefix_arguments.len != 0) try output.appendSlice(allocator, ", ");
+    try render.runtimeCallStart(output, allocator, values, .table_unpack);
+    try output.appendSlice(allocator, "__lifter_repeated_values_");
+    try output.print(allocator, "{d}, 1, __lifter_repeated_count_", .{instruction.id.index()});
+    try output.print(allocator, "{d}))\n", .{instruction.id.index()});
+
+    try output.appendSlice(allocator, statement_indent);
+    try output.appendSlice(allocator, "end)(");
+    try render.valueUseScalar(output, allocator, program, values, operation.callee);
+    for (operation.prefix_arguments) |argument| {
+        try output.appendSlice(allocator, ", ");
+        try render.valueUseScalar(output, allocator, program, values, argument);
+    }
+    const range_values = [_]ir.ValueId{ operation.table, operation.key, operation.from, operation.to, operation.step };
+    for (range_values) |value| {
+        try output.appendSlice(allocator, ", ");
+        try render.valueUseScalar(output, allocator, program, values, value);
+    }
+    try output.appendSlice(allocator, ")\n");
+}
+
+fn emitRepeatedTableGetCounterIncrement(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    values: render.ValuePlan,
+    counter: ir.PlaceId,
+    indent: []const u8,
+    place_aliases: []const PlaceAlias,
+) !void {
+    const resolved = place_render.resolve(counter, place_aliases) orelse return error.UnsupportedOperation;
+    try output.appendSlice(allocator, indent);
+    switch (resolved) {
+        .place => {
+            try lexical.emitPlaceName(output, allocator, &emission_plan.names, program, counter, place_aliases);
+            try output.appendSlice(allocator, " = ");
+            try lexical.emitPlaceName(output, allocator, &emission_plan.names, program, counter, place_aliases);
+            try output.appendSlice(allocator, " + 1\n");
+        },
+        .external_binding => |binding_id| {
+            try render.runtimeCallStart(output, allocator, values, .rawset);
+            try place_render.emitExternalBindingName(output, allocator, &emission_plan.names, binding_id);
+            try output.appendSlice(allocator, ", 1, ");
+            try render.runtimeCallStart(output, allocator, values, .rawget);
+            try place_render.emitExternalBindingName(output, allocator, &emission_plan.names, binding_id);
+            try output.appendSlice(allocator, ", 1) + 1)\n");
+        },
+    }
+}
+
+fn emitScopedClosureDestinationDeclaration(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    destination: ClosureDestination,
+    indent: []const u8,
+    parent_place_aliases: []const PlaceAlias,
+) !void {
+    switch (destination) {
+        .value => |value| {
+            if (!value.declare) return;
+            if (value.id.index() >= program.values.len) return error.UnsupportedOperation;
+            if (emission_plan.names.valueUsesStorage(value.id)) return;
+            try output.appendSlice(allocator, indent);
+            try output.appendSlice(allocator, "local ");
+            try render.valueName(output, allocator, &emission_plan.names, value.id);
+            try output.append(allocator, '\n');
+        },
+        .place => |place| {
+            if (!place.declare) return;
+            const resolved = place_render.resolve(place.id, parent_place_aliases) orelse return error.UnsupportedOperation;
+            if (resolved != .place) return error.UnsupportedOperation;
+            if (emission_plan.names.placeUsesStorage(resolved.place)) return;
+            try output.appendSlice(allocator, indent);
+            try output.appendSlice(allocator, "local ");
+            try lexical.emitPlaceName(output, allocator, &emission_plan.names, program, place.id, parent_place_aliases);
+            try output.append(allocator, '\n');
+        },
+        .table, .environment => {},
+    }
 }
 
 test "empty branch arm requires a parameter-free jump to its join" {
