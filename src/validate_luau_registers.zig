@@ -161,10 +161,7 @@ fn validatePrepared(
             @intFromBool(emission.names.functionUsesStorage(function)),
             @intFromBool(emission.names.functionUsesValueStorage(program, function)),
         );
-        const base = saturatingAdd(
-            saturatingAdd(function_base, structured_escape.maxOwnedDepth(structured.root)),
-            storage_locals,
-        );
+        const base = try functionRegisterBase(allocator, function_base, storage_locals, structured.root);
         const pressure = try maximumPressure(allocator, program, readable, &emission, &scopes, function, base);
         // The dispatcher (arbitrary-CFG) layout declares a flat set of locals at
         // the function root that `maximumPressure` undercounts: it scores only
@@ -201,6 +198,35 @@ fn validatePrepared(
     try validateFixedReturnCounts(report, program, readable, &emission, emitted_functions);
     try prototype_validation.validate(report, program, readable, &emission, emitted_functions);
     try upvalue_validation.validate(allocator, report, program, readable, &emission, stable_values);
+}
+
+/// The function-scope registers a certified layout holds before any scoped
+/// binding: the parameters (the entry chunk's bindings for the entry
+/// function), the owned-escape depth, the storage tables and, on a structured
+/// root, the escape flags `emitFunctionBody` declares at function scope: one
+/// per root free target and one per loop-boundary exit target not among them.
+fn functionRegisterBase(
+    allocator: std.mem.Allocator,
+    function_base: usize,
+    storage_locals: usize,
+    root: *const structure.Region,
+) std.mem.Allocator.Error!usize {
+    const base = saturatingAdd(
+        saturatingAdd(function_base, structured_escape.maxOwnedDepth(root)),
+        storage_locals,
+    );
+    if (root.arbitrary_cfg) return base;
+    const root_escape_targets = try structured_escape.regionFreeTargetsAlloc(allocator, root);
+    defer allocator.free(root_escape_targets);
+    const loop_boundary_exit_targets = try structured_escape.loopBoundaryExitTargetsAlloc(allocator, root);
+    defer allocator.free(loop_boundary_exit_targets);
+    var escape_flags = root_escape_targets.len;
+    for (loop_boundary_exit_targets) |target| {
+        for (root_escape_targets) |declared| {
+            if (declared == target) break;
+        } else escape_flags += 1;
+    }
+    return saturatingAdd(base, escape_flags);
 }
 
 fn hasDiagnosticForFunction(
@@ -749,4 +775,175 @@ fn topLevelFunctionCount(program: *const ir.Program) usize {
 
 fn saturatingAdd(left: usize, right: usize) usize {
     return std.math.add(usize, left, right) catch std.math.maxInt(usize);
+}
+
+test "automatic register certificate covers the function-scope escape flags of nested_repeat" {
+    // The recorded native held-out case nested_repeat
+    // (research/runs/2026-10-06-native-heldout-v1/cases/nested_repeat/disassembly.normalized.json,
+    // sha256 b7b550d0bf1b908702a5a36beeb4618782c0ddadf2cc3713158735a7b2e2e2bc), re-serialized with
+    // one entity per line. Its worker (function 1, two parameters) runs two nested loops whose exits
+    // the automatic layout routes through function-scope escape flags; the automatic output declares
+    // two such flags and needs 10 locals, maxstacksize 11 (luau-compile -O0).
+    const nested_repeat_ir =
+        \\{"schema_version":"lifter_ir_v1","program_id":"native-nested_repeat","source_semantics":"luau","entry_function":0,"entry_bindings":[],"external_bindings":[],"functions":[
+        \\{"id":0,"name_hint":"module","lexical_parent":null,"parameters":[],"captures":[],"local_places":[],"blocks":[0],"entry_block":0,"is_variadic":false,"vararg_pack":null,"evidence":[0]},
+        \\{"id":1,"name_hint":"worker","lexical_parent":0,"parameters":[0,1],"captures":[],"local_places":[0,1,2,3,4,5],"blocks":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16],"entry_block":1,"is_variadic":false,"vararg_pack":null,"evidence":[0]}]
+        \\,"blocks":[
+        \\{"id":0,"function":0,"name_hint":null,"parameters":[],"instructions":[37],"terminator":{"return_values":[27]},"evidence":[0]},
+        \\{"id":1,"function":1,"name_hint":"register_entry","parameters":[],"instructions":[0,1],"terminator":{"jump":{"target":2,"arguments":[]}},"evidence":[0]},
+        \\{"id":2,"function":1,"name_hint":"instruction_1","parameters":[],"instructions":[2,3],"terminator":{"jump":{"target":3,"arguments":[]}},"evidence":[1]},
+        \\{"id":3,"function":1,"name_hint":"instruction_2","parameters":[],"instructions":[4,5],"terminator":{"jump":{"target":4,"arguments":[]}},"evidence":[2]},
+        \\{"id":4,"function":1,"name_hint":"instruction_3","parameters":[],"instructions":[6,7],"terminator":{"jump":{"target":5,"arguments":[]}},"evidence":[3]},
+        \\{"id":5,"function":1,"name_hint":"instruction_4","parameters":[],"instructions":[8,9],"terminator":{"jump":{"target":6,"arguments":[]}},"evidence":[4]},
+        \\{"id":6,"function":1,"name_hint":"instruction_5","parameters":[],"instructions":[10,11,12,13],"terminator":{"jump":{"target":7,"arguments":[]}},"evidence":[5]},
+        \\{"id":7,"function":1,"name_hint":"instruction_6","parameters":[],"instructions":[14,15,16,17],"terminator":{"jump":{"target":8,"arguments":[]}},"evidence":[6]},
+        \\{"id":8,"function":1,"name_hint":"instruction_7","parameters":[],"instructions":[18,19,20,21],"terminator":{"jump":{"target":9,"arguments":[]}},"evidence":[7]},
+        \\{"id":9,"function":1,"name_hint":"instruction_8","parameters":[],"instructions":[22,23],"terminator":{"jump":{"target":10,"arguments":[]}},"evidence":[8]},
+        \\{"id":10,"function":1,"name_hint":"instruction_9","parameters":[],"instructions":[24,25,26],"terminator":{"branch":{"condition":18,"then_edge":{"target":12,"arguments":[]},"else_edge":{"target":11,"arguments":[]}}},"evidence":[9]},
+        \\{"id":11,"function":1,"name_hint":"instruction_10","parameters":[],"instructions":[],"terminator":{"jump":{"target":5,"arguments":[]}},"evidence":[10]},
+        \\{"id":12,"function":1,"name_hint":"instruction_11","parameters":[],"instructions":[27,28],"terminator":{"jump":{"target":13,"arguments":[]}},"evidence":[11]},
+        \\{"id":13,"function":1,"name_hint":"instruction_12","parameters":[],"instructions":[29,30,31,32],"terminator":{"jump":{"target":14,"arguments":[]}},"evidence":[12]},
+        \\{"id":14,"function":1,"name_hint":"instruction_13","parameters":[],"instructions":[33,34,35],"terminator":{"branch":{"condition":25,"then_edge":{"target":16,"arguments":[]},"else_edge":{"target":15,"arguments":[]}}},"evidence":[13]},
+        \\{"id":15,"function":1,"name_hint":"instruction_14","parameters":[],"instructions":[],"terminator":{"jump":{"target":4,"arguments":[]}},"evidence":[14]},
+        \\{"id":16,"function":1,"name_hint":"instruction_15","parameters":[],"instructions":[36],"terminator":{"return_values":[26]},"evidence":[15]}]
+        \\,"instructions":[
+        \\{"id":0,"block":1,"operation":{"place_write":{"place":0,"value":0}},"results":[],"pack_result":null,"effects":{"precision":"exact","reads_memory":false,"writes_memory":true,"may_throw":false,"may_yield":false,"invokes_unknown_code":false},"evidence":[0],"claims":[]},
+        \\{"id":1,"block":1,"operation":{"place_write":{"place":1,"value":1}},"results":[],"pack_result":null,"effects":{"precision":"exact","reads_memory":false,"writes_memory":true,"may_throw":false,"may_yield":false,"invokes_unknown_code":false},"evidence":[0],"claims":[]},
+        \\{"id":2,"block":2,"operation":{"constant":{"number":0}},"results":[2],"pack_result":null,"effects":{"precision":"exact","reads_memory":false,"writes_memory":false,"may_throw":false,"may_yield":false,"invokes_unknown_code":false},"evidence":[1],"claims":[]},
+        \\{"id":3,"block":2,"operation":{"place_write":{"place":2,"value":2}},"results":[],"pack_result":null,"effects":{"precision":"exact","reads_memory":false,"writes_memory":true,"may_throw":false,"may_yield":false,"invokes_unknown_code":false},"evidence":[1],"claims":[]},
+        \\{"id":4,"block":3,"operation":{"constant":{"number":0}},"results":[3],"pack_result":null,"effects":{"precision":"exact","reads_memory":false,"writes_memory":false,"may_throw":false,"may_yield":false,"invokes_unknown_code":false},"evidence":[2],"claims":[]},
+        \\{"id":5,"block":3,"operation":{"place_write":{"place":3,"value":3}},"results":[],"pack_result":null,"effects":{"precision":"exact","reads_memory":false,"writes_memory":true,"may_throw":false,"may_yield":false,"invokes_unknown_code":false},"evidence":[2],"claims":[]},
+        \\{"id":6,"block":4,"operation":{"constant":{"number":0}},"results":[4],"pack_result":null,"effects":{"precision":"exact","reads_memory":false,"writes_memory":false,"may_throw":false,"may_yield":false,"invokes_unknown_code":false},"evidence":[3],"claims":[]},
+        \\{"id":7,"block":4,"operation":{"place_write":{"place":4,"value":4}},"results":[],"pack_result":null,"effects":{"precision":"exact","reads_memory":false,"writes_memory":true,"may_throw":false,"may_yield":false,"invokes_unknown_code":false},"evidence":[3],"claims":[]},
+        \\{"id":8,"block":5,"operation":{"constant":{"number":1}},"results":[5],"pack_result":null,"effects":{"precision":"exact","reads_memory":false,"writes_memory":false,"may_throw":false,"may_yield":false,"invokes_unknown_code":false},"evidence":[4],"claims":[]},
+        \\{"id":9,"block":5,"operation":{"place_write":{"place":5,"value":5}},"results":[],"pack_result":null,"effects":{"precision":"exact","reads_memory":false,"writes_memory":true,"may_throw":false,"may_yield":false,"invokes_unknown_code":false},"evidence":[4],"claims":[]},
+        \\{"id":10,"block":6,"operation":{"place_read":4},"results":[6],"pack_result":null,"effects":{"precision":"exact","reads_memory":true,"writes_memory":false,"may_throw":false,"may_yield":false,"invokes_unknown_code":false},"evidence":[5],"claims":[]},
+        \\{"id":11,"block":6,"operation":{"place_read":5},"results":[7],"pack_result":null,"effects":{"precision":"exact","reads_memory":true,"writes_memory":false,"may_throw":false,"may_yield":false,"invokes_unknown_code":false},"evidence":[5],"claims":[]},
+        \\{"id":12,"block":6,"operation":{"binary":{"operator":"add","left":6,"right":7,"mode":"semantic","shift_behavior":null}},"results":[8],"pack_result":null,"effects":{"precision":"conservative","reads_memory":true,"writes_memory":true,"may_throw":true,"may_yield":true,"invokes_unknown_code":true},"evidence":[5],"claims":[]},
+        \\{"id":13,"block":6,"operation":{"place_write":{"place":4,"value":8}},"results":[],"pack_result":null,"effects":{"precision":"exact","reads_memory":false,"writes_memory":true,"may_throw":false,"may_yield":false,"invokes_unknown_code":false},"evidence":[5],"claims":[]},
+        \\{"id":14,"block":7,"operation":{"place_read":2},"results":[9],"pack_result":null,"effects":{"precision":"exact","reads_memory":true,"writes_memory":false,"may_throw":false,"may_yield":false,"invokes_unknown_code":false},"evidence":[6],"claims":[]},
+        \\{"id":15,"block":7,"operation":{"place_read":0},"results":[10],"pack_result":null,"effects":{"precision":"exact","reads_memory":true,"writes_memory":false,"may_throw":false,"may_yield":false,"invokes_unknown_code":false},"evidence":[6],"claims":[]},
+        \\{"id":16,"block":7,"operation":{"binary":{"operator":"add","left":9,"right":10,"mode":"semantic","shift_behavior":null}},"results":[11],"pack_result":null,"effects":{"precision":"conservative","reads_memory":true,"writes_memory":true,"may_throw":true,"may_yield":true,"invokes_unknown_code":true},"evidence":[6],"claims":[]},
+        \\{"id":17,"block":7,"operation":{"place_write":{"place":5,"value":11}},"results":[],"pack_result":null,"effects":{"precision":"exact","reads_memory":false,"writes_memory":true,"may_throw":false,"may_yield":false,"invokes_unknown_code":false},"evidence":[6],"claims":[]},
+        \\{"id":18,"block":8,"operation":{"place_read":5},"results":[12],"pack_result":null,"effects":{"precision":"exact","reads_memory":true,"writes_memory":false,"may_throw":false,"may_yield":false,"invokes_unknown_code":false},"evidence":[7],"claims":[]},
+        \\{"id":19,"block":8,"operation":{"place_read":4},"results":[13],"pack_result":null,"effects":{"precision":"exact","reads_memory":true,"writes_memory":false,"may_throw":false,"may_yield":false,"invokes_unknown_code":false},"evidence":[7],"claims":[]},
+        \\{"id":20,"block":8,"operation":{"binary":{"operator":"add","left":12,"right":13,"mode":"semantic","shift_behavior":null}},"results":[14],"pack_result":null,"effects":{"precision":"conservative","reads_memory":true,"writes_memory":true,"may_throw":true,"may_yield":true,"invokes_unknown_code":true},"evidence":[7],"claims":[]},
+        \\{"id":21,"block":8,"operation":{"place_write":{"place":2,"value":14}},"results":[],"pack_result":null,"effects":{"precision":"exact","reads_memory":false,"writes_memory":true,"may_throw":false,"may_yield":false,"invokes_unknown_code":false},"evidence":[7],"claims":[]},
+        \\{"id":22,"block":9,"operation":{"constant":{"number":2}},"results":[15],"pack_result":null,"effects":{"precision":"exact","reads_memory":false,"writes_memory":false,"may_throw":false,"may_yield":false,"invokes_unknown_code":false},"evidence":[8],"claims":[]},
+        \\{"id":23,"block":9,"operation":{"place_write":{"place":5,"value":15}},"results":[],"pack_result":null,"effects":{"precision":"exact","reads_memory":false,"writes_memory":true,"may_throw":false,"may_yield":false,"invokes_unknown_code":false},"evidence":[8],"claims":[]},
+        \\{"id":24,"block":10,"operation":{"place_read":5},"results":[16],"pack_result":null,"effects":{"precision":"exact","reads_memory":true,"writes_memory":false,"may_throw":false,"may_yield":false,"invokes_unknown_code":false},"evidence":[9],"claims":[]},
+        \\{"id":25,"block":10,"operation":{"place_read":4},"results":[17],"pack_result":null,"effects":{"precision":"exact","reads_memory":true,"writes_memory":false,"may_throw":false,"may_yield":false,"invokes_unknown_code":false},"evidence":[9],"claims":[]},
+        \\{"id":26,"block":10,"operation":{"binary":{"operator":"less_equal","left":16,"right":17,"mode":"semantic","shift_behavior":null}},"results":[18],"pack_result":null,"effects":{"precision":"conservative","reads_memory":true,"writes_memory":true,"may_throw":true,"may_yield":true,"invokes_unknown_code":true},"evidence":[9],"claims":[]},
+        \\{"id":27,"block":12,"operation":{"constant":{"number":1}},"results":[19],"pack_result":null,"effects":{"precision":"exact","reads_memory":false,"writes_memory":false,"may_throw":false,"may_yield":false,"invokes_unknown_code":false},"evidence":[11],"claims":[]},
+        \\{"id":28,"block":12,"operation":{"place_write":{"place":5,"value":19}},"results":[],"pack_result":null,"effects":{"precision":"exact","reads_memory":false,"writes_memory":true,"may_throw":false,"may_yield":false,"invokes_unknown_code":false},"evidence":[11],"claims":[]},
+        \\{"id":29,"block":13,"operation":{"place_read":3},"results":[20],"pack_result":null,"effects":{"precision":"exact","reads_memory":true,"writes_memory":false,"may_throw":false,"may_yield":false,"invokes_unknown_code":false},"evidence":[12],"claims":[]},
+        \\{"id":30,"block":13,"operation":{"place_read":5},"results":[21],"pack_result":null,"effects":{"precision":"exact","reads_memory":true,"writes_memory":false,"may_throw":false,"may_yield":false,"invokes_unknown_code":false},"evidence":[12],"claims":[]},
+        \\{"id":31,"block":13,"operation":{"binary":{"operator":"add","left":20,"right":21,"mode":"semantic","shift_behavior":null}},"results":[22],"pack_result":null,"effects":{"precision":"conservative","reads_memory":true,"writes_memory":true,"may_throw":true,"may_yield":true,"invokes_unknown_code":true},"evidence":[12],"claims":[]},
+        \\{"id":32,"block":13,"operation":{"place_write":{"place":3,"value":22}},"results":[],"pack_result":null,"effects":{"precision":"exact","reads_memory":false,"writes_memory":true,"may_throw":false,"may_yield":false,"invokes_unknown_code":false},"evidence":[12],"claims":[]},
+        \\{"id":33,"block":14,"operation":{"place_read":1},"results":[23],"pack_result":null,"effects":{"precision":"exact","reads_memory":true,"writes_memory":false,"may_throw":false,"may_yield":false,"invokes_unknown_code":false},"evidence":[13],"claims":[]},
+        \\{"id":34,"block":14,"operation":{"place_read":3},"results":[24],"pack_result":null,"effects":{"precision":"exact","reads_memory":true,"writes_memory":false,"may_throw":false,"may_yield":false,"invokes_unknown_code":false},"evidence":[13],"claims":[]},
+        \\{"id":35,"block":14,"operation":{"binary":{"operator":"less_equal","left":23,"right":24,"mode":"semantic","shift_behavior":null}},"results":[25],"pack_result":null,"effects":{"precision":"conservative","reads_memory":true,"writes_memory":true,"may_throw":true,"may_yield":true,"invokes_unknown_code":true},"evidence":[13],"claims":[]},
+        \\{"id":36,"block":16,"operation":{"place_read":2},"results":[26],"pack_result":null,"effects":{"precision":"exact","reads_memory":true,"writes_memory":false,"may_throw":false,"may_yield":false,"invokes_unknown_code":false},"evidence":[15],"claims":[]},
+        \\{"id":37,"block":0,"operation":{"make_closure":{"function":1,"bindings":[]}},"results":[27],"pack_result":null,"effects":{"precision":"exact","reads_memory":false,"writes_memory":false,"may_throw":false,"may_yield":false,"invokes_unknown_code":false},"evidence":[0],"claims":[]}]
+        \\,"values":[
+        \\{"id":0,"function":1,"type":{"kind":"dynamic","bit_width":0,"signed":false},"name_hint":"argument_0","origin":{"parameter":0}},
+        \\{"id":1,"function":1,"type":{"kind":"dynamic","bit_width":0,"signed":false},"name_hint":"argument_1","origin":{"parameter":1}},
+        \\{"id":2,"function":1,"type":{"kind":"number","bit_width":64,"signed":false},"name_hint":null,"origin":{"instruction_result":{"instruction":2,"index":0}}},
+        \\{"id":3,"function":1,"type":{"kind":"number","bit_width":64,"signed":false},"name_hint":null,"origin":{"instruction_result":{"instruction":4,"index":0}}},
+        \\{"id":4,"function":1,"type":{"kind":"number","bit_width":64,"signed":false},"name_hint":null,"origin":{"instruction_result":{"instruction":6,"index":0}}},
+        \\{"id":5,"function":1,"type":{"kind":"number","bit_width":64,"signed":false},"name_hint":null,"origin":{"instruction_result":{"instruction":8,"index":0}}},
+        \\{"id":6,"function":1,"type":{"kind":"dynamic","bit_width":0,"signed":false},"name_hint":null,"origin":{"instruction_result":{"instruction":10,"index":0}}},
+        \\{"id":7,"function":1,"type":{"kind":"dynamic","bit_width":0,"signed":false},"name_hint":null,"origin":{"instruction_result":{"instruction":11,"index":0}}},
+        \\{"id":8,"function":1,"type":{"kind":"dynamic","bit_width":0,"signed":false},"name_hint":null,"origin":{"instruction_result":{"instruction":12,"index":0}}},
+        \\{"id":9,"function":1,"type":{"kind":"dynamic","bit_width":0,"signed":false},"name_hint":null,"origin":{"instruction_result":{"instruction":14,"index":0}}},
+        \\{"id":10,"function":1,"type":{"kind":"dynamic","bit_width":0,"signed":false},"name_hint":null,"origin":{"instruction_result":{"instruction":15,"index":0}}},
+        \\{"id":11,"function":1,"type":{"kind":"dynamic","bit_width":0,"signed":false},"name_hint":null,"origin":{"instruction_result":{"instruction":16,"index":0}}},
+        \\{"id":12,"function":1,"type":{"kind":"dynamic","bit_width":0,"signed":false},"name_hint":null,"origin":{"instruction_result":{"instruction":18,"index":0}}},
+        \\{"id":13,"function":1,"type":{"kind":"dynamic","bit_width":0,"signed":false},"name_hint":null,"origin":{"instruction_result":{"instruction":19,"index":0}}},
+        \\{"id":14,"function":1,"type":{"kind":"dynamic","bit_width":0,"signed":false},"name_hint":null,"origin":{"instruction_result":{"instruction":20,"index":0}}},
+        \\{"id":15,"function":1,"type":{"kind":"number","bit_width":64,"signed":false},"name_hint":null,"origin":{"instruction_result":{"instruction":22,"index":0}}},
+        \\{"id":16,"function":1,"type":{"kind":"dynamic","bit_width":0,"signed":false},"name_hint":null,"origin":{"instruction_result":{"instruction":24,"index":0}}},
+        \\{"id":17,"function":1,"type":{"kind":"dynamic","bit_width":0,"signed":false},"name_hint":null,"origin":{"instruction_result":{"instruction":25,"index":0}}},
+        \\{"id":18,"function":1,"type":{"kind":"boolean","bit_width":0,"signed":false},"name_hint":null,"origin":{"instruction_result":{"instruction":26,"index":0}}},
+        \\{"id":19,"function":1,"type":{"kind":"number","bit_width":64,"signed":false},"name_hint":null,"origin":{"instruction_result":{"instruction":27,"index":0}}},
+        \\{"id":20,"function":1,"type":{"kind":"dynamic","bit_width":0,"signed":false},"name_hint":null,"origin":{"instruction_result":{"instruction":29,"index":0}}},
+        \\{"id":21,"function":1,"type":{"kind":"dynamic","bit_width":0,"signed":false},"name_hint":null,"origin":{"instruction_result":{"instruction":30,"index":0}}},
+        \\{"id":22,"function":1,"type":{"kind":"dynamic","bit_width":0,"signed":false},"name_hint":null,"origin":{"instruction_result":{"instruction":31,"index":0}}},
+        \\{"id":23,"function":1,"type":{"kind":"dynamic","bit_width":0,"signed":false},"name_hint":null,"origin":{"instruction_result":{"instruction":33,"index":0}}},
+        \\{"id":24,"function":1,"type":{"kind":"dynamic","bit_width":0,"signed":false},"name_hint":null,"origin":{"instruction_result":{"instruction":34,"index":0}}},
+        \\{"id":25,"function":1,"type":{"kind":"boolean","bit_width":0,"signed":false},"name_hint":null,"origin":{"instruction_result":{"instruction":35,"index":0}}},
+        \\{"id":26,"function":1,"type":{"kind":"dynamic","bit_width":0,"signed":false},"name_hint":null,"origin":{"instruction_result":{"instruction":36,"index":0}}},
+        \\{"id":27,"function":0,"type":{"kind":"function","bit_width":0,"signed":false},"name_hint":null,"origin":{"instruction_result":{"instruction":37,"index":0}}}]
+        \\,"value_packs":[],"places":[
+        \\{"id":0,"function":1,"type":{"kind":"dynamic","bit_width":0,"signed":false},"name_hint":"r0","origin":{"local":0},"evidence":[0]},
+        \\{"id":1,"function":1,"type":{"kind":"dynamic","bit_width":0,"signed":false},"name_hint":"r1","origin":{"local":1},"evidence":[0]},
+        \\{"id":2,"function":1,"type":{"kind":"dynamic","bit_width":0,"signed":false},"name_hint":"r2","origin":{"local":2},"evidence":[0]},
+        \\{"id":3,"function":1,"type":{"kind":"dynamic","bit_width":0,"signed":false},"name_hint":"r3","origin":{"local":3},"evidence":[0]},
+        \\{"id":4,"function":1,"type":{"kind":"dynamic","bit_width":0,"signed":false},"name_hint":"r4","origin":{"local":4},"evidence":[0]},
+        \\{"id":5,"function":1,"type":{"kind":"dynamic","bit_width":0,"signed":false},"name_hint":"r5","origin":{"local":5},"evidence":[0]}]
+        \\,"captures":[],"evidence":[
+        \\{"id":0,"kind":"decoded_record","locator":"compiler-listing:0","digest":"18e064a6cac4d4ffbe21d366607a2eefa9601016c42b69cec5285c6f35f3ac45"},
+        \\{"id":1,"kind":"decoded_record","locator":"compiler-listing:0:line:5","digest":"18e064a6cac4d4ffbe21d366607a2eefa9601016c42b69cec5285c6f35f3ac45"},
+        \\{"id":2,"kind":"decoded_record","locator":"compiler-listing:0:line:6","digest":"18e064a6cac4d4ffbe21d366607a2eefa9601016c42b69cec5285c6f35f3ac45"},
+        \\{"id":3,"kind":"decoded_record","locator":"compiler-listing:0:line:7","digest":"18e064a6cac4d4ffbe21d366607a2eefa9601016c42b69cec5285c6f35f3ac45"},
+        \\{"id":4,"kind":"decoded_record","locator":"compiler-listing:0:line:8","digest":"18e064a6cac4d4ffbe21d366607a2eefa9601016c42b69cec5285c6f35f3ac45"},
+        \\{"id":5,"kind":"decoded_record","locator":"compiler-listing:0:line:9","digest":"18e064a6cac4d4ffbe21d366607a2eefa9601016c42b69cec5285c6f35f3ac45"},
+        \\{"id":6,"kind":"decoded_record","locator":"compiler-listing:0:line:10","digest":"18e064a6cac4d4ffbe21d366607a2eefa9601016c42b69cec5285c6f35f3ac45"},
+        \\{"id":7,"kind":"decoded_record","locator":"compiler-listing:0:line:11","digest":"18e064a6cac4d4ffbe21d366607a2eefa9601016c42b69cec5285c6f35f3ac45"},
+        \\{"id":8,"kind":"decoded_record","locator":"compiler-listing:0:line:12","digest":"18e064a6cac4d4ffbe21d366607a2eefa9601016c42b69cec5285c6f35f3ac45"},
+        \\{"id":9,"kind":"decoded_record","locator":"compiler-listing:0:line:13","digest":"18e064a6cac4d4ffbe21d366607a2eefa9601016c42b69cec5285c6f35f3ac45"},
+        \\{"id":10,"kind":"decoded_record","locator":"compiler-listing:0:line:14","digest":"18e064a6cac4d4ffbe21d366607a2eefa9601016c42b69cec5285c6f35f3ac45"},
+        \\{"id":11,"kind":"decoded_record","locator":"compiler-listing:0:line:15","digest":"18e064a6cac4d4ffbe21d366607a2eefa9601016c42b69cec5285c6f35f3ac45"},
+        \\{"id":12,"kind":"decoded_record","locator":"compiler-listing:0:line:16","digest":"18e064a6cac4d4ffbe21d366607a2eefa9601016c42b69cec5285c6f35f3ac45"},
+        \\{"id":13,"kind":"decoded_record","locator":"compiler-listing:0:line:17","digest":"18e064a6cac4d4ffbe21d366607a2eefa9601016c42b69cec5285c6f35f3ac45"},
+        \\{"id":14,"kind":"decoded_record","locator":"compiler-listing:0:line:18","digest":"18e064a6cac4d4ffbe21d366607a2eefa9601016c42b69cec5285c6f35f3ac45"},
+        \\{"id":15,"kind":"decoded_record","locator":"compiler-listing:0:line:19","digest":"18e064a6cac4d4ffbe21d366607a2eefa9601016c42b69cec5285c6f35f3ac45"}]
+        \\,"solver_terms":[],"constraints":[],"queries":[],"solver_models":[],"unsat_cores":[],"certificates":[],"edge_rewrites":[],"claims":[],"obligations":[]}
+    ;
+    const allocator = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(ir.Program, allocator, nested_repeat_ir, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    // The per-function certification path of validateWithStrategy and
+    // validatePrepared (standard target, automatic strategy) for the worker.
+    var transfer_arena = std.heap.ArenaAllocator.init(allocator);
+    defer transfer_arena.deinit();
+    const program = try lexical_transfer.prepareInArena(transfer_arena.allocator(), &parsed.value);
+    var readable = try readable_scope.Scope.init(allocator, &program);
+    defer readable.deinit();
+    var emission = try emission_planning.Plan.init(allocator, &program, .standard_luau);
+    defer emission.deinit();
+    const function = program.functions[1];
+    var analysis = try cfg.Analysis.init(allocator, &program, function);
+    defer analysis.deinit();
+    var structured = try structure.Plan.initWithArbitraryFallback(allocator, &analysis);
+    defer structured.deinit();
+    var scopes = try emission_scope.Plan.init(
+        allocator,
+        &program,
+        function,
+        &analysis,
+        &structured,
+        &emission.packs,
+        &emission.dead,
+        &emission.place_writes,
+        &emission.place_reads,
+        &emission.fused_values,
+        &emission.closure_stores,
+    );
+    defer scopes.deinit();
+    if (!structured.root.arbitrary_cfg) {
+        branch_expression.markDeclarations(&program, &emission, &scopes, structured.root, true);
+    }
+    const storage_locals = saturatingAdd(
+        @intFromBool(emission.names.functionUsesStorage(function)),
+        @intFromBool(emission.names.functionUsesValueStorage(&program, function)),
+    );
+    const base = try functionRegisterBase(allocator, function.parameters.len, storage_locals, structured.root);
+    const pressure = try maximumPressure(allocator, &program, &readable, &emission, &scopes, function, base);
+    // The certified total must cover the emitted peak.
+    try std.testing.expectEqual(@as(usize, 11), pressure.total);
 }
