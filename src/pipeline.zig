@@ -173,10 +173,14 @@ pub fn runAlloc(
         if (readable_report.isClean()) {
             defer readable_report.deinit();
             var resolved = if (!has_authenticated_rewrite_history)
+                // The caller's engine solves the pending proofs on this path.
+                // Partial scope: unlike resolveAlloc, this path never calls
+                // verifyCoreCertificatesAlloc, so persisted unsat cores are
+                // still not replayed with `engine` here.
                 try proof_orchestrator.preserveAdmittedWithExactControlAlloc(
                     allocator,
                     program,
-                    solver_backend.internalFacts(),
+                    engine,
                 )
             else
                 try proof_orchestrator.preserveAdmittedAlloc(allocator, program);
@@ -372,6 +376,64 @@ test "explicit readable preservation keeps an admitted solver-free program" {
     try std.testing.expectEqual(@as(usize, 0), outcome.program().?.obligations.len);
     try std.testing.expect(outcome.luau_source != null);
     try std.testing.expect(std.mem.indexOf(u8, outcome.luau_source.?, "return fn_add_and_double") != null);
+}
+
+const EngineProbe = struct {
+    attempts: usize = 0,
+
+    fn backend(self: *EngineProbe) solver_backend.Backend {
+        return .{ .engine = .internal_facts, .context = self, .solve_fn = solve };
+    }
+
+    fn solve(context: ?*anyopaque, _: std.mem.Allocator, program: *const ir.Program, query: ir.SolverQuery) !solver_backend.Result {
+        const self: *EngineProbe = @ptrCast(@alignCast(context.?));
+        self.attempts += 1;
+        const resolution = @import("solver.zig").solve(program, query);
+        return .{
+            .engine = .internal_facts,
+            .resolution = resolution,
+            .unknown_reason = if (resolution == .unknown) .bounded_internal_incompleteness else null,
+        };
+    }
+};
+
+test "readable preservation resolves pending proofs with the caller's engine" {
+    const fixture = @import("fixtures.zig").arithmetic_module;
+    const terms = [_]ir.SolverTerm{.{ .id = ir.SolverTermId.fromIndex(0), .sort = .{ .kind = .boolean }, .operation = .{ .boolean_literal = true } }};
+    const queries = [_]ir.SolverQuery{.{ .id = ir.QueryId.fromIndex(0), .kind = .prove_true, .goal = ir.SolverTermId.fromIndex(0) }};
+    const claims = [_]ir.Claim{.{
+        .id = ir.ClaimId.fromIndex(0),
+        .subject = .{ .program = {} },
+        .predicate = ir.SolverTermId.fromIndex(0),
+        .status = .unproven,
+        .evidence = &.{fixture.proof},
+        .query = ir.QueryId.fromIndex(0),
+    }};
+    var program = fixture.program;
+    program.solver_terms = &terms;
+    program.queries = &queries;
+    program.claims = &claims;
+    const options: Options = .{
+        .profile = .readable_luau,
+        .emit_luau = .standard_luau,
+        .preserve_admitted_readable = true,
+        .force_preserve_admitted_readable = true,
+    };
+
+    var probe: EngineProbe = .{};
+    var outcome = try runAlloc(std.testing.allocator, &program, probe.backend(), options);
+    defer outcome.deinit();
+    try std.testing.expect(outcome.isAdmitted());
+    try std.testing.expectEqual(@as(usize, 1), probe.attempts); // fails today: 0
+    try std.testing.expectEqual(@as(usize, 1), outcome.program().?.certificates.len);
+    try std.testing.expectEqual(ir.ClaimStatus.proved, outcome.program().?.claims[0].status);
+
+    // A selected engine that cannot run must surface, not be silently replaced (no Z3 needed:
+    // z3_disabled.zig is a plain Zig file whose backend reports engine .z3 and fails with Z3Disabled).
+    try std.testing.expectError(
+        error.Z3Disabled,
+        runAlloc(std.testing.allocator, &program, @import("z3_disabled.zig").defaultBackend(), options),
+    );
 }
 
 test "readable preservation resolves exact pure branches before structuring" {
