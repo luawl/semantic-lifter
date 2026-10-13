@@ -4122,7 +4122,7 @@ fn emitGenericForNextTransition(
     try output.appendSlice(allocator, iterator_name);
     try output.appendSlice(allocator, ")\n");
     try output.appendSlice(allocator, preparation_indent);
-    try output.appendSlice(allocator, "elseif (" );
+    try output.appendSlice(allocator, "elseif (");
     try output.appendSlice(allocator, metatable_name);
     try output.appendSlice(allocator, " == nil or ");
     try output.appendSlice(allocator, metatable_name);

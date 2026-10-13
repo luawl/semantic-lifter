@@ -449,10 +449,8 @@ fn markNativeIterationBodyParameters(program: *const ir.Program, marked: []bool)
         const transition = iteration_protocol.transitionForHeader(program, header) orelse continue;
         const iteration_values = switch (transition.operation) {
             .numeric_for_next => if (transition.results.len == 4) transition.results[3..4] else continue,
-            .generic_for_next => |operation| if (
-                operation.variable_count != 0 and
-                    transition.results.len == @as(usize, operation.variable_count) + 3
-            )
+            .generic_for_next => |operation| if (operation.variable_count != 0 and
+                transition.results.len == @as(usize, operation.variable_count) + 3)
                 transition.results[3..]
             else
                 continue,
@@ -676,7 +674,6 @@ test "standard storage fallback counts values and packs" {
 
     try std.testing.expect(functionNeedsPrivateStorage(&program, function_item, .standard_luau));
     try std.testing.expect(!functionNeedsPrivateStorage(&program, function_item, .direct_locals_luau));
-
 }
 
 test "names are sanitized and deterministically disambiguated" {
