@@ -489,17 +489,20 @@ test "dominated four-arm terminal remains the outer branch continuation" {
     const blocks = [_]ir.Block{
         .{ .id = ids[0], .function = function_id, .terminator = .{ .branch = .{
             .condition = ir.ValueId.fromIndex(0),
-            .then_edge = .{ .target = ids[1] }, .else_edge = .{ .target = ids[2] },
+            .then_edge = .{ .target = ids[1] },
+            .else_edge = .{ .target = ids[2] },
         } } },
         .{ .id = ids[1], .function = function_id, .terminator = .{ .jump = .{ .target = terminal } } },
         .{ .id = ids[2], .function = function_id, .terminator = .{ .branch = .{
             .condition = ir.ValueId.fromIndex(1),
-            .then_edge = .{ .target = ids[3] }, .else_edge = .{ .target = ids[4] },
+            .then_edge = .{ .target = ids[3] },
+            .else_edge = .{ .target = ids[4] },
         } } },
         .{ .id = ids[3], .function = function_id, .terminator = .{ .jump = .{ .target = terminal } } },
         .{ .id = ids[4], .function = function_id, .terminator = .{ .branch = .{
             .condition = ir.ValueId.fromIndex(2),
-            .then_edge = .{ .target = ids[5] }, .else_edge = .{ .target = ids[6] },
+            .then_edge = .{ .target = ids[5] },
+            .else_edge = .{ .target = ids[6] },
         } } },
         .{ .id = ids[5], .function = function_id, .terminator = .{ .jump = .{ .target = terminal } } },
         .{ .id = ids[6], .function = function_id, .terminator = .{ .jump = .{ .target = terminal } } },
@@ -508,8 +511,11 @@ test "dominated four-arm terminal remains the outer branch continuation" {
     const functions = [_]ir.Function{.{ .id = function_id, .blocks = &ids, .entry_block = ids[0] }};
     const program: ir.Program = .{
         .program_id = "dominated-four-arm-terminal",
-        .entry_function = function_id, .functions = &functions,
-        .blocks = &blocks, .instructions = &.{}, .values = &.{},
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &.{},
     };
     var analysis = try cfg.Analysis.init(std.testing.allocator, &program, functions[0]);
     defer analysis.deinit();

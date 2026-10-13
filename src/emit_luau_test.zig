@@ -92,14 +92,14 @@ test "forced dispatcher lowers generic iteration protocol" {
     const blocks = [_]ir.Block{.{
         .id = block_id,
         .function = function_id,
-        .instructions = &.{ instruction_id },
+        .instructions = &.{instruction_id},
         .terminator = .{ .return_values = &.{ has_value, prepared_iterator, prepared_state, first, second } },
         .evidence = &.{proof},
     }};
     const functions = [_]ir.Function{.{
         .id = function_id,
         .parameters = &.{ iterator, state, control, initial },
-        .blocks = &.{ block_id },
+        .blocks = &.{block_id},
         .entry_block = block_id,
         .evidence = &.{proof},
     }};
