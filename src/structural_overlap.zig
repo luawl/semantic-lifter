@@ -11,6 +11,7 @@ const clone_availability = @import("clone_availability.zig");
 const iteration_state = @import("iteration_state.zig");
 const proof_effect_closure = @import("proof_effect_closure.zig");
 const build_options = @import("build_options");
+const stage_trace = @import("stage_trace.zig");
 
 const trace_structural_phases = build_options.trace_normalize_phases;
 const trace_conditional_batch = false;
@@ -9072,7 +9073,7 @@ fn appendAuthenticatedGroupCarrierPathAlloc(
     expanded: *std.ArrayList(ir.BlockId),
 ) std.mem.Allocator.Error!bool {
     const target_index = analysis.blockIndex(target) orelse {
-        std.debug.print("group_carrier_path_abort target={} reason=target_not_in_analysis\n", .{target.index()});
+        if (stage_trace.enabled) std.debug.print("group_carrier_path_abort target={} reason=target_not_in_analysis\n", .{target.index()});
         return false;
     };
     if (membership[target_index]) return true;
@@ -9120,7 +9121,7 @@ fn appendAuthenticatedGroupCarrierPathAlloc(
     while (head < tail) : (head += 1) {
         const current = queue[head];
         if (analysis.blockIndex(current) == null) {
-            std.debug.print("group_carrier_path_abort target={} current={} reason=current_not_in_analysis\n", .{ target.index(), current.index() });
+            if (stage_trace.enabled) std.debug.print("group_carrier_path_abort target={} current={} reason=current_not_in_analysis\n", .{ target.index(), current.index() });
             return false;
         }
         var predecessor_index: usize = 0;
@@ -9138,7 +9139,7 @@ fn appendAuthenticatedGroupCarrierPathAlloc(
             }
 
             const predecessor_local_index = analysis.blockIndex(predecessor) orelse {
-                std.debug.print("group_carrier_path_abort target={} current={} predecessor={} reason=predecessor_not_in_analysis\n", .{ target.index(), current.index(), predecessor.index() });
+                if (stage_trace.enabled) std.debug.print("group_carrier_path_abort target={} current={} predecessor={} reason=predecessor_not_in_analysis\n", .{ target.index(), current.index(), predecessor.index() });
                 return false;
             };
             if (membership[predecessor_local_index]) {
@@ -9163,7 +9164,7 @@ fn appendAuthenticatedGroupCarrierPathAlloc(
             seen[predecessor_local_index] = true;
             candidates[predecessor_local_index] = true;
             if (tail >= queue.len) {
-                std.debug.print("group_carrier_path_abort target={} current={} predecessor={} reason=queue_exhausted explored={} capacity={}\n", .{ target.index(), current.index(), predecessor.index(), tail, queue.len });
+                if (stage_trace.enabled) std.debug.print("group_carrier_path_abort target={} current={} predecessor={} reason=queue_exhausted explored={} capacity={}\n", .{ target.index(), current.index(), predecessor.index(), tail, queue.len });
                 return false;
             }
             queue[tail] = predecessor;
@@ -12004,7 +12005,7 @@ pub fn findCollisionSplitAllocWithAnalysisAndReplayContext(
         structuralPhaseMillis(prepare_start),
     });
     if (!prepared) {
-        std.debug.print("structural_collision_prepare_failure block={} header={} closure={any} incoming={any}\n", .{
+        if (stage_trace.enabled) std.debug.print("structural_collision_prepare_failure block={} header={} closure={any} incoming={any}\n", .{
             block.index(),
             header.index(),
             closure,

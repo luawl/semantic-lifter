@@ -19,6 +19,7 @@ const lexical_transfer = @import("lexical_transfer.zig");
 const loop_continue_projection = @import("loop_continue_projection.zig");
 const loop_exit_shape = @import("loop_exit_shape.zig");
 const transparent_stop = @import("transparent_stop.zig");
+const stage_trace = @import("stage_trace.zig");
 
 pub const EmitError = error{
     InvalidIr,
@@ -1185,7 +1186,7 @@ fn emitRegionBodyWithPredeclaredBlock(
 
                 branch_emission: {
                     trace_stage = "branch_emission";
-                    std.debug.print(
+                    if (stage_trace.enabled) std.debug.print(
                         "emit branch block={} join={?d} then_target={} else_target={} then_nodes={} else_nodes={}\n",
                         .{
                             branch_plan.block.index(),

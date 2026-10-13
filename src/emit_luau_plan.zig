@@ -11,6 +11,7 @@ const closure_store_fusion = @import("closure_store_fusion.zig");
 const place_render = @import("emit_luau_place.zig");
 const render = @import("emit_luau_expr.zig");
 const name_plan = @import("name_plan.zig");
+const stage_trace = @import("stage_trace.zig");
 
 pub const Plan = struct {
     force_dispatcher: bool = false,
@@ -24,34 +25,34 @@ pub const Plan = struct {
     closure_stores: closure_store_fusion.Plan,
 
     pub fn init(allocator: std.mem.Allocator, program: *const ir.Program, target: luau_runtime.Target) !Plan {
-        std.debug.print("emission_plan stage=scope_begin\n", .{});
+        if (stage_trace.enabled) std.debug.print("emission_plan stage=scope_begin\n", .{});
         var scope = try readable_scope.Scope.init(allocator, program);
         defer scope.deinit();
-        std.debug.print("emission_plan stage=scope_done\n", .{});
-        std.debug.print("emission_plan stage=packs_begin\n", .{});
+        if (stage_trace.enabled) std.debug.print("emission_plan stage=scope_done\n", .{});
+        if (stage_trace.enabled) std.debug.print("emission_plan stage=packs_begin\n", .{});
         var packs = try pack_plan.Plan.init(allocator, program);
         errdefer packs.deinit();
-        std.debug.print("emission_plan stage=packs_done\n", .{});
-        std.debug.print("emission_plan stage=dead_begin\n", .{});
+        if (stage_trace.enabled) std.debug.print("emission_plan stage=packs_done\n", .{});
+        if (stage_trace.enabled) std.debug.print("emission_plan stage=dead_begin\n", .{});
         var dead = try dead_code.Plan.init(allocator, program, &packs);
         errdefer dead.deinit();
-        std.debug.print("emission_plan stage=dead_done\n", .{});
-        std.debug.print("emission_plan stage=place_writes_begin\n", .{});
+        if (stage_trace.enabled) std.debug.print("emission_plan stage=dead_done\n", .{});
+        if (stage_trace.enabled) std.debug.print("emission_plan stage=place_writes_begin\n", .{});
         var place_writes = try place_write_fusion.Plan.init(allocator, program, &packs, &dead);
         errdefer place_writes.deinit();
-        std.debug.print("emission_plan stage=place_writes_done\n", .{});
-        std.debug.print("emission_plan stage=place_reads_begin\n", .{});
+        if (stage_trace.enabled) std.debug.print("emission_plan stage=place_writes_done\n", .{});
+        if (stage_trace.enabled) std.debug.print("emission_plan stage=place_reads_begin\n", .{});
         var place_reads = try place_read_fusion.Plan.init(allocator, program, &packs, &dead);
         errdefer place_reads.deinit();
-        std.debug.print("emission_plan stage=place_reads_done\n", .{});
-        std.debug.print("emission_plan stage=closure_stores_begin\n", .{});
+        if (stage_trace.enabled) std.debug.print("emission_plan stage=place_reads_done\n", .{});
+        if (stage_trace.enabled) std.debug.print("emission_plan stage=closure_stores_begin\n", .{});
         var closure_stores = try closure_store_fusion.Plan.init(allocator, program, &dead);
         errdefer closure_stores.deinit();
-        std.debug.print("emission_plan stage=closure_stores_done\n", .{});
-        std.debug.print("emission_plan stage=fused_values_begin\n", .{});
+        if (stage_trace.enabled) std.debug.print("emission_plan stage=closure_stores_done\n", .{});
+        if (stage_trace.enabled) std.debug.print("emission_plan stage=fused_values_begin\n", .{});
         var fused_values = try value_fusion.Plan.init(allocator, program, &packs, &dead, &place_writes, &place_reads);
         errdefer fused_values.deinit();
-        std.debug.print("emission_plan stage=fused_values_done\n", .{});
+        if (stage_trace.enabled) std.debug.print("emission_plan stage=fused_values_done\n", .{});
         var runtime = luau_runtime.Plan.initForEmission(target, program, &scope, &dead);
         for (program.instructions) |instruction| {
             if (packs.role(instruction.id) != .stored_invocation_producer) continue;
