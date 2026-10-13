@@ -17,6 +17,7 @@ const proof_digest = @import("proof_digest.zig");
 const control_flow = @import("control_flow.zig");
 const iteration_protocol = @import("iteration_protocol.zig");
 const structure = @import("structure.zig");
+const stage_trace = @import("stage_trace.zig");
 
 const SliceToken = struct {
     address: usize,
@@ -106,7 +107,7 @@ pub const State = struct {
         const edge_fact_start = Io.Clock.awake.now(Io.Threaded.global_single_threaded.io()).nanoseconds;
         try state.deriveEdgeFacts(program, &scope);
         state.edge_facts_source = EdgeFactsSource.from(program);
-        std.debug.print(
+        if (stage_trace.enabled) std.debug.print(
             "control_phase edge_facts_done terms={} constraints={} queries={} claims={} ms={}\\n",
             .{
                 state.terms.items.len,
@@ -126,7 +127,7 @@ pub const State = struct {
             &state.claims,
             &state.obligations,
         );
-        std.debug.print(
+        if (stage_trace.enabled) std.debug.print(
             "control_phase query_promotion_done terms={} queries={} obligations={} claims={} ms={}\\n",
             .{
                 state.terms.items.len,
@@ -405,7 +406,7 @@ pub const State = struct {
             );
             processed += 1;
             if (processed % 250 == 0) {
-                std.debug.print(
+                if (stage_trace.enabled) std.debug.print(
                     "control_phase edge_facts_progress blocks={} terms={} constraints={} ms={}\n",
                     .{
                         processed,
@@ -416,7 +417,7 @@ pub const State = struct {
                 );
             }
         }
-        std.debug.print(
+        if (stage_trace.enabled) std.debug.print(
             "control_phase edge_facts_complete blocks={} terms={} constraints={} ms={}\n",
             .{
                 processed,
@@ -443,7 +444,7 @@ pub const State = struct {
             var fact_program = self.programView(program);
             try self.deriveEdgeFacts(&fact_program, &scope);
         } else {
-            std.debug.print("control_phase edge_facts_reused\n", .{});
+            if (stage_trace.enabled) std.debug.print("control_phase edge_facts_reused\n", .{});
         }
         var planned = self.programView(program);
         const working = &planned;
@@ -645,12 +646,12 @@ fn exactControlBoundaryMaskAlloc(
             boundary_candidates[block.id.index()] = true;
             function_candidates += 1;
             total_boundary_candidates += 1;
-            std.debug.print(
+            if (stage_trace.enabled) std.debug.print(
                 "exact_branch_boundary_candidate function={} block={} then={} else={} truth={s}\n",
                 .{ function.id.index(), block.id.index(), branch.then_edge.target.index(), branch.else_edge.target.index(), @tagName(truth) },
             );
         }
-        std.debug.print(
+        if (stage_trace.enabled) std.debug.print(
             "exact_branch_boundary_scan function={} blocks={} exact_branches={} candidates={} ms={}\n",
             .{
                 function.id.index(),
@@ -662,7 +663,7 @@ fn exactControlBoundaryMaskAlloc(
         );
     }
 
-    std.debug.print(
+    if (stage_trace.enabled) std.debug.print(
         "exact_branch_boundary_mask blocks={} candidates={} ms={}\n",
         .{
             program.blocks.len,
@@ -729,14 +730,14 @@ fn admittedExactControlBoundaryMaskAlloc(
         const before = total_boundary_candidates;
         markAdmittedExactBoundaryRegion(program, plan.root, boundary_candidates, &total_boundary_candidates);
         if (total_boundary_candidates != before) {
-            std.debug.print(
+            if (stage_trace.enabled) std.debug.print(
                 "admitted_exact_boundary_scan function={} candidates={}\n",
                 .{ function.id.index(), total_boundary_candidates - before },
             );
         }
     }
 
-    std.debug.print(
+    if (stage_trace.enabled) std.debug.print(
         "admitted_exact_boundary_mask blocks={} candidates={} ms={}\n",
         .{
             program.blocks.len,

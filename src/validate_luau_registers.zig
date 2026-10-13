@@ -16,6 +16,7 @@ const prototype_validation = @import("validate_luau_prototypes.zig");
 const syntax_depth_validation = @import("validate_luau_syntax_depth.zig");
 const upvalue_validation = @import("validate_luau_upvalues.zig");
 const jump_budget_validation = @import("validate_luau_jump_budget.zig");
+const stage_trace = @import("stage_trace.zig");
 
 const StableCaptureValues = struct {
     scopes: *const emission_scope.Plan,
@@ -37,19 +38,19 @@ pub fn validate(
     _: *const readable_scope.Scope,
     target: luau_runtime.Target,
 ) !void {
-    std.debug.print("register_validation stage=begin\n", .{});
+    if (stage_trace.enabled) std.debug.print("register_validation stage=begin\n", .{});
     var transfer_arena = std.heap.ArenaAllocator.init(allocator);
     defer transfer_arena.deinit();
     const prepared = lexical_transfer.prepareInArena(transfer_arena.allocator(), program) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.UnsupportedControlFlow, error.UnsupportedTransfer => unreachable,
     };
-    std.debug.print("register_validation stage=prepared functions={} blocks={} instructions={}\n", .{ prepared.functions.len, prepared.blocks.len, prepared.instructions.len });
+    if (stage_trace.enabled) std.debug.print("register_validation stage=prepared functions={} blocks={} instructions={}\n", .{ prepared.functions.len, prepared.blocks.len, prepared.instructions.len });
     var readable = try readable_scope.Scope.init(allocator, &prepared);
     defer readable.deinit();
-    std.debug.print("register_validation stage=scope\n", .{});
+    if (stage_trace.enabled) std.debug.print("register_validation stage=scope\n", .{});
     try validatePrepared(allocator, report, &prepared, &readable, target);
-    std.debug.print("register_validation stage=done\n", .{});
+    if (stage_trace.enabled) std.debug.print("register_validation stage=done\n", .{});
 }
 
 fn validatePrepared(
@@ -59,10 +60,10 @@ fn validatePrepared(
     readable: *const readable_scope.Scope,
     target: luau_runtime.Target,
 ) !void {
-    std.debug.print("register_validation stage=emission_plan_begin\n", .{});
+    if (stage_trace.enabled) std.debug.print("register_validation stage=emission_plan_begin\n", .{});
     var emission = try emission_planning.Plan.init(allocator, program, target);
     defer emission.deinit();
-    std.debug.print("register_validation stage=emission_plan_done\n", .{});
+    if (stage_trace.enabled) std.debug.print("register_validation stage=emission_plan_done\n", .{});
 
     const emitted_functions = try findEmittedFunctions(allocator, program, readable, &emission);
     defer allocator.free(emitted_functions);
@@ -71,7 +72,7 @@ fn validatePrepared(
     @memset(stable_values, false);
     var syntax_depths = try syntax_depth_validation.Plan.init(allocator, program, readable, &emission);
     defer syntax_depths.deinit();
-    std.debug.print("register_validation stage=syntax_plan_done\n", .{});
+    if (stage_trace.enabled) std.debug.print("register_validation stage=syntax_plan_done\n", .{});
 
     var entry_bindings = lexical.EntryPlan.init(allocator, program) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -88,7 +89,7 @@ fn validatePrepared(
 
     for (program.functions) |function| {
         if (!emitted_functions[function.id.index()]) continue;
-        std.debug.print("register_validation function={} stage=begin\n", .{function.id.index()});
+        if (stage_trace.enabled) std.debug.print("register_validation function={} stage=begin\n", .{function.id.index()});
         var analysis = cfg.Analysis.init(allocator, program, function) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.InvalidCfg => unreachable,
@@ -144,7 +145,7 @@ fn validatePrepared(
             storage_locals,
         );
         const pressure = try maximumPressure(allocator, program, readable, &emission, &scopes, function, base);
-        std.debug.print("register_pressure function={} base={} locals={} total={} scopes={}\n", .{
+        if (stage_trace.enabled) std.debug.print("register_pressure function={} base={} locals={} total={} scopes={}\n", .{
             function.id.index(),
             base,
             pressure.locals,
@@ -156,7 +157,7 @@ fn validatePrepared(
         } else if (pressure.total > luau_runtime.max_registers) {
             try report.add(.unsupported_readable_temporary_register_pressure, function.id.index());
         }
-        std.debug.print("register_validation function={} stage=done\n", .{function.id.index()});
+        if (stage_trace.enabled) std.debug.print("register_validation function={} stage=done\n", .{function.id.index()});
     }
 
     try syntax_depths.addDiagnostics(report, emitted_functions);
@@ -394,7 +395,7 @@ fn maximumPressure(
         maximum_total = @max(maximum_total, saturatingAdd(local_total, @max(closure_locals[host], temporaries[host])));
     }
     if (maximum_locals > luau_runtime.max_local_registers or maximum_total > luau_runtime.max_registers) {
-        std.debug.print("register_pressure_detail function={} host={} base={} values={} packs={} places={} branches={} closures={} temporaries={} locals={} total={}\n", .{
+        if (stage_trace.enabled) std.debug.print("register_pressure_detail function={} host={} base={} values={} packs={} places={} branches={} closures={} temporaries={} locals={} total={}\n", .{
             function.id.index(),
             peak_host,
             base,

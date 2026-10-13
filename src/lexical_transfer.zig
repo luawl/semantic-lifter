@@ -7,6 +7,7 @@ const natural_loop = @import("natural_loop.zig");
 const irreducible_region = @import("irreducible_region.zig");
 const runtime_uses = @import("runtime_uses.zig");
 const runtime_value_rewrite = @import("runtime_value_rewrite.zig");
+const stage_trace = @import("stage_trace.zig");
 
 const LoopId = usize;
 const invalid_loop = std.math.maxInt(LoopId);
@@ -556,7 +557,7 @@ pub fn prepareInArena(allocator: std.mem.Allocator, program: *const ir.Program) 
     var transfer_count: usize = 0;
     var alias_count: usize = 0;
     for (program.functions) |function| {
-        std.debug.print("lexical_transfer function={} blocks={} stage=begin\n", .{ function.id.index(), function.blocks.len });
+        if (stage_trace.enabled) std.debug.print("lexical_transfer function={} blocks={} stage=begin\n", .{ function.id.index(), function.blocks.len });
         var function_scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer function_scratch.deinit();
         const scratch = function_scratch.allocator();
@@ -567,7 +568,7 @@ pub fn prepareInArena(allocator: std.mem.Allocator, program: *const ir.Program) 
         };
         defer analysis.deinit();
         const needs_preparation = try needsStructuredPreparation(scratch, program, &analysis);
-        std.debug.print("lexical_transfer function={} needs_preparation={} stage=checked\n", .{ function.id.index(), needs_preparation });
+        if (stage_trace.enabled) std.debug.print("lexical_transfer function={} needs_preparation={} stage=checked\n", .{ function.id.index(), needs_preparation });
         if (!needs_preparation) {
             var empty = try emptyPlan(allocator, program, function);
             plans.append(allocator, empty) catch |err| {
@@ -576,7 +577,7 @@ pub fn prepareInArena(allocator: std.mem.Allocator, program: *const ir.Program) 
             };
             continue;
         }
-        std.debug.print("lexical_transfer function={} stage=structure_begin\n", .{function.id.index()});
+        if (stage_trace.enabled) std.debug.print("lexical_transfer function={} stage=structure_begin\n", .{function.id.index()});
         var structured = if (structure.Plan.shouldUseArbitraryFallback(&analysis))
             structure.Plan.initArbitrary(scratch, &analysis) catch |err| switch (err) {
                 error.UnsupportedShape => return error.UnsupportedControlFlow,
@@ -591,7 +592,7 @@ pub fn prepareInArena(allocator: std.mem.Allocator, program: *const ir.Program) 
                 error.OutOfMemory => return error.OutOfMemory,
             };
         defer structured.deinit();
-        std.debug.print("lexical_transfer function={} stage=structure_done\n", .{function.id.index()});
+        if (stage_trace.enabled) std.debug.print("lexical_transfer function={} stage=structure_done\n", .{function.id.index()});
         if (structured.root.arbitrary_cfg) {
             var empty = try emptyPlan(allocator, program, function);
             plans.append(allocator, empty) catch |append_error| {
@@ -611,7 +612,7 @@ pub fn prepareInArena(allocator: std.mem.Allocator, program: *const ir.Program) 
         );
         defer uses.deinit();
         var scratch_plan = try Plan.initWithRuntimeUses(scratch, program, function, &analysis, &structured, &uses);
-        std.debug.print("lexical_transfer function={} transfers={} aliases={} unsupported={} stage=plan_done\n", .{
+        if (stage_trace.enabled) std.debug.print("lexical_transfer function={} transfers={} aliases={} unsupported={} stage=plan_done\n", .{
             function.id.index(),
             scratch_plan.transfers.len,
             scratch_plan.aliases.len,

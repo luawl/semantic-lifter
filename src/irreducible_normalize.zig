@@ -12,6 +12,7 @@ const structural_overlap = @import("structural_overlap.zig");
 const clone_availability = @import("clone_availability.zig");
 const structure = @import("structure.zig");
 const build_options = @import("build_options");
+const stage_trace = @import("stage_trace.zig");
 
 pub const NormalizeError = error{NormalizationInvariantFailed} || std.mem.Allocator.Error;
 
@@ -2427,104 +2428,106 @@ fn normalizeImpl(
                 collision_seedable = alternative_seedable;
                 const chosen_alternative = alternative orelse {
                     std.debug.print("normalize failure phase=feedback-no-alternative iteration={} source={} target={} blocks={} structural_clones={} rewrites={} arms={}\n", .{ iteration, collision_arm.source.index(), collision_arm.target.index(), blocks.items.len, structural_cloned_blocks, rewrites.items.len, collision_arms.items.len });
-                    if (previous_collision_arm) |owner_arm| {
-                        const exact_position = owner_arm.source == collision_arm.source and
-                            owner_arm.kind == collision_arm.kind and
-                            owner_arm.target == collision_arm.target;
-                        const direct_position = sameNodeSplitDirectArmLineage(
-                            result.program.edge_rewrites,
-                            owner_arm,
-                            collision_arm,
-                        );
-                        const adjacent_lineage = sameNodeSplitAdjacentArmLineageWithReplay(
-                            collision_projection_context,
-                            owner_arm,
-                            collision_arm,
-                        );
-                        const paired_lineage = sameNodeSplitPairedArmLineageWithReplay(
-                            &result.program,
-                            collision_projection_context,
-                            owner_arm,
-                            collision_arm,
-                        );
-                        const owner_composed = try sameNodeSplitOwnerComposedArmLineageWithReplay(
-                            &result.program,
-                            &collision_analysis,
-                            collision_projection_context,
-                            owner_arm,
-                            collision_arm,
-                        );
-                        const source_lineage = sameNodeSplitLineage(
-                            result.program.edge_rewrites,
-                            owner_arm.source,
-                            collision_arm.source,
-                        );
-                        const target_lineage = sameNodeSplitLineage(
-                            result.program.edge_rewrites,
-                            owner_arm.target,
-                            collision_arm.target,
-                        );
-                        const continuation_bridge = try collision_projection_context.hasAuthenticatedContinuationBridgeForEdge(
-                            &collision_analysis,
-                            .{
-                                .source = collision_arm.source,
-                                .kind = collision_arm.kind,
-                                .target = collision_arm.target,
-                            },
-                        );
-                        std.debug.print("feedback_repeated_owner previous_source={} previous_target={} exact={} direct={} adjacent={} paired={} owner_composed={} source_lineage={} target_lineage={} bridge={}\n", .{
-                            owner_arm.source.index(),
-                            owner_arm.target.index(),
-                            exact_position,
-                            direct_position,
-                            adjacent_lineage,
-                            paired_lineage,
-                            owner_composed,
-                            source_lineage,
-                            target_lineage,
-                            continuation_bridge,
+                    if (stage_trace.enabled) {
+                        if (previous_collision_arm) |owner_arm| {
+                            const exact_position = owner_arm.source == collision_arm.source and
+                                owner_arm.kind == collision_arm.kind and
+                                owner_arm.target == collision_arm.target;
+                            const direct_position = sameNodeSplitDirectArmLineage(
+                                result.program.edge_rewrites,
+                                owner_arm,
+                                collision_arm,
+                            );
+                            const adjacent_lineage = sameNodeSplitAdjacentArmLineageWithReplay(
+                                collision_projection_context,
+                                owner_arm,
+                                collision_arm,
+                            );
+                            const paired_lineage = sameNodeSplitPairedArmLineageWithReplay(
+                                &result.program,
+                                collision_projection_context,
+                                owner_arm,
+                                collision_arm,
+                            );
+                            const owner_composed = try sameNodeSplitOwnerComposedArmLineageWithReplay(
+                                &result.program,
+                                &collision_analysis,
+                                collision_projection_context,
+                                owner_arm,
+                                collision_arm,
+                            );
+                            const source_lineage = sameNodeSplitLineage(
+                                result.program.edge_rewrites,
+                                owner_arm.source,
+                                collision_arm.source,
+                            );
+                            const target_lineage = sameNodeSplitLineage(
+                                result.program.edge_rewrites,
+                                owner_arm.target,
+                                collision_arm.target,
+                            );
+                            const continuation_bridge = try collision_projection_context.hasAuthenticatedContinuationBridgeForEdge(
+                                &collision_analysis,
+                                .{
+                                    .source = collision_arm.source,
+                                    .kind = collision_arm.kind,
+                                    .target = collision_arm.target,
+                                },
+                            );
+                            std.debug.print("feedback_repeated_owner previous_source={} previous_target={} exact={} direct={} adjacent={} paired={} owner_composed={} source_lineage={} target_lineage={} bridge={}\n", .{
+                                owner_arm.source.index(),
+                                owner_arm.target.index(),
+                                exact_position,
+                                direct_position,
+                                adjacent_lineage,
+                                paired_lineage,
+                                owner_composed,
+                                source_lineage,
+                                target_lineage,
+                                continuation_bridge,
+                            });
+                        }
+                        for (collision_arms.items) |arm| {
+                            const source_root = if (nodeSplitRoot(result.program.edge_rewrites, arm.source)) |root| root.index() else null;
+                            const target_root = if (nodeSplitRoot(result.program.edge_rewrites, arm.target)) |root| root.index() else null;
+                            std.debug.print("feedback_tried_arm source={} kind={s} target={} source_root={?d} target_root={?d}\n", .{
+                                arm.source.index(),
+                                @tagName(arm.kind),
+                                arm.target.index(),
+                                source_root,
+                                target_root,
+                            });
+                        }
+                        const current_source_root = if (nodeSplitRoot(result.program.edge_rewrites, collision_arm.source)) |root| root.index() else null;
+                        const current_target_root = if (nodeSplitRoot(result.program.edge_rewrites, collision_arm.target)) |root| root.index() else null;
+                        std.debug.print("feedback_current_arm source={} target={} source_root={?d} target_root={?d} args=", .{
+                            collision_arm.source.index(),
+                            collision_arm.target.index(),
+                            current_source_root,
+                            current_target_root,
                         });
-                    }
-                    for (collision_arms.items) |arm| {
-                        const source_root = if (nodeSplitRoot(result.program.edge_rewrites, arm.source)) |root| root.index() else null;
-                        const target_root = if (nodeSplitRoot(result.program.edge_rewrites, arm.target)) |root| root.index() else null;
-                        std.debug.print("feedback_tried_arm source={} kind={s} target={} source_root={?d} target_root={?d}\n", .{
-                            arm.source.index(),
-                            @tagName(arm.kind),
-                            arm.target.index(),
-                            source_root,
-                            target_root,
-                        });
-                    }
-                    const current_source_root = if (nodeSplitRoot(result.program.edge_rewrites, collision_arm.source)) |root| root.index() else null;
-                    const current_target_root = if (nodeSplitRoot(result.program.edge_rewrites, collision_arm.target)) |root| root.index() else null;
-                    std.debug.print("feedback_current_arm source={} target={} source_root={?d} target_root={?d} args=", .{
-                        collision_arm.source.index(),
-                        collision_arm.target.index(),
-                        current_source_root,
-                        current_target_root,
-                    });
-                    if (cfg_edge.value(&result.program, .{
-                        .source = collision_arm.source,
-                        .kind = collision_arm.kind,
-                        .target = collision_arm.target,
-                    })) |edge| {
-                        for (edge.arguments) |value_id| std.debug.print(" {}", .{value_id.index()});
-                    }
-                    std.debug.print("\n", .{});
-                    for (result.program.edge_rewrites) |rewrite| {
-                        if (rewrite.rule != .node_split or
-                            (rewrite.from.target != collision_arm.source and rewrite.to.target != collision_arm.source and
-                                rewrite.from.target != collision_arm.target and rewrite.to.target != collision_arm.target)) continue;
-                        std.debug.print("feedback_current_rewrite id={} source={} from={} to={} group={?} from_args={any} to_args={any}\n", .{
-                            rewrite.id.index(),
-                            rewrite.source.index(),
-                            rewrite.from.target.index(),
-                            rewrite.to.target.index(),
-                            rewrite.node_split_group,
-                            rewrite.from.arguments,
-                            rewrite.to.arguments,
-                        });
+                        if (cfg_edge.value(&result.program, .{
+                            .source = collision_arm.source,
+                            .kind = collision_arm.kind,
+                            .target = collision_arm.target,
+                        })) |edge| {
+                            for (edge.arguments) |value_id| std.debug.print(" {}", .{value_id.index()});
+                        }
+                        std.debug.print("\n", .{});
+                        for (result.program.edge_rewrites) |rewrite| {
+                            if (rewrite.rule != .node_split or
+                                (rewrite.from.target != collision_arm.source and rewrite.to.target != collision_arm.source and
+                                    rewrite.from.target != collision_arm.target and rewrite.to.target != collision_arm.target)) continue;
+                            std.debug.print("feedback_current_rewrite id={} source={} from={} to={} group={?} from_args={any} to_args={any}\n", .{
+                                rewrite.id.index(),
+                                rewrite.source.index(),
+                                rewrite.from.target.index(),
+                                rewrite.to.target.index(),
+                                rewrite.node_split_group,
+                                rewrite.from.arguments,
+                                rewrite.to.arguments,
+                            });
+                        }
                     }
                     return error.NormalizationInvariantFailed;
                 };
@@ -2705,6 +2708,7 @@ fn traceUnvisitedPlanCloneLimit(
     rewrites: usize,
     arms: usize,
 ) void {
+    if (!stage_trace.enabled) return;
     const secondaries = plan.secondaries[0..plan.secondary_count];
     var total_closure: usize = 0;
     for (secondaries) |secondary| total_closure += secondary.closure.len;
@@ -9901,7 +9905,7 @@ fn cloneClosure(
     if (closure.items.len == 0) return null;
     const initial_closure_len = closure.items.len;
     if (!try extendContinuationClosure(allocator, program, graph, primary, &closure)) return null;
-    std.debug.print("normalize diagnostic clone-closure secondary={} primary={} primary_parameters={} before={} after={}\n", .{
+    if (stage_trace.enabled) std.debug.print("normalize diagnostic clone-closure secondary={} primary={} primary_parameters={} before={} after={}\n", .{
         secondary.index(),
         primary.index(),
         program.blocks[primary.index()].parameters.len,
@@ -10396,14 +10400,14 @@ fn applyPlan(
     };
     defer availability_analysis.deinit();
     if (!(try clone_availability.functionUsesAreAvailable(allocator, program, &availability_analysis))) {
-        std.debug.print("normalize diagnostic clone-availability-plan function={} secondaries={} blocks={} rewrites={}\n", .{
+        if (stage_trace.enabled) std.debug.print("normalize diagnostic clone-availability-plan function={} secondaries={} blocks={} rewrites={}\n", .{
             plan.function_index,
             secondaries.len,
             blocks.items.len,
             rewrites.items.len,
         });
         for (secondaries, 0..) |secondary, index| {
-            std.debug.print("normalize diagnostic clone-availability-secondary index={} entry={} closure={any} incoming={any}\n", .{
+            if (stage_trace.enabled) std.debug.print("normalize diagnostic clone-availability-secondary index={} entry={} closure={any} incoming={any}\n", .{
                 index,
                 secondary.block.index(),
                 secondary.closure,

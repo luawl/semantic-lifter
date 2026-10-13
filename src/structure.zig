@@ -14,6 +14,7 @@ const runtime_uses = @import("runtime_uses.zig");
 const shared_control_shape = @import("shared_control_shape.zig");
 const structural_overlap = @import("structural_overlap.zig");
 const luau_runtime = @import("luau_runtime.zig");
+const stage_trace = @import("stage_trace.zig");
 
 pub const BuildError = error{UnsupportedShape} || std.mem.Allocator.Error;
 
@@ -7006,7 +7007,7 @@ const Builder = struct {
                         }
                     }
                 }
-                std.debug.print("COLLISION on block {d}! already_owned by outer region\n", .{current.index()});
+                if (stage_trace.enabled) std.debug.print("COLLISION on block {d}! already_owned by outer region\n", .{current.index()});
                 try self.noteCollisionNode(
                     current,
                     if (nodes.items.len == 0) null else nodes.items[nodes.items.len - 1],

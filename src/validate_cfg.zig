@@ -10,6 +10,7 @@ const pack_validation = @import("validate_packs.zig");
 const iteration_protocol = @import("iteration_protocol.zig");
 const syntax_depth_validation = @import("validate_luau_syntax_depth.zig");
 const luau_runtime = @import("luau_runtime.zig");
+const stage_trace = @import("stage_trace.zig");
 
 pub fn validate(
     allocator: std.mem.Allocator,
@@ -32,7 +33,7 @@ pub fn validate(
 
     for (program.functions) |function| {
         if (!hasCanonicalMembership(program, function, block_memberships, instruction_memberships)) continue;
-        std.debug.print("cfg_validation function={} stage=begin\n", .{function.id.index()});
+        if (stage_trace.enabled) std.debug.print("cfg_validation function={} stage=begin\n", .{function.id.index()});
         var analysis = cfg.Analysis.init(allocator, program, function) catch |err| switch (err) {
             error.InvalidCfg => continue,
             error.OutOfMemory => return error.OutOfMemory,
@@ -55,13 +56,15 @@ pub fn validate(
             if (!skip_recursive_structuring) {
                 var maybe_plan: ?structure.Plan = structure.Plan.initWithArbitraryFallback(allocator, &analysis) catch |err| switch (err) {
                     error.UnsupportedShape => blk: {
-                        if (@errorReturnTrace()) |trace| {
-                            std.debug.print("UnsupportedShape trace for function {d}:\n", .{function.id.index()});
-                            const st = std.debug.StackTrace{
-                                .return_addresses = trace.instruction_addresses[0..@min(trace.index, 6)],
-                                .skipped = .none,
-                            };
-                            std.debug.dumpStackTrace(&st);
+                        if (stage_trace.enabled) {
+                            if (@errorReturnTrace()) |trace| {
+                                std.debug.print("UnsupportedShape trace for function {d}:\n", .{function.id.index()});
+                                const st = std.debug.StackTrace{
+                                    .return_addresses = trace.instruction_addresses[0..@min(trace.index, 6)],
+                                    .skipped = .none,
+                                };
+                                std.debug.dumpStackTrace(&st);
+                            }
                         }
                         try report.add(.unsupported_readable_control_flow, function.id.index());
                         var regions = try irreducible_region.analyze(allocator, &analysis);
@@ -108,7 +111,7 @@ pub fn validate(
             try validateTerminatorUses(report, program, &analysis, instruction_positions, block);
             try pack_validation.validateTerminatorUse(report, program, &analysis, instruction_positions, block);
         }
-        std.debug.print("cfg_validation function={} stage=done\n", .{function.id.index()});
+        if (stage_trace.enabled) std.debug.print("cfg_validation function={} stage=done\n", .{function.id.index()});
     }
 }
 
@@ -318,7 +321,7 @@ fn validateValueUse(
         .block_parameter => |origin| {
             if (!validId(origin.block, program.blocks.len) or origin.block == use_block.id) return;
             if (!analysis.dominates(origin.block, use_block.id)) {
-                std.debug.print(
+                if (stage_trace.enabled) std.debug.print(
                     "cfg_non_dom function={} value={} origin_block={} use_block={} use_position={} entity={} kind=block_parameter\n",
                     .{ use_block.function.index(), value_id.index(), origin.block.index(), use_block.id.index(), use_position, entity_index },
                 );
@@ -333,7 +336,7 @@ fn validateValueUse(
                 const definition_position = instruction_positions[origin.instruction.index()] orelse return;
                 if (definition_position >= use_position) try report.add(.value_used_before_definition, entity_index);
             } else if (!analysis.dominates(definition.block, use_block.id)) {
-                std.debug.print(
+                if (stage_trace.enabled) std.debug.print(
                     "cfg_non_dom function={} value={} origin_instruction={} origin_block={} use_block={} use_position={} entity={} kind=instruction_result\n",
                     .{ use_block.function.index(), value_id.index(), origin.instruction.index(), definition.block.index(), use_block.id.index(), use_position, entity_index },
                 );

@@ -10,6 +10,7 @@ const proof_plan = @import("proof_plan.zig");
 const control_flow = @import("control_flow.zig");
 const control_query_plan = @import("control_query_plan.zig");
 const irreducible_normalize = @import("irreducible_normalize.zig");
+const stage_trace = @import("stage_trace.zig");
 
 pub const ResolvedProgram = struct {
     backing_allocator: std.mem.Allocator,
@@ -470,13 +471,13 @@ fn resolveAdmittedAlloc(
     const exact_prepass_start = Io.Clock.awake.now(Io.Threaded.global_single_threaded.io()).nanoseconds;
     const has_exact_branch = control_query_plan.State.hasExactBranchTruth(&current);
     if (has_exact_branch) {
-        std.debug.print(
+        if (stage_trace.enabled) std.debug.print(
             "control_phase exact_prepass_begin functions={} blocks={} terms={} queries={}\\n",
             .{ current.functions.len, current.blocks.len, current.solver_terms.len, current.queries.len },
         );
         var initial_planning = try control_query_plan.State.initExact(allocator, &current);
         current = try initial_planning.expandExactBranches(&current);
-        std.debug.print(
+        if (stage_trace.enabled) std.debug.print(
             "control_phase exact_prepass_expanded terms={} queries={} obligations={} claims={} ms={}\\n",
             .{
                 current.solver_terms.len,
@@ -501,7 +502,7 @@ fn resolveAdmittedAlloc(
             &attempted_queries,
             &solve_report,
         );
-        std.debug.print(
+        if (stage_trace.enabled) std.debug.print(
             "control_phase exact_prepass_solved models={} cores={} certificates={} ms={}\\n",
             .{
                 models.items.len,
@@ -531,7 +532,7 @@ fn resolveAdmittedAlloc(
         } else {
             backing_allocator.free(next_blocks);
         }
-        std.debug.print(
+        if (stage_trace.enabled) std.debug.print(
             "control_phase exact_prepass_applied rewritten={} specialized={} ms={}\\n",
             .{
                 initial_control.rewritten_blocks,
@@ -547,7 +548,7 @@ fn resolveAdmittedAlloc(
         backing_allocator,
         &current,
     );
-    std.debug.print(
+    if (stage_trace.enabled) std.debug.print(
         "control_phase control_normalize_done has_exact={} blocks={} rewrites={} ms={}\\n",
         .{
             has_exact_branch,
@@ -566,12 +567,12 @@ fn resolveAdmittedAlloc(
     current.edge_rewrites = rewrites.items;
 
     const planning_init_start = Io.Clock.awake.now(Io.Threaded.global_single_threaded.io()).nanoseconds;
-    std.debug.print(
+    if (stage_trace.enabled) std.debug.print(
         "control_phase planning_init_begin blocks={} rewrites={} terms={} queries={}\\n",
         .{ current.blocks.len, current.edge_rewrites.len, current.solver_terms.len, current.queries.len },
     );
     var planning = try control_query_plan.State.init(allocator, &current);
-    std.debug.print(
+    if (stage_trace.enabled) std.debug.print(
         "control_phase planning_init_done terms={} queries={} obligations={} claims={} ms={}\\n",
         .{
             planning.terms.items.len,
@@ -582,7 +583,7 @@ fn resolveAdmittedAlloc(
         },
     );
     current = try planning.expand(&current);
-    std.debug.print(
+    if (stage_trace.enabled) std.debug.print(
         "control_phase planning_expand_done terms={} queries={} obligations={} claims={}\\n",
         .{ current.solver_terms.len, current.queries.len, current.obligations.len, current.claims.len },
     );

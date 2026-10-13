@@ -916,6 +916,8 @@ pub fn build(b: *std.Build) void {
     _ = compile_check_positive.addOutputFileArg("compile-check-positive.generated.luau");
     compile_check_positive.addArg("standard-luau");
     compile_check_positive.addFileArg(.{ .cwd_relative = luauCompileExe(b) });
+    compile_check_positive.expectExitCode(0);
+    if (!trace_normalize_phases) compile_check_positive.expectStdErrEqual("");
     const rejection_output_files = b.addWriteFiles();
     const rejection_output = rejection_output_files.add(
         "compile-check-preserved-invalid.luau",
