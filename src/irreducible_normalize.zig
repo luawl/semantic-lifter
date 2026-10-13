@@ -1333,6 +1333,12 @@ fn normalizeImpl(
     var structural_cloned_blocks: usize = 0;
 
     if (!options.skip_initial_phases) {
+        // Phase 0, the transparent forwarding collapse, runs only for a targeted invocation
+        // (`only_function != null`). Whole-program and control normalization leave
+        // rewrite-free inputs history-free here and collapse forwarders only after a
+        // feedback split (the feedback-collision `collapseTransparentForwardingBlocks`
+        // call). The rationale for this targeted-only gate is unconfirmed: no record
+        // states it (K17, decision D4).
         if (only_function != null) {
             _ = try collapseTransparentForwardingBlocks(allocator, &result.program, &blocks, &rewrites, only_function);
         }
@@ -9834,6 +9840,7 @@ fn planRegion(
 
     for (region.entries) |entry| {
         if (entry.block == primary) continue;
+        // Successor shape deliberately not refused; see `irreducible_policy.classifySecondary`.
         if (irreducible_policy.classifySecondarySource(program, entry) != null) continue;
         const closure = try cloneClosure(
             allocator,

@@ -3,6 +3,7 @@ const ir = @import("ir.zig");
 const cfg = @import("cfg.zig");
 const irreducible_region = @import("irreducible_region.zig");
 const irreducible_normalize = @import("irreducible_normalize.zig");
+const irreducible_policy = @import("irreducible_policy.zig");
 const node_split = @import("node_split.zig");
 const control_flow = @import("control_flow.zig");
 const validation = @import("validate.zig");
@@ -87,6 +88,22 @@ test "secondary closure splits a branch reached before the primary" {
         .values = &values,
         .evidence = &evidence,
     };
+
+    var input_graph = try cfg.Analysis.init(std.testing.allocator, &program, program.functions[0]);
+    defer input_graph.deinit();
+    var input_regions = try irreducible_region.analyze(std.testing.allocator, &input_graph);
+    defer input_regions.deinit();
+    try std.testing.expectEqual(@as(usize, 1), input_regions.regions.len);
+    const input_region = input_regions.regions[0];
+    const selection = try irreducible_policy.selectPrimary(std.testing.allocator, &program, input_region);
+    try std.testing.expectEqual(primary, selection.block);
+    const secondary_entry = for (input_region.entries) |region_entry| {
+        if (region_entry.block == secondary) break region_entry;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectEqual(
+        @as(?irreducible_policy.Refusal, .nonprimary_successor),
+        irreducible_policy.classifySecondary(&program, input_region, primary, secondary_entry),
+    );
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -296,6 +313,47 @@ test "transparent forwarding chains are replayable and function scoped" {
         try std.testing.expectEqual(rewrite.to.target, replayed.target);
         try std.testing.expectEqualSlices(ir.ValueId, rewrite.to.arguments, replayed.arguments);
     }
+}
+
+test "whole-program normalization leaves transparent forwarding chains in place" {
+    const function_zero = ir.FunctionId.fromIndex(0);
+    const function_one = ir.FunctionId.fromIndex(1);
+    const zero_entry = ir.BlockId.fromIndex(0);
+    const zero_forward_one = ir.BlockId.fromIndex(1);
+    const zero_forward_two = ir.BlockId.fromIndex(2);
+    const zero_exit = ir.BlockId.fromIndex(3);
+    const one_entry = ir.BlockId.fromIndex(4);
+    const one_forward = ir.BlockId.fromIndex(5);
+    const one_exit = ir.BlockId.fromIndex(6);
+    const blocks = [_]ir.Block{
+        .{ .id = zero_entry, .function = function_zero, .terminator = .{ .jump = .{ .target = zero_forward_one } } },
+        .{ .id = zero_forward_one, .function = function_zero, .terminator = .{ .jump = .{ .target = zero_forward_two } } },
+        .{ .id = zero_forward_two, .function = function_zero, .terminator = .{ .jump = .{ .target = zero_exit } } },
+        .{ .id = zero_exit, .function = function_zero, .terminator = .{ .return_values = &.{} } },
+        .{ .id = one_entry, .function = function_one, .terminator = .{ .jump = .{ .target = one_forward } } },
+        .{ .id = one_forward, .function = function_one, .terminator = .{ .jump = .{ .target = one_exit } } },
+        .{ .id = one_exit, .function = function_one, .terminator = .{ .return_values = &.{} } },
+    };
+    const functions = [_]ir.Function{
+        .{ .id = function_zero, .blocks = &.{ zero_entry, zero_forward_one, zero_forward_two, zero_exit }, .entry_block = zero_entry },
+        .{ .id = function_one, .blocks = &.{ one_entry, one_forward, one_exit }, .entry_block = one_entry },
+    };
+    const program: ir.Program = .{
+        .program_id = "transparent-forwarding-chain-scope",
+        .entry_function = function_zero,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &.{},
+    };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const normalized = try irreducible_normalize.normalizeInArena(arena.allocator(), &program);
+
+    try std.testing.expectEqual(@as(usize, 0), normalized.program.edge_rewrites.len);
+    try std.testing.expectEqual(zero_forward_one, normalized.program.blocks[zero_entry.index()].terminator.jump.target);
+    try std.testing.expectEqual(one_forward, normalized.program.blocks[one_entry.index()].terminator.jump.target);
 }
 
 test "conditional multi-entry loop clones each authenticated incoming edge" {
