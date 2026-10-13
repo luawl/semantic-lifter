@@ -1,11 +1,44 @@
 const std = @import("std");
 
+// External tools (the Lune runtime and the Luau 0.720 tools) are resolved once at the top of
+// build() from the -Dlune / -Dluau-compile / -Dluau-ast / -Dluau-analyze options and cached here,
+// so a clone that passes the options (or has the tools on PATH) can build and test. This machine's
+// workspace paths are never hard-coded; see resolveExternalTool.
+var resolved_lune: []const u8 = "";
+var resolved_luau_compile: []const u8 = "";
+var resolved_luau_ast: []const u8 = "";
+var resolved_luau_analyze: []const u8 = "";
+
+fn failMissingTool(name: []const u8) noreturn {
+    std.debug.print(
+        "semantic-lifter: external tool {s} not found; pass -D{s}=<path> (needs Lune 0.10.4 and the Luau 0.720 tools)\n",
+        .{ name, name },
+    );
+    std.process.exit(1);
+}
+
+fn resolveExternalTool(b: *std.Build, option_value: ?[]const u8, name: []const u8) []const u8 {
+    if (option_value) |value| {
+        const resolved = if (std.fs.path.isAbsolute(value)) value else b.pathFromRoot(value);
+        std.Io.Dir.cwd().access(b.graph.io, resolved, .{}) catch failMissingTool(name);
+        return resolved;
+    }
+    return b.findProgram(&.{name}, &.{}) catch failMissingTool(name);
+}
+
 fn luneExe(b: *std.Build) []const u8 {
-    return b.pathFromRoot("../../../../lune.exe");
+    _ = b;
+    return resolved_lune;
 }
 
 fn luauCompileExe(b: *std.Build) []const u8 {
-    return b.pathFromRoot("../../../../tools/bin/luau-compile.exe");
+    _ = b;
+    return resolved_luau_compile;
+}
+
+fn luauAstExe(b: *std.Build) []const u8 {
+    _ = b;
+    return resolved_luau_ast;
 }
 
 fn addStructureAstAudit(
@@ -16,14 +49,15 @@ fn addStructureAstAudit(
     const command = b.addSystemCommand(&.{ luneExe(b), "run" });
     command.addFileArg(b.path("luau/structure_ast_audit.luau"));
     command.addFileInput(b.path("luau/structure_ast_audit.luau"));
-    command.addFileArg(b.path("../../../../tools/luau-0.720/luau-ast.exe"));
+    command.addFileArg(.{ .cwd_relative = luauAstExe(b) });
     command.addArg(fixture_name);
     command.addFileArg(generated_luau);
     return command;
 }
 
 fn luauAnalyzeExe(b: *std.Build) []const u8 {
-    return b.pathFromRoot("../../../../tools/bin/luau-analyze.exe");
+    _ = b;
+    return resolved_luau_analyze;
 }
 
 pub fn build(b: *std.Build) void {
@@ -45,6 +79,16 @@ pub fn build(b: *std.Build) void {
         "workspace-sample-conformance",
         "Include optional whole-program samples owned by the parent workspace",
     ) orelse false;
+
+    const lune_option = b.option([]const u8, "lune", "Path to the Lune 0.10.4 runtime (default: lune on PATH)");
+    const luau_compile_option = b.option([]const u8, "luau-compile", "Path to luau-compile from the Luau 0.720 tools (default: luau-compile on PATH)");
+    const luau_ast_option = b.option([]const u8, "luau-ast", "Path to luau-ast from the Luau 0.720 tools (default: luau-ast on PATH)");
+    const luau_analyze_option = b.option([]const u8, "luau-analyze", "Path to luau-analyze from the Luau 0.720 tools (default: luau-analyze on PATH)");
+    resolved_lune = resolveExternalTool(b, lune_option, "lune");
+    resolved_luau_compile = resolveExternalTool(b, luau_compile_option, "luau-compile");
+    resolved_luau_ast = resolveExternalTool(b, luau_ast_option, "luau-ast");
+    resolved_luau_analyze = resolveExternalTool(b, luau_analyze_option, "luau-analyze");
+
     const z3_include = "../../../dep/z3/z3-4.16.0-x64-win/include";
     const z3_library = "../../../dep/z3/z3-4.16.0-x64-win/bin/libz3.lib";
     const z3_bin = "../../../dep/z3/z3-4.16.0-x64-win/bin";
@@ -871,7 +915,7 @@ pub fn build(b: *std.Build) void {
     compile_check_positive.addFileArg(absolute_conformance.input_ir);
     _ = compile_check_positive.addOutputFileArg("compile-check-positive.generated.luau");
     compile_check_positive.addArg("standard-luau");
-    compile_check_positive.addFileArg(b.path("../../../../tools/bin/luau-compile.exe"));
+    compile_check_positive.addFileArg(.{ .cwd_relative = luauCompileExe(b) });
     const rejection_output_files = b.addWriteFiles();
     const rejection_output = rejection_output_files.add(
         "compile-check-preserved-invalid.luau",
@@ -1138,7 +1182,7 @@ pub fn build(b: *std.Build) void {
     const run_generated_lexical_oracle_tests = b.addSystemCommand(&.{ luneExe(b), "run" });
     run_generated_lexical_oracle_tests.addFileArg(b.path("luau/generated_lexical_oracle.luau"));
     run_generated_lexical_oracle_tests.addArg("self-test");
-    run_generated_lexical_oracle_tests.addFileArg(b.path("../../../../tools/bin/luau-analyze.exe"));
+    run_generated_lexical_oracle_tests.addFileArg(.{ .cwd_relative = luauAnalyzeExe(b) });
     _ = run_generated_lexical_oracle_tests.addOutputFileArg("generated-lexical-oracle-source.luau");
     _ = run_generated_lexical_oracle_tests.addOutputFileArg("generated-lexical-oracle-negative.luau");
     const run_luau_ir_typecheck = b.addSystemCommand(&.{luauAnalyzeExe(b)});
@@ -1433,7 +1477,7 @@ pub fn build(b: *std.Build) void {
 fn addRegisterBudgetOracle(b: *std.Build) *std.Build.Step.Run {
     const command = b.addSystemCommand(&.{ luneExe(b), "run" });
     command.addFileArg(b.path("luau/register_budget_oracle.luau"));
-    command.addFileArg(b.path("../../../../tools/bin/luau-compile.exe"));
+    command.addFileArg(.{ .cwd_relative = luauCompileExe(b) });
     _ = command.addOutputFileArg("register-budget-oracle.txt");
     const cases = [_][]const u8{
         "local-200",
@@ -1673,7 +1717,7 @@ fn addGeneratedLexicalConformance(
     const command = b.addSystemCommand(&.{ luneExe(b), "run" });
     command.addFileArg(b.path("luau/generated_lexical_oracle.luau"));
     command.addArg("check");
-    command.addFileArg(b.path("../../../../tools/bin/luau-analyze.exe"));
+    command.addFileArg(.{ .cwd_relative = luauAnalyzeExe(b) });
     command.addFileArg(b.path(source_path));
     command.addFileArg(generated_luau);
     return &command.step;
@@ -1802,7 +1846,7 @@ fn addLuauSourceIrConfigured(
     frontend_command.addFileInput(b.path("luau/target_recovery.luau"));
     frontend_command.addFileInput(b.path("luau/target_result_contracts.luau"));
     frontend_command.addFileInput(b.path("luau/target_proof_bundle.luau"));
-    frontend_command.addFileArg(b.path("../../../../tools/luau-0.720/luau-ast.exe"));
+    frontend_command.addFileArg(.{ .cwd_relative = luauAstExe(b) });
     frontend_command.addFileArg(b.path(source_path));
     frontend_command.addArg(fixture_name);
     const fixture_json = frontend_command.addOutputFileArg(b.fmt("{s}.lifter-ir.json", .{fixture_name}));
@@ -1864,7 +1908,7 @@ fn addSerializedConformanceWithEngine(
     const emitted_luau = emit_command.addOutputFileArg(b.fmt("{s}.generated.luau", .{fixture_name}));
     emit_command.addArg(engine_name);
     emit_command.addArg("standard-luau");
-    emit_command.addFileArg(b.path("../../../../tools/bin/luau-compile.exe"));
+    emit_command.addFileArg(.{ .cwd_relative = luauCompileExe(b) });
 
     const runtime_command = b.addSystemCommand(&.{ luneExe(b), "run" });
     runtime_command.addFileArg(b.path("luau/runtime_oracle.luau"));
@@ -1914,7 +1958,7 @@ fn addSerializedCompileConformanceWithEngine(
     const emitted_luau = emit_command.addOutputFileArg(b.fmt("{s}.generated.luau", .{fixture_name}));
     emit_command.addArg(engine_name);
     emit_command.addArg("standard-luau");
-    emit_command.addFileArg(b.path("../../../../tools/bin/luau-compile.exe"));
+    emit_command.addFileArg(.{ .cwd_relative = luauCompileExe(b) });
 
     return .{
         .validate = &validate_command.step,
