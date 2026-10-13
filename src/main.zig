@@ -7,35 +7,50 @@ const lifter = @import("semantic_lifter");
 // unbounded.
 const max_ir_json_bytes: usize = 2 * 1024 * 1024 * 1024;
 
+const usage_text =
+    \\usage:
+    \\  semantic-lifter fixture-json <arithmetic|absolute|function-reference-identity|dynamic-truthiness|variadic-identity|open-pack|immutable-closure|shared-place-closure> <output.json>
+    \\      built-in fixtures; nothing to admit
+    \\  semantic-lifter validate <input.json> <core|readable-luau>
+    \\  semantic-lifter validate-solved <input.json> <core|readable-luau> <internal|z3>
+    \\  semantic-lifter emit-luau <input.json> <output.luau> <standard-luau|direct-locals-luau> <compiler>
+    \\  semantic-lifter emit-luau-solved <input.json> <output.luau> <internal|z3> <standard-luau|direct-locals-luau> <compiler>
+    \\  semantic-lifter emit-readable-luau <input.json> <output.luau> <standard-luau|direct-locals-luau> <compiler>
+    \\  semantic-lifter emit-admitted-readable-luau <input.json> <output.luau> <standard-luau|direct-locals-luau> <compiler>
+    \\  semantic-lifter resolve-ir <input.json> <output.json> <internal|z3>
+    \\  semantic-lifter resolve-readable-ir <input.json> <output.json> <internal|z3>
+    \\  semantic-lifter resolve-admitted-readable-ir <input.json> <output.json>
+    \\  semantic-lifter refresh-proof-digests <input.json> <output.json>
+    \\  semantic-lifter normalize-control-ir <input.json> <output.json>
+    \\  semantic-lifter normalize-ir <input.json> <output.json> [<function-index>]
+    \\  semantic-lifter normalize-ir-budget <input.json> <output.json> <function-index> <feedback-iterations> [resume]
+    \\  semantic-lifter normalize-ir-resume <input.json> <output.json> <function-index> <feedback-iterations> <resume-token.json>
+    \\      resolve-*: a refusal can still leave an output file; check the exit status.
+    \\
+    \\test helpers (no output file; exit 0 when the expectation holds):
+    \\  semantic-lifter expect-diagnostic <input.json> <core|readable-luau> <diagnostic>
+    \\  semantic-lifter expect-blocker-census <input.json> <core|readable-luau> <total> [<kind> <subject> <operation> <producer> <value-type> <place-flow> <count>]...
+    \\  semantic-lifter expect-blocker-proof-census <input.json> <core|readable-luau> <total> [<kind> <subject> <operation> <producer> <value-type> <place-flow> <proof-links> <count>]...
+    \\
+    \\diagnostic-only or unchecked (exit 0 is not a checked publication):
+    \\  semantic-lifter emit-admitted-readable-luau-raw <input.json> <output.luau> <standard-luau|direct-locals-luau>
+    \\      checks nothing; the caller must already have admitted the input
+    \\  semantic-lifter emit-readable-luau-strategy <normalized.json> <output.luau> <standard-luau|direct-locals-luau> <automatic|dispatcher>
+    \\      checks readable-luau admission of the input only; no resolution, no compile check,
+    \\      no diagnostic lines on refusal (exit 1, error: InvalidIr)
+    \\  semantic-lifter emit-function-probe <input.json> <output.luau> <function-index>
+    \\      one function, standard-luau only; checks nothing
+    \\  semantic-lifter resolve-exact-control-ir <input.json> <output.json> <internal|z3>
+    \\      exact-branch checkpoint; neither its input nor its output is validated
+    \\  semantic-lifter inspect-structure <input.json> <function-index>
+    \\  semantic-lifter inspect-edge-rewrite <input.json> <rewrite-index>
+    \\
+    \\exit status: 0 success; 1 refusal, with diagnostic= lines on stderr.
+    \\
+;
+
 fn usage() void {
-    std.debug.print(
-        \\usage:
-        \\  semantic-lifter fixture-json <arithmetic|absolute|function-reference-identity|dynamic-truthiness|variadic-identity|open-pack|immutable-closure|shared-place-closure> <output.json>
-        \\  semantic-lifter validate <input.json> <core|readable-luau>
-        \\  semantic-lifter expect-diagnostic <input.json> <core|readable-luau> <diagnostic>
-        \\  semantic-lifter expect-blocker-census <input.json> <core|readable-luau> <total> [<kind> <subject> <operation> <producer> <value-type> <place-flow> <count>]...
-        \\  semantic-lifter expect-blocker-proof-census <input.json> <core|readable-luau> <total> [<kind> <subject> <operation> <producer> <value-type> <place-flow> <proof-links> <count>]...
-        \\  semantic-lifter validate-solved <input.json> <core|readable-luau> <internal|z3>
-        \\  semantic-lifter emit-luau <input.json> <output.luau> <standard-luau|direct-locals-luau> <compiler>
-        \\  semantic-lifter emit-readable-luau <input.json> <output.luau> <standard-luau|direct-locals-luau> <compiler>
-        \\  semantic-lifter emit-admitted-readable-luau <input.json> <output.luau> <standard-luau|direct-locals-luau> <compiler>
-        \\  semantic-lifter emit-admitted-readable-luau-raw <input.json> <output.luau> <standard-luau|direct-locals-luau>
-        \\  semantic-lifter emit-readable-luau-strategy <normalized.json> <output.luau> <standard-luau|direct-locals-luau> <automatic|dispatcher>
-        \\  semantic-lifter emit-luau-solved <input.json> <output.luau> <internal|z3> <standard-luau|direct-locals-luau> <compiler>
-        \\  semantic-lifter resolve-ir <input.json> <output.json> <internal|z3>
-        \\  semantic-lifter resolve-exact-control-ir <input.json> <output.json> <internal|z3>
-        \\  semantic-lifter resolve-readable-ir <input.json> <output.json> <internal|z3>
-        \\  semantic-lifter resolve-admitted-readable-ir <input.json> <output.json>
-        \\  semantic-lifter refresh-proof-digests <input.json> <output.json>
-        \\  semantic-lifter normalize-control-ir <input.json> <output.json>
-        \\  semantic-lifter normalize-ir <input.json> <output.json> [<function-index>]
-        \\  semantic-lifter normalize-ir-budget <input.json> <output.json> <function-index> <feedback-iterations> [resume]
-        \\  semantic-lifter normalize-ir-resume <input.json> <output.json> <function-index> <feedback-iterations> <resume-token.json>
-        \\  semantic-lifter inspect-structure <input.json> <function-index>
-        \\  semantic-lifter inspect-edge-rewrite <input.json> <rewrite-index>
-        \\  semantic-lifter emit-function-probe <input.json> <output.luau> <function-index>
-        \\
-    , .{});
+    std.debug.print(usage_text, .{});
 }
 
 fn inspectIndent(depth: usize) void {
@@ -1382,4 +1397,21 @@ test "fixture registry contains only family-neutral contract cases" {
     try std.testing.expectEqualStrings("generic-immutable-closure-module", (try fixtureByName("immutable-closure")).program_id);
     try std.testing.expectEqualStrings("generic-shared-place-closure-module", (try fixtureByName("shared-place-closure")).program_id);
     try std.testing.expectError(error.UnknownFixture, fixtureByName("sample-family"));
+}
+
+test "diagnostic-only commands are labelled in the usage text" {
+    const header = "diagnostic-only or unchecked";
+    const header_pos = std.mem.indexOf(u8, usage_text, header);
+    try std.testing.expect(header_pos != null);
+    const diagnostic_only_commands = [_][]const u8{
+        "emit-admitted-readable-luau-raw",
+        "emit-readable-luau-strategy",
+        "resolve-exact-control-ir",
+        "emit-function-probe",
+    };
+    for (diagnostic_only_commands) |command| {
+        const command_pos = std.mem.indexOf(u8, usage_text, command);
+        try std.testing.expect(command_pos != null);
+        try std.testing.expect(command_pos.? > header_pos.?);
+    }
 }
