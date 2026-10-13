@@ -1,0 +1,151 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="540" height="830" viewBox="0 0 540 830" role="img" aria-labelledby="title desc">
+<title id="title">The piecewise_chain miscompile: one shared return in two IRs of the same program</title>
+<desc id="desc">Panel (a): disassembly-path IR of the worker function, straight-line chains contracted, listing lines in brackets. B1-B3 store the arguments and zero r2 and r3. Branch B4 (r0 &lt; r3) leads to the then-arm B5-B7 or to B8-B9 (r0 == r3), which leads to B10-B12 or to B13 (r0 &lt;= r1), which leads to B14-B17 or to B18. B7, B12, and B17 jump to the shared return block B19 and B18 falls through to it, so B19 has four predecessors; its immediate dominator is B4. Before the repair only the then-arm kept its transfer to B19 (solid line); the other three transfers became escapes to a flag that nothing reads (dashed lines). After the repair B19 is adopted as the join of B4 (dotted line). Panel (b): source-path IR of the same program, in which each if/elseif level has its own join block (B8, B9, B10), so the terminal B10 has two predecessors, B2 and B9.</desc>
+<defs>
+  <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="#333333"/></marker>
+  <marker id="arrLost" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="#8c2d1e"/></marker>
+  <marker id="arrFix" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="#1f4e8c"/></marker>
+  <style>
+    text { font-family: sans-serif; fill: #1a1a1a; }
+    .ttl { font-size: 15px; font-weight: bold; }
+    .id { font-size: 15px; font-weight: bold; text-anchor: middle; }
+    .tx { font-size: 15px; text-anchor: middle; }
+    .sm { font-size: 13px; text-anchor: middle; }
+    .lb { font-size: 13px; fill: #333333; }
+    .nd { fill: #ffffff; stroke: #333333; stroke-width: 1.6; }
+    .term { fill: #e6e6e6; stroke: #000000; stroke-width: 3; }
+    .e { fill: none; stroke: #333333; stroke-width: 1.6; }
+    .lost { fill: none; stroke: #8c2d1e; stroke-width: 2.2; stroke-dasharray: 7 4; }
+    .fix { fill: none; stroke: #1f4e8c; stroke-width: 2.6; stroke-dasharray: 0.5 5.5; stroke-linecap: round; }
+  </style>
+</defs>
+<rect width="540" height="830" fill="#ffffff"/>
+
+<!-- ===== Panel (a): disassembly-path IR ===== -->
+<text x="10" y="20" class="ttl">(a) Disassembly-path IR (listing lines in brackets)</text>
+
+<!-- a1: B1-B3 -->
+<rect x="22" y="32" width="290" height="50" rx="6" class="nd"/>
+<text x="167" y="52" class="id">B1–B3 [5–6]</text>
+<text x="167" y="72" class="tx">r0, r1 ← arguments; r2 = 0; r3 = 0</text>
+<path d="M142,82 V104" class="e" marker-end="url(#arr)"/>
+
+<!-- a2: B4 -->
+<polygon points="142,104 262,136 142,168 22,136" class="nd"/>
+<text x="142" y="132" class="id">B4 [7]</text>
+<text x="142" y="151" class="tx">r0 &lt; r3 ?</text>
+<path d="M262,136 H296" class="e" marker-end="url(#arr)"/>
+<text x="279" y="129" class="lb" text-anchor="middle">then</text>
+<path d="M142,168 V198" class="e" marker-end="url(#arr)"/>
+<text x="149" y="188" class="lb">else</text>
+
+<!-- a3: B5-B7 (then-arm of B4) -->
+<rect x="296" y="110" width="176" height="52" rx="6" class="nd"/>
+<text x="384" y="131" class="id">B5–B7 [8–10]</text>
+<text x="384" y="151" class="tx">r3 = −r0; r2 = r3 · r1</text>
+<text x="384" y="183" class="lb" text-anchor="middle" font-style="italic">pre-fix: returns r2 inline</text>
+
+<!-- a4: B8-B9 -->
+<polygon points="142,198 262,230 142,262 22,230" class="nd"/>
+<text x="142" y="226" class="id">B8–B9 [11–12]</text>
+<text x="142" y="245" class="tx">r3 = 0; r0 == r3 ?</text>
+<path d="M262,230 H296" class="e" marker-end="url(#arr)"/>
+<text x="279" y="223" class="lb" text-anchor="middle">then</text>
+<path d="M142,262 V292" class="e" marker-end="url(#arr)"/>
+<text x="149" y="282" class="lb">else</text>
+
+<!-- a5: B10-B12 -->
+<rect x="296" y="204" width="176" height="52" rx="6" class="nd"/>
+<text x="384" y="225" class="id">B10–B12 [13–15]</text>
+<text x="384" y="245" class="tx">r3 = 11; r2 = r1 + r3</text>
+
+<!-- a6: B13 -->
+<polygon points="142,292 262,324 142,356 22,324" class="nd"/>
+<text x="142" y="320" class="id">B13 [16]</text>
+<text x="142" y="339" class="tx">r0 &lt;= r1 ?</text>
+<path d="M262,324 H296" class="e" marker-end="url(#arr)"/>
+<text x="279" y="317" class="lb" text-anchor="middle">then</text>
+<path d="M142,356 V386" class="e" marker-end="url(#arr)"/>
+<text x="149" y="376" class="lb">else</text>
+
+<!-- a7: B14-B17 -->
+<rect x="296" y="289" width="176" height="70" rx="6" class="nd"/>
+<text x="384" y="309" class="id">B14–B17 [17–20]</text>
+<text x="384" y="328" class="tx">r4 = 3; r3 = r1 · r4;</text>
+<text x="384" y="347" class="tx">r2 = r0 + r3</text>
+
+<!-- a8: B18 -->
+<rect x="52" y="386" width="180" height="50" rx="6" class="nd"/>
+<text x="142" y="406" class="id">B18 [21]</text>
+<text x="142" y="426" class="tx">r2 = r0 − r1</text>
+
+<!-- a9: B19, the shared return (bold outline) -->
+<rect x="350" y="462" width="182" height="52" rx="6" class="term"/>
+<text x="441" y="483" class="id">B19 [22]</text>
+<text x="441" y="503" class="tx">return r2</text>
+
+<!-- Transfers into B19: B7 kept (solid); B12, B17, B18 lost (dashed) -->
+<path d="M472,136 H522 V462" class="e" marker-end="url(#arr)"/>
+<path d="M472,230 H505 V462" class="lost" marker-end="url(#arrLost)"/>
+<path d="M472,324 H488 V462" class="lost" marker-end="url(#arrLost)"/>
+<path d="M142,436 V478 H350" class="lost" marker-end="url(#arrLost)"/>
+<text x="160" y="472" class="lb" fill="#8c2d1e">escape flag set, never read</text>
+
+<!-- Repair: B19 adopted as the join of B4 (dotted) -->
+<path d="M22,136 H10 V500 H350" class="fix" marker-end="url(#arrFix)"/>
+<text x="20" y="517" class="lb" fill="#1f4e8c">post-fix: B19 becomes B4's join</text>
+<text x="20" y="533" class="lb" fill="#1f4e8c">(unvisited, dominated by B4)</text>
+
+<text x="532" y="532" class="lb" text-anchor="end">4 predecessors: B7, B12, B17, B18</text>
+<text x="532" y="548" class="lb" text-anchor="end">immediate dominator: B4</text>
+
+<line x1="10" y1="562" x2="530" y2="562" stroke="#bbbbbb" stroke-width="1"/>
+
+<!-- ===== Panel (b): source-path IR ===== -->
+<text x="10" y="590" class="ttl">(b) Source-path IR: one join per if/elseif level</text>
+
+<!-- branch blocks -->
+<polygon points="142,616 176,630 142,644 108,630" class="nd"/>
+<text x="142" y="635" class="id">B1</text>
+<polygon points="142,660 176,674 142,688 108,674" class="nd"/>
+<text x="142" y="679" class="id">B3</text>
+<polygon points="142,704 176,718 142,732 108,718" class="nd"/>
+<text x="142" y="723" class="id">B5</text>
+
+<!-- arms -->
+<rect x="451" y="618" width="50" height="24" rx="5" class="nd"/>
+<text x="476" y="635" class="id">B2</text>
+<rect x="337" y="662" width="50" height="24" rx="5" class="nd"/>
+<text x="362" y="679" class="id">B4</text>
+<rect x="233" y="706" width="50" height="24" rx="5" class="nd"/>
+<text x="258" y="723" class="id">B6</text>
+<rect x="117" y="750" width="50" height="24" rx="5" class="nd"/>
+<text x="142" y="767" class="id">B7</text>
+
+<!-- joins -->
+<rect x="225" y="750" width="66" height="24" rx="5" class="nd"/>
+<text x="258" y="767" class="tx">B8 join</text>
+<rect x="329" y="750" width="66" height="24" rx="5" class="nd"/>
+<text x="362" y="767" class="tx">B9 join</text>
+<rect x="424" y="743" width="104" height="38" rx="5" class="term"/>
+<text x="476" y="759" class="id">B10 join</text>
+<text x="476" y="775" class="sm">return result</text>
+
+<!-- edges -->
+<path d="M176,630 H451" class="e" marker-end="url(#arr)"/>
+<path d="M142,644 V660" class="e" marker-end="url(#arr)"/>
+<path d="M176,674 H337" class="e" marker-end="url(#arr)"/>
+<path d="M142,688 V704" class="e" marker-end="url(#arr)"/>
+<path d="M176,718 H233" class="e" marker-end="url(#arr)"/>
+<path d="M142,732 V750" class="e" marker-end="url(#arr)"/>
+<path d="M167,762 H225" class="e" marker-end="url(#arr)"/>
+<path d="M258,730 V750" class="e" marker-end="url(#arr)"/>
+<path d="M291,762 H329" class="e" marker-end="url(#arr)"/>
+<path d="M362,686 V750" class="e" marker-end="url(#arr)"/>
+<path d="M395,762 H424" class="e" marker-end="url(#arr)"/>
+<path d="M476,642 V743" class="e" marker-end="url(#arr)"/>
+
+<text x="528" y="802" class="lb" text-anchor="end">B10 has 2 predecessors (B2, B9), so the</text>
+<text x="528" y="818" class="lb" text-anchor="end">more-than-two-predecessor rule never applies</text>
+</svg>
