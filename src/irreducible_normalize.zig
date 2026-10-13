@@ -6509,7 +6509,7 @@ test "repeated collision arm composes a multi-step parameterized continuation" {
 fn collisionCanSplit(reason: structure.CollisionReason) bool {
     return switch (reason) {
         .already_owned, .unvisited_loop_member, .unvisited_reachable => true,
-        .outside_region => false,
+        .outside_region, .unowned_escape_target => false,
     };
 }
 

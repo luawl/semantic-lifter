@@ -531,6 +531,107 @@ test "dominated four-arm terminal remains the outer branch continuation" {
     try std.testing.expectEqual(@as(usize, 0), free_targets.len);
 }
 
+test "plan accounting refuses an unowned escape target (pre-fix piecewise_chain shape)" {
+    const S = lifter.structure;
+    const function_id = ir.FunctionId.fromIndex(0);
+    const ids = [_]ir.BlockId{
+        ir.BlockId.fromIndex(0), ir.BlockId.fromIndex(1),
+        ir.BlockId.fromIndex(2), ir.BlockId.fromIndex(3),
+        ir.BlockId.fromIndex(4), ir.BlockId.fromIndex(5),
+        ir.BlockId.fromIndex(6), ir.BlockId.fromIndex(7),
+    };
+    const terminal = ids[7];
+    const blocks = [_]ir.Block{
+        .{ .id = ids[0], .function = function_id, .terminator = .{ .branch = .{
+            .condition = ir.ValueId.fromIndex(0),
+            .then_edge = .{ .target = ids[1] },
+            .else_edge = .{ .target = ids[2] },
+        } } },
+        .{ .id = ids[1], .function = function_id, .terminator = .{ .jump = .{ .target = terminal } } },
+        .{ .id = ids[2], .function = function_id, .terminator = .{ .branch = .{
+            .condition = ir.ValueId.fromIndex(1),
+            .then_edge = .{ .target = ids[3] },
+            .else_edge = .{ .target = ids[4] },
+        } } },
+        .{ .id = ids[3], .function = function_id, .terminator = .{ .jump = .{ .target = terminal } } },
+        .{ .id = ids[4], .function = function_id, .terminator = .{ .branch = .{
+            .condition = ir.ValueId.fromIndex(2),
+            .then_edge = .{ .target = ids[5] },
+            .else_edge = .{ .target = ids[6] },
+        } } },
+        .{ .id = ids[5], .function = function_id, .terminator = .{ .jump = .{ .target = terminal } } },
+        .{ .id = ids[6], .function = function_id, .terminator = .{ .jump = .{ .target = terminal } } },
+        .{ .id = terminal, .function = function_id, .terminator = .{ .return_values = &.{ir.ValueId.fromIndex(0)} } },
+    };
+    const functions = [_]ir.Function{.{ .id = function_id, .blocks = &ids, .entry_block = ids[0] }};
+    const program: ir.Program = .{
+        .program_id = "pre-fix-piecewise-chain-accounting",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &.{},
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, functions[0]);
+    defer analysis.deinit();
+
+    // The plan the pre-fix planner built for this CFG (before the accounting
+    // gate): no branch has a join, every arm has `stop = null`, the
+    // root then-arm absorbs the shared return, and the arms 3, 5 and 6
+    // escape to the terminal while no region stop or owned loop exit
+    // consumes it.
+    var arm3_nodes = [_]S.Node{.{ .block = ids[3] }};
+    var arm3: S.Region = .{
+        .nodes = &arm3_nodes,
+        .stop = null,
+        .loop_exit = null,
+        .escape_projection = .{ .target = terminal, .edge = .{ .target = terminal } },
+    };
+    var arm5_nodes = [_]S.Node{.{ .block = ids[5] }};
+    var arm5: S.Region = .{
+        .nodes = &arm5_nodes,
+        .stop = null,
+        .loop_exit = null,
+        .escape_projection = .{ .target = terminal, .edge = .{ .target = terminal } },
+    };
+    var arm6_nodes = [_]S.Node{.{ .block = ids[6] }};
+    var arm6: S.Region = .{
+        .nodes = &arm6_nodes,
+        .stop = null,
+        .loop_exit = null,
+        .escape_projection = .{ .target = terminal, .edge = .{ .target = terminal } },
+    };
+    var inner_nodes = [_]S.Node{.{ .branch = .{ .block = ids[4], .then_region = &arm5, .else_region = &arm6, .join = null } }};
+    var inner: S.Region = .{ .nodes = &inner_nodes, .stop = null, .loop_exit = null };
+    var middle_nodes = [_]S.Node{.{ .branch = .{ .block = ids[2], .then_region = &arm3, .else_region = &inner, .join = null } }};
+    var middle: S.Region = .{ .nodes = &middle_nodes, .stop = null, .loop_exit = null };
+    var absorbed_nodes = [_]S.Node{ .{ .block = ids[1] }, .{ .block = terminal } };
+    var absorbed: S.Region = .{ .nodes = &absorbed_nodes, .stop = null, .loop_exit = null };
+    var root_nodes = [_]S.Node{.{ .branch = .{ .block = ids[0], .then_region = &absorbed, .else_region = &middle, .join = null } }};
+    const root: S.Region = .{ .nodes = &root_nodes, .stop = null, .loop_exit = null };
+
+    // The existing census already names the unowned target.
+    const free_targets = try S.regionFreeTargetsAlloc(std.testing.allocator, &root);
+    defer std.testing.allocator.free(free_targets);
+    try std.testing.expectEqualSlices(ir.BlockId, &.{terminal}, free_targets);
+
+    // The planner's own post-build entry point must refuse the plan.
+    var collision: ?S.Collision = null;
+    defer if (collision) |*value| value.deinit(std.testing.allocator);
+    try std.testing.expectError(error.UnsupportedShape, S.finishPlan(std.testing.allocator, &analysis, &root, &collision));
+    try std.testing.expectEqual(S.CollisionReason.unowned_escape_target, collision.?.reason);
+    try std.testing.expectEqual(terminal, collision.?.block);
+    try std.testing.expectEqual(@as(usize, 3), collision.?.incoming_group.len); // 3->7, 5->7, 6->7
+
+    // Control: the current planner's plan for the same CFG passes the same
+    // entry point and leaves the collision slot empty.
+    var plan = try Plan.init(std.testing.allocator, &analysis);
+    defer plan.deinit();
+    var none: ?S.Collision = null;
+    try S.finishPlan(std.testing.allocator, &analysis, plan.root, &none);
+    try std.testing.expect(none == null);
+}
+
 test "nested terminal arm may bypass an acyclic parent join" {
     const function_id = ir.FunctionId.fromIndex(0);
     const entry = ir.BlockId.fromIndex(0);

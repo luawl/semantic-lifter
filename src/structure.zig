@@ -63,6 +63,10 @@ pub const CollisionReason = enum {
     outside_region,
     unvisited_loop_member,
     unvisited_reachable,
+    /// The plan escapes to a block that no enclosing region stop or owned
+    /// loop exit consumes; the gate closes "root escape target consumed",
+    /// not "each CFG edge realized".
+    unowned_escape_target,
 };
 
 pub const Region = struct {
@@ -692,6 +696,7 @@ pub const Plan = struct {
             try builder.noteUnvisitedReachable();
             return error.UnsupportedShape;
         }
+        try finishPlan(allocator, analysis, root, collision);
         return .{ .allocator = allocator, .root = root };
     }
 
@@ -700,6 +705,215 @@ pub const Plan = struct {
         self.* = undefined;
     }
 };
+
+/// Post-build plan checks shared by `Plan.initWithCollisionAndReplayContext`
+/// and the plan-accounting test, so the test drives the constructor's own
+/// entry point. The constructor runs its
+/// builder-owned visited-count check first and then calls this.
+pub fn finishPlan(
+    allocator: std.mem.Allocator,
+    analysis: *const cfg.Analysis,
+    root: *const Region,
+    collision: ?*?Collision,
+) BuildError!void {
+    try checkEscapeAccounting(allocator, analysis, root, collision);
+}
+
+/// Plan-level accounting gate (described in the preprint): refuse a plan whose root
+/// free-target census is not empty, i.e. a plan that escapes to a block that
+/// no enclosing region stop or owned loop exit consumes; such a plan emits a
+/// write-only escape flag and falls through. The gate closes "root escape
+/// target consumed", not "each CFG edge realized".
+pub fn checkEscapeAccounting(
+    allocator: std.mem.Allocator,
+    analysis: *const cfg.Analysis,
+    root: *const Region,
+    collision: ?*?Collision,
+) BuildError!void {
+    const free_targets = try regionFreeTargetsAlloc(allocator, root);
+    defer allocator.free(free_targets);
+    if (free_targets.len == 0) return;
+    const output = collision orelse return error.UnsupportedShape;
+    if (output.* != null) return error.UnsupportedShape;
+    const target = free_targets[0];
+    var edges: std.ArrayList(ir.CfgEdgeRef) = .empty;
+    defer edges.deinit(allocator);
+    try collectRegionEscapeEdges(allocator, analysis, root, null, target, &edges);
+    const incoming_group: []ir.CfgEdgeRef = if (edges.items.len == 0) &.{} else try edges.toOwnedSlice(allocator);
+    output.* = .{
+        .block = target,
+        .previous = if (incoming_group.len != 0) incoming_group[0].source else null,
+        .incoming = if (incoming_group.len != 0) incoming_group[0] else null,
+        .reason = .unowned_escape_target,
+        .incoming_group = incoming_group,
+    };
+    return error.UnsupportedShape;
+}
+
+// The escape-edge walker mirrors `collectRegionFreeTargets`,
+// `collectNodeFreeTargets` and `collectLoopFreeTargets` with the same capture
+// chain, for one free target: it appends the CFG edges of every escape to
+// `target` that no enclosing capture consumes.
+fn collectRegionEscapeEdges(
+    allocator: std.mem.Allocator,
+    analysis: *const cfg.Analysis,
+    region: *const Region,
+    captures: ?*const FreeTargetCapture,
+    target: ir.BlockId,
+    edges: *std.ArrayList(ir.CfgEdgeRef),
+) std.mem.Allocator.Error!void {
+    var own_capture: FreeTargetCapture = undefined;
+    const nested_captures = if (region.stop) |stop| nested: {
+        own_capture = .{ .target = stop, .parent = captures };
+        break :nested &own_capture;
+    } else captures;
+    for (region.nodes) |node| try collectNodeEscapeEdges(allocator, analysis, node, nested_captures, target, edges);
+    if (region.nodes.len == 0) return;
+    const last = region.nodes[region.nodes.len - 1];
+    if (region.escape_projection) |projection| {
+        if (projection.target == target) try appendEscapeEdges(allocator, analysis, nested_captures, last, target, edges);
+    }
+    if (region.continue_projection) |projection| {
+        if ((region.continue_target == null or region.continue_target.? != projection.target) and
+            projection.target == target)
+        {
+            try appendEscapeEdges(allocator, analysis, nested_captures, last, target, edges);
+        }
+    }
+}
+
+fn collectNodeEscapeEdges(
+    allocator: std.mem.Allocator,
+    analysis: *const cfg.Analysis,
+    node: Node,
+    captures: ?*const FreeTargetCapture,
+    target: ir.BlockId,
+    edges: *std.ArrayList(ir.CfgEdgeRef),
+) std.mem.Allocator.Error!void {
+    switch (node) {
+        .block, .loop_control, .loop_terminal => {},
+        .branch => |branch| {
+            try collectRegionEscapeEdges(allocator, analysis, branch.then_region, captures, target, edges);
+            try collectRegionEscapeEdges(allocator, analysis, branch.else_region, captures, target, edges);
+        },
+        .loop, .latch_loop, .infinite_loop => try collectLoopEscapeEdges(allocator, analysis, node, captures, target, edges),
+        .loop_boundary => |control| {
+            try collectRegionEscapeEdges(allocator, analysis, control.body_region, captures, target, edges);
+            switch (control.boundary) {
+                .escape => |edge| {
+                    if (edge.target == target) try appendEscapeEdges(allocator, analysis, captures, node, target, edges);
+                },
+                .side_exit => |side| try collectRegionEscapeEdges(allocator, analysis, side.region, captures, target, edges),
+                .side_escape => |side| {
+                    try collectRegionEscapeEdges(allocator, analysis, side.region, captures, target, edges);
+                    if (side.target == target) try appendEscapeEdges(allocator, analysis, captures, node, target, edges);
+                },
+                .exit, .terminal, .shared_exit => {},
+            }
+        },
+    }
+}
+
+fn collectLoopEscapeEdges(
+    allocator: std.mem.Allocator,
+    analysis: *const cfg.Analysis,
+    node: Node,
+    captures: ?*const FreeTargetCapture,
+    target: ir.BlockId,
+    edges: *std.ArrayList(ir.CfgEdgeRef),
+) std.mem.Allocator.Error!void {
+    switch (node) {
+        .loop => |loop| {
+            var loop_capture: FreeTargetCapture = undefined;
+            const body_captures = if (!loop.exit_is_escape)
+                capturesWithOwnedExit(captures, loop.exit_edge.target, &loop_capture)
+            else
+                captures;
+            if (loop.exit_is_escape and loop.exit_edge.target == target) {
+                try appendEscapeEdges(allocator, analysis, captures, node, target, edges);
+            }
+            try collectRegionEscapeEdges(allocator, analysis, loop.body_region, body_captures, target, edges);
+        },
+        .latch_loop => |loop| {
+            var loop_capture: FreeTargetCapture = undefined;
+            const body_captures = if (!loop.exit_is_escape)
+                capturesWithOwnedExit(captures, loop.exit, &loop_capture)
+            else
+                captures;
+            if (loop.exit_is_escape and loop.exit == target) {
+                try appendEscapeEdges(allocator, analysis, captures, node, target, edges);
+            }
+            try collectRegionEscapeEdges(allocator, analysis, loop.body_region, body_captures, target, edges);
+        },
+        .infinite_loop => |loop| {
+            var loop_capture: FreeTargetCapture = undefined;
+            const loop_captures = if (!loop.exit_is_escape and loop.exit != null)
+                capturesWithOwnedExit(captures, loop.exit.?, &loop_capture)
+            else
+                captures;
+            if (loop.exit_is_escape and loop.exit.? == target) {
+                try appendEscapeEdges(allocator, analysis, captures, node, target, edges);
+            }
+            var side_captures: []FreeTargetCapture = &.{};
+            defer if (side_captures.len != 0) allocator.free(side_captures);
+            const body_captures = if (loop.shared_side_exit) |side| captured: {
+                side_captures = try allocator.alloc(FreeTargetCapture, side.entries.len);
+                for (side_captures, 0..) |*capture, index| {
+                    capture.* = .{
+                        .target = side.entries[index].entry,
+                        .parent = if (index + 1 < side_captures.len)
+                            &side_captures[index + 1]
+                        else
+                            loop_captures,
+                    };
+                }
+                break :captured if (side_captures.len == 0) loop_captures else &side_captures[0];
+            } else loop_captures;
+            try collectRegionEscapeEdges(allocator, analysis, loop.body_region, body_captures, target, edges);
+            if (loop.shared_side_exit) |side| {
+                for (side.entries) |entry| {
+                    try collectRegionEscapeEdges(allocator, analysis, entry.region, captures, target, edges);
+                }
+            }
+        },
+        else => unreachable,
+    }
+}
+
+// Record the CFG edges of one escape to `target` unless a capture in the
+// chain consumes it: the direct edge of a `.block` node, otherwise the edges
+// into `target` from blocks the node owns (transferred escapes, escaping loop
+// exits and loop-boundary escapes).
+fn appendEscapeEdges(
+    allocator: std.mem.Allocator,
+    analysis: *const cfg.Analysis,
+    captures: ?*const FreeTargetCapture,
+    node: Node,
+    target: ir.BlockId,
+    edges: *std.ArrayList(ir.CfgEdgeRef),
+) std.mem.Allocator.Error!void {
+    var current = captures;
+    while (current) |capture| : (current = capture.parent) {
+        if (capture.target == target) return;
+    }
+    if (directEdgeReference(analysis.program, node, target)) |reference| {
+        return appendUniqueEscapeEdge(allocator, edges, reference);
+    }
+    const owned = try nodeIncomingEdgesAlloc(allocator, analysis, node, target);
+    defer allocator.free(owned);
+    for (owned) |reference| try appendUniqueEscapeEdge(allocator, edges, reference);
+}
+
+fn appendUniqueEscapeEdge(
+    allocator: std.mem.Allocator,
+    edges: *std.ArrayList(ir.CfgEdgeRef),
+    reference: ir.CfgEdgeRef,
+) std.mem.Allocator.Error!void {
+    for (edges.items) |existing| {
+        if (std.meta.eql(existing, reference)) return;
+    }
+    try edges.append(allocator, reference);
+}
 
 fn functionExceedsLocalRegisterBudget(program: *const ir.Program, function: ir.Function) bool {
     var potential_locals = function.parameters.len;
