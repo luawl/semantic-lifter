@@ -101,8 +101,10 @@ semantic-lifter emit-luau <program.ir.json> <output.luau> standard-luau <path to
 the given `luau-compile` accepts it; `direct-locals-luau` is its other output form.
 
 A refusal is reported on stderr as `diagnostic=<code> entity=<index>` lines (`entity=null` when no
-single IR entity applies), some followed by indented detail lines. Exit status 0 means success and 1
-a refusal; a `resolve-*` command can leave an output file behind on refusal, so check the exit
+single IR entity applies), some followed by indented detail lines; by default stderr carries nothing
+else (the internal stage traces print only in a `-Dtrace-normalize-phases=true` build). Exit status 0
+means success; 1 means a refusal or an error such as a missing file or a bad argument, and the stderr
+lines say which. A `resolve-*` command can leave an output file behind on refusal, so check the exit
 status. Running `semantic-lifter` without arguments prints the usage text.
 
 Three commands are diagnostic-only: `emit-admitted-readable-luau-raw`, `emit-readable-luau-strategy`
@@ -120,7 +122,6 @@ These are the limits that the preprint reports:
 - There is no plan-level accounting check.
 - The two raw protected inputs produced no handoff.
 - Re-resolution is not idempotent.
-- stderr carries untyped stage traces by default, next to the typed diagnostic lines.
 
 The issue tracker holds the K-numbered items.
 
