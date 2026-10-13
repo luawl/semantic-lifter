@@ -78,6 +78,11 @@ pub fn classifyPrimary(program: *const ir.Program, entry: irreducible_region.Ent
     return null;
 }
 
+// Diagnostic classification only: the splitter (`planRegion` in irreducible_normalize.zig)
+// consults `classifySecondarySource`, not this function, and `cloneClosure` clones the
+// secondary's whole in-region closure up to the primary, so a non-primary successor is
+// cloned with it. `.nonprimary_successor` names the single-block repair shape for the
+// `validate_cfg` UnsupportedShape report, which is currently unreachable for valid CFGs.
 pub fn classifySecondary(
     program: *const ir.Program,
     region: irreducible_region.Region,
