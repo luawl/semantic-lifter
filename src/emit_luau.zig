@@ -102,7 +102,13 @@ pub fn emitAllocForTargetWithOptions(
     target: Target,
     options: Options,
 ) (EmitError || std.mem.Allocator.Error)![]u8 {
-    var report = try validation.validateForTarget(allocator, program, .readable_luau, target);
+    var report = try validation.validateForTargetWithStrategy(
+        allocator,
+        program,
+        .readable_luau,
+        target,
+        if (options.force_dispatcher) .dispatcher else .automatic,
+    );
     defer report.deinit();
     if (!report.isClean()) return error.InvalidIr;
     return emitAdmittedAllocForTargetWithOptions(allocator, program, target, options);
@@ -557,6 +563,45 @@ fn emitArbitraryDispatch(
     try emitArbitraryDispatch(output, allocator, program, emission_plan, scopes, nodes, middle, end, pc_name, nested_indent, place_aliases);
     try output.appendSlice(allocator, indent);
     try output.appendSlice(allocator, "end\n");
+}
+
+/// Count exactly the root-level `local` names `emitArbitraryCfgDeclarations`
+/// declares for the arbitrary-CFG (dispatcher) layout of `function`: every
+/// non-storage, non-capture local place, every named non-storage
+/// block-parameter/instruction-result value, and every named value pack. The
+/// register validator budgets this flat count (plus the `__lifter_pc` slot)
+/// against the compiler's local-register limit so a forced-dispatcher layout is
+/// certified consistently with what is emitted. Keep this in lockstep
+/// with `emitArbitraryCfgDeclarations` below.
+pub fn arbitraryDeclarationCount(
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    function: ir.Function,
+) usize {
+    var count: usize = 0;
+    for (function.local_places) |place_id| {
+        if (place_id.index() >= program.places.len or emission_plan.names.placeUsesStorage(place_id)) continue;
+        const place = program.places[place_id.index()];
+        switch (place.origin) {
+            .local, .instruction => {},
+            .capture => continue,
+        }
+        if (emission_plan.names.place(place_id) != null) count += 1;
+    }
+    for (program.values) |value| {
+        if (value.function != function.id) continue;
+        if (emission_plan.names.valueUsesStorage(value.id)) continue;
+        switch (value.origin) {
+            .parameter, .capture => continue,
+            .block_parameter, .instruction_result => {},
+        }
+        if (emission_plan.names.value(value.id) != null) count += 1;
+    }
+    for (program.value_packs) |pack| {
+        if (pack.function != function.id) continue;
+        if (emission_plan.names.valuePack(pack.id) != null) count += 1;
+    }
+    return count;
 }
 
 fn emitArbitraryCfgDeclarations(

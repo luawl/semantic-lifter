@@ -16,6 +16,10 @@ pub const DiagnosticCode = diagnostics.Code;
 pub const Diagnostic = diagnostics.Diagnostic;
 pub const Report = diagnostics.Report;
 
+/// Emission layout the readable-Luau register budget models. `automatic`
+/// is the default admission; `dispatcher` mirrors the emitter's forced layout.
+pub const EmissionStrategy = register_validation.EmissionStrategy;
+
 fn validId(id: anytype, length: usize) bool {
     return id.index() < length;
 }
@@ -35,6 +39,16 @@ pub fn validateForTarget(
     program: *const ir.Program,
     profile: ir.AdmissionProfile,
     target: luau_runtime.Target,
+) !Report {
+    return validateForTargetWithStrategy(allocator, program, profile, target, .automatic);
+}
+
+pub fn validateForTargetWithStrategy(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    profile: ir.AdmissionProfile,
+    target: luau_runtime.Target,
+    strategy: EmissionStrategy,
 ) !Report {
     var report = Report.init(allocator);
     errdefer report.deinit();
@@ -117,7 +131,7 @@ pub fn validateForTarget(
     try proof_validation.validate(&report, program, profile, scope);
     if (profile == .readable_luau) try operation_validation.validateReadableCapabilities(&report, program, scope.?);
     if (profile == .readable_luau and report.isClean()) {
-        try register_validation.validate(allocator, &report, program, scope.?, target);
+        try register_validation.validateWithStrategy(allocator, &report, program, scope.?, target, strategy);
     }
 
     return report;
