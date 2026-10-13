@@ -963,6 +963,34 @@ pub fn build(b: *std.Build) void {
     resolve_refusal_audit.addArtifactArg(exe);
     resolve_refusal_audit.addFileArg(b.path("luau/fixtures/resolve_refusal_b3.lifter-ir.json"));
     _ = resolve_refusal_audit.addOutputDirectoryArg("resolve-refusal");
+    // T1.8 (K14): re-resolution fixed-point conformance over the recorded nested graph.
+    // resolve-ir iterates to a fixed point (src/proof_orchestrator.zig), so re-resolving the resolved
+    // IR is byte-idempotent and the resolved IR is already a normalizer fixed point.
+    const nested_reresolve_resolve = b.addRunArtifact(exe);
+    nested_reresolve_resolve.addArg("resolve-ir");
+    nested_reresolve_resolve.addFileArg(b.path("luau/fixtures/nested_inner_cycle_w1.lifter-ir.json"));
+    const nested_reresolve_resolved_ir = nested_reresolve_resolve.addOutputFileArg("nested-inner-cycle-w1.resolved.lifter-ir.json");
+    nested_reresolve_resolve.addArg("internal");
+    const nested_reresolve_reresolve = b.addRunArtifact(exe);
+    nested_reresolve_reresolve.addArg("resolve-ir");
+    nested_reresolve_reresolve.addFileArg(nested_reresolve_resolved_ir);
+    const nested_reresolve_reresolved_ir = nested_reresolve_reresolve.addOutputFileArg("nested-inner-cycle-w1.reresolved.lifter-ir.json");
+    nested_reresolve_reresolve.addArg("internal");
+    const nested_reresolve_third = b.addRunArtifact(exe);
+    nested_reresolve_third.addArg("resolve-ir");
+    nested_reresolve_third.addFileArg(nested_reresolve_reresolved_ir);
+    const nested_reresolve_third_ir = nested_reresolve_third.addOutputFileArg("nested-inner-cycle-w1.third.lifter-ir.json");
+    nested_reresolve_third.addArg("internal");
+    const nested_reresolve_renormalize = b.addRunArtifact(exe);
+    nested_reresolve_renormalize.addArg("normalize-ir");
+    nested_reresolve_renormalize.addFileArg(nested_reresolve_resolved_ir);
+    const nested_reresolve_renormalized_ir = nested_reresolve_renormalize.addOutputFileArg("nested-inner-cycle-w1.renormalized.lifter-ir.json");
+    const nested_reresolve_audit = b.addSystemCommand(&.{ luneExe(b), "run" });
+    nested_reresolve_audit.addFileArg(b.path("luau/irreducible_nested_reresolve_audit.luau"));
+    nested_reresolve_audit.addFileArg(nested_reresolve_resolved_ir);
+    nested_reresolve_audit.addFileArg(nested_reresolve_reresolved_ir);
+    nested_reresolve_audit.addFileArg(nested_reresolve_third_ir);
+    nested_reresolve_audit.addFileArg(nested_reresolve_renormalized_ir);
     const conformance_step = b.step("conformance", "Validate, emit, and compile Zig- and Luau-built generic fixtures");
     conformance_step.dependOn(&register_budget_oracle.step);
     dispatcher_local_budget_conformance.addTo(conformance_step);
@@ -972,6 +1000,7 @@ pub fn build(b: *std.Build) void {
     conformance_step.dependOn(&legacy_unchecked_rejection.step);
     conformance_step.dependOn(&legacy_unchecked_preserved_output.step);
     conformance_step.dependOn(&resolve_refusal_audit.step);
+    conformance_step.dependOn(&nested_reresolve_audit.step);
     absolute_conformance.addTo(conformance_step);
     function_reference_conformance.addTo(conformance_step);
     dynamic_truthiness_conformance.addTo(conformance_step);

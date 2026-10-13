@@ -464,232 +464,260 @@ fn resolveAdmittedAlloc(
     errdefer if (owned_blocks) |blocks| backing_allocator.free(blocks);
     var aggregate_control: control_flow.ApplyResult = .{};
 
-    // Direct exact branch facts are already semantic evidence. Resolve their
-    // authenticated obligations before structural normalization can retain a
-    // dead arm as a loop boundary. The lightweight state copy avoids deriving
-    // the full edge-fact graph before this simplification.
-    const exact_prepass_start = Io.Clock.awake.now(Io.Threaded.global_single_threaded.io()).nanoseconds;
-    const has_exact_branch = control_query_plan.State.hasExactBranchTruth(&current);
-    if (has_exact_branch) {
-        if (stage_trace.enabled) std.debug.print(
-            "control_phase exact_prepass_begin functions={} blocks={} terms={} queries={}\\n",
-            .{ current.functions.len, current.blocks.len, current.solver_terms.len, current.queries.len },
-        );
-        var initial_planning = try control_query_plan.State.initExact(allocator, &current);
-        current = try initial_planning.expandExactBranches(&current);
-        if (stage_trace.enabled) std.debug.print(
-            "control_phase exact_prepass_expanded terms={} queries={} obligations={} claims={} ms={}\\n",
-            .{
-                current.solver_terms.len,
-                current.queries.len,
-                current.obligations.len,
-                current.claims.len,
-                @divTrunc(Io.Clock.awake.now(Io.Threaded.global_single_threaded.io()).nanoseconds - exact_prepass_start, std.time.ns_per_ms),
-            },
-        );
-        current.solver_models = models.items;
-        current.unsat_cores = cores.items;
-        current.certificates = certificates.items;
-        current.edge_rewrites = rewrites.items;
-        try resolvePlannedQueries(
-            allocator,
-            &current,
-            &initial_planning,
-            engine,
-            &models,
-            &cores,
-            &certificates,
-            &attempted_queries,
-            &solve_report,
-        );
-        if (stage_trace.enabled) std.debug.print(
-            "control_phase exact_prepass_solved models={} cores={} certificates={} ms={}\\n",
-            .{
-                models.items.len,
-                cores.items.len,
-                certificates.items.len,
-                @divTrunc(Io.Clock.awake.now(Io.Threaded.global_single_threaded.io()).nanoseconds - exact_prepass_start, std.time.ns_per_ms),
-            },
-        );
-        current.claims = initial_planning.claims.items;
-        current.obligations = initial_planning.obligations.items;
-
-        const next_blocks = try backing_allocator.alloc(ir.Block, current.blocks.len);
-        const initial_control = try control_flow.applyProvedBranchesWithState(
-            allocator,
-            &current,
-            next_blocks,
-            &rewrites,
-        );
-        if (initial_control.conflicting_certificate) |conflict| {
-            backing_allocator.free(next_blocks);
-            aggregate_control.conflicting_certificate = conflict;
-        } else if (initial_control.rewritten_blocks != 0 or initial_control.specialized_edges != 0) {
-            aggregate_control.rewritten_blocks += initial_control.rewritten_blocks;
-            aggregate_control.specialized_edges += initial_control.specialized_edges;
-            owned_blocks = next_blocks;
+    // Re-resolution is iterated to a fixed point (K14, diagnosis note T1-RERESOLVE.md §5.1): when the
+    // final full normalization below changes the CFG (a structure-feedback split), the derived edge
+    // facts are stale for the new CFG, so the pass restarts on the normalized program in this same
+    // arena until that final normalization is a no-op. models/cores/certificates/rewrites and
+    // aggregate_control accumulate across passes; attempted_queries resets so a restart re-solves as
+    // a fresh resolve-ir of the normalized output would. A conflicting certificate stops iteration.
+    var resolve_pass: usize = 0;
+    const max_resolve_passes: usize = 4;
+    reresolve: while (true) : (resolve_pass += 1) {
+        // Direct exact branch facts are already semantic evidence. Resolve their
+        // authenticated obligations before structural normalization can retain a
+        // dead arm as a loop boundary. The lightweight state copy avoids deriving
+        // the full edge-fact graph before this simplification.
+        const exact_prepass_start = Io.Clock.awake.now(Io.Threaded.global_single_threaded.io()).nanoseconds;
+        const has_exact_branch = control_query_plan.State.hasExactBranchTruth(&current);
+        if (has_exact_branch) {
+            if (stage_trace.enabled) std.debug.print(
+                "control_phase exact_prepass_begin functions={} blocks={} terms={} queries={}\\n",
+                .{ current.functions.len, current.blocks.len, current.solver_terms.len, current.queries.len },
+            );
+            var initial_planning = try control_query_plan.State.initExact(allocator, &current);
+            current = try initial_planning.expandExactBranches(&current);
+            if (stage_trace.enabled) std.debug.print(
+                "control_phase exact_prepass_expanded terms={} queries={} obligations={} claims={} ms={}\\n",
+                .{
+                    current.solver_terms.len,
+                    current.queries.len,
+                    current.obligations.len,
+                    current.claims.len,
+                    @divTrunc(Io.Clock.awake.now(Io.Threaded.global_single_threaded.io()).nanoseconds - exact_prepass_start, std.time.ns_per_ms),
+                },
+            );
+            current.solver_models = models.items;
+            current.unsat_cores = cores.items;
+            current.certificates = certificates.items;
             current.edge_rewrites = rewrites.items;
-        } else {
-            backing_allocator.free(next_blocks);
-        }
-        if (stage_trace.enabled) std.debug.print(
-            "control_phase exact_prepass_applied rewritten={} specialized={} ms={}\\n",
-            .{
-                initial_control.rewritten_blocks,
-                initial_control.specialized_edges,
-                @divTrunc(Io.Clock.awake.now(Io.Threaded.global_single_threaded.io()).nanoseconds - exact_prepass_start, std.time.ns_per_ms),
-            },
-        );
-    }
+            try resolvePlannedQueries(
+                allocator,
+                &current,
+                &initial_planning,
+                engine,
+                &models,
+                &cores,
+                &certificates,
+                &attempted_queries,
+                &solve_report,
+            );
+            if (stage_trace.enabled) std.debug.print(
+                "control_phase exact_prepass_solved models={} cores={} certificates={} ms={}\\n",
+                .{
+                    models.items.len,
+                    cores.items.len,
+                    certificates.items.len,
+                    @divTrunc(Io.Clock.awake.now(Io.Threaded.global_single_threaded.io()).nanoseconds - exact_prepass_start, std.time.ns_per_ms),
+                },
+            );
+            current.claims = initial_planning.claims.items;
+            current.obligations = initial_planning.obligations.items;
 
-    const control_normalize_start = Io.Clock.awake.now(Io.Threaded.global_single_threaded.io()).nanoseconds;
-    const control_normalized = try irreducible_normalize.normalizeControlWithScratchInArena(
-        allocator,
-        backing_allocator,
-        &current,
-    );
-    if (stage_trace.enabled) std.debug.print(
-        "control_phase control_normalize_done has_exact={} blocks={} rewrites={} ms={}\\n",
-        .{
-            has_exact_branch,
-            control_normalized.program.blocks.len,
-            control_normalized.program.edge_rewrites.len,
-            @divTrunc(Io.Clock.awake.now(Io.Threaded.global_single_threaded.io()).nanoseconds - control_normalize_start, std.time.ns_per_ms),
-        },
-    );
-    if (owned_blocks) |blocks| {
-        backing_allocator.free(blocks);
-        owned_blocks = null;
-    }
-    current = control_normalized.program;
-    rewrites = .empty;
-    try rewrites.appendSlice(allocator, current.edge_rewrites);
-    current.edge_rewrites = rewrites.items;
-
-    const planning_init_start = Io.Clock.awake.now(Io.Threaded.global_single_threaded.io()).nanoseconds;
-    if (stage_trace.enabled) std.debug.print(
-        "control_phase planning_init_begin blocks={} rewrites={} terms={} queries={}\\n",
-        .{ current.blocks.len, current.edge_rewrites.len, current.solver_terms.len, current.queries.len },
-    );
-    var planning = try control_query_plan.State.init(allocator, &current);
-    if (stage_trace.enabled) std.debug.print(
-        "control_phase planning_init_done terms={} queries={} obligations={} claims={} ms={}\\n",
-        .{
-            planning.terms.items.len,
-            planning.queries.items.len,
-            planning.obligations.items.len,
-            planning.claims.items.len,
-            @divTrunc(Io.Clock.awake.now(Io.Threaded.global_single_threaded.io()).nanoseconds - planning_init_start, std.time.ns_per_ms),
-        },
-    );
-    current = try planning.expand(&current);
-    if (stage_trace.enabled) std.debug.print(
-        "control_phase planning_expand_done terms={} queries={} obligations={} claims={}\\n",
-        .{ current.solver_terms.len, current.queries.len, current.obligations.len, current.claims.len },
-    );
-
-    // A frontend may publish an IR whose control history is already
-    // authenticated and whose proof graph is empty. The control-only pass
-    // above is still required to canonicalize that history, but the later
-    // semantic-feedback pass has no query or obligation it can discharge.
-    // Preserve the normalized program instead of replaying every function's
-    // full irreducible search.
-    if (current.queries.len == 0 and current.claims.len == 0 and current.obligations.len == 0) {
-        current.solver_models = models.items;
-        current.unsat_cores = cores.items;
-        current.certificates = certificates.items;
-        try refreshDependencyDigests(allocator, &current, certificates.items);
-        return .{
-            .backing_allocator = backing_allocator,
-            .arena = arena,
-            .program = current,
-            .solve_report = solve_report,
-            .control_result = aggregate_control,
-            .owned_blocks = owned_blocks,
-        };
-    }
-
-    var edge_slots: usize = 0;
-    for (current.blocks) |block| edge_slots += switch (block.terminator) {
-        .jump => 1,
-        .branch => 2,
-        else => 0,
-    };
-    const block_bound = @max(current.blocks.len, 1);
-    const iteration_limit = std.math.mul(usize, block_bound, edge_slots + 1) catch return error.ControlRewriteLimitOverflow;
-    var iteration: usize = 0;
-    while (iteration < iteration_limit) : (iteration += 1) {
-        if (iteration != 0) current = try planning.expand(&current);
-        current.solver_models = models.items;
-        current.unsat_cores = cores.items;
-        current.certificates = certificates.items;
-        current.edge_rewrites = rewrites.items;
-        try resolvePlannedQueries(
-            allocator,
-            &current,
-            &planning,
-            engine,
-            &models,
-            &cores,
-            &certificates,
-            &attempted_queries,
-            &solve_report,
-        );
-        if (try planning.materializeProvedControlBranches(&current)) {
-            current.obligations = planning.obligations.items;
-            try refreshDependencyDigests(allocator, &current, certificates.items);
+            const next_blocks = try backing_allocator.alloc(ir.Block, current.blocks.len);
+            const initial_control = try control_flow.applyProvedBranchesWithState(
+                allocator,
+                &current,
+                next_blocks,
+                &rewrites,
+            );
+            if (initial_control.conflicting_certificate) |conflict| {
+                backing_allocator.free(next_blocks);
+                aggregate_control.conflicting_certificate = conflict;
+            } else if (initial_control.rewritten_blocks != 0 or initial_control.specialized_edges != 0) {
+                aggregate_control.rewritten_blocks += initial_control.rewritten_blocks;
+                aggregate_control.specialized_edges += initial_control.specialized_edges;
+                owned_blocks = next_blocks;
+                current.edge_rewrites = rewrites.items;
+            } else {
+                backing_allocator.free(next_blocks);
+            }
+            if (stage_trace.enabled) std.debug.print(
+                "control_phase exact_prepass_applied rewritten={} specialized={} ms={}\\n",
+                .{
+                    initial_control.rewritten_blocks,
+                    initial_control.specialized_edges,
+                    @divTrunc(Io.Clock.awake.now(Io.Threaded.global_single_threaded.io()).nanoseconds - exact_prepass_start, std.time.ns_per_ms),
+                },
+            );
         }
 
-        const release_deferred_branch_arms = try planning.hasDeferredBranchArms(&current);
-        if (release_deferred_branch_arms) planning.releaseDeferredBranchArms();
-
-        const next_blocks = try backing_allocator.alloc(ir.Block, current.blocks.len);
-        const control_result = try control_flow.applyProvedBranchesWithState(allocator, &current, next_blocks, &rewrites);
-        if (control_result.conflicting_certificate) |conflict| {
-            backing_allocator.free(next_blocks);
-            aggregate_control.conflicting_certificate = conflict;
-            break;
-        }
-        if (control_result.rewritten_blocks == 0 and control_result.specialized_edges == 0) {
-            backing_allocator.free(next_blocks);
-            if (release_deferred_branch_arms) continue;
-            break;
-        }
-        aggregate_control.rewritten_blocks += control_result.rewritten_blocks;
-        aggregate_control.specialized_edges += control_result.specialized_edges;
-        if (owned_blocks) |blocks| backing_allocator.free(blocks);
-        owned_blocks = next_blocks;
-        current.edge_rewrites = rewrites.items;
-        const renormalized = try irreducible_normalize.normalizeControlWithScratchInArena(
+        const control_normalize_start = Io.Clock.awake.now(Io.Threaded.global_single_threaded.io()).nanoseconds;
+        const control_normalized = try irreducible_normalize.normalizeControlWithScratchInArena(
             allocator,
             backing_allocator,
             &current,
         );
-        current = renormalized.program;
+        if (stage_trace.enabled) std.debug.print(
+            "control_phase control_normalize_done has_exact={} blocks={} rewrites={} ms={}\\n",
+            .{
+                has_exact_branch,
+                control_normalized.program.blocks.len,
+                control_normalized.program.edge_rewrites.len,
+                @divTrunc(Io.Clock.awake.now(Io.Threaded.global_single_threaded.io()).nanoseconds - control_normalize_start, std.time.ns_per_ms),
+            },
+        );
+        if (owned_blocks) |blocks| {
+            backing_allocator.free(blocks);
+            owned_blocks = null;
+        }
+        current = control_normalized.program;
         rewrites = .empty;
         try rewrites.appendSlice(allocator, current.edge_rewrites);
         current.edge_rewrites = rewrites.items;
-        if (owned_blocks) |blocks| backing_allocator.free(blocks);
-        owned_blocks = null;
-    } else {
-        return error.NonConvergentControlRewrite;
-    }
 
-    current = planning.programView(&current);
-    current.solver_models = models.items;
-    current.unsat_cores = cores.items;
-    current.certificates = certificates.items;
-    current.edge_rewrites = rewrites.items;
-    const final_normalized = try irreducible_normalize.normalizeWithScratchInArena(
-        allocator,
-        backing_allocator,
-        &current,
-    );
-    current = final_normalized.program;
-    rewrites = .empty;
-    try rewrites.appendSlice(allocator, current.edge_rewrites);
-    current.edge_rewrites = rewrites.items;
-    try refreshDependencyDigests(allocator, &current, certificates.items);
+        const planning_init_start = Io.Clock.awake.now(Io.Threaded.global_single_threaded.io()).nanoseconds;
+        if (stage_trace.enabled) std.debug.print(
+            "control_phase planning_init_begin blocks={} rewrites={} terms={} queries={}\\n",
+            .{ current.blocks.len, current.edge_rewrites.len, current.solver_terms.len, current.queries.len },
+        );
+        var planning = try control_query_plan.State.init(allocator, &current);
+        if (stage_trace.enabled) std.debug.print(
+            "control_phase planning_init_done terms={} queries={} obligations={} claims={} ms={}\\n",
+            .{
+                planning.terms.items.len,
+                planning.queries.items.len,
+                planning.obligations.items.len,
+                planning.claims.items.len,
+                @divTrunc(Io.Clock.awake.now(Io.Threaded.global_single_threaded.io()).nanoseconds - planning_init_start, std.time.ns_per_ms),
+            },
+        );
+        current = try planning.expand(&current);
+        if (stage_trace.enabled) std.debug.print(
+            "control_phase planning_expand_done terms={} queries={} obligations={} claims={}\\n",
+            .{ current.solver_terms.len, current.queries.len, current.obligations.len, current.claims.len },
+        );
+
+        // A frontend may publish an IR whose control history is already
+        // authenticated and whose proof graph is empty. The control-only pass
+        // above is still required to canonicalize that history, but the later
+        // semantic-feedback pass has no query or obligation it can discharge.
+        // Preserve the normalized program instead of replaying every function's
+        // full irreducible search.
+        if (current.queries.len == 0 and current.claims.len == 0 and current.obligations.len == 0) {
+            current.solver_models = models.items;
+            current.unsat_cores = cores.items;
+            current.certificates = certificates.items;
+            try refreshDependencyDigests(allocator, &current, certificates.items);
+            return .{
+                .backing_allocator = backing_allocator,
+                .arena = arena,
+                .program = current,
+                .solve_report = solve_report,
+                .control_result = aggregate_control,
+                .owned_blocks = owned_blocks,
+            };
+        }
+
+        var edge_slots: usize = 0;
+        for (current.blocks) |block| edge_slots += switch (block.terminator) {
+            .jump => 1,
+            .branch => 2,
+            else => 0,
+        };
+        const block_bound = @max(current.blocks.len, 1);
+        const iteration_limit = std.math.mul(usize, block_bound, edge_slots + 1) catch return error.ControlRewriteLimitOverflow;
+        var iteration: usize = 0;
+        while (iteration < iteration_limit) : (iteration += 1) {
+            if (iteration != 0) current = try planning.expand(&current);
+            current.solver_models = models.items;
+            current.unsat_cores = cores.items;
+            current.certificates = certificates.items;
+            current.edge_rewrites = rewrites.items;
+            try resolvePlannedQueries(
+                allocator,
+                &current,
+                &planning,
+                engine,
+                &models,
+                &cores,
+                &certificates,
+                &attempted_queries,
+                &solve_report,
+            );
+            if (try planning.materializeProvedControlBranches(&current)) {
+                current.obligations = planning.obligations.items;
+                try refreshDependencyDigests(allocator, &current, certificates.items);
+            }
+
+            const release_deferred_branch_arms = try planning.hasDeferredBranchArms(&current);
+            if (release_deferred_branch_arms) planning.releaseDeferredBranchArms();
+
+            const next_blocks = try backing_allocator.alloc(ir.Block, current.blocks.len);
+            const control_result = try control_flow.applyProvedBranchesWithState(allocator, &current, next_blocks, &rewrites);
+            if (control_result.conflicting_certificate) |conflict| {
+                backing_allocator.free(next_blocks);
+                aggregate_control.conflicting_certificate = conflict;
+                break;
+            }
+            if (control_result.rewritten_blocks == 0 and control_result.specialized_edges == 0) {
+                backing_allocator.free(next_blocks);
+                if (release_deferred_branch_arms) continue;
+                break;
+            }
+            aggregate_control.rewritten_blocks += control_result.rewritten_blocks;
+            aggregate_control.specialized_edges += control_result.specialized_edges;
+            if (owned_blocks) |blocks| backing_allocator.free(blocks);
+            owned_blocks = next_blocks;
+            current.edge_rewrites = rewrites.items;
+            const renormalized = try irreducible_normalize.normalizeControlWithScratchInArena(
+                allocator,
+                backing_allocator,
+                &current,
+            );
+            current = renormalized.program;
+            rewrites = .empty;
+            try rewrites.appendSlice(allocator, current.edge_rewrites);
+            current.edge_rewrites = rewrites.items;
+            if (owned_blocks) |blocks| backing_allocator.free(blocks);
+            owned_blocks = null;
+        } else {
+            return error.NonConvergentControlRewrite;
+        }
+
+        current = planning.programView(&current);
+        current.solver_models = models.items;
+        current.unsat_cores = cores.items;
+        current.certificates = certificates.items;
+        current.edge_rewrites = rewrites.items;
+        const blocks_before_final = current.blocks.len;
+        const rewrites_before_final = current.edge_rewrites.len;
+        const final_normalized = try irreducible_normalize.normalizeWithScratchInArena(
+            allocator,
+            backing_allocator,
+            &current,
+        );
+        current = final_normalized.program;
+        rewrites = .empty;
+        try rewrites.appendSlice(allocator, current.edge_rewrites);
+        current.edge_rewrites = rewrites.items;
+        if (aggregate_control.conflicting_certificate == null and
+            (current.blocks.len != blocks_before_final or
+                current.edge_rewrites.len != rewrites_before_final))
+        {
+            // The final full normalization changed the CFG, so the serialized edge facts no longer
+            // describe it. Restart the pass on the normalized program (same arena) so the facts are
+            // re-derived, bounded by max_resolve_passes; accumulated proof state persists.
+            if (resolve_pass + 1 >= max_resolve_passes) return error.NonConvergentControlRewrite;
+            if (owned_blocks) |blocks| {
+                backing_allocator.free(blocks);
+                owned_blocks = null;
+            }
+            attempted_queries.clearRetainingCapacity();
+            continue :reresolve;
+        }
+        try refreshDependencyDigests(allocator, &current, certificates.items);
+        break :reresolve;
+    }
     return .{
         .backing_allocator = backing_allocator,
         .arena = arena,

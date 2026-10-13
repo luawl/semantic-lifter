@@ -1,0 +1,1356 @@
+{
+  "schema_version": "lifter_ir_v1",
+  "source_semantics": "luau",
+  "program_id": "nested-inner-cycle-w1",
+  "entry_function": 0,
+  "functions": [
+    {
+      "id": 0,
+      "name_hint": "chunk",
+      "blocks": [
+        0
+      ],
+      "captures": [],
+      "local_places": [],
+      "parameters": [],
+      "is_variadic": false,
+      "evidence": [
+        0
+      ],
+      "entry_block": 0
+    },
+    {
+      "id": 1,
+      "name_hint": "worker",
+      "blocks": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "captures": [],
+      "local_places": [],
+      "parameters": [
+        0,
+        1
+      ],
+      "is_variadic": false,
+      "evidence": [
+        0
+      ],
+      "entry_block": 1
+    }
+  ],
+  "blocks": [
+    {
+      "id": 0,
+      "function": 0,
+      "name_hint": "entry",
+      "parameters": [],
+      "instructions": [
+        4
+      ],
+      "evidence": [
+        0
+      ],
+      "terminator": {
+        "return_values": [
+          6
+        ]
+      }
+    },
+    {
+      "id": 1,
+      "function": 1,
+      "name_hint": "entry",
+      "parameters": [],
+      "instructions": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "evidence": [
+        0
+      ],
+      "terminator": {
+        "jump": {
+          "target": 2,
+          "arguments": [
+            1,
+            2
+          ]
+        }
+      }
+    },
+    {
+      "id": 2,
+      "function": 1,
+      "name_hint": "H",
+      "parameters": [
+        7,
+        8
+      ],
+      "instructions": [
+        5
+      ],
+      "evidence": [
+        0
+      ],
+      "terminator": {
+        "branch": {
+          "condition": 19,
+          "then_edge": {
+            "target": 3,
+            "arguments": [
+              7,
+              8
+            ]
+          },
+          "else_edge": {
+            "target": 4,
+            "arguments": [
+              7,
+              8
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 3,
+      "function": 1,
+      "name_hint": "A",
+      "parameters": [
+        9,
+        10
+      ],
+      "instructions": [
+        6
+      ],
+      "evidence": [
+        0
+      ],
+      "terminator": {
+        "branch": {
+          "condition": 20,
+          "then_edge": {
+            "target": 5,
+            "arguments": [
+              9,
+              10
+            ]
+          },
+          "else_edge": {
+            "target": 7,
+            "arguments": [
+              9,
+              10
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 4,
+      "function": 1,
+      "name_hint": "B",
+      "parameters": [
+        11,
+        12
+      ],
+      "instructions": [
+        14
+      ],
+      "evidence": [
+        0
+      ],
+      "terminator": {
+        "branch": {
+          "condition": 28,
+          "then_edge": {
+            "target": 6,
+            "arguments": [
+              11,
+              12
+            ]
+          },
+          "else_edge": {
+            "target": 7,
+            "arguments": [
+              11,
+              12
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 5,
+      "function": 1,
+      "name_hint": "A_work",
+      "parameters": [
+        13,
+        14
+      ],
+      "instructions": [
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13
+      ],
+      "evidence": [
+        0
+      ],
+      "terminator": {
+        "branch": {
+          "condition": 27,
+          "then_edge": {
+            "target": 2,
+            "arguments": [
+              25,
+              24
+            ]
+          },
+          "else_edge": {
+            "target": 4,
+            "arguments": [
+              25,
+              24
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 6,
+      "function": 1,
+      "name_hint": "B_work",
+      "parameters": [
+        15,
+        16
+      ],
+      "instructions": [
+        15,
+        16,
+        17,
+        18,
+        19
+      ],
+      "evidence": [
+        0
+      ],
+      "terminator": {
+        "jump": {
+          "target": 3,
+          "arguments": [
+            33,
+            32
+          ]
+        }
+      }
+    },
+    {
+      "id": 7,
+      "function": 1,
+      "name_hint": "exit",
+      "parameters": [
+        17,
+        18
+      ],
+      "instructions": [],
+      "evidence": [
+        0
+      ],
+      "terminator": {
+        "return_values": [
+          17,
+          18
+        ]
+      }
+    }
+  ],
+  "instructions": [
+    {
+      "id": 0,
+      "block": 1,
+      "operation": {
+        "constant": {
+          "integer": "0"
+        }
+      },
+      "results": [
+        2
+      ],
+      "effects": {
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false,
+        "may_throw": false,
+        "may_yield": false,
+        "invokes_unknown_code": false
+      },
+      "evidence": [
+        0
+      ],
+      "claims": []
+    },
+    {
+      "id": 1,
+      "block": 1,
+      "operation": {
+        "constant": {
+          "integer": "1"
+        }
+      },
+      "results": [
+        3
+      ],
+      "effects": {
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false,
+        "may_throw": false,
+        "may_yield": false,
+        "invokes_unknown_code": false
+      },
+      "evidence": [
+        0
+      ],
+      "claims": []
+    },
+    {
+      "id": 2,
+      "block": 1,
+      "operation": {
+        "constant": {
+          "integer": "17"
+        }
+      },
+      "results": [
+        4
+      ],
+      "effects": {
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false,
+        "may_throw": false,
+        "may_yield": false,
+        "invokes_unknown_code": false
+      },
+      "evidence": [
+        0
+      ],
+      "claims": []
+    },
+    {
+      "id": 3,
+      "block": 1,
+      "operation": {
+        "constant": {
+          "integer": "65521"
+        }
+      },
+      "results": [
+        5
+      ],
+      "effects": {
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false,
+        "may_throw": false,
+        "may_yield": false,
+        "invokes_unknown_code": false
+      },
+      "evidence": [
+        0
+      ],
+      "claims": []
+    },
+    {
+      "id": 4,
+      "block": 0,
+      "operation": {
+        "function_ref": 1
+      },
+      "results": [
+        6
+      ],
+      "effects": {
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false,
+        "may_throw": false,
+        "may_yield": false,
+        "invokes_unknown_code": false
+      },
+      "evidence": [
+        0
+      ],
+      "claims": []
+    },
+    {
+      "id": 5,
+      "block": 2,
+      "operation": {
+        "binary": {
+          "operator": "equal",
+          "left": 0,
+          "right": 2,
+          "mode": "semantic"
+        }
+      },
+      "results": [
+        19
+      ],
+      "effects": {
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false,
+        "may_throw": false,
+        "may_yield": false,
+        "invokes_unknown_code": false
+      },
+      "evidence": [
+        0
+      ],
+      "claims": []
+    },
+    {
+      "id": 6,
+      "block": 3,
+      "operation": {
+        "binary": {
+          "operator": "greater",
+          "left": 9,
+          "right": 2,
+          "mode": "semantic"
+        }
+      },
+      "results": [
+        20
+      ],
+      "effects": {
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false,
+        "may_throw": false,
+        "may_yield": false,
+        "invokes_unknown_code": false
+      },
+      "evidence": [
+        0
+      ],
+      "claims": []
+    },
+    {
+      "id": 7,
+      "block": 5,
+      "operation": {
+        "constant": {
+          "integer": "1"
+        }
+      },
+      "results": [
+        21
+      ],
+      "effects": {
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false,
+        "may_throw": false,
+        "may_yield": false,
+        "invokes_unknown_code": false
+      },
+      "evidence": [
+        0
+      ],
+      "claims": []
+    },
+    {
+      "id": 8,
+      "block": 5,
+      "operation": {
+        "binary": {
+          "operator": "multiply",
+          "left": 14,
+          "right": 4,
+          "mode": "semantic"
+        }
+      },
+      "results": [
+        22
+      ],
+      "effects": {
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false,
+        "may_throw": false,
+        "may_yield": false,
+        "invokes_unknown_code": false
+      },
+      "evidence": [
+        0
+      ],
+      "claims": []
+    },
+    {
+      "id": 9,
+      "block": 5,
+      "operation": {
+        "binary": {
+          "operator": "add",
+          "left": 22,
+          "right": 21,
+          "mode": "semantic"
+        }
+      },
+      "results": [
+        23
+      ],
+      "effects": {
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false,
+        "may_throw": false,
+        "may_yield": false,
+        "invokes_unknown_code": false
+      },
+      "evidence": [
+        0
+      ],
+      "claims": []
+    },
+    {
+      "id": 10,
+      "block": 5,
+      "operation": {
+        "binary": {
+          "operator": "modulo",
+          "left": 23,
+          "right": 5,
+          "mode": "semantic"
+        }
+      },
+      "results": [
+        24
+      ],
+      "effects": {
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false,
+        "may_throw": false,
+        "may_yield": false,
+        "invokes_unknown_code": false
+      },
+      "evidence": [
+        0
+      ],
+      "claims": []
+    },
+    {
+      "id": 11,
+      "block": 5,
+      "operation": {
+        "binary": {
+          "operator": "subtract",
+          "left": 13,
+          "right": 3,
+          "mode": "semantic"
+        }
+      },
+      "results": [
+        25
+      ],
+      "effects": {
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false,
+        "may_throw": false,
+        "may_yield": false,
+        "invokes_unknown_code": false
+      },
+      "evidence": [
+        0
+      ],
+      "claims": []
+    },
+    {
+      "id": 12,
+      "block": 5,
+      "operation": {
+        "constant": {
+          "integer": "2"
+        }
+      },
+      "results": [
+        26
+      ],
+      "effects": {
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false,
+        "may_throw": false,
+        "may_yield": false,
+        "invokes_unknown_code": false
+      },
+      "evidence": [
+        0
+      ],
+      "claims": []
+    },
+    {
+      "id": 13,
+      "block": 5,
+      "operation": {
+        "binary": {
+          "operator": "equal",
+          "left": 0,
+          "right": 26,
+          "mode": "semantic"
+        }
+      },
+      "results": [
+        27
+      ],
+      "effects": {
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false,
+        "may_throw": false,
+        "may_yield": false,
+        "invokes_unknown_code": false
+      },
+      "evidence": [
+        0
+      ],
+      "claims": []
+    },
+    {
+      "id": 14,
+      "block": 4,
+      "operation": {
+        "binary": {
+          "operator": "greater",
+          "left": 11,
+          "right": 2,
+          "mode": "semantic"
+        }
+      },
+      "results": [
+        28
+      ],
+      "effects": {
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false,
+        "may_throw": false,
+        "may_yield": false,
+        "invokes_unknown_code": false
+      },
+      "evidence": [
+        0
+      ],
+      "claims": []
+    },
+    {
+      "id": 15,
+      "block": 6,
+      "operation": {
+        "constant": {
+          "integer": "2"
+        }
+      },
+      "results": [
+        29
+      ],
+      "effects": {
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false,
+        "may_throw": false,
+        "may_yield": false,
+        "invokes_unknown_code": false
+      },
+      "evidence": [
+        0
+      ],
+      "claims": []
+    },
+    {
+      "id": 16,
+      "block": 6,
+      "operation": {
+        "binary": {
+          "operator": "multiply",
+          "left": 16,
+          "right": 4,
+          "mode": "semantic"
+        }
+      },
+      "results": [
+        30
+      ],
+      "effects": {
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false,
+        "may_throw": false,
+        "may_yield": false,
+        "invokes_unknown_code": false
+      },
+      "evidence": [
+        0
+      ],
+      "claims": []
+    },
+    {
+      "id": 17,
+      "block": 6,
+      "operation": {
+        "binary": {
+          "operator": "add",
+          "left": 30,
+          "right": 29,
+          "mode": "semantic"
+        }
+      },
+      "results": [
+        31
+      ],
+      "effects": {
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false,
+        "may_throw": false,
+        "may_yield": false,
+        "invokes_unknown_code": false
+      },
+      "evidence": [
+        0
+      ],
+      "claims": []
+    },
+    {
+      "id": 18,
+      "block": 6,
+      "operation": {
+        "binary": {
+          "operator": "modulo",
+          "left": 31,
+          "right": 5,
+          "mode": "semantic"
+        }
+      },
+      "results": [
+        32
+      ],
+      "effects": {
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false,
+        "may_throw": false,
+        "may_yield": false,
+        "invokes_unknown_code": false
+      },
+      "evidence": [
+        0
+      ],
+      "claims": []
+    },
+    {
+      "id": 19,
+      "block": 6,
+      "operation": {
+        "binary": {
+          "operator": "subtract",
+          "left": 15,
+          "right": 3,
+          "mode": "semantic"
+        }
+      },
+      "results": [
+        33
+      ],
+      "effects": {
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false,
+        "may_throw": false,
+        "may_yield": false,
+        "invokes_unknown_code": false
+      },
+      "evidence": [
+        0
+      ],
+      "claims": []
+    }
+  ],
+  "values": [
+    {
+      "id": 0,
+      "function": 1,
+      "type": {
+        "kind": "integer",
+        "bit_width": 64,
+        "signed": true
+      },
+      "origin": {
+        "parameter": 0
+      },
+      "name_hint": "selector"
+    },
+    {
+      "id": 1,
+      "function": 1,
+      "type": {
+        "kind": "integer",
+        "bit_width": 64,
+        "signed": true
+      },
+      "origin": {
+        "parameter": 1
+      },
+      "name_hint": "budget"
+    },
+    {
+      "id": 2,
+      "function": 1,
+      "type": {
+        "kind": "integer",
+        "bit_width": 64,
+        "signed": true
+      },
+      "origin": {
+        "instruction_result": {
+          "instruction": 0,
+          "index": 0
+        }
+      },
+      "name_hint": "c_0"
+    },
+    {
+      "id": 3,
+      "function": 1,
+      "type": {
+        "kind": "integer",
+        "bit_width": 64,
+        "signed": true
+      },
+      "origin": {
+        "instruction_result": {
+          "instruction": 1,
+          "index": 0
+        }
+      },
+      "name_hint": "c_1"
+    },
+    {
+      "id": 4,
+      "function": 1,
+      "type": {
+        "kind": "integer",
+        "bit_width": 64,
+        "signed": true
+      },
+      "origin": {
+        "instruction_result": {
+          "instruction": 2,
+          "index": 0
+        }
+      },
+      "name_hint": "c_2"
+    },
+    {
+      "id": 5,
+      "function": 1,
+      "type": {
+        "kind": "integer",
+        "bit_width": 64,
+        "signed": true
+      },
+      "origin": {
+        "instruction_result": {
+          "instruction": 3,
+          "index": 0
+        }
+      },
+      "name_hint": "c_3"
+    },
+    {
+      "id": 6,
+      "function": 0,
+      "type": {
+        "kind": "function",
+        "bit_width": 0,
+        "signed": false
+      },
+      "origin": {
+        "instruction_result": {
+          "instruction": 4,
+          "index": 0
+        }
+      },
+      "name_hint": "exported_4"
+    },
+    {
+      "id": 7,
+      "function": 1,
+      "type": {
+        "kind": "integer",
+        "bit_width": 64,
+        "signed": true
+      },
+      "origin": {
+        "block_parameter": {
+          "block": 2,
+          "index": 0
+        }
+      },
+      "name_hint": "remaining"
+    },
+    {
+      "id": 8,
+      "function": 1,
+      "type": {
+        "kind": "integer",
+        "bit_width": 64,
+        "signed": true
+      },
+      "origin": {
+        "block_parameter": {
+          "block": 2,
+          "index": 1
+        }
+      },
+      "name_hint": "checksum"
+    },
+    {
+      "id": 9,
+      "function": 1,
+      "type": {
+        "kind": "integer",
+        "bit_width": 64,
+        "signed": true
+      },
+      "origin": {
+        "block_parameter": {
+          "block": 3,
+          "index": 0
+        }
+      },
+      "name_hint": "remaining"
+    },
+    {
+      "id": 10,
+      "function": 1,
+      "type": {
+        "kind": "integer",
+        "bit_width": 64,
+        "signed": true
+      },
+      "origin": {
+        "block_parameter": {
+          "block": 3,
+          "index": 1
+        }
+      },
+      "name_hint": "checksum"
+    },
+    {
+      "id": 11,
+      "function": 1,
+      "type": {
+        "kind": "integer",
+        "bit_width": 64,
+        "signed": true
+      },
+      "origin": {
+        "block_parameter": {
+          "block": 4,
+          "index": 0
+        }
+      },
+      "name_hint": "remaining"
+    },
+    {
+      "id": 12,
+      "function": 1,
+      "type": {
+        "kind": "integer",
+        "bit_width": 64,
+        "signed": true
+      },
+      "origin": {
+        "block_parameter": {
+          "block": 4,
+          "index": 1
+        }
+      },
+      "name_hint": "checksum"
+    },
+    {
+      "id": 13,
+      "function": 1,
+      "type": {
+        "kind": "integer",
+        "bit_width": 64,
+        "signed": true
+      },
+      "origin": {
+        "block_parameter": {
+          "block": 5,
+          "index": 0
+        }
+      },
+      "name_hint": "remaining"
+    },
+    {
+      "id": 14,
+      "function": 1,
+      "type": {
+        "kind": "integer",
+        "bit_width": 64,
+        "signed": true
+      },
+      "origin": {
+        "block_parameter": {
+          "block": 5,
+          "index": 1
+        }
+      },
+      "name_hint": "checksum"
+    },
+    {
+      "id": 15,
+      "function": 1,
+      "type": {
+        "kind": "integer",
+        "bit_width": 64,
+        "signed": true
+      },
+      "origin": {
+        "block_parameter": {
+          "block": 6,
+          "index": 0
+        }
+      },
+      "name_hint": "remaining"
+    },
+    {
+      "id": 16,
+      "function": 1,
+      "type": {
+        "kind": "integer",
+        "bit_width": 64,
+        "signed": true
+      },
+      "origin": {
+        "block_parameter": {
+          "block": 6,
+          "index": 1
+        }
+      },
+      "name_hint": "checksum"
+    },
+    {
+      "id": 17,
+      "function": 1,
+      "type": {
+        "kind": "integer",
+        "bit_width": 64,
+        "signed": true
+      },
+      "origin": {
+        "block_parameter": {
+          "block": 7,
+          "index": 0
+        }
+      },
+      "name_hint": "remaining"
+    },
+    {
+      "id": 18,
+      "function": 1,
+      "type": {
+        "kind": "integer",
+        "bit_width": 64,
+        "signed": true
+      },
+      "origin": {
+        "block_parameter": {
+          "block": 7,
+          "index": 1
+        }
+      },
+      "name_hint": "checksum"
+    },
+    {
+      "id": 19,
+      "function": 1,
+      "type": {
+        "kind": "boolean",
+        "bit_width": 0,
+        "signed": false
+      },
+      "origin": {
+        "instruction_result": {
+          "instruction": 5,
+          "index": 0
+        }
+      },
+      "name_hint": "equal_5"
+    },
+    {
+      "id": 20,
+      "function": 1,
+      "type": {
+        "kind": "boolean",
+        "bit_width": 0,
+        "signed": false
+      },
+      "origin": {
+        "instruction_result": {
+          "instruction": 6,
+          "index": 0
+        }
+      },
+      "name_hint": "greater_6"
+    },
+    {
+      "id": 21,
+      "function": 1,
+      "type": {
+        "kind": "integer",
+        "bit_width": 64,
+        "signed": true
+      },
+      "origin": {
+        "instruction_result": {
+          "instruction": 7,
+          "index": 0
+        }
+      },
+      "name_hint": "c_7"
+    },
+    {
+      "id": 22,
+      "function": 1,
+      "type": {
+        "kind": "integer",
+        "bit_width": 64,
+        "signed": true
+      },
+      "origin": {
+        "instruction_result": {
+          "instruction": 8,
+          "index": 0
+        }
+      },
+      "name_hint": "multiply_8"
+    },
+    {
+      "id": 23,
+      "function": 1,
+      "type": {
+        "kind": "integer",
+        "bit_width": 64,
+        "signed": true
+      },
+      "origin": {
+        "instruction_result": {
+          "instruction": 9,
+          "index": 0
+        }
+      },
+      "name_hint": "add_9"
+    },
+    {
+      "id": 24,
+      "function": 1,
+      "type": {
+        "kind": "integer",
+        "bit_width": 64,
+        "signed": true
+      },
+      "origin": {
+        "instruction_result": {
+          "instruction": 10,
+          "index": 0
+        }
+      },
+      "name_hint": "modulo_10"
+    },
+    {
+      "id": 25,
+      "function": 1,
+      "type": {
+        "kind": "integer",
+        "bit_width": 64,
+        "signed": true
+      },
+      "origin": {
+        "instruction_result": {
+          "instruction": 11,
+          "index": 0
+        }
+      },
+      "name_hint": "subtract_11"
+    },
+    {
+      "id": 26,
+      "function": 1,
+      "type": {
+        "kind": "integer",
+        "bit_width": 64,
+        "signed": true
+      },
+      "origin": {
+        "instruction_result": {
+          "instruction": 12,
+          "index": 0
+        }
+      },
+      "name_hint": "c_12"
+    },
+    {
+      "id": 27,
+      "function": 1,
+      "type": {
+        "kind": "boolean",
+        "bit_width": 0,
+        "signed": false
+      },
+      "origin": {
+        "instruction_result": {
+          "instruction": 13,
+          "index": 0
+        }
+      },
+      "name_hint": "equal_13"
+    },
+    {
+      "id": 28,
+      "function": 1,
+      "type": {
+        "kind": "boolean",
+        "bit_width": 0,
+        "signed": false
+      },
+      "origin": {
+        "instruction_result": {
+          "instruction": 14,
+          "index": 0
+        }
+      },
+      "name_hint": "greater_14"
+    },
+    {
+      "id": 29,
+      "function": 1,
+      "type": {
+        "kind": "integer",
+        "bit_width": 64,
+        "signed": true
+      },
+      "origin": {
+        "instruction_result": {
+          "instruction": 15,
+          "index": 0
+        }
+      },
+      "name_hint": "c_15"
+    },
+    {
+      "id": 30,
+      "function": 1,
+      "type": {
+        "kind": "integer",
+        "bit_width": 64,
+        "signed": true
+      },
+      "origin": {
+        "instruction_result": {
+          "instruction": 16,
+          "index": 0
+        }
+      },
+      "name_hint": "multiply_16"
+    },
+    {
+      "id": 31,
+      "function": 1,
+      "type": {
+        "kind": "integer",
+        "bit_width": 64,
+        "signed": true
+      },
+      "origin": {
+        "instruction_result": {
+          "instruction": 17,
+          "index": 0
+        }
+      },
+      "name_hint": "add_17"
+    },
+    {
+      "id": 32,
+      "function": 1,
+      "type": {
+        "kind": "integer",
+        "bit_width": 64,
+        "signed": true
+      },
+      "origin": {
+        "instruction_result": {
+          "instruction": 18,
+          "index": 0
+        }
+      },
+      "name_hint": "modulo_18"
+    },
+    {
+      "id": 33,
+      "function": 1,
+      "type": {
+        "kind": "integer",
+        "bit_width": 64,
+        "signed": true
+      },
+      "origin": {
+        "instruction_result": {
+          "instruction": 19,
+          "index": 0
+        }
+      },
+      "name_hint": "subtract_19"
+    }
+  ],
+  "evidence": [
+    {
+      "id": 0,
+      "kind": "dynamic_fixture",
+      "locator": "research-generated:nested-inner-cycle-w1"
+    }
+  ],
+  "captures": [],
+  "certificates": [],
+  "claims": [],
+  "constraints": [],
+  "edge_rewrites": [],
+  "entry_bindings": [],
+  "external_bindings": [],
+  "obligations": [],
+  "places": [],
+  "queries": [],
+  "solver_models": [],
+  "solver_terms": [],
+  "unsat_cores": [],
+  "value_packs": []
+}
