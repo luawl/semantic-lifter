@@ -4,6 +4,7 @@ const cfg = @import("cfg.zig");
 const dead_code = @import("dead_code.zig");
 const diagnostics = @import("diagnostics.zig");
 const branch_expression = @import("emit_luau_branch_expr.zig");
+const emit_luau = @import("emit_luau.zig");
 const emission_planning = @import("emit_luau_plan.zig");
 const emission_scope = @import("emit_luau_scope.zig");
 const lexical = @import("emit_luau_lexical.zig");
@@ -31,12 +32,28 @@ const Pressure = struct {
     total: usize,
 };
 
+/// Which emission layout the register budget must model. `automatic` lets the
+/// structured plan fall back to the arbitrary CFG only when the shape demands
+/// it; `dispatcher` mirrors the emitter's forced-dispatcher layout (K16).
+pub const EmissionStrategy = enum { automatic, dispatcher };
+
 pub fn validate(
+    allocator: std.mem.Allocator,
+    report: *diagnostics.Report,
+    program: *const ir.Program,
+    scope: *const readable_scope.Scope,
+    target: luau_runtime.Target,
+) !void {
+    return validateWithStrategy(allocator, report, program, scope, target, .automatic);
+}
+
+pub fn validateWithStrategy(
     allocator: std.mem.Allocator,
     report: *diagnostics.Report,
     program: *const ir.Program,
     _: *const readable_scope.Scope,
     target: luau_runtime.Target,
+    strategy: EmissionStrategy,
 ) !void {
     if (stage_trace.enabled) std.debug.print("register_validation stage=begin\n", .{});
     var transfer_arena = std.heap.ArenaAllocator.init(allocator);
@@ -49,7 +66,7 @@ pub fn validate(
     var readable = try readable_scope.Scope.init(allocator, &prepared);
     defer readable.deinit();
     if (stage_trace.enabled) std.debug.print("register_validation stage=scope\n", .{});
-    try validatePrepared(allocator, report, &prepared, &readable, target);
+    try validatePrepared(allocator, report, &prepared, &readable, target, strategy);
     if (stage_trace.enabled) std.debug.print("register_validation stage=done\n", .{});
 }
 
@@ -59,6 +76,7 @@ fn validatePrepared(
     program: *const ir.Program,
     readable: *const readable_scope.Scope,
     target: luau_runtime.Target,
+    strategy: EmissionStrategy,
 ) !void {
     if (stage_trace.enabled) std.debug.print("register_validation stage=emission_plan_begin\n", .{});
     var emission = try emission_planning.Plan.init(allocator, program, target);
@@ -105,7 +123,10 @@ fn validatePrepared(
             syntax_depths.recordDirectSpineFunction(function, direct_spine_depth);
             continue;
         }
-        var structured = structure.Plan.initWithArbitraryFallback(allocator, &analysis) catch |err| switch (err) {
+        var structured = (if (strategy == .dispatcher)
+            structure.Plan.initArbitrary(allocator, &analysis)
+        else
+            structure.Plan.initWithArbitraryFallback(allocator, &analysis)) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.UnsupportedShape => unreachable,
         };
@@ -145,16 +166,32 @@ fn validatePrepared(
             storage_locals,
         );
         const pressure = try maximumPressure(allocator, program, readable, &emission, &scopes, function, base);
+        // The dispatcher (arbitrary-CFG) layout declares a flat set of locals at
+        // the function root that `maximumPressure` undercounts: it scores only
+        // materialized (scoped) bindings and omits both the never-materialized
+        // declarations and the `__lifter_pc` slot. Budget the emitter's own
+        // declaration count plus the pc slot so a forced or natural dispatcher
+        // layout past the compiler's limit is refused at admission (K16).
+        var effective_locals = pressure.locals;
+        var effective_total = pressure.total;
+        if (structured.root.arbitrary_cfg) {
+            const flat_locals = saturatingAdd(
+                saturatingAdd(function_base, storage_locals),
+                saturatingAdd(emit_luau.arbitraryDeclarationCount(program, &emission, function), 1),
+            );
+            effective_locals = @max(effective_locals, flat_locals);
+            effective_total = @max(effective_total, saturatingAdd(flat_locals, pressure.total -| pressure.locals));
+        }
         if (stage_trace.enabled) std.debug.print("register_pressure function={} base={} locals={} total={} scopes={}\n", .{
             function.id.index(),
             base,
-            pressure.locals,
-            pressure.total,
+            effective_locals,
+            effective_total,
             scopes.pressureSlotCount(),
         });
-        if (pressure.locals > luau_runtime.max_local_registers) {
+        if (effective_locals > luau_runtime.max_local_registers) {
             try report.add(.unsupported_readable_register_pressure, function.id.index());
-        } else if (pressure.total > luau_runtime.max_registers) {
+        } else if (effective_total > luau_runtime.max_registers) {
             try report.add(.unsupported_readable_temporary_register_pressure, function.id.index());
         }
         if (stage_trace.enabled) std.debug.print("register_validation function={} stage=done\n", .{function.id.index()});

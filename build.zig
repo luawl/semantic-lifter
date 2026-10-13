@@ -909,6 +909,7 @@ pub fn build(b: *std.Build) void {
     );
 
     const register_budget_oracle = addRegisterBudgetOracle(b);
+    const dispatcher_local_budget_conformance = addDispatcherLocalBudgetConformance(b, exe, z3_enabled, z3_bin);
     const compile_check_positive = b.addRunArtifact(exe);
     if (z3_enabled) compile_check_positive.addPathDir(b.pathFromRoot(z3_bin));
     compile_check_positive.addArg("emit-luau");
@@ -964,6 +965,7 @@ pub fn build(b: *std.Build) void {
     _ = resolve_refusal_audit.addOutputDirectoryArg("resolve-refusal");
     const conformance_step = b.step("conformance", "Validate, emit, and compile Zig- and Luau-built generic fixtures");
     conformance_step.dependOn(&register_budget_oracle.step);
+    dispatcher_local_budget_conformance.addTo(conformance_step);
     conformance_step.dependOn(&compile_check_positive.step);
     conformance_step.dependOn(&compile_check_rejection.step);
     conformance_step.dependOn(&compile_check_preserved_output.step);
@@ -1752,6 +1754,87 @@ fn addLuauSourceCompileConformance(
     );
     result.lexical = addGeneratedLexicalConformance(b, source_path, result.generated_luau);
     return result;
+}
+
+const DispatcherLocalBudgetConformance = struct {
+    automatic_compile: *std.Build.Step,
+    dispatcher_refusal: *std.Build.Step,
+    boundary_compile: *std.Build.Step,
+
+    fn addTo(self: DispatcherLocalBudgetConformance, step: *std.Build.Step) void {
+        step.dependOn(self.automatic_compile);
+        step.dependOn(self.dispatcher_refusal);
+        step.dependOn(self.boundary_compile);
+    }
+};
+
+// K16 (T1.5): the forced-dispatcher layout is budgeted at emission admission.
+// The 192-local fixture emits under `automatic` (structured, O0-compilable) but
+// is refused under `dispatcher` (flat layout = 201 locals > 200); the 191-local
+// sibling pins the boundary (200 locals, dispatcher accepted and O0-compilable).
+fn addDispatcherLocalBudgetConformance(
+    b: *std.Build,
+    exe: *std.Build.Step.Compile,
+    z3_enabled: bool,
+    z3_bin: []const u8,
+) DispatcherLocalBudgetConformance {
+    const engine = if (z3_enabled) "z3" else "internal";
+
+    const json_192 = addLuauSourceIr(b, "luau/fixtures/dispatcher_local_budget_source.luau", null, "dispatcher-local-budget");
+    const resolve_192 = b.addRunArtifact(exe);
+    if (z3_enabled) resolve_192.addPathDir(b.pathFromRoot(z3_bin));
+    resolve_192.addArg("resolve-ir");
+    resolve_192.addFileArg(json_192);
+    const resolved_192 = resolve_192.addOutputFileArg("dispatcher-local-budget.resolved.lifter-ir.json");
+    resolve_192.addArg(engine);
+
+    const emit_192_automatic = b.addRunArtifact(exe);
+    if (z3_enabled) emit_192_automatic.addPathDir(b.pathFromRoot(z3_bin));
+    emit_192_automatic.addArg("emit-readable-luau-strategy");
+    emit_192_automatic.addFileArg(resolved_192);
+    const luau_192_automatic = emit_192_automatic.addOutputFileArg("dispatcher-local-budget.automatic.luau");
+    emit_192_automatic.addArgs(&.{ "standard-luau", "automatic" });
+    emit_192_automatic.expectExitCode(0);
+
+    const compile_192_automatic = b.addSystemCommand(&.{ luauCompileExe(b), "--null", "-O0" });
+    compile_192_automatic.addFileArg(luau_192_automatic);
+    compile_192_automatic.expectExitCode(0);
+
+    const emit_192_dispatcher = b.addRunArtifact(exe);
+    if (z3_enabled) emit_192_dispatcher.addPathDir(b.pathFromRoot(z3_bin));
+    emit_192_dispatcher.addArg("emit-readable-luau-strategy");
+    emit_192_dispatcher.addFileArg(resolved_192);
+    const dispatcher_192_seed_files = b.addWriteFiles();
+    const dispatcher_192_seed = dispatcher_192_seed_files.add("dispatcher-local-budget.dispatcher.luau", "");
+    emit_192_dispatcher.addFileArg(dispatcher_192_seed);
+    emit_192_dispatcher.addArgs(&.{ "standard-luau", "dispatcher" });
+    emit_192_dispatcher.expectExitCode(1);
+
+    const json_191 = addLuauSourceIr(b, "luau/fixtures/dispatcher_local_budget_191_source.luau", null, "dispatcher-local-budget-191");
+    const resolve_191 = b.addRunArtifact(exe);
+    if (z3_enabled) resolve_191.addPathDir(b.pathFromRoot(z3_bin));
+    resolve_191.addArg("resolve-ir");
+    resolve_191.addFileArg(json_191);
+    const resolved_191 = resolve_191.addOutputFileArg("dispatcher-local-budget-191.resolved.lifter-ir.json");
+    resolve_191.addArg(engine);
+
+    const emit_191_dispatcher = b.addRunArtifact(exe);
+    if (z3_enabled) emit_191_dispatcher.addPathDir(b.pathFromRoot(z3_bin));
+    emit_191_dispatcher.addArg("emit-readable-luau-strategy");
+    emit_191_dispatcher.addFileArg(resolved_191);
+    const luau_191_dispatcher = emit_191_dispatcher.addOutputFileArg("dispatcher-local-budget-191.dispatcher.luau");
+    emit_191_dispatcher.addArgs(&.{ "standard-luau", "dispatcher" });
+    emit_191_dispatcher.expectExitCode(0);
+
+    const compile_191_dispatcher = b.addSystemCommand(&.{ luauCompileExe(b), "--null", "-O0" });
+    compile_191_dispatcher.addFileArg(luau_191_dispatcher);
+    compile_191_dispatcher.expectExitCode(0);
+
+    return .{
+        .automatic_compile = &compile_192_automatic.step,
+        .dispatcher_refusal = &emit_192_dispatcher.step,
+        .boundary_compile = &compile_191_dispatcher.step,
+    };
 }
 
 fn addLuauSourceRecoveryObligationConformance(
