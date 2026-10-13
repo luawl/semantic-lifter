@@ -35,6 +35,57 @@ test "dispatch option shares readable admission and preserves the default emitte
     ));
 }
 
+/// One function that reads the host global `__make_closure` and returns it: a
+/// neutral handoff that merely names that global.
+const ambient_closure_read = struct {
+    const proof = ir.EvidenceId.fromIndex(0);
+    const function_id = ir.FunctionId.fromIndex(0);
+    const block_id = ir.BlockId.fromIndex(0);
+    const get_id = ir.InstructionId.fromIndex(0);
+    const closure = ir.ValueId.fromIndex(0);
+    const values = [_]ir.Value{
+        .{ .id = closure, .function = function_id, .name_hint = "make_closure", .origin = .{ .instruction_result = .{ .instruction = get_id, .index = 0 } } },
+    };
+    const instructions = [_]ir.Instruction{
+        .{ .id = get_id, .block = block_id, .operation = .{ .environment_get = .{ .target = .{ .ambient = {} }, .mode = .semantic, .name = "__make_closure" } }, .results = &.{closure}, .effects = .semantic_environment_read, .evidence = &.{proof} },
+    };
+    const blocks = [_]ir.Block{.{ .id = block_id, .function = function_id, .instructions = &.{get_id}, .terminator = .{ .return_values = &.{closure} }, .evidence = &.{proof} }};
+    const functions = [_]ir.Function{.{ .id = function_id, .blocks = &.{block_id}, .entry_block = block_id, .evidence = &.{proof} }};
+    const evidence = [_]ir.Evidence{.{ .id = proof, .kind = .dynamic_fixture, .locator = "fixture:ambient-closure-read" }};
+    const program: ir.Program = .{
+        .program_id = "ambient-closure-read",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+        .evidence = &evidence,
+    };
+};
+
+test "neutral emission defines no helper for an ambient __make_closure read" {
+    const source = try emitAlloc(std.testing.allocator, &ambient_closure_read.program);
+    defer std.testing.allocator.free(source);
+    try std.testing.expect(std.mem.indexOf(u8, source, "__make_closure") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "local function __make_closure") == null);
+}
+
+test "registered ambient helper is emitted once for its ambient read" {
+    const helpers = [_]lifter.luau_runtime.AmbientHelper{.{
+        .name = "__make_closure",
+        .source = "local function __make_closure(target)\n  return target\nend\n\n",
+    }};
+    const source = try lifter.emit_luau.emitAllocForTargetWithOptions(
+        std.testing.allocator,
+        &ambient_closure_read.program,
+        .standard_luau,
+        .{ .ambient_helpers = &helpers },
+    );
+    defer std.testing.allocator.free(source);
+    try std.testing.expect(std.mem.indexOf(u8, source, helpers[0].source) != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "local function __make_closure"));
+}
+
 test "generic semantic IR emits readable Luau without family knowledge" {
     const fixtures = lifter.fixtures;
     const source = try emitAlloc(std.testing.allocator, &fixtures.arithmetic_module.program);

@@ -41,6 +41,10 @@ pub const Target = luau_runtime.Target;
 
 pub const Options = struct {
     force_dispatcher: bool = false,
+    /// Target-family ambient helpers: the emitter records each one on its
+    /// runtime plan with `luau_runtime.Plan.requireAmbientHelper` and defines it
+    /// only when the program reads its name. Neutral emission passes none.
+    ambient_helpers: []const luau_runtime.AmbientHelper = &.{},
 };
 
 const StableCaptureValues = struct {
@@ -132,6 +136,7 @@ pub fn emitAdmittedAllocForTargetWithOptions(
     const emission_program = &prepared;
     var emission_plan = try EmissionPlan.init(allocator, emission_program, target);
     defer emission_plan.deinit();
+    for (options.ambient_helpers) |helper| emission_plan.runtime.requireAmbientHelper(helper);
     var entry_plan = lexical.EntryPlan.init(allocator, emission_program) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.InvalidEntryBinding => return error.UnsupportedOperation,
@@ -258,50 +263,31 @@ fn emitRuntimePrelude(
     }
     if (wrote_capture) try output.append(allocator, '\n');
 
-    // The crackme lift represents the VM's dynamic function-factory handler as
-    // an explicit ambient helper. Keep that dependency in the emitted module
-    // instead of assuming the host happens to provide it. Native IR closures
-    // continue through emitClosure; this helper is only for wrappers whose
-    // callable is selected dynamically at runtime.
-    var needs_dynamic_closure_helper = false;
-    for (program.instructions) |instruction| {
-        switch (instruction.operation) {
-            .environment_get => |get| {
-                if (get.mode != .semantic) continue;
-                switch (get.target) {
-                    .ambient => {
-                        if (std.mem.eql(u8, get.name, "__make_closure")) {
-                            needs_dynamic_closure_helper = true;
-                        }
-                    },
-                    .value => {},
-                }
-            },
-            else => {},
+    // Ambient helpers are target-family runtime definitions that a frontend
+    // recorded on the runtime plan (luau_runtime.Plan.requireAmbientHelper).
+    // The neutral core records none, so no ambient name has special meaning
+    // here: a recorded helper is defined once, and only when the program reads
+    // its name through a semantic ambient environment_get.
+    for (emission_plan.runtime.ambient_helpers) |helper| {
+        var referenced = false;
+        for (program.instructions) |instruction| {
+            switch (instruction.operation) {
+                .environment_get => |get| {
+                    if (get.mode != .semantic) continue;
+                    switch (get.target) {
+                        .ambient => {
+                            if (std.mem.eql(u8, get.name, helper.name)) {
+                                referenced = true;
+                            }
+                        },
+                        .value => {},
+                    }
+                },
+                else => {},
+            }
+            if (referenced) break;
         }
-        if (needs_dynamic_closure_helper) break;
-    }
-    if (needs_dynamic_closure_helper) {
-        try output.appendSlice(
-            allocator,
-            "local __closure_frames = {}\n" ++
-                "local function __make_closure(target, registers, capture_index, scope, owner, pc, slot)\n" ++
-                "  return function(...)\n" ++
-                "    local callable = target\n" ++
-                "    if callable == nil and registers ~= nil then callable = registers[capture_index] end\n" ++
-                "    if type(callable) ~= \"function\" then return nil end\n" ++
-                "    local active = __closure_frames[owner]\n" ++
-                "    if active then\n" ++
-                "      error(\"re-entrant VM closure frame\", 0)\n" ++
-                "    end\n" ++
-                "    __closure_frames[owner] = { pc, slot, scope }\n" ++
-                "    local results = table.pack(pcall(callable, ...))\n" ++
-                "    __closure_frames[owner] = nil\n" ++
-                "    if not results[1] then error(results[2], 0) end\n" ++
-                "    return table.unpack(results, 2, results.n)\n" ++
-                "  end\n" ++
-                "end\n\n",
-        );
+        if (referenced) try output.appendSlice(allocator, helper.source);
     }
 }
 

@@ -253,9 +253,27 @@ pub const Set = struct {
     }
 };
 
+/// A runtime definition that a target-family frontend asks the emitter to
+/// place ahead of the program, keyed by the ambient (host-global) name that the
+/// family's handoff reads. The neutral core registers none, so a semantic
+/// ambient read of any name stays a plain host-global read unless the frontend
+/// that chose the name supplied its definition.
+pub const AmbientHelper = struct {
+    name: []const u8,
+    source: []const u8,
+};
+
+/// Upper bound on the distinct ambient helpers one runtime plan records.
+pub const max_ambient_helpers: usize = 8;
+
 pub const Plan = struct {
     target: Target,
     required: Set,
+    /// Helpers recorded through `requireAmbientHelper`, in registration order.
+    ambient_helpers: []const AmbientHelper = &.{},
+    /// Backing storage for `ambient_helpers`. The slice points into this plan,
+    /// so helpers are recorded on the plan in its final location.
+    ambient_helper_storage: [max_ambient_helpers]AmbientHelper = undefined,
 
     pub fn init(target: Target, program: *const ir.Program, scope: *const readable_scope.Scope) Plan {
         return initFiltered(target, program, scope, null);
@@ -296,6 +314,19 @@ pub const Plan = struct {
 
     pub fn require(self: *Plan, capability: Capability) void {
         self.required.mark(capability);
+    }
+
+    /// Records `h` for this emission, once per name (the first registration
+    /// wins). The emitter defines a recorded helper only when the program reads
+    /// its name through a semantic ambient `environment_get`.
+    pub fn requireAmbientHelper(self: *Plan, h: AmbientHelper) void {
+        for (self.ambient_helpers) |recorded| {
+            if (std.mem.eql(u8, recorded.name, h.name)) return;
+        }
+        const count = self.ambient_helpers.len;
+        if (count == max_ambient_helpers) @panic("ambient helper limit exceeded");
+        self.ambient_helper_storage[count] = h;
+        self.ambient_helpers = self.ambient_helper_storage[0 .. count + 1];
     }
 };
 
