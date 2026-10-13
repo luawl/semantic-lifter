@@ -15,6 +15,10 @@ the official Luau VM.
 
 The preprint that describes the design is published separately and will be linked here.
 
+## Release note
+
+This repository is the proof of concept behind the preprint *Checked, Not Trusted: Typed Evidence Contracts and Paired-Representation Testing for Luau Lifting Backends*: the backend and the two frontends the paper evaluated, cleaned up for release and verified as the build section below describes (every unit test and conformance step passes, and a fresh clone builds with the documented tool options). The paper's known limitations are listed at the end of this file; if anything else goes wrong, please open an issue.
+
 ## Repository contents
 
 - `src/`: the backend (IR, validation, solving, restructuring, emission) and the command-line
@@ -125,7 +129,20 @@ These are the limits that the preprint reports:
 
 The issue tracker holds the open items.
 
+## Citation
+
+If this repository is useful for your work, please cite the preprint. The arXiv entry will replace
+this block when it is live; `CITATION.cff` carries the same reference.
+
+```bibtex
+@misc{luawl2026semanticlifter,
+  title  = {Checked, Not Trusted: Typed Evidence Contracts and Paired-Representation Testing for Luau Lifting Backends},
+  author = {Luawl},
+  year   = {2026},
+  note   = {Preprint. Code: https://github.com/luawl/semantic-lifter},
+}
+```
+
 ## Licence
 
-PolyForm Strict License 1.0.0 (`LICENSE`), copyright Luawl. Third-party: the modified Luraph-family frontend is not
-redistributed.
+PolyForm Strict License 1.0.0 (`LICENSE`), copyright Luawl.
