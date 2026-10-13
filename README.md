@@ -104,8 +104,8 @@ A refusal is reported on stderr as `diagnostic=<code> entity=<index>` lines (`en
 single IR entity applies), some followed by indented detail lines; by default stderr carries nothing
 else (the internal stage traces print only in a `-Dtrace-normalize-phases=true` build). Exit status 0
 means success; 1 means a refusal or an error such as a missing file or a bad argument, and the stderr
-lines say which. A `resolve-*` command can leave an output file behind on refusal, so check the exit
-status. Running `semantic-lifter` without arguments prints the usage text.
+lines say which. A refused `resolve-*` command writes no output file. Running `semantic-lifter`
+without arguments prints the usage text.
 
 Three commands are diagnostic-only: `emit-admitted-readable-luau-raw`, `emit-readable-luau-strategy`
 and `resolve-exact-control-ir` skip admission or part of the checked pipeline (the usage text says

@@ -957,6 +957,11 @@ pub fn build(b: *std.Build) void {
         .expected_exact = "local =\n",
     });
     legacy_unchecked_preserved_output.step.dependOn(&legacy_unchecked_rejection.step);
+    const resolve_refusal_audit = b.addSystemCommand(&.{ luneExe(b), "run" });
+    resolve_refusal_audit.addFileArg(b.path("luau/resolve_refusal_audit.luau"));
+    resolve_refusal_audit.addArtifactArg(exe);
+    resolve_refusal_audit.addFileArg(b.path("luau/fixtures/resolve_refusal_b3.lifter-ir.json"));
+    _ = resolve_refusal_audit.addOutputDirectoryArg("resolve-refusal");
     const conformance_step = b.step("conformance", "Validate, emit, and compile Zig- and Luau-built generic fixtures");
     conformance_step.dependOn(&register_budget_oracle.step);
     conformance_step.dependOn(&compile_check_positive.step);
@@ -964,6 +969,7 @@ pub fn build(b: *std.Build) void {
     conformance_step.dependOn(&compile_check_preserved_output.step);
     conformance_step.dependOn(&legacy_unchecked_rejection.step);
     conformance_step.dependOn(&legacy_unchecked_preserved_output.step);
+    conformance_step.dependOn(&resolve_refusal_audit.step);
     absolute_conformance.addTo(conformance_step);
     function_reference_conformance.addTo(conformance_step);
     dynamic_truthiness_conformance.addTo(conformance_step);

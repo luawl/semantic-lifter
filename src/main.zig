@@ -25,7 +25,6 @@ const usage_text =
     \\  semantic-lifter normalize-ir <input.json> <output.json> [<function-index>]
     \\  semantic-lifter normalize-ir-budget <input.json> <output.json> <function-index> <feedback-iterations> [resume]
     \\  semantic-lifter normalize-ir-resume <input.json> <output.json> <function-index> <feedback-iterations> <resume-token.json>
-    \\      resolve-*: a refusal can still leave an output file; check the exit status.
     \\
     \\test helpers (no output file; exit 0 when the expectation holds):
     \\  semantic-lifter expect-diagnostic <input.json> <core|readable-luau> <diagnostic>
@@ -45,7 +44,7 @@ const usage_text =
     \\  semantic-lifter inspect-structure <input.json> <function-index>
     \\  semantic-lifter inspect-edge-rewrite <input.json> <rewrite-index>
     \\
-    \\exit status: 0 success; 1 refusal, with diagnostic= lines on stderr.
+    \\exit status: 0 success; 1 refusal (diagnostic= lines on stderr) or an error such as a missing file or a bad argument.
     \\
 ;
 
@@ -1014,11 +1013,11 @@ pub fn main(init: std.process.Init) !void {
         );
         defer outcome.deinit();
         printDiagnostics(allocator, &outcome.report, outcome.program() orelse &parsed.value);
+        if (!outcome.isAdmitted()) return error.ValidationFailed;
         const resolved_program = outcome.program() orelse return error.ValidationFailed;
         const encoded = try lifter.codec.encodeAlloc(allocator, resolved_program);
         defer allocator.free(encoded);
         try writeFile(io, args[3], encoded);
-        if (!outcome.isAdmitted()) return error.ValidationFailed;
         return;
     }
 
@@ -1069,11 +1068,11 @@ pub fn main(init: std.process.Init) !void {
         );
         defer outcome.deinit();
         printDiagnostics(allocator, &outcome.report, outcome.program() orelse &parsed.value);
+        if (!outcome.isAdmitted()) return error.ValidationFailed;
         const resolved_program = outcome.program() orelse return error.ValidationFailed;
         const encoded = try lifter.codec.encodeAlloc(allocator, resolved_program);
         defer allocator.free(encoded);
         try writeFile(io, args[3], encoded);
-        if (!outcome.isAdmitted()) return error.ValidationFailed;
         return;
     }
 
@@ -1098,11 +1097,11 @@ pub fn main(init: std.process.Init) !void {
         );
         defer outcome.deinit();
         printDiagnostics(allocator, &outcome.report, outcome.program() orelse &parsed.value);
+        if (!outcome.isAdmitted()) return error.ValidationFailed;
         const resolved_program = outcome.program() orelse return error.ValidationFailed;
         const encoded = try lifter.codec.encodeAlloc(allocator, resolved_program);
         defer allocator.free(encoded);
         try writeFile(io, args[3], encoded);
-        if (!outcome.isAdmitted()) return error.ValidationFailed;
         return;
     }
 
