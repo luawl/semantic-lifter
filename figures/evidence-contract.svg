@@ -1,0 +1,111 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="500" viewBox="0 0 1200 500" role="img" font-family="Arial, Helvetica, sans-serif">
+<title>Fig. A — the contract: frontends, the lifter_ir_v1 handoff, and the backend gates</title>
+<desc>Left column: three frontend boxes, AST frontend, disassembly frontend, and a dotted future adapter; each has an arrow into the centre box. Centre: the lifter_ir_v1 handoff box, listing values · places · packs · closures, provenance, evidence (7 kinds), and obligations (12 kinds). Right: the backend gates in order, core admission, then checked resolution (certificates), then emission admission incl. compiler limits, then emit; the handoff enters core admission. Each step is joined to the next by a solid green arrow labelled admit. Each of the three gates also has a dashed red arrow into a box labelled refuse: typed diagnostic (241 codes), which lists three example codes: missing_emission_evidence, open_profile_obligation, unsupported_readable_register_pressure. A legend at the bottom pairs the solid line with admit and the dashed line with refuse.</desc>
+<defs>
+  <marker id="mk-flow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="#526579"/></marker>
+  <marker id="mk-future" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="#8a96a3"/></marker>
+  <marker id="mk-admit" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="11" markerHeight="11" markerUnits="userSpaceOnUse" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="#2e7d32"/></marker>
+  <marker id="mk-refuse" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="11" markerHeight="11" markerUnits="userSpaceOnUse" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="#c62828"/></marker>
+  <style>
+    text { font-family: Arial, Helvetica, sans-serif; fill: #1f2d3d; }
+    .title { font-size: 21px; font-weight: 700; }
+    .colhead { font-size: 14px; font-weight: 700; fill: #4a5d70; }
+    .node { font-size: 15px; font-weight: 700; text-anchor: middle; }
+    .sub { font-size: 14px; fill: #3c4f63; text-anchor: middle; }
+    .hotitle { font-size: 18px; font-weight: 700; text-anchor: middle; }
+    .item { font-size: 14px; text-anchor: middle; }
+    .future { font-size: 15px; font-weight: 700; font-style: italic; fill: #5b6b7b; text-anchor: middle; }
+    .admitlbl { font-size: 13px; font-weight: 700; fill: #1b5e20; }
+    .refusehead { font-size: 15px; font-weight: 700; fill: #8e1b1b; }
+    .eg { font-size: 13px; fill: #6b4b4b; }
+    .code { font-size: 14px; fill: #4a1010; }
+    .legend { font-size: 13px; fill: #3c4f63; }
+    .box { fill: #f5f8fb; stroke: #526579; stroke-width: 1.6; }
+    .futurebox { fill: #ffffff; stroke: #8a96a3; stroke-width: 1.8; }
+    .handoff { fill: #eef4fa; stroke: #2f4a66; stroke-width: 2.2; }
+    .row { fill: #ffffff; stroke: #9db0c3; stroke-width: 1.2; }
+    .gate { fill: #f0edfa; stroke: #6a5a9e; stroke-width: 1.6; }
+    .emit { fill: #e8f5e9; stroke: #2e7d32; stroke-width: 1.8; }
+    .refusebox { fill: #fdf0ef; stroke: #c62828; stroke-width: 1.6; }
+    .chip { fill: #ffffff; stroke: #e2a9a9; stroke-width: 1.2; }
+  </style>
+</defs>
+<rect x="0" y="0" width="1200" height="500" fill="#ffffff"/>
+
+<text x="24" y="38" class="title">The lifter_ir_v1 contract: frontends, handoff, backend gates</text>
+
+<!-- Column headings -->
+<text x="24" y="80" class="colhead">frontends</text>
+<text x="264" y="80" class="colhead">handoff</text>
+<text x="584" y="80" class="colhead">backend gates (in order)</text>
+
+<!-- Left column: frontends -->
+<rect x="24" y="130" width="190" height="60" rx="8" class="box"/>
+<text x="119" y="165" class="node">AST frontend</text>
+<rect x="24" y="234" width="190" height="60" rx="8" class="box"/>
+<text x="119" y="269" class="node">disassembly frontend</text>
+<rect x="24" y="338" width="190" height="60" rx="8" class="futurebox" stroke-dasharray="1 5" stroke-linecap="round"/>
+<text x="119" y="373" class="future">future adapter</text>
+
+<path d="M214 160 H264" fill="none" stroke="#526579" stroke-width="1.8" marker-end="url(#mk-flow)"/>
+<path d="M214 264 H264" fill="none" stroke="#526579" stroke-width="1.8" marker-end="url(#mk-flow)"/>
+<path d="M214 368 H264" fill="none" stroke="#8a96a3" stroke-width="1.8" stroke-dasharray="1 5" stroke-linecap="round" marker-end="url(#mk-future)"/>
+
+<!-- Centre: the lifter_ir_v1 handoff -->
+<rect x="264" y="96" width="270" height="336" rx="10" class="handoff"/>
+<text x="399" y="129" class="hotitle">lifter_ir_v1</text>
+<rect x="282" y="146" width="234" height="54" rx="6" class="row"/>
+<text x="399" y="178" class="item">values · places · packs · closures</text>
+<rect x="282" y="214" width="234" height="54" rx="6" class="row"/>
+<text x="399" y="246" class="item">provenance</text>
+<rect x="282" y="282" width="234" height="54" rx="6" class="row"/>
+<text x="399" y="314" class="item">evidence (7 kinds)</text>
+<rect x="282" y="350" width="234" height="54" rx="6" class="row"/>
+<text x="399" y="382" class="item">obligations (12 kinds)</text>
+
+<!-- Handoff enters the first gate -->
+<path d="M534 120 H584" fill="none" stroke="#526579" stroke-width="1.8" marker-end="url(#mk-flow)"/>
+
+<!-- Right: backend gates in order, joined by admit arrows -->
+<rect x="584" y="96" width="210" height="48" rx="8" class="gate"/>
+<text x="689" y="125" class="node">core admission</text>
+<path d="M689 144 V184" fill="none" stroke="#2e7d32" stroke-width="2.4" marker-end="url(#mk-admit)"/>
+<text x="699" y="169" class="admitlbl">admit</text>
+
+<rect x="584" y="184" width="210" height="60" rx="8" class="gate"/>
+<text x="689" y="209" class="node">checked resolution</text>
+<text x="689" y="230" class="sub">(certificates)</text>
+<path d="M689 244 V284" fill="none" stroke="#2e7d32" stroke-width="2.4" marker-end="url(#mk-admit)"/>
+<text x="699" y="269" class="admitlbl">admit</text>
+
+<rect x="584" y="284" width="210" height="60" rx="8" class="gate"/>
+<text x="689" y="309" class="node">emission admission</text>
+<text x="689" y="330" class="sub">incl. compiler limits</text>
+<path d="M689 344 V384" fill="none" stroke="#2e7d32" stroke-width="2.4" marker-end="url(#mk-admit)"/>
+<text x="699" y="369" class="admitlbl">admit</text>
+
+<rect x="584" y="384" width="210" height="48" rx="8" class="emit"/>
+<text x="689" y="413" class="node">emit</text>
+
+<!-- Refuse outcome: dashed red from each gate -->
+<path d="M794 120 H850" fill="none" stroke="#c62828" stroke-width="2.4" stroke-dasharray="8 5" marker-end="url(#mk-refuse)"/>
+<path d="M794 214 H850" fill="none" stroke="#c62828" stroke-width="2.4" stroke-dasharray="8 5" marker-end="url(#mk-refuse)"/>
+<path d="M794 314 H850" fill="none" stroke="#c62828" stroke-width="2.4" stroke-dasharray="8 5" marker-end="url(#mk-refuse)"/>
+
+<rect x="850" y="96" width="326" height="234" rx="8" class="refusebox"/>
+<text x="868" y="128" class="refusehead">refuse: typed diagnostic (241 codes)</text>
+<text x="868" y="172" class="eg">example codes:</text>
+<rect x="866" y="186" width="294" height="30" rx="5" class="chip"/>
+<text x="880" y="206" class="code">missing_emission_evidence</text>
+<rect x="866" y="226" width="294" height="30" rx="5" class="chip"/>
+<text x="880" y="246" class="code">open_profile_obligation</text>
+<rect x="866" y="266" width="294" height="30" rx="5" class="chip"/>
+<text x="880" y="286" class="code">unsupported_readable_register_pressure</text>
+
+<!-- Legend -->
+<path d="M24 470 H70" fill="none" stroke="#2e7d32" stroke-width="2.4" marker-end="url(#mk-admit)"/>
+<text x="80" y="475" class="legend">admit</text>
+<path d="M150 470 H196" fill="none" stroke="#c62828" stroke-width="2.4" stroke-dasharray="8 5" marker-end="url(#mk-refuse)"/>
+<text x="206" y="475" class="legend">refuse</text>
+</svg>

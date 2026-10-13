@@ -15,6 +15,20 @@ the official Luau VM.
 
 The preprint that describes the design is published separately and will be linked here.
 
+## How it works
+
+![The lifter_ir_v1 contract: frontends, the handoff, and the backend gates](figures/evidence-contract.svg)
+
+A frontend hands the backend a `lifter_ir_v1` program with evidence on every entity. The backend admits it under the `core` profile, resolves and restructures it, and publishes readable Luau only under the `emission` profile; anything it cannot justify becomes a typed diagnostic that names the entity and, for an obligation, its kind and the profile it blocks.
+
+![Two paths from one source program into one backend, compared under the official Luau VM](figures/two-paths.svg)
+
+The same author-owned program is lifted twice, once from its syntax tree and once from the official compiler's disassembly listing, through the same backend; both outputs and a forced-dispatcher control are executed against the original under the official Luau VM over an input grid. A disagreement is a finding, never silenced.
+
+![The piecewise_chain control-flow graph on the disassembly path and the source path](figures/piecewise-chain-cfg.svg)
+
+What that caught: on `piecewise_chain` the disassembly path produced output that passed every static gate, compiled and parsed, and returned nothing for every non-negative selector; the compiler shares one return among four arms, and the planner absorbed it into the wrong arm. The oracle exposed it, the control confined it to structuring, and the repair and its regression test are in this repository.
+
 ## Release note
 
 This repository is the proof of concept behind the preprint *Checked, Not Trusted: Typed Evidence Contracts and Paired-Representation Testing for Luau Lifting Backends*: the backend and the two frontends the paper evaluated, cleaned up for release and verified as the build section below describes (every unit test and conformance step passes, and a fresh clone builds with the documented tool options). The paper's known limitations are listed at the end of this file; if anything else goes wrong, please open an issue.

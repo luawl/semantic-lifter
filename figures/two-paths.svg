@@ -1,0 +1,99 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="628" viewBox="0 0 1200 628" role="img" font-family="Arial, Helvetica, sans-serif">
+<title>Fig. B — two paths from one source program into one frozen backend, checked by the native observer against the original bytecode</title>
+<desc>One source program at the left feeds two paths. Path 1: luau-ast, then the AST frontend, then a handoff. Path 2: luau-compile -O0, then a text listing, then adapter + bridge, then a handoff. Both handoffs enter one box, frozen backend (cb0605c5…), which leads down to emitted Luau (automatic; dispatcher), then luau-compile, then the native observer. The original bytecode, built from the same source program by luau-compile --binary -O0 -g0, enters the native observer from below. The observer's output, to the right, is agreement per input (grid). A footnote box under the two paths reads: same source, same compiler build; disassembly side is a scalar single-function listing parser.</desc>
+<defs>
+  <marker id="mk-flow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="#526579"/></marker>
+  <style>
+    text { font-family: Arial, Helvetica, sans-serif; fill: #1f2d3d; }
+    .title { font-size: 20px; font-weight: 700; }
+    .pathlbl { font-size: 13px; font-weight: 700; fill: #4a5d70; }
+    .node { font-size: 15px; font-weight: 700; text-anchor: middle; }
+    .nodebig { font-size: 16px; font-weight: 700; text-anchor: middle; }
+    .node14 { font-size: 14px; font-weight: 700; text-anchor: middle; }
+    .sub { font-size: 14px; fill: #3c4f63; text-anchor: middle; }
+    .notetext { font-size: 13px; fill: #3c4f63; text-anchor: middle; }
+    .box { fill: #f5f8fb; stroke: #526579; stroke-width: 1.6; }
+    .backend { fill: #e6eef7; stroke: #2f4a66; stroke-width: 2.4; }
+    .observer { fill: #f0edfa; stroke: #6a5a9e; stroke-width: 1.8; }
+    .out { fill: #ffffff; stroke: #243447; stroke-width: 1.8; }
+    .note { fill: #fafafa; stroke: #9aa7b4; stroke-width: 1; }
+    .flow { fill: none; stroke: #526579; stroke-width: 1.8; }
+  </style>
+</defs>
+<rect x="0" y="0" width="1200" height="628" fill="#ffffff"/>
+
+<text x="24" y="36" class="title">Two paths into one frozen backend, checked against the original bytecode</text>
+
+<!-- Path labels -->
+<text x="162" y="76" class="pathlbl">path 1</text>
+<text x="162" y="188" class="pathlbl">path 2</text>
+
+<!-- One source program -->
+<rect x="24" y="84" width="110" height="168" rx="8" class="box"/>
+<text x="79" y="163" class="node">source</text>
+<text x="79" y="183" class="node">program</text>
+<path d="M134 112 H162" class="flow" marker-end="url(#mk-flow)"/>
+<path d="M134 224 H162" class="flow" marker-end="url(#mk-flow)"/>
+
+<!-- Path 1: luau-ast -> AST frontend -> handoff -->
+<rect x="162" y="84" width="150" height="56" rx="8" class="box"/>
+<text x="237" y="117" class="node">luau-ast</text>
+<path d="M312 112 H474" class="flow" marker-end="url(#mk-flow)"/>
+<rect x="474" y="84" width="150" height="56" rx="8" class="box"/>
+<text x="549" y="117" class="node">AST frontend</text>
+<path d="M624 112 H650" class="flow" marker-end="url(#mk-flow)"/>
+<rect x="650" y="84" width="90" height="56" rx="8" class="box"/>
+<text x="695" y="117" class="node">handoff</text>
+<path d="M740 112 H776" class="flow" marker-end="url(#mk-flow)"/>
+
+<!-- Path 2: luau-compile -O0 -> text listing -> adapter + bridge -> handoff -->
+<rect x="162" y="196" width="150" height="56" rx="8" class="box"/>
+<text x="237" y="229" class="node">luau-compile -O0</text>
+<path d="M312 224 H338" class="flow" marker-end="url(#mk-flow)"/>
+<rect x="338" y="196" width="110" height="56" rx="8" class="box"/>
+<text x="393" y="229" class="node">text listing</text>
+<path d="M448 224 H474" class="flow" marker-end="url(#mk-flow)"/>
+<rect x="474" y="196" width="150" height="56" rx="8" class="box"/>
+<text x="549" y="229" class="node">adapter + bridge</text>
+<path d="M624 224 H650" class="flow" marker-end="url(#mk-flow)"/>
+<rect x="650" y="196" width="90" height="56" rx="8" class="box"/>
+<text x="695" y="229" class="node">handoff</text>
+<path d="M740 224 H776" class="flow" marker-end="url(#mk-flow)"/>
+
+<!-- Footnote box under the two paths -->
+<rect x="162" y="290" width="578" height="46" rx="6" class="note"/>
+<text x="451" y="318" class="notetext">same source, same compiler build; disassembly side is a scalar single-function listing parser</text>
+
+<!-- One frozen backend -->
+<rect x="776" y="84" width="200" height="168" rx="10" class="backend"/>
+<text x="876" y="163" class="nodebig">frozen backend</text>
+<text x="876" y="185" class="sub">(cb0605c5…)</text>
+
+<!-- Backend -> emitted Luau -> luau-compile -> native observer -->
+<path d="M876 252 V284" class="flow" marker-end="url(#mk-flow)"/>
+<rect x="776" y="284" width="200" height="56" rx="8" class="box"/>
+<text x="876" y="307" class="node">emitted Luau</text>
+<text x="876" y="328" class="sub">(automatic; dispatcher)</text>
+<path d="M876 340 V372" class="flow" marker-end="url(#mk-flow)"/>
+<rect x="776" y="372" width="200" height="44" rx="8" class="box"/>
+<text x="876" y="399" class="node">luau-compile</text>
+<path d="M876 416 V448" class="flow" marker-end="url(#mk-flow)"/>
+<rect x="776" y="448" width="200" height="56" rx="8" class="observer"/>
+<text x="876" y="481" class="node">native observer</text>
+
+<!-- Output -->
+<path d="M976 476 H1010" class="flow" marker-end="url(#mk-flow)"/>
+<rect x="1010" y="444" width="166" height="64" rx="8" class="out"/>
+<text x="1093" y="472" class="node14">agreement per input</text>
+<text x="1093" y="493" class="sub">(grid)</text>
+
+<!-- Original bytecode enters the observer from below -->
+<rect x="726" y="544" width="300" height="60" rx="8" class="box"/>
+<text x="876" y="569" class="node">original bytecode</text>
+<text x="876" y="591" class="sub">luau-compile --binary -O0 -g0</text>
+<path d="M876 544 V504" class="flow" marker-end="url(#mk-flow)"/>
+
+<!-- Same source program -> original bytecode -->
+<path d="M79 252 V574 H726" class="flow" marker-end="url(#mk-flow)"/>
+</svg>
