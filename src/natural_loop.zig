@@ -725,6 +725,18 @@ pub fn outsidePathMustTerminateAlloc(
     membership: []const bool,
     start: ir.BlockId,
 ) Error!bool {
+    return outsidePathMustTerminateOrReachAlloc(allocator, analysis, membership, start, null);
+}
+
+/// As outsidePathMustTerminateAlloc, except that a path ends when it reaches
+/// sink: the sink counts as terminating and its successors are not walked.
+pub fn outsidePathMustTerminateOrReachAlloc(
+    allocator: std.mem.Allocator,
+    analysis: *const cfg.Analysis,
+    membership: []const bool,
+    start: ir.BlockId,
+    sink: ?ir.BlockId,
+) Error!bool {
     if (membership.len != analysis.function.blocks.len) return error.UnsupportedShape;
     const start_index = analysis.blockIndex(start) orelse return error.UnsupportedShape;
     if (membership[start_index] or !analysis.isReachable(start)) return false;
@@ -740,6 +752,7 @@ pub fn outsidePathMustTerminateAlloc(
     var pending_len: usize = 1;
     while (pending_index < pending_len) : (pending_index += 1) {
         const current = pending[pending_index];
+        if (sink != null and current == sink.?) continue;
         for (0..analysis.successorCount(current)) |successor_index| {
             const successor = analysis.successorAt(current, successor_index) orelse return error.UnsupportedShape;
             const local_index = analysis.blockIndex(successor) orelse return error.UnsupportedShape;
@@ -767,7 +780,7 @@ pub fn outsidePathMustTerminateAlloc(
     for (active, 0..) |is_active, local_index| {
         if (!is_active) continue;
         const block = analysis.function.blocks[local_index];
-        if (isStructuredTerminal(analysis.program.blocks[block.index()].terminator)) {
+        if (isStructuredTerminal(analysis.program.blocks[block.index()].terminator) or (sink != null and block == sink.?)) {
             must_terminate[local_index] = true;
             pending[termination_queue_len] = block;
             termination_queue_len += 1;
