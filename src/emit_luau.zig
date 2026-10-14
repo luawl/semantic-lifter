@@ -1538,6 +1538,27 @@ fn emitElseIfChain(
     try emitBranchArm(output, allocator, program, emission_plan, scopes, else_edge, structured.else_region, structured.join, arm_indent, place_aliases);
 }
 
+/// A privately owned return clone: a block with exactly one predecessor, no instructions, and a
+/// `return <values>` terminator whose values are exactly its parameters. Node-split normalization
+/// produces such clones (one per escape) so a multi-entry ring becomes reducible; because the clone
+/// has a single predecessor its parameters are bound only from that edge, so the clone's return can
+/// be emitted inline as `return <edge arguments>` wherever the edge is reached.
+fn isPrivatelyOwnedReturnClone(
+    analysis: *const cfg.Analysis,
+    program: *const ir.Program,
+    block_id: ir.BlockId,
+) bool {
+    if (block_id.index() >= program.blocks.len) return false;
+    const block = program.blocks[block_id.index()];
+    if (block.instructions.len != 0) return false;
+    const returns = switch (block.terminator) {
+        .return_values => |values| values,
+        else => return false,
+    };
+    if (!std.mem.eql(ir.ValueId, returns, block.parameters)) return false;
+    return analysis.predecessorCount(block_id) == 1;
+}
+
 fn emitBranchArmImpl(
     output: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
@@ -1643,6 +1664,9 @@ fn emitBranchArmImpl(
         if (projection.edge == null and region.nodes.len == 0) {
             if (edge.target != projection.target) return error.UnsupportedControlFlow;
         } else if (region.nodes.len == 0 or edge.target != region.nodes[0].blockId()) {
+            if (region.nodes.len == 0 and isPrivatelyOwnedReturnClone(scopes.analysis, program, edge.target)) {
+                return emitReturnArguments(output, allocator, program, valuePlan(emission_plan, place_aliases), edge.arguments, indent);
+            }
             return error.UnsupportedControlFlow;
         }
     }
@@ -1975,7 +1999,18 @@ fn emitLoop(
         return error.UnsupportedControlFlow;
     }
 
-    try prepareLoopExit(output, allocator, program, emission_plan, enclosing_region, node_index, loop_plan.exit_edge.target, indent);
+    const exit_is_return_clone = isPrivatelyOwnedReturnClone(scopes.analysis, program, loop_plan.exit_edge.target);
+    // Loop exit into a return clone: run prepareLoopExit exactly as before; only when it raises
+    // error.UnsupportedControlFlow on a privately owned return clone is the exit inlined as a
+    // return instead (prepareLoopExit ignores `output` and mutates nothing, so the catch is safe).
+    var inline_return_exit = false;
+    prepareLoopExit(output, allocator, program, emission_plan, enclosing_region, node_index, loop_plan.exit_edge.target, indent) catch |err| {
+        if (err == error.UnsupportedControlFlow and exit_is_return_clone) {
+            inline_return_exit = true;
+        } else {
+            return err;
+        }
+    };
     const loop_indent = try allocDeeperIndent(allocator, indent);
     defer allocator.free(loop_indent);
     const arm_indent = try allocDeeperIndent(allocator, loop_indent);
@@ -1998,13 +2033,13 @@ fn emitLoop(
     if (loop_plan.continue_on_true) {
         try emitLoopBody(output, allocator, program, emission_plan, scopes, loop_plan, arm_indent, place_aliases, predeclared_header);
     } else {
-        try emitLoopExit(output, allocator, program, emission_plan, loop_plan.exit_edge, arm_indent, place_aliases);
+        try emitLoopExitTransfer(output, allocator, program, emission_plan, loop_plan.exit_edge, inline_return_exit, arm_indent, place_aliases);
     }
 
     try output.appendSlice(allocator, loop_indent);
     try output.appendSlice(allocator, "else\n");
     if (loop_plan.continue_on_true) {
-        try emitLoopExit(output, allocator, program, emission_plan, loop_plan.exit_edge, arm_indent, place_aliases);
+        try emitLoopExitTransfer(output, allocator, program, emission_plan, loop_plan.exit_edge, inline_return_exit, arm_indent, place_aliases);
     } else {
         try emitLoopBody(output, allocator, program, emission_plan, scopes, loop_plan, arm_indent, place_aliases, predeclared_header);
     }
@@ -2631,6 +2666,58 @@ fn emitInfiniteLoop(
 fn emitLoopExit(output: *std.ArrayList(u8), allocator: std.mem.Allocator, program: *const ir.Program, emission_plan: *const EmissionPlan, edge: ir.Edge, indent: []const u8, place_aliases: []const PlaceAlias) !void {
     try emitEdgeParameters(output, allocator, program, emission_plan, program.blocks[edge.target.index()], edge.arguments, indent, false, place_aliases);
     try emitBreakStatement(output, allocator, indent);
+}
+
+/// Emit `return <values>` for an explicit value list, mirroring the ordinary `return_values`
+/// terminator rendering (scalar uses for the leading values, a root use for the last).
+fn emitReturnArguments(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    values: render.ValuePlan,
+    arguments: []const ir.ValueId,
+    indent: []const u8,
+) !void {
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "return");
+    if (arguments.len != 0) try output.append(allocator, ' ');
+    for (arguments, 0..) |value, index| {
+        if (index != 0) try output.appendSlice(allocator, ", ");
+        if (index + 1 < arguments.len)
+            try render.valueUseScalar(output, allocator, program, values, value)
+        else
+            try render.valueUseRoot(output, allocator, program, values, value);
+    }
+    try output.append(allocator, '\n');
+}
+
+/// Emit a loop's exit transfer. When the exit edge enters a privately owned return clone the loop
+/// returns inline (`return <edge arguments>`) in place of the usual edge-parameter copy + `break`.
+/// The return is wrapped in `do ... end` so it stays a non-terminal statement, exactly as
+/// `emitBreakStatement` wraps `break`, because loop escape propagation is emitted after it in the
+/// same block; the edge arguments are the clone's incoming values, already in scope, so the clone's
+/// parameters (which are never declared, the clone not being walked) are not referenced.
+fn emitLoopExitTransfer(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    edge: ir.Edge,
+    exit_is_return_clone: bool,
+    indent: []const u8,
+    place_aliases: []const PlaceAlias,
+) (EmitError || std.mem.Allocator.Error)!void {
+    if (exit_is_return_clone) {
+        const body_indent = try allocDeeperIndent(allocator, indent);
+        defer allocator.free(body_indent);
+        try output.appendSlice(allocator, indent);
+        try output.appendSlice(allocator, "do\n");
+        try emitReturnArguments(output, allocator, program, valuePlan(emission_plan, place_aliases), edge.arguments, body_indent);
+        try output.appendSlice(allocator, indent);
+        try output.appendSlice(allocator, "end\n");
+        return;
+    }
+    try emitLoopExit(output, allocator, program, emission_plan, edge, indent, place_aliases);
 }
 
 fn emitBreakStatement(output: *std.ArrayList(u8), allocator: std.mem.Allocator, indent: []const u8) std.mem.Allocator.Error!void {
