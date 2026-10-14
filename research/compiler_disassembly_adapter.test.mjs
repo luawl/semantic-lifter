@@ -181,3 +181,42 @@ test('imports stay refused at the pinned level', () => {
     (error) => error.name === 'DisassemblyRefusal' && error.code === 'unsupported_opcode' && error.opcode === 'GETIMPORT'
       && /unsupported opcode GETIMPORT at disassembly line 5/.test(error.message));
 });
+
+// Task T2.3 (T2-ADAPTER step 3). Excerpts are verbatim -O0 listing lines of the author-owned diagnosis programs
+// p03_call_fixed (lines 4, 12-14 and 19) and p05_namecall (lines 4-5 and 15-17); the declared parameter_count makes
+// the registers the full listing initialises elsewhere parameters of the excerpt.
+const project = (instruction, expected) => Object.fromEntries(Object.keys(expected).map((key) => [key, instruction[key]]));
+const callExcerpt = ["K2: 'tostring'", "GETGLOBAL R3 K2 ['tostring']", 'MOVE R4 R2', 'CALL R3 1 0', 'RETURN R2 1'];
+const namecallExcerpt = ['K2: 2', "K3: 'rep'", 'LOADK R7 K2 [2]', "NAMECALL R5 R5 K3 ['rep']", 'CALL R5 2 1', 'RETURN R5 1'];
+
+test('fixed calls name callee, arguments and results', () => {
+  const statement = { op: 'CALL', kind: 'call', callee: 3, arguments: [4], result_count: 0, reads: [3, 4], writes: [],
+    clobbers_from: 3 };
+  const { instructions } = parseDisassembly(excerpt(...callExcerpt), { parameter_count: 3 });
+  assert.deepEqual(project(instructions[2], statement), statement);
+  const results = { kind: 'call', callee: 3, arguments: [4], result_count: 2, reads: [3, 4], writes: [3, 4], clobbers_from: 5 };
+  const [call] = parseDisassembly(excerpt('CALL R3 1 2', 'RETURN R3 2'), { parameter_count: 5 }).instructions;
+  assert.deepEqual(project(call, results), results);
+});
+
+test('a call clobbers its frame', () => {
+  const lines = [...callExcerpt.slice(0, 4), 'MOVE R9 R4', ...callExcerpt.slice(4)];
+  assert.throws(() => parseDisassembly(excerpt(...lines), { parameter_count: 3 }),
+    (error) => error.name === 'DisassemblyRefusal' && error.code === 'uninitialized_register'
+      && /uninitialized R4 at disassembly line 6/.test(error.message));
+});
+
+test('NAMECALL fuses with its CALL', () => {
+  const { instructions } = parseDisassembly(excerpt(...namecallExcerpt), { parameter_count: 6 });
+  assert.equal(instructions.length, 3);
+  const fused = { op: 'NAMECALL', kind: 'namecall', receiver: 5, method: 'rep', arguments: [7], result_count: 1,
+    reads: [5, 7], writes: [5], clobbers_from: 6, line_number: 5, line_numbers: [5, 6] };
+  assert.deepEqual(project(instructions[1], fused), fused);
+  const refused = (code) => (error) => error.name === 'DisassemblyRefusal' && error.code === code;
+  assert.throws(() => parseDisassembly(excerpt(...namecallExcerpt.slice(0, 4), 'MOVE R9 R0', ...namecallExcerpt.slice(4)),
+    { parameter_count: 6 }), refused('namecall_without_call'));
+  assert.throws(() => parseDisassembly(excerpt(...namecallExcerpt.map((line) => (line === 'CALL R5 2 1' ? 'L0: CALL R5 2 1' : line))),
+    { parameter_count: 6 }), refused('label_inside_namecall'));
+  assert.throws(() => parseDisassembly(excerpt(...namecallExcerpt.map((line) => line.replaceAll("'rep'", "'r p'"))),
+    { parameter_count: 6 }), refused('non_identifier_name'));
+});

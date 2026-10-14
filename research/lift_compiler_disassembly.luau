@@ -51,11 +51,16 @@ end
 local blocks = {}
 for index, instruction in handoff.instructions do
     local lineEvidence = builder:addEvidence("decoded_record", `compiler-listing:{handoff.function_index}:line:{instruction.line_number}`, handoff.listing_sha256)
-    blocks[index] = builder:reserveBlock(worker, { name_hint = `instruction_{index}`, evidence = { lineEvidence } })
+    local cited = { lineEvidence }
+    if instruction.kind == "namecall" then
+        -- The fused NAMECALL + CALL pair is one block; it also cites the CALL line's record.
+        table.insert(cited, builder:addEvidence("decoded_record", `compiler-listing:{handoff.function_index}:line:{instruction.line_numbers[2]}`, handoff.listing_sha256))
+    end
+    blocks[index] = builder:reserveBlock(worker, { name_hint = `instruction_{index}`, evidence = cited })
 end
 builder:finalizeBlock(entry, IR.Terminator.jump(IR.Edge(blocks[1])))
 for index, instruction in handoff.instructions do
-    assert(table.find({ "constant", "move", "binary", "unary", "concat", "jump", "branch", "return", "environment_get", "environment_set" }, instruction.kind) ~= nil,
+    assert(table.find({ "constant", "move", "binary", "unary", "concat", "jump", "branch", "return", "environment_get", "environment_set", "call", "namecall" }, instruction.kind) ~= nil,
         "unsupported handoff instruction kind")
     local block = blocks[index]
     local blockEvidence = builder.program.blocks[block + 1].evidence
@@ -68,6 +73,7 @@ for index, instruction in handoff.instructions do
         reads[slot] = value(IR.Operation.placeRead(places[reg]), IR.Types.dynamic(), IR.Effects.placeRead())
     end
     local result: number? = nil
+    local results: { number }? = nil
     if instruction.kind == "constant" then
         local literal: any = instruction.value
         local kind: any
@@ -104,9 +110,36 @@ for index, instruction in handoff.instructions do
     elseif instruction.kind == "environment_set" then
         -- A global assignment has no result; its value is the per-instruction place read of the source register.
         builder:addInstruction(block, IR.Operation.environmentSet(IR.EnvironmentTarget.ambient(), instruction.name, reads[1]), {}, { effects = IR.Effects.semanticTableWrite(), evidence = blockEvidence })
+    elseif instruction.kind == "call" or instruction.kind == "namecall" then
+        -- A call whose callee the frontend cannot see (T2-IR-GAPS.md 3.5): fixed(m) dynamic results, effects
+        -- dynamicCall (namecall: IR.Effects.namecall(), the same set), no obligations. reads[1] is the callee R(a)
+        -- (namecall: the receiver R(b)); the remaining reads are the arguments.
+        local arguments: { number } = {}
+        for slot = 2, #reads do
+            table.insert(arguments, reads[slot])
+        end
+        local resultSpecs = {}
+        for _ = 1, instruction.result_count do
+            table.insert(resultSpecs, { type = IR.Types.dynamic() })
+        end
+        local arity = IR.ResultArity.fixed(instruction.result_count)
+        local operation = if instruction.kind == "namecall"
+            then IR.Operation.namecall(reads[1], instruction.method, arguments, arity)
+            else IR.Operation.call(reads[1], arguments, arity)
+        local effects = if instruction.kind == "namecall" then IR.Effects.namecall() else IR.Effects.dynamicCall()
+        local _, values = builder:addInstruction(block, operation, resultSpecs, { effects = effects, evidence = blockEvidence })
+        results = values
     end
     if result ~= nil and places[instruction.writes[1]] ~= nil then
         builder:addInstruction(block, IR.Operation.placeWrite(places[instruction.writes[1]], result), {}, { effects = IR.Effects.placeWrite(), evidence = blockEvidence })
+    end
+    if results ~= nil then
+        -- call and namecall: result i goes to writes[i], only where that register has a place (decision D3).
+        for slot, reg in instruction.writes do
+            if places[reg] ~= nil then
+                builder:addInstruction(block, IR.Operation.placeWrite(places[reg], results[slot]), {}, { effects = IR.Effects.placeWrite(), evidence = blockEvidence })
+            end
+        end
     end
     if instruction.kind == "return" then
         builder:finalizeBlock(block, IR.Terminator.returnValues(reads))
