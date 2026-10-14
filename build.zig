@@ -1,17 +1,18 @@
 const std = @import("std");
 
-// External tools (the Lune runtime and the Luau 0.720 tools) are resolved once at the top of
-// build() from the -Dlune / -Dluau-compile / -Dluau-ast / -Dluau-analyze options and cached here,
+// External tools (the Lune runtime, the Luau 0.720 tools and Node) are resolved once at the top of
+// build() from the -Dlune / -Dluau-compile / -Dluau-ast / -Dluau-analyze / -Dnode options and cached here,
 // so a clone that passes the options (or has the tools on PATH) can build and test. This machine's
 // workspace paths are never hard-coded; see resolveExternalTool.
 var resolved_lune: []const u8 = "";
 var resolved_luau_compile: []const u8 = "";
 var resolved_luau_ast: []const u8 = "";
 var resolved_luau_analyze: []const u8 = "";
+var resolved_node: []const u8 = "";
 
 fn failMissingTool(name: []const u8) noreturn {
     std.debug.print(
-        "semantic-lifter: external tool {s} not found; pass -D{s}=<path> (needs Lune 0.10.4 and the Luau 0.720 tools)\n",
+        "semantic-lifter: external tool {s} not found; pass -D{s}=<path> (needs Lune 0.10.4, the Luau 0.720 tools and Node 24)\n",
         .{ name, name },
     );
     std.process.exit(1);
@@ -79,6 +80,11 @@ fn luauAnalyzeExe(b: *std.Build) []const u8 {
     return resolved_luau_analyze;
 }
 
+fn nodeExe(b: *std.Build) []const u8 {
+    _ = b;
+    return resolved_node;
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -104,10 +110,12 @@ pub fn build(b: *std.Build) void {
     const luau_compile_option = b.option([]const u8, "luau-compile", "Path to luau-compile from the Luau 0.720 tools (default: luau-compile on PATH)");
     const luau_ast_option = b.option([]const u8, "luau-ast", "Path to luau-ast from the Luau 0.720 tools (default: luau-ast on PATH)");
     const luau_analyze_option = b.option([]const u8, "luau-analyze", "Path to luau-analyze from the Luau 0.720 tools (default: luau-analyze on PATH)");
+    const node_option = b.option([]const u8, "node", "Path to the Node 24 runtime, which runs the compiler-disassembly adapter tests (default: node on PATH)");
     resolved_lune = resolveExternalTool(b, lune_option, "lune");
     resolved_luau_compile = resolveExternalTool(b, luau_compile_option, "luau-compile");
     resolved_luau_ast = resolveExternalTool(b, luau_ast_option, "luau-ast");
     resolved_luau_analyze = resolveExternalTool(b, luau_analyze_option, "luau-analyze");
+    resolved_node = resolveExternalTool(b, node_option, "node");
 
     const z3_dir = if (z3_enabled) checkZ3Dir(b, z3_dir_option) else "";
     const z3_include = b.pathJoin(&.{ z3_dir, "include" });
@@ -1492,6 +1500,12 @@ pub fn build(b: *std.Build) void {
     run_temporal_loop_transfer_tests.addFileArg(b.path("luau/temporal_loop_transfer_test.luau"));
     addTemporalTestInputs(b, run_temporal_loop_transfer_tests);
 
+    const run_disassembly_adapter_tests = b.addSystemCommand(&.{ nodeExe(b), "--test" });
+    run_disassembly_adapter_tests.addFileArg(b.path("frontends/disassembly/compiler_disassembly_adapter.test.mjs"));
+    run_disassembly_adapter_tests.addFileInput(b.path("frontends/disassembly/compiler_disassembly_adapter.mjs"));
+    const disassembly_test_step = b.step("test-disassembly", "Run the compiler-disassembly adapter tests under Node");
+    disassembly_test_step.dependOn(&run_disassembly_adapter_tests.step);
+
     const test_step = b.step("test", "Run semantic lifter tests");
     test_step.dependOn(&run_module_tests.step);
     test_step.dependOn(&run_cli_tests.step);
@@ -1504,6 +1518,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_generated_lexical_oracle_tests.step);
     test_step.dependOn(&run_luau_ir_typecheck.step);
     test_step.dependOn(&run_frontend_tests.step);
+    test_step.dependOn(&run_disassembly_adapter_tests.step);
     test_step.dependOn(&run_recovery_manifest_tests.step);
     test_step.dependOn(&run_target_proof_bundle_tests.step);
     test_step.dependOn(&run_ast_admission_tests.step);

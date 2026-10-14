@@ -288,15 +288,17 @@ repository.
 
 ## Release note
 
-This repository is the implementation behind the forthcoming preprint *Checked, Not Trusted: Typed Evidence Contracts and Paired-Representation Testing for Luau Lifting Backends*: the backend and the frontends in this repository, cleaned up for release. The build section below verifies the backend and the source frontend (every unit test and conformance step passes, and a fresh clone builds with the documented tool options), and `node --test` runs the compiler-disassembly frontend's tests. The preprint reports the evaluation and the issue tracker holds the open items; anything else is welcome as an issue.
+This repository is the implementation behind the forthcoming preprint *Checked, Not Trusted: Typed Evidence Contracts and Paired-Representation Testing for Luau Lifting Backends*: the backend and the frontends in this repository, cleaned up for release. The build section below verifies the backend and the source frontend (every unit test and conformance step passes, and a fresh clone builds with the documented tool options); its `test` step also runs the compiler-disassembly adapter's tests under Node. The preprint reports the evaluation and the issue tracker holds the open items; anything else is welcome as an issue.
 
 ## Repository contents
 
 - `src/`: the backend (IR, validation, solving, restructuring, emission) and the command-line
   interface, `semantic-lifter`.
 - `luau/`: the source frontend, the IR library and codec, and the conformance fixtures and audits.
-- `research/compiler_disassembly_adapter.mjs` and `research/lift_compiler_disassembly.luau`: the
-  compiler-disassembly frontend (`research/compiler_disassembly_adapter.test.mjs` tests the adapter).
+- `frontends/disassembly/`: the compiler-disassembly frontend: `compiler_disassembly_adapter.mjs`
+  (Node) turns a `luau-compile --text` listing into a handoff document, `lift_compiler_disassembly.luau`
+  (Lune) turns the handoff into `lifter_ir_v1`, and `compiler_disassembly_adapter.test.mjs` holds the
+  adapter's tests, which `zig build test` runs.
 - `build.zig` and `build.ps1`: the build graph and its Windows wrapper.
 - `LICENSE`, `CONTRIBUTING.md` and `.gitattributes`.
 
@@ -308,8 +310,9 @@ Manuscripts, run records and evidence archives will be published with the prepri
 - Lune 0.10.4 ([lune-org/lune releases](https://github.com/lune-org/lune/releases)).
 - The Luau 0.720 command-line tools `luau-compile`, `luau-ast` and `luau-analyze`
   ([luau-lang/luau releases, tag `0.720`](https://github.com/luau-lang/luau/releases/tag/0.720)).
-- Node 24, only for the disassembly adapter and its test
-  (`node --test research/compiler_disassembly_adapter.test.mjs`).
+- Node 24 ([nodejs.org](https://nodejs.org/)). Node is a build requirement: `zig build` resolves it
+  like the four tools above, so every build command needs `node` on `PATH` or `-Dnode=<path>`, and
+  `zig build test` runs the compiler-disassembly adapter's tests with it.
 - Z3 4.16.0, optional ([Z3Prover/z3 releases](https://github.com/Z3Prover/z3/releases)):
   `-Dz3=true -Dz3-dir=<path>` (off by default) compiles the Z3 backend against the C API in `<path>`,
   an unpacked Z3 4.16.0 release for Windows x64 that holds `include/z3.h`, `bin/libz3.lib` and
@@ -320,24 +323,27 @@ Manuscripts, run records and evidence archives will be published with the prepri
 
 ## Build and test
 
-Every `zig build` command resolves the four external tools before it runs any step, so each command
-below takes their paths. An option can be left out when that tool is on `PATH` under its own name.
+Every `zig build` command resolves the five external tools (Lune, `luau-compile`, `luau-ast`,
+`luau-analyze` and Node) before it runs any step, so each command below takes their paths. An option
+can be left out when that tool is on `PATH` under its own name.
 
 ```sh
-zig build test -Doptimize=ReleaseFast -Dlune=<path> -Dluau-compile=<path> -Dluau-ast=<path> -Dluau-analyze=<path>
-zig build conformance -Doptimize=ReleaseFast -Dlune=<path> -Dluau-compile=<path> -Dluau-ast=<path> -Dluau-analyze=<path>
-zig build -Doptimize=ReleaseFast -Dlune=<path> -Dluau-compile=<path> -Dluau-ast=<path> -Dluau-analyze=<path>
+zig build test -Doptimize=ReleaseFast -Dlune=<path> -Dluau-compile=<path> -Dluau-ast=<path> -Dluau-analyze=<path> -Dnode=<path>
+zig build conformance -Doptimize=ReleaseFast -Dlune=<path> -Dluau-compile=<path> -Dluau-ast=<path> -Dluau-analyze=<path> -Dnode=<path>
+zig build -Doptimize=ReleaseFast -Dlune=<path> -Dluau-compile=<path> -Dluau-ast=<path> -Dluau-analyze=<path> -Dnode=<path>
 ```
 
-`test` runs the Zig unit tests and the Luau frontend's tests; `conformance` validates, emits,
-compiles and runs the generic fixtures and audits; the install step (the last line) puts `semantic-lifter.exe`, with the `proof-attest.exe`
-helper, under `zig-out/bin/`. `-Doptimize` also takes `Debug` and `ReleaseSafe`.
+`test` runs the Zig unit tests, the Luau frontend's tests and the compiler-disassembly adapter's
+tests (`test-disassembly` runs the adapter's tests alone); `conformance` validates, emits, compiles
+and runs the generic fixtures and audits; the install step (the last line) puts
+`semantic-lifter.exe`, with the `proof-attest.exe` helper, under `zig-out/bin/`. `-Doptimize` also
+takes `Debug` and `ReleaseSafe`.
 
 On Windows, `build.ps1 <step> [zig build args]` runs the same build, for example
 `pwsh -File build.ps1 test -Doptimize=ReleaseFast`. It uses the Zig toolchain under
 `tools\zig-x86_64-windows-0.16.0\` when that directory exists and `zig` from `PATH` otherwise, runs
 in the repository root, and adds each of the four tool options that the caller did not pass when it
-finds that tool in the maintainers' workspace layout. It never sets `--prefix` or the cache
+finds that tool in the maintainers' workspace layout; Node comes from `PATH` unless `-Dnode` is passed. It never sets `--prefix` or the cache
 directories; pass them as arguments when you need them. Every other argument, such as
 `-Dz3=true -Dz3-dir=<path>`, reaches `zig build` unchanged, and a `-D` value that PowerShell splits
 at a drive colon or at a dot is joined again.
@@ -361,8 +367,8 @@ that `function_index` selects into a handoff document, then into IR; the one-lin
 compiler and the adapter in one step):
 
 ```sh
-node --input-type=module -e "import { execFileSync } from 'node:child_process'; import { writeFileSync } from 'node:fs'; import { parseDisassembly } from './research/compiler_disassembly_adapter.mjs'; const [compiler, source, out] = process.argv.slice(1); writeFileSync(out, JSON.stringify(parseDisassembly(execFileSync(compiler, ['--text', '--dump-constants', '-O0', '-g0', source], { encoding: 'utf8' }), { function_index: 0, parameter_count: 2 })));" <path to luau-compile> <input.luau> <handoff.json>
-lune run research/lift_compiler_disassembly.luau <handoff.json> <program.ir.json> <program-id>
+node --input-type=module -e "import { execFileSync } from 'node:child_process'; import { writeFileSync } from 'node:fs'; import { parseDisassembly } from './frontends/disassembly/compiler_disassembly_adapter.mjs'; const [compiler, source, out] = process.argv.slice(1); writeFileSync(out, JSON.stringify(parseDisassembly(execFileSync(compiler, ['--text', '--dump-constants', '-O0', '-g0', source], { encoding: 'utf8' }), { function_index: 0, parameter_count: 2 })));" <path to luau-compile> <input.luau> <handoff.json>
+lune run frontends/disassembly/lift_compiler_disassembly.luau <handoff.json> <program.ir.json> <program-id>
 ```
 
 `function_index` selects the compiled function in the listing; the caller declares its signature,

@@ -1,7 +1,7 @@
 # The public repository holds the codebase only: the backend (src/, build.zig, build.ps1), the Luau
-# frontend, IR library and conformance fixtures (luau/), and the compiler-disassembly frontend files
-# under research/. Manuscripts, run records, evidence, test-data archives and working directories
-# stay out of the repository and are published separately (see README.md).
+# frontend, IR library and conformance fixtures (luau/), and the compiler-disassembly frontend
+# (frontends/disassembly/). Manuscripts, run records, evidence, test-data archives and working
+# directories stay out of the repository and are published separately (see README.md).
 
 # build outputs and caches
 /tmp/
@@ -23,6 +23,3 @@
 !/README.md
 !/CONTRIBUTING.md
 /research/*
-!/research/compiler_disassembly_adapter.mjs
-!/research/compiler_disassembly_adapter.test.mjs
-!/research/lift_compiler_disassembly.luau

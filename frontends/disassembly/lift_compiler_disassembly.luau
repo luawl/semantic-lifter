@@ -3,7 +3,7 @@
 local fs = require("@lune/fs")
 local process = require("@lune/process")
 local serde = require("@lune/serde")
-local IR = require("../luau/lifter_ir")
+local IR = require("../../luau/lifter_ir")
 
 local handoff: any = serde.decode("json", fs.readFile(process.args[1]))
 local version2 = handoff.schema_version == "compiler_disassembly_handoff_v2"
