@@ -2631,3 +2631,301 @@ test "authenticated arbitrary fallback uses the shared block budget" {
     no_history_program.edge_rewrites = &.{};
     try std.testing.expect(!Plan.shouldUseArbitraryFallbackForFunction(&no_history_program, function));
 }
+
+test "generic for with a code-carrying break stays a recognized loop when a cycle follows its exit" {
+    // Author-written worker(f, s, c, t, cond, g); the bracketed parts depend on the shape:
+    //   [while cond do]                          outer
+    //     [if g then]                            guard; the if joins at the continuation
+    //       for k, v in f, s, c do
+    //         if v then [t.hit = v] break end    code-carrying break unless plain_break
+    //       end                                  empty exit block, bypassed when forward
+    //     [end]
+    //     t.after = true                         the continuation
+    //   [end]
+    //   [while cond do t.tail = true end]        tail (top level only)
+    // Function 0 returns function_ref 1, so the generic_for_next is instruction 3.
+    const Synthetic = struct {
+        arena: std.mem.Allocator,
+        blocks: std.ArrayList(ir.Block) = .empty,
+        instructions: std.ArrayList(ir.Instruction) = .empty,
+        values: std.ArrayList(ir.Value) = .empty,
+        worker_blocks: std.ArrayList(ir.BlockId) = .empty,
+
+        const Self = @This();
+        const chunk_id = ir.FunctionId.fromIndex(0);
+        const worker_id = ir.FunctionId.fromIndex(1);
+        const evidence_ids = [_]ir.EvidenceId{ir.EvidenceId.fromIndex(0)};
+
+        const Shape = struct {
+            outer: bool = false,
+            guard: bool = false,
+            forward: bool = false,
+            plain_break: bool = false,
+            tail: bool = false,
+        };
+
+        const Built = struct {
+            program: ir.Program,
+            header: ir.BlockId,
+        };
+
+        fn value(self: *Self, function: ir.FunctionId, value_type: ir.ValueType, origin: ir.ValueOrigin, name: ?[]const u8) !ir.ValueId {
+            const id = ir.ValueId.fromIndex(self.values.items.len);
+            try self.values.append(self.arena, .{ .id = id, .function = function, .type = value_type, .name_hint = name, .origin = origin });
+            return id;
+        }
+
+        fn block(self: *Self, function: ir.FunctionId, name: []const u8, parameter_types: []const ir.ValueType) !ir.BlockId {
+            const id = ir.BlockId.fromIndex(self.blocks.items.len);
+            const parameters = try self.arena.alloc(ir.ValueId, parameter_types.len);
+            for (parameter_types, parameters, 0..) |parameter_type, *parameter, index| {
+                parameter.* = try self.value(function, parameter_type, .{ .block_parameter = .{ .block = id, .index = @intCast(index) } }, null);
+            }
+            try self.blocks.append(self.arena, .{
+                .id = id,
+                .function = function,
+                .name_hint = name,
+                .parameters = parameters,
+                .terminator = .{ .unreachable_block = {} },
+                .evidence = &evidence_ids,
+            });
+            if (function == worker_id) try self.worker_blocks.append(self.arena, id);
+            return id;
+        }
+
+        fn instruction(self: *Self, block_id: ir.BlockId, operation: ir.Operation, result_types: []const ir.ValueType, effects: ir.EffectSummary) ![]const ir.ValueId {
+            const id = ir.InstructionId.fromIndex(self.instructions.items.len);
+            const function = self.blocks.items[block_id.index()].function;
+            const results = try self.arena.alloc(ir.ValueId, result_types.len);
+            for (result_types, results, 0..) |result_type, *result, index| {
+                result.* = try self.value(function, result_type, .{ .instruction_result = .{ .instruction = id, .index = @intCast(index) } }, null);
+            }
+            try self.instructions.append(self.arena, .{
+                .id = id,
+                .block = block_id,
+                .operation = operation,
+                .results = results,
+                .effects = effects,
+                .evidence = &evidence_ids,
+            });
+            const owner = &self.blocks.items[block_id.index()];
+            const ids = try self.arena.alloc(ir.InstructionId, owner.instructions.len + 1);
+            @memcpy(ids[0..owner.instructions.len], owner.instructions);
+            ids[owner.instructions.len] = id;
+            owner.instructions = ids;
+            return results;
+        }
+
+        fn constant(self: *Self, block_id: ir.BlockId, literal: ir.Literal, value_type: ir.ValueType) !ir.ValueId {
+            return (try self.instruction(block_id, .{ .constant = literal }, &[_]ir.ValueType{value_type}, ir.EffectSummary.pure))[0];
+        }
+
+        fn tableSet(self: *Self, block_id: ir.BlockId, table: ir.ValueId, key: ir.ValueId, stored: ir.ValueId) !void {
+            _ = try self.instruction(block_id, .{ .table_set = .{
+                .table = table,
+                .key = key,
+                .value = stored,
+                .mode = .semantic,
+            } }, &[_]ir.ValueType{}, ir.EffectSummary.semantic_table_write);
+        }
+
+        fn jump(self: *Self, source: ir.BlockId, target: ir.BlockId, arguments: []const ir.ValueId) !void {
+            self.blocks.items[source.index()].terminator = .{ .jump = .{
+                .target = target,
+                .arguments = try self.arena.dupe(ir.ValueId, arguments),
+            } };
+        }
+
+        fn branch(self: *Self, source: ir.BlockId, condition: ir.ValueId, then_target: ir.BlockId, then_arguments: []const ir.ValueId, else_target: ir.BlockId) !void {
+            self.blocks.items[source.index()].terminator = .{ .branch = .{
+                .condition = condition,
+                .then_edge = .{ .target = then_target, .arguments = try self.arena.dupe(ir.ValueId, then_arguments) },
+                .else_edge = .{ .target = else_target },
+            } };
+        }
+
+        fn build(arena: std.mem.Allocator, program_id: []const u8, shape: Shape) !Built {
+            var self: Self = .{ .arena = arena };
+            const chunk_entry = try self.block(chunk_id, "entry", &[_]ir.ValueType{});
+            const parameter_names = [_][]const u8{ "f", "s", "c", "t", "cond", "g" };
+            var parameters: [parameter_names.len]ir.ValueId = undefined;
+            for (parameter_names, &parameters, 0..) |name, *parameter, index| {
+                parameter.* = try self.value(worker_id, ir.ValueType.dynamic, .{ .parameter = @intCast(index) }, name);
+            }
+            const f, const s, const c, const t, const cond, const g = parameters;
+            const worker_ref = (try self.instruction(chunk_entry, .{ .function_ref = worker_id }, &[_]ir.ValueType{ir.ValueType.function}, ir.EffectSummary.pure))[0];
+            self.blocks.items[chunk_entry.index()].terminator = .{ .return_values = try arena.dupe(ir.ValueId, &[_]ir.ValueId{worker_ref}) };
+
+            const entry = try self.block(worker_id, "entry", &[_]ir.ValueType{});
+            const while_header: ?ir.BlockId = if (shape.outer) try self.block(worker_id, "while_header", &[_]ir.ValueType{}) else null;
+            const guard: ?ir.BlockId = if (shape.guard) try self.block(worker_id, "then", &[_]ir.ValueType{}) else null;
+            const preheader = try self.block(worker_id, "preheader", &[_]ir.ValueType{});
+            const header = try self.block(worker_id, "generic_for_header", &[_]ir.ValueType{ .dynamic, .dynamic, .dynamic, .boolean });
+            const body = try self.block(worker_id, "generic_for_body", &[_]ir.ValueType{ .dynamic, .dynamic });
+            const side_exit: ?ir.BlockId = if (shape.plain_break) null else try self.block(worker_id, "then", &[_]ir.ValueType{});
+            const latch = try self.block(worker_id, "join", &[_]ir.ValueType{});
+            const loop_exit = try self.block(worker_id, "generic_for_exit", &[_]ir.ValueType{});
+            const continuation = try self.block(worker_id, "join", &[_]ir.ValueType{});
+            const tail_header: ?ir.BlockId = if (shape.tail) try self.block(worker_id, "while_header", &[_]ir.ValueType{}) else null;
+            const tail_body: ?ir.BlockId = if (shape.tail) try self.block(worker_id, "while_body", &[_]ir.ValueType{}) else null;
+            const while_exit: ?ir.BlockId = if (shape.outer or shape.tail) try self.block(worker_id, "while_exit", &[_]ir.ValueType{}) else null;
+
+            const loop_entry = guard orelse preheader;
+            if (while_header) |outer_header| {
+                try self.jump(entry, outer_header, &[_]ir.ValueId{});
+                try self.branch(outer_header, cond, loop_entry, &[_]ir.ValueId{}, while_exit.?);
+            } else {
+                try self.jump(entry, loop_entry, &[_]ir.ValueId{});
+            }
+            if (guard) |guard_block| try self.branch(guard_block, g, preheader, &[_]ir.ValueId{}, continuation);
+            const initial_true = try self.constant(preheader, .{ .boolean = true }, ir.ValueType.boolean);
+            const initial_false = try self.constant(preheader, .{ .boolean = false }, ir.ValueType.boolean);
+            try self.jump(preheader, header, &[_]ir.ValueId{ f, s, c, initial_true });
+            const header_parameters = self.blocks.items[header.index()].parameters;
+            const results = try self.instruction(header, .{ .generic_for_next = .{
+                .iterator = header_parameters[0],
+                .state = header_parameters[1],
+                .control = header_parameters[2],
+                .initial = header_parameters[3],
+                .variable_count = 2,
+            } }, &[_]ir.ValueType{ .boolean, .dynamic, .dynamic, .dynamic, .dynamic }, ir.EffectSummary.generic_for_next);
+            const exit_target = if (shape.forward) continuation else loop_exit;
+            try self.branch(header, results[0], body, &[_]ir.ValueId{ results[3], results[4] }, exit_target);
+            const body_value = self.blocks.items[body.index()].parameters[1];
+            if (side_exit) |side| {
+                try self.branch(body, body_value, side, &[_]ir.ValueId{}, latch);
+                const hit_key = try self.constant(side, .{ .string = "hit" }, ir.ValueType.string);
+                try self.tableSet(side, t, hit_key, body_value);
+                try self.jump(side, exit_target, &[_]ir.ValueId{});
+            } else {
+                try self.branch(body, body_value, loop_exit, &[_]ir.ValueId{}, latch);
+            }
+            try self.jump(latch, header, &[_]ir.ValueId{ results[1], results[2], results[3], initial_false });
+            try self.jump(loop_exit, continuation, &[_]ir.ValueId{});
+            const after_key = try self.constant(continuation, .{ .string = "after" }, ir.ValueType.string);
+            const after_value = try self.constant(continuation, .{ .boolean = true }, ir.ValueType.boolean);
+            try self.tableSet(continuation, t, after_key, after_value);
+            if (while_header) |outer_header| {
+                try self.jump(continuation, outer_header, &[_]ir.ValueId{});
+            } else if (tail_header) |tail| {
+                try self.jump(continuation, tail, &[_]ir.ValueId{});
+                try self.branch(tail, cond, tail_body.?, &[_]ir.ValueId{}, while_exit.?);
+                const tail_key = try self.constant(tail_body.?, .{ .string = "tail" }, ir.ValueType.string);
+                const tail_value = try self.constant(tail_body.?, .{ .boolean = true }, ir.ValueType.boolean);
+                try self.tableSet(tail_body.?, t, tail_key, tail_value);
+                try self.jump(tail_body.?, tail, &[_]ir.ValueId{});
+            } else {
+                self.blocks.items[continuation.index()].terminator = .{ .return_values = &.{} };
+            }
+            if (while_exit) |exit_block| self.blocks.items[exit_block.index()].terminator = .{ .return_values = &.{} };
+
+            const functions = try arena.alloc(ir.Function, 2);
+            functions[0] = .{
+                .id = chunk_id,
+                .name_hint = "chunk",
+                .blocks = try arena.dupe(ir.BlockId, &[_]ir.BlockId{chunk_entry}),
+                .entry_block = chunk_entry,
+                .evidence = &evidence_ids,
+            };
+            functions[1] = .{
+                .id = worker_id,
+                .name_hint = "worker",
+                .parameters = try arena.dupe(ir.ValueId, &parameters),
+                .blocks = self.worker_blocks.items,
+                .entry_block = entry,
+                .evidence = &evidence_ids,
+            };
+            const evidence = try arena.alloc(ir.Evidence, 1);
+            evidence[0] = .{ .id = evidence_ids[0], .kind = .dynamic_fixture, .locator = "fixture:generic-for-side-exit-cycle" };
+            return .{
+                .program = .{
+                    .program_id = program_id,
+                    .entry_function = chunk_id,
+                    .functions = functions,
+                    .blocks = self.blocks.items,
+                    .instructions = self.instructions.items,
+                    .values = self.values.items,
+                    .evidence = evidence,
+                },
+                .header = header,
+            };
+        }
+
+        fn findLoop(region: *const lifter.structure.Region, header: ir.BlockId) ?lifter.structure.Loop {
+            for (region.nodes) |node| switch (node) {
+                .block, .loop_control, .loop_terminal => {},
+                .branch => |branch_node| {
+                    if (findLoop(branch_node.then_region, header)) |found| return found;
+                    if (findLoop(branch_node.else_region, header)) |found| return found;
+                },
+                .loop => |loop| {
+                    if (loop.header == header) return loop;
+                    if (findLoop(loop.body_region, header)) |found| return found;
+                },
+                .latch_loop => |loop| {
+                    if (findLoop(loop.body_region, header)) |found| return found;
+                },
+                .infinite_loop => |loop| {
+                    if (findLoop(loop.body_region, header)) |found| return found;
+                    if (loop.shared_side_exit) |shared| {
+                        for (shared.entries) |shared_entry| {
+                            if (findLoop(shared_entry.region, header)) |found| return found;
+                        }
+                    }
+                },
+                .loop_boundary => |control| {
+                    if (findLoop(control.body_region, header)) |found| return found;
+                    switch (control.boundary) {
+                        .side_exit => |side| {
+                            if (findLoop(side.region, header)) |found| return found;
+                        },
+                        .side_escape => |side| {
+                            if (findLoop(side.region, header)) |found| return found;
+                        },
+                        else => {},
+                    }
+                },
+            };
+            return null;
+        }
+
+        fn expectRecognizedLoop(built: *const Built) !void {
+            var analysis = try cfg.Analysis.init(std.testing.allocator, &built.program, built.program.functions[worker_id.index()]);
+            defer analysis.deinit();
+            var plan = try Plan.init(std.testing.allocator, &analysis);
+            defer plan.deinit();
+            const loop = findLoop(plan.root, built.header);
+            try std.testing.expect(loop != null);
+            const match = try lifter.iteration_protocol.matchLoop(std.testing.allocator, &built.program, loop.?);
+            try std.testing.expect(match != null);
+            try std.testing.expectEqual(ir.InstructionId.fromIndex(3), match.?.instructionId());
+        }
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const nested_guarded = try Synthetic.build(arena, "nested-guarded", .{ .outer = true, .guard = true, .forward = true });
+    const tail_loop = try Synthetic.build(arena, "toplevel-guarded-forwarded-tail-loop", .{ .guard = true, .forward = true, .tail = true });
+    const forwarded_control = try Synthetic.build(arena, "toplevel-guarded-forwarded", .{ .guard = true, .forward = true });
+    const plain_break_control = try Synthetic.build(arena, "nested-guarded-plain-break", .{ .outer = true, .guard = true, .plain_break = true });
+
+    // Readable admission runs first so that a refusal is printed before any assertion stops the test.
+    for ([_]*const Synthetic.Built{ &nested_guarded, &tail_loop }) |built| {
+        var report = try lifter.validate.validate(std.testing.allocator, &built.program, .readable_luau);
+        defer report.deinit();
+        for (report.diagnostics.items) |diagnostic| {
+            std.debug.print("program={s} diagnostic={s} entity={?d}\n", .{ built.program.program_id, @tagName(diagnostic.code), diagnostic.entity_index });
+        }
+        try std.testing.expect(report.isClean());
+        try std.testing.expect(!report.contains(.unsupported_readable_iteration_protocol));
+    }
+
+    // The generic-for header is planned as a loop that recognizes its transition.
+    try Synthetic.expectRecognizedLoop(&nested_guarded);
+    try Synthetic.expectRecognizedLoop(&tail_loop);
+
+    // Controls: the same loop with no cycle after its exit, and with a plain break.
+    try Synthetic.expectRecognizedLoop(&forwarded_control);
+    try Synthetic.expectRecognizedLoop(&plain_break_control);
+}

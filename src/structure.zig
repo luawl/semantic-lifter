@@ -8410,7 +8410,7 @@ const Builder = struct {
         if (membership[target_index] or target == primary_exit or
             isEscapeTarget(escape_targets, target) or isEscapeTarget(continue_targets, target) or
             (enclosing_loop_exit != null and target == enclosing_loop_exit.?)) return true;
-        return self.outsidePathMustTerminate(membership, target);
+        return self.outsidePathMustTerminateOrReach(membership, target, primary_exit);
     }
 
     fn outsidePathMustTerminate(
@@ -8432,6 +8432,38 @@ const Builder = struct {
         }
         const trace_start = structural_overlap.structuralPhaseNow();
         const result = natural_loop.outsidePathMustTerminateAlloc(self.allocator, self.analysis, membership, start);
+        if (trace_call) {
+            structural_overlap.traceStructural("structural_phase outside_termination_done function={} call={} start={} result={} ms={}\n", .{
+                self.analysis.function.id.index(),
+                call_index,
+                start.index(),
+                result catch false,
+                structural_overlap.structuralPhaseMillis(trace_start),
+            });
+        }
+        return result;
+    }
+
+    fn outsidePathMustTerminateOrReach(
+        self: *const Builder,
+        membership: []const bool,
+        start: ir.BlockId,
+        sink: ir.BlockId,
+    ) BuildError!bool {
+        const mutable_self = @constCast(self);
+        const call_index = mutable_self.trace_outside_termination_calls;
+        mutable_self.trace_outside_termination_calls += 1;
+        const trace_call = call_index < 64;
+        if (trace_call) {
+            structural_overlap.traceStructural("structural_phase outside_termination_begin function={} call={} start={} membership={}\n", .{
+                self.analysis.function.id.index(),
+                call_index,
+                start.index(),
+                membership.len,
+            });
+        }
+        const trace_start = structural_overlap.structuralPhaseNow();
+        const result = natural_loop.outsidePathMustTerminateOrReachAlloc(self.allocator, self.analysis, membership, start, sink);
         if (trace_call) {
             structural_overlap.traceStructural("structural_phase outside_termination_done function={} call={} start={} result={} ms={}\n", .{
                 self.analysis.function.id.index(),
