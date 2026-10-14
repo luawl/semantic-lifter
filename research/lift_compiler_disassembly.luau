@@ -6,23 +6,47 @@ local serde = require("@lune/serde")
 local IR = require("../luau/lifter_ir")
 
 local handoff: any = serde.decode("json", fs.readFile(process.args[1]))
-assert(handoff.schema_version == "compiler_disassembly_handoff_v1")
+local version2 = handoff.schema_version == "compiler_disassembly_handoff_v2"
+assert(version2 or handoff.schema_version == "compiler_disassembly_handoff_v1")
+local isVariadic = version2 and handoff.is_variadic == true
 local builder = IR.Builder.new(process.args[3] or "compiler-disassembly")
 local evidence = builder:addEvidence("decoded_record", `compiler-listing:{handoff.function_index}`, handoff.listing_sha256)
 local root = builder:reserveFunction({ name_hint = "module", evidence = { evidence } })
-local worker = builder:reserveFunction({ name_hint = "worker", lexical_parent = root, evidence = { evidence } })
+local worker = builder:reserveFunction({ name_hint = "worker", lexical_parent = root, is_variadic = isVariadic, evidence = { evidence } })
 builder:setEntryFunction(root)
 local rootBlock = builder:reserveBlock(root, { evidence = { evidence } })
 builder:setFunctionEntry(root, rootBlock)
 local entry = builder:reserveBlock(worker, { name_hint = "register_entry", evidence = { evidence } })
 builder:setFunctionEntry(worker, entry)
 local places: { [number]: number } = {}
-for _, reg in handoff.registers do
+local placed: { number } = handoff.registers
+if version2 then
+    -- v2 (decision D3): a place only for a register that some instruction reads, in ascending order; the
+    -- backend refuses a declared local place that nothing reads.
+    local read: { [number]: boolean } = {}
+    placed = {}
+    for _, instruction in handoff.instructions do
+        for _, reg in instruction.reads do
+            if not read[reg] then
+                read[reg] = true
+                table.insert(placed, reg)
+            end
+        end
+    end
+    table.sort(placed)
+end
+for _, reg in placed do
     places[reg] = builder:addLocalPlace(worker, IR.Types.dynamic(), `r{reg}`, { evidence })
 end
 for reg = 0, handoff.parameter_count - 1 do
     local parameter = builder:addParameter(worker, IR.Types.dynamic(), `argument_{reg}`)
-    builder:addInstruction(entry, IR.Operation.placeWrite(places[reg], parameter), {}, { effects = IR.Effects.placeWrite(), evidence = { evidence } })
+    if places[reg] ~= nil then
+        builder:addInstruction(entry, IR.Operation.placeWrite(places[reg], parameter), {}, { effects = IR.Effects.placeWrite(), evidence = { evidence } })
+    end
+end
+if isVariadic then
+    -- The source frontend's rule (luau/ast_frontend.luau:961-962): a variadic function owns its vararg pack.
+    builder:addVarargPack(worker, { evidence })
 end
 local blocks = {}
 for index, instruction in handoff.instructions do
@@ -31,7 +55,7 @@ for index, instruction in handoff.instructions do
 end
 builder:finalizeBlock(entry, IR.Terminator.jump(IR.Edge(blocks[1])))
 for index, instruction in handoff.instructions do
-    assert(table.find({ "constant", "move", "binary", "unary", "jump", "branch", "return" }, instruction.kind) ~= nil,
+    assert(table.find({ "constant", "move", "binary", "unary", "concat", "jump", "branch", "return" }, instruction.kind) ~= nil,
         "unsupported handoff instruction kind")
     local block = blocks[index]
     local blockEvidence = builder.program.blocks[block + 1].evidence
@@ -45,9 +69,21 @@ for index, instruction in handoff.instructions do
     end
     local result: number? = nil
     if instruction.kind == "constant" then
-        local kind = if instruction.value.number ~= nil then IR.Types.number()
-            elseif instruction.value.boolean ~= nil then IR.Types.boolean() else IR.Types.nilValue()
-        result = value(IR.Operation.constant(instruction.value), kind, IR.Effects.pure())
+        local literal: any = instruction.value
+        local kind: any
+        if literal.number ~= nil then
+            kind = IR.Types.number()
+        elseif literal.boolean ~= nil then
+            kind = IR.Types.boolean()
+        elseif literal.nil_value ~= nil then
+            kind = IR.Types.nilValue()
+        elseif type(literal.string) == "string" then
+            kind = IR.Types.string()
+            literal = IR.Literal.string(literal.string)
+        else
+            error("unsupported handoff constant")
+        end
+        result = value(IR.Operation.constant(literal), kind, IR.Effects.pure())
     elseif instruction.kind == "move" then
         result = reads[1]
     elseif instruction.kind == "binary" then
@@ -55,8 +91,15 @@ for index, instruction in handoff.instructions do
     elseif instruction.kind == "unary" then
         local resultType = if instruction.operator == "logical_not" then IR.Types.boolean() else IR.Types.dynamic()
         result = value(IR.Operation.unary(instruction.operator, reads[1]), resultType, IR.Effects.dynamicCall())
+    elseif instruction.kind == "concat" then
+        -- Luau `..` is right-associative: R(b) .. (R(b+1) .. (... .. R(c))), one dynamic call per step.
+        local folded = reads[#reads]
+        for slot = #reads - 1, 1, -1 do
+            folded = value(IR.Operation.binary("concat", reads[slot], folded), IR.Types.dynamic(), IR.Effects.dynamicCall())
+        end
+        result = folded
     end
-    if result ~= nil then
+    if result ~= nil and places[instruction.writes[1]] ~= nil then
         builder:addInstruction(block, IR.Operation.placeWrite(places[instruction.writes[1]], result), {}, { effects = IR.Effects.placeWrite(), evidence = blockEvidence })
     end
     if instruction.kind == "return" then
@@ -73,6 +116,9 @@ for index, instruction in handoff.instructions do
         builder:finalizeBlock(block, IR.Terminator.branch(condition,
             if instruction.inverted then fallthrough else target,
             if instruction.inverted then target else fallthrough))
+    elseif instruction.kind == "constant" and instruction.successors[1] ~= index then
+        -- A LOADB skip: the adapter resolved the labelled skip target (0-based) into the successors.
+        builder:finalizeBlock(block, IR.Terminator.jump(IR.Edge(blocks[instruction.successors[1] + 1])))
     else
         builder:finalizeBlock(block, IR.Terminator.jump(IR.Edge(blocks[index + 1])))
     end
