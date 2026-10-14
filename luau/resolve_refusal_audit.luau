@@ -1,6 +1,6 @@
 --!strict
 
--- Refusal audit for `resolve-admitted-readable-ir`: a refused resolve publishes nothing.
+-- Refusal audit for `resolve-admitted-readable-ir`.
 --
 -- Usage: lune run luau/resolve_refusal_audit.luau <semantic-lifter.exe> <fixture.json> <output-dir>
 --

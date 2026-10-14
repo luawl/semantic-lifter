@@ -1,6 +1,6 @@
 --!strict
 
--- Re-resolution fixed-point audit for `resolve-ir`, run on the recorded nested graph.
+-- Re-resolution fixed-point audit for `resolve-ir`.
 --
 -- Usage: lune run luau/irreducible_nested_reresolve_audit.luau <resolved> <reresolved> <third> <renormalized>
 --
@@ -15,8 +15,7 @@
 --   (c) <renormalized> has the same block count and the    (the resolver's output is already a
 --       same edge_rewrites count as <resolved>              normalizer fixed point).
 -- It compares bytes, not a canonical form: resolve-ir is deterministic across builds and modes, and
--- the differences between passes are additions, not renumberings, so a canonical form would hide them
--- (the comparison below is therefore byte for byte).
+-- the differences between passes are additions, not renumberings, so a canonical form would hide them.
 
 local fs = require("@lune/fs")
 local process = require("@lune/process")
