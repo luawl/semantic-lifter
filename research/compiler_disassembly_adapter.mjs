@@ -19,6 +19,7 @@ const OPERAND_COUNTS = new Map([
   ['LOADK', [2]], ['LOADN', [2]], ['LOADNIL', [1]], ['LOADB', [3, 2]], ['MOVE', [2]],
   ['MINUS', [2]], ['NOT', [2]], ['LENGTH', [2]], ['CONCAT', [3]],
   ['JUMP', [1]], ['JUMPBACK', [1]], ['JUMPIF', [2]], ['JUMPIFNOT', [2]], ['RETURN', [2]],
+  ['GETGLOBAL', [2]], ['SETGLOBAL', [2]],
   ...Object.keys(BINARY).map((op) => [op, [3]]),
   ...['', 'NOT'].flatMap((not) => Object.keys(COMPARE).map((test) => [`JUMPIF${not}${test}`, [3]])),
 ]);
@@ -206,6 +207,19 @@ export function parseDisassembly(text, { function_index = 0, parameter_count = 2
       if (!(results <= 255 && first + results <= 255)) refuseAt(site, 'operand_form', 'invalid return range');
       instruction.kind = 'return';
       instruction.reads = Array.from({ length: results }, (_, i) => first + i);
+    } else if (op === 'GETGLOBAL' || op === 'SETGLOBAL') {
+      // A named environment access (T2-ADAPTER step 2): the name is an identifier string constant read through
+      // the lazy decoder; GETGLOBAL writes R<a>, SETGLOBAL reads its source R<a>.
+      if (!/^K\d+$/.test(args[1])) refuseAt(site, 'operand_form', 'invalid constant operand');
+      const key = Number(args[1].slice(1));
+      if (!constants.has(key)) refuseAt(site, 'operand_form', 'constant is absent');
+      const { string: name } = constantValue(key, constants.get(key), site);
+      if (typeof name !== 'string') refuseAt(site, 'constant_kind_mismatch', `${op}: K${key} is not a string`);
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) refuseAt(site, 'non_identifier_name', `${op}: K${key} is not an identifier`);
+      instruction.kind = op === 'GETGLOBAL' ? 'environment_get' : 'environment_set';
+      instruction.name = name;
+      if (op === 'GETGLOBAL') instruction.writes = [register(args[0], site)];
+      else instruction.reads = [register(args[0], site)];
     } else {
       refuse('unsupported_opcode', `unsupported opcode ${op} at disassembly line ${record.line_number}`, record.line_number, op);
     }
