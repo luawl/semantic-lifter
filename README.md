@@ -140,15 +140,145 @@ rendering of the program rather than a copy of it.
 
 ## How it works
 
-![The lifter_ir_v1 contract: frontends, the handoff, and the backend gates](figures/evidence-contract.svg)
+```mermaid
+%% The lifter_ir_v1 contract: frontends, handoff, and backend gates
+flowchart LR
+    subgraph FE["frontends"]
+        O["any other frontend"]
+        subgraph DF["compiler-disassembly frontend"]
+            direction TB
+            D1["listing<br/>luau-compile<br/>--text"] --> D2["adapter<br/>compiler_disassembly_adapter.mjs"] --> D3["bridge<br/>lift_compiler_disassembly.luau"]
+        end
+        subgraph SF["source frontend"]
+            direction TB
+            S1["parser<br/>luau-ast"] --> S2["lift<br/>luau/lift_source.luau"]
+        end
+    end
+    FE --> H["lifter_ir_v1 handoff<br/>evidence (7 kinds),<br/>obligations (12 kinds)"]
+    H --> BE
+    subgraph BE["backend"]
+        direction TB
+        G1["core admission<br/>validate &lt;ir&gt; core"] --> G2["checked resolution<br/>resolve-admitted-<br/>readable-ir"]
+        G2 --> G3["emission admission<br/>validate &lt;admitted&gt;<br/>readable-luau"]
+        G3 --> G4["normalization<br/>normalize-ir"]
+        G4 --> G5["structuring<br/>(the planner)"]
+        G5 --> G6["emission<br/>emit-luau"]
+        G6 --> G7["compile check<br/>luau-compile<br/>--null"]
+        G7 --> P[["published Luau"]]
+        G4 -.->|refuse| T["typed diagnostic<br/>code + entity"]
+        G1 -.->|refuse| T
+        G7 -.->|refuse| T
+    end
+    style O stroke-dasharray: 5 5
+```
 
-A frontend hands the backend a `lifter_ir_v1` program with evidence on every entity. The backend admits it under the `core` profile, resolves and restructures it, and publishes readable Luau only under the `emission` profile; anything it cannot justify becomes a typed diagnostic that names the entity and, for an obligation, its kind and the profile it blocks.
+A frontend hands the backend a `lifter_ir_v1` program with evidence on every entity. The backend admits it under the `core` profile, resolves and restructures it, and publishes readable Luau only under the `emission` profile; anything it cannot justify becomes a typed diagnostic that names the entity and, for an obligation, its kind and the profile it blocks. Every gate refuses the same way; the diagram draws the refuse edge from three of them.
 
-![Two paths from one source program into one backend, compared under the official Luau VM](figures/two-paths.svg)
+```mermaid
+%% Two lifting paths into one backend, compared under the official Luau VM
+flowchart TB
+    source["source program"]
+
+    subgraph path1 ["path 1 (AST)"]
+        ast["luau-ast"]
+        liftsrc["lift_source.luau<br/>source frontend"]
+        handoff1["lifter_ir_v1 handoff"]
+    end
+
+    subgraph path2 ["path 2 (disassembly)"]
+        disasm["luau-compile --text<br/>--dump-constants<br/>-O0 -g0"]
+        adapter["compiler_disassembly_adapter.mjs"]
+        liftdis["lift_compiler_disassembly.luau"]
+        handoff2["lifter_ir_v1 handoff"]
+    end
+
+    backend["backend<br/>the same binary<br/>for both paths"]
+    auto1["emitted Luau<br/>path 1 automatic"]
+    auto2["emitted Luau<br/>path 2 automatic"]
+    control["dispatcher control<br/>same IR, forced<br/>state-machine form"]
+    compile["luau-compile<br/>--binary -O0 -g0"]
+    bytecode["original bytecode"]
+    observer["native observer<br/>official Luau VM"]
+    agreement["agreement per input<br/>over the input grid"]
+
+    source --> path1
+    ast --> liftsrc
+    liftsrc --> handoff1
+    source --> path2
+    disasm --> adapter
+    adapter --> liftdis
+    liftdis --> handoff2
+    source --> compile
+    handoff1 --> backend
+    handoff2 --> backend
+    backend --> auto1
+    backend --> auto2
+    backend -->|path 2 handoff only| control
+    compile --> bytecode
+    auto1 --> observer
+    auto2 --> observer
+    control --> observer
+    bytecode -.->|compared against| observer
+    observer --> agreement
+```
 
 In the preprint's paired tests, the same program is lifted twice, once from its syntax tree and once from the official compiler's disassembly listing, through the same backend; both outputs and a forced-dispatcher control are executed against the original under the official Luau VM over an input grid. A disagreement is a finding, never silenced.
 
-![The piecewise_chain control-flow graph on the disassembly path and the source path](figures/piecewise-chain-cfg.svg)
+The disassembly-path IR of the worker, straight-line chains contracted:
+
+```mermaid
+%% piecewise_chain: one shared return in the two IRs of the same program
+flowchart TB
+    B1_B3["B1-B3<br/>r0, r1 &lt;- arguments<br/>r2 = 0<br/>r3 = 0"]
+    B4{"B4<br/>r0 &lt; r3"}
+    B5_B7["B5-B7<br/>r3 = -r0<br/>r2 = r3 * r1<br/>jump to B19"]
+    B8_B9{"B8-B9<br/>r3 = 0; r0 == r3"}
+    B10_B12["B10-B12<br/>r3 = 11<br/>r2 = r1 + r3<br/>jump to B19"]
+    B13{"B13<br/>r0 &lt;= r1"}
+    B14_B17["B14-B17<br/>r4 = 3<br/>r3 = r1 * r4<br/>r2 = r0 + r3<br/>jump to B19"]
+    B18["B18<br/>r2 = r0 - r1"]
+    B19[["B19 return r2<br/>4 predecessors:<br/>B7, B12, B17, B18<br/>immediate dominator: B4"]]
+    B1_B3 --> B4
+    B4 -->|T| B5_B7
+    B4 -->|F| B8_B9
+    B8_B9 -->|T| B10_B12
+    B8_B9 -->|F| B13
+    B13 -->|T| B14_B17
+    B13 -->|F| B18
+    B5_B7 -->|jump| B19
+    B10_B12 -->|jump| B19
+    B14_B17 -->|jump| B19
+    B18 -->|fall-through| B19
+```
+
+The source-path IR of the same worker, one join per `if`/`elseif` level:
+
+```mermaid
+%% piecewise_chain: one shared return in the two IRs of the same program
+flowchart TB
+    B1{"B1<br/>selector &lt; 0"}
+    B2["B2<br/>result =<br/>-selector * budget"]
+    B3{"B3<br/>selector == 0"}
+    B4["B4<br/>result =<br/>budget + 11"]
+    B5{"B5<br/>selector &lt;= budget"}
+    B6["B6<br/>result =<br/>selector + budget * 3"]
+    B7["B7<br/>result =<br/>selector - budget"]
+    B8["B8<br/>join of B5"]
+    B9["B9<br/>join of B3"]
+    B10[["B10<br/>join of B1<br/>return result<br/>2 predecessors: B2, B9"]]
+    B1 -->|T| B2
+    B1 -->|F| B3
+    B3 -->|T| B4
+    B3 -->|F| B5
+    B5 -->|T| B6
+    B5 -->|F| B7
+    B6 --> B8
+    B7 --> B8
+    B8 --> B9
+    B4 --> B9
+    B9 --> B10
+    B2 --> B10
+```
 
 The figure draws one program, `piecewise_chain`, as each path presents it. On the disassembly path
 the compiler shares one return block among the four arms; on the source path each inner `if`/`elseif`
