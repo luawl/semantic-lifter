@@ -1,19 +1,81 @@
 # Semantic-Lifter
 
-Semantic-Lifter lifts protected (obfuscated or virtualized) Luau to readable, verified Luau. A
-frontend recovers the program as `lifter_ir_v1`, a typed intermediate representation; the backend
-in this repository validates it, solves and restructures its control flow, and emits Luau that the
-official Luau compiler must accept before the output is published.
+Semantic-Lifter is a checked lifting backend for Luau, built for lifting pipelines over protected
+Luau. It takes a program that a frontend has recovered as `lifter_ir_v1`, a typed intermediate
+representation, and produces readable Luau that the official Luau compiler accepts; whatever it
+cannot justify, it refuses with a typed diagnostic. It works under a typed evidence contract: output
+is published only for a program that passes an admission profile, `core` for the IR and `emission`
+for readable Luau output (`readable-luau` on the command line), and every refusal is a code plus
+the index of the IR entity it concerns. The design is tested on paired representations: one program
+is lifted through the source path (the Luau parser's syntax tree) and through the
+compiler-disassembly path (the official compiler's text listing), and the results are compared
+under the official Luau VM.
 
-The backend works under a typed evidence contract. Output is published only for a program that
-passes an admission profile, `core` for the IR itself and `emission` for readable Luau output (named
-`readable-luau` on the command line), and every refusal is a typed diagnostic: a code plus the index
-of the IR entity it concerns. The design is tested on paired representations: the same program is
-lifted once through the source path (the Luau parser's syntax tree) and once through the
-compiler-disassembly path (the official compiler's text listing), and the results are compared under
-the official Luau VM.
+This repository ships the backend, the source frontend, which lifts Luau source to `lifter_ir_v1`,
+and the compiler-disassembly adapter that serves as the second path of the paired tests. A frontend
+is any component that writes a `lifter_ir_v1` handoff: a lifting or analysis tool supplies the
+frontend for the artefact it targets, and the contract is what that frontend has to satisfy.
 
-The preprint that describes the design is published separately and will be linked here.
+The backend is about 148,000 lines of Zig across 159 files, with over 800 unit tests. The source
+frontend, the IR library and codec, and the conformance suite take about 55,000 lines across 168
+files under `luau/`. The suite holds 48 fixture files, 28 conformance scripts, 9 audits and 7
+oracles; it compiles the emitted programs with the official Luau compiler and runs its oracles under
+Lune, a standalone Luau runtime.
+
+The preprint that describes the design will be published separately and linked here.
+
+## What it handles
+
+**Source path.** The source frontend covers declarations, plain and compound assignment, `if`,
+`while`, `repeat`, both `for` forms, `break`, `continue`, open returns, closures, varargs, tables,
+method calls, string interpolation, `and`/`or` and `if` expressions. An unsupported construct is
+refused with a typed diagnostic, never lifted silently. Before the handoff, the frontend admits the
+parser's syntax tree in a bounded preflight, checks every runtime local's canonical identity, owning
+function and lexical visibility, and lowers expressions and result packs in Luau's evaluation
+order. Numeric and generic `for` loops keep their hidden state for the backend to validate and
+re-emit, and a table constructor whose keys can fail is lowered to explicit ordered writes. Once the
+whole program is known, place domains are finalised: closure bindings make each captured-place
+alias class explicit, and a class is refined only when all of its writes agree on one domain.
+
+**Backend.**
+
+- **Validation.** The checked pipeline validates every handoff under the typed evidence contract: 7 evidence kinds, 12
+  obligation kinds, 241 typed diagnostics and 2 admission profiles. The validators cover types,
+  ownership, closures, operations, declared effects, packs, the dominance of every use, and the
+  consistency of claims, obligations, certificates and CFG rewrites; an open obligation blocks the
+  profile it names.
+- **Solving.** Checked resolution answers the queries that frontends attach to obligations and
+  those the backend derives from control facts. Only proved facts change the program, as replayable
+  CFG rewrites; an unknown answer leaves its obligation open, and admission re-checks certificates,
+  models and digests rather than trusting the run that produced them. The internal engine is the
+  default; an optional Z3 backend is built with `-Dz3=true`.
+- **Restructuring.** Planned regions become nested `if` statements, `while` loops with `break` and
+  `continue`, and native numeric and generic `for` loops. Irreducible control, such as a loop
+  entered at two points, goes through guarded node splitting within a growth budget; each
+  redirected edge is logged as a rewrite that validation replays. The conformance cases cover loop
+  topologies; edge-scoped, relational and chained branch control; and irreducible control carrying
+  closure captures, coroutines, table construction, string interpolation, and numeric and generic
+  iteration, which must come out as native `for` loops.
+- **Emission.** Before any Luau is written, compiler-limit admission reports each predicted excess
+  over the compiler's limits as a typed diagnostic: 200 live locals including parameters, 255
+  registers for locals plus temporaries, 200 upvalues per nested function, the jump budget, syntax
+  depth and child prototypes. Value fusion folds a value used exactly once into its consumer when
+  evaluation order allows. The two output forms are `standard-luau`, which captures the builtins it
+  uses when the chunk starts, and `direct-locals-luau`, which prefers lexical locals for private
+  values. The official compiler is the final gate: `emit-luau` publishes its output only after the
+  given `luau-compile` accepts it.
+
+**Verification.** Over 800 unit tests cover the backend. The conformance suite lifts its source
+fixtures and builds IR from its conformance scripts, then resolves, validates, emits and compiles
+the programs; runtime oracles execute the output, and for source fixtures the original program too,
+against the results each case expects. The irreducible-control audits check what resolution and
+node splitting wrote: each clone takes fresh identities and keeps its arity, successors and
+provenance, and resolving a resolved program again leaves it byte-identical. A structure audit
+parses the output with `luau-ast` and requires structured branches and loops, and a refusal audit
+checks that a refused resolution prints its diagnostic and writes no file. A compiler-limit oracle
+checks that the official compiler accepts a program at each limit above and rejects it one step
+past; a lexical oracle checks with `luau-analyze` that emitted code introduces no global the source
+did not use. In the release build, every unit test and every conformance step passes.
 
 ## How it works
 
@@ -23,15 +85,19 @@ A frontend hands the backend a `lifter_ir_v1` program with evidence on every ent
 
 ![Two paths from one source program into one backend, compared under the official Luau VM](figures/two-paths.svg)
 
-The same author-owned program is lifted twice, once from its syntax tree and once from the official compiler's disassembly listing, through the same backend; both outputs and a forced-dispatcher control are executed against the original under the official Luau VM over an input grid. A disagreement is a finding, never silenced.
+The same program is lifted twice, once from its syntax tree and once from the official compiler's disassembly listing, through the same backend; both outputs and a forced-dispatcher control are executed against the original under the official Luau VM over an input grid. A disagreement is a finding, never silenced.
 
 ![The piecewise_chain control-flow graph on the disassembly path and the source path](figures/piecewise-chain-cfg.svg)
 
-What that caught: on `piecewise_chain` the disassembly path produced output that passed every static gate, compiled and parsed, and returned nothing for every non-negative selector; the compiler shares one return among four arms, and the planner absorbed it into the wrong arm. The oracle exposed it, the control confined it to structuring, and the repair and its regression test are in this repository.
+The figure draws one program, `piecewise_chain`, as each path presents it. On the disassembly path
+the compiler shares one return block among the four arms; on the source path each inner `if`/`elseif`
+level has its own join, and the outer join holds the single return. One program reaches the backend as two different
+graphs, which is why the backend is tested on both; a regression test for this program is in the
+repository.
 
 ## Release note
 
-This repository is the proof of concept behind the preprint *Checked, Not Trusted: Typed Evidence Contracts and Paired-Representation Testing for Luau Lifting Backends*: the backend and the two frontends the paper evaluated, cleaned up for release and verified as the build section below describes (every unit test and conformance step passes, and a fresh clone builds with the documented tool options). The paper's known limitations are listed at the end of this file; if anything else goes wrong, please open an issue.
+This repository is the implementation behind the forthcoming preprint *Checked, Not Trusted: Typed Evidence Contracts and Paired-Representation Testing for Luau Lifting Backends*: the backend and the frontends in this repository, cleaned up for release and verified as the build section below describes (every unit test and conformance step passes, and a fresh clone builds with the documented tool options). The preprint reports the evaluation and the issue tracker holds the open items; anything else is welcome as an issue.
 
 ## Repository contents
 
@@ -43,8 +109,7 @@ This repository is the proof of concept behind the preprint *Checked, Not Truste
 - `build.zig` and `build.ps1`: the build graph and its Windows wrapper.
 - `LICENSE`, `CONTRIBUTING.md` and `.gitattributes`.
 
-Manuscripts, run records, evidence and test-data archives are published separately and are not in
-this repository.
+Manuscripts, run records and evidence archives will be published with the preprint.
 
 ## Requirements
 
@@ -79,9 +144,9 @@ in the repository root, and adds each of the four tool options that the caller d
 finds that tool in the maintainers' workspace layout. It never sets `--prefix` or the cache
 directories; pass them as arguments when you need them.
 
-Expected results on the maintainers' machine (ReleaseFast, with `--summary all`): `test` ends with
-`Build Summary: 46/46 steps succeeded; 828/828 tests passed` (828 unit tests) and `conformance` with
-`Build Summary: 489/489 steps succeeded` (489 conformance steps).
+With `--summary all`, `test` reports a `Build Summary` in which every step succeeded and
+every test passed, and `conformance` one in which every step succeeded; the summary names any
+step that fails.
 
 ## Command-line use
 
@@ -125,23 +190,19 @@ means success; 1 means a refusal or an error such as a missing file or a bad arg
 lines say which. A refused `resolve-*` command writes no output file. Running `semantic-lifter`
 without arguments prints the usage text.
 
-Three commands are diagnostic-only: `emit-admitted-readable-luau-raw`, `emit-readable-luau-strategy`
-and `resolve-exact-control-ir` skip admission or part of the checked pipeline (the usage text says
-which) and exist for analysis, never for output you rely on. The usage text lists them, with
-`emit-function-probe`, under "diagnostic-only or unchecked".
+The usage text lists some commands under "diagnostic-only or unchecked (exit 0 is not a checked
+publication)", among them `emit-admitted-readable-luau-raw`, `emit-readable-luau-strategy`,
+`emit-function-probe` and `resolve-exact-control-ir`. Each skips admission or part of the checked
+pipeline, and the usage text says which. Unlike `emit-luau`, these commands do not gate their own
+output, so their output serves analysis, or a harness that gates it separately. The paired tests use
+`emit-readable-luau-strategy` this way: every file it emits must pass `luau-compile` and `luau-ast`
+before it runs against the original under the official Luau VM.
 
-## Known limitations
+## Scope
 
-These are the limits that the preprint reports:
-
-- The compiler-disassembly frontend covers scalar programs only: 24 opcodes, no calls, globals or
-  tables.
-- 28 of 28 generated multi-entry rings fall back to the dispatcher form.
-- There is no plan-level accounting check.
-- The two raw protected inputs produced no handoff.
-- Re-resolution is not idempotent.
-
-The issue tracker holds the open items.
+The backend and the source frontend are the maintained components, and the compiler-disassembly
+adapter under `research/` is the second path of the paired tests. The preprint reports the
+evaluation, and the issue tracker holds the open items.
 
 ## Citation
 
