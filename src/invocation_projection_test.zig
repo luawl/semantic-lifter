@@ -732,3 +732,202 @@ test "indirect invocation latch refuses a reachable side entry" {
     try std.testing.expect(plan.role(Diamond.produce) == .ordinary);
     try std.testing.expect(plan.invocationProjection(&program, Diamond.produce) == null);
 }
+
+test "frame-local place reads between an open call and its consumer are movable gaps" {
+    const p0 = ir.PlaceId.fromIndex(0);
+    const places = [_]ir.Place{.{
+        .id = p0,
+        .function = Diamond.function_id,
+        .origin = .{ .local = 0 },
+        .evidence = &Diamond.evidence_ids,
+    }};
+    var values = Diamond.values;
+    var instructions = Diamond.instructions;
+    var functions = Diamond.functions;
+    var program = Diamond.program;
+    program.values = &values;
+    program.instructions = &instructions;
+    program.functions = &functions;
+    program.places = &places;
+
+    functions[Diamond.function_id.index()].local_places = &.{p0};
+    instructions[Diamond.join_gap.index()].operation = .{ .place_read = p0 };
+    instructions[Diamond.join_gap.index()].effects = .place_read;
+    values[Diamond.join_value.index()].type = .dynamic;
+
+    var core_report = try validation.validate(std.testing.allocator, &program, .core);
+    defer core_report.deinit();
+    try std.testing.expect(core_report.isClean());
+
+    var plan = try pack_plan.Plan.init(std.testing.allocator, &program);
+    defer plan.deinit();
+    try std.testing.expectEqual(
+        std.meta.Tag(pack_plan.InstructionRole).fused_invocation_producer,
+        std.meta.activeTag(plan.role(Diamond.produce)),
+    );
+    try std.testing.expect(plan.invocationProjection(&program, Diamond.produce) != null);
+}
+
+test "a captured place read between an open call and its consumer stays stored" {
+    const p0 = ir.PlaceId.fromIndex(0);
+    const captured_place = ir.PlaceId.fromIndex(1);
+    const capture_id = ir.CaptureId.fromIndex(0);
+    const child_function = ir.FunctionId.fromIndex(Diamond.functions.len);
+    const child_block = ir.BlockId.fromIndex(Diamond.blocks.len);
+    const closure_instruction = ir.InstructionId.fromIndex(Diamond.instructions.len);
+    const closure_value = ir.ValueId.fromIndex(Diamond.values.len);
+    const places = [_]ir.Place{
+        .{
+            .id = p0,
+            .function = Diamond.function_id,
+            .origin = .{ .local = 0 },
+            .evidence = &Diamond.evidence_ids,
+        },
+        .{
+            .id = captured_place,
+            .function = child_function,
+            .origin = .{ .capture = capture_id },
+            .evidence = &Diamond.evidence_ids,
+        },
+    };
+    const captures = [_]ir.Capture{.{
+        .id = capture_id,
+        .function = child_function,
+        .kind = .{ .shared_place = captured_place },
+        .evidence = &Diamond.evidence_ids,
+    }};
+    var values = Diamond.values ++ [_]ir.Value{.{
+        .id = closure_value,
+        .function = Diamond.function_id,
+        .type = .function,
+        .origin = .{ .instruction_result = .{ .instruction = closure_instruction, .index = 0 } },
+    }};
+    var instructions = Diamond.instructions ++ [_]ir.Instruction{.{
+        .id = closure_instruction,
+        .block = Diamond.entry,
+        .operation = .{ .make_closure = .{
+            .function = child_function,
+            .bindings = &.{.{ .place = p0 }},
+        } },
+        .results = &.{closure_value},
+        .effects = .pure,
+        .evidence = &Diamond.evidence_ids,
+    }};
+    var blocks = Diamond.blocks ++ [_]ir.Block{.{
+        .id = child_block,
+        .function = child_function,
+        .terminator = .{ .return_values = &.{} },
+        .evidence = &Diamond.evidence_ids,
+    }};
+    var functions = Diamond.functions ++ [_]ir.Function{.{
+        .id = child_function,
+        .lexical_parent = Diamond.function_id,
+        .captures = &.{capture_id},
+        .blocks = &.{child_block},
+        .entry_block = child_block,
+        .evidence = &Diamond.evidence_ids,
+    }};
+    var program = Diamond.program;
+    program.values = &values;
+    program.instructions = &instructions;
+    program.blocks = &blocks;
+    program.functions = &functions;
+    program.places = &places;
+    program.captures = &captures;
+
+    functions[Diamond.function_id.index()].local_places = &.{p0};
+    instructions[Diamond.join_gap.index()].operation = .{ .place_read = p0 };
+    instructions[Diamond.join_gap.index()].effects = .place_read;
+    values[Diamond.join_value.index()].type = .dynamic;
+    blocks[Diamond.entry.index()].instructions = &.{ Diamond.get_callee, closure_instruction, Diamond.produce, Diamond.condition_instruction };
+
+    var core_report = try validation.validate(std.testing.allocator, &program, .core);
+    defer core_report.deinit();
+    try std.testing.expect(core_report.isClean());
+
+    var plan = try pack_plan.Plan.init(std.testing.allocator, &program);
+    defer plan.deinit();
+    try std.testing.expectEqual(
+        std.meta.Tag(pack_plan.InstructionRole).stored_invocation_producer,
+        std.meta.activeTag(plan.role(Diamond.produce)),
+    );
+}
+
+test "a call_repeated_table_get counter place read between an open call and its consumer stays stored" {
+    const p0 = ir.PlaceId.fromIndex(0);
+    const repeated = ir.InstructionId.fromIndex(Diamond.instructions.len);
+    const table = ir.ValueId.fromIndex(Diamond.values.len);
+    const key = ir.ValueId.fromIndex(Diamond.values.len + 1);
+    const from = ir.ValueId.fromIndex(Diamond.values.len + 2);
+    const to = ir.ValueId.fromIndex(Diamond.values.len + 3);
+    const step = ir.ValueId.fromIndex(Diamond.values.len + 4);
+    const places = [_]ir.Place{.{
+        .id = p0,
+        .function = Diamond.function_id,
+        .origin = .{ .local = 0 },
+        .evidence = &Diamond.evidence_ids,
+    }};
+    var values = Diamond.values ++ [_]ir.Value{
+        .{ .id = table, .function = Diamond.function_id, .type = .{ .kind = .table }, .origin = .{ .parameter = 0 } },
+        .{ .id = key, .function = Diamond.function_id, .type = .integer, .origin = .{ .parameter = 1 } },
+        .{ .id = from, .function = Diamond.function_id, .type = .integer, .origin = .{ .parameter = 2 } },
+        .{ .id = to, .function = Diamond.function_id, .type = .integer, .origin = .{ .parameter = 3 } },
+        .{ .id = step, .function = Diamond.function_id, .type = .integer, .origin = .{ .parameter = 4 } },
+    };
+    var instructions = Diamond.instructions ++ [_]ir.Instruction{.{
+        .id = repeated,
+        .block = Diamond.entry,
+        .operation = .{ .call_repeated_table_get = .{
+            .callee = Diamond.callee,
+            .prefix_arguments = &.{},
+            .table = table,
+            .key = key,
+            .from = from,
+            .to = to,
+            .step = step,
+            .counter = p0,
+            .result_arity = .{ .fixed = 0 },
+        } },
+        .results = &.{},
+        .effects = .dynamic_call,
+        .evidence = &Diamond.evidence_ids,
+    }};
+    var blocks = Diamond.blocks;
+    var functions = Diamond.functions;
+    var program = Diamond.program;
+    program.values = &values;
+    program.instructions = &instructions;
+    program.blocks = &blocks;
+    program.functions = &functions;
+    program.places = &places;
+
+    functions[Diamond.function_id.index()].parameters = &.{ table, key, from, to, step };
+    functions[Diamond.function_id.index()].local_places = &.{p0};
+    blocks[Diamond.entry.index()].instructions = &.{ Diamond.get_callee, repeated, Diamond.produce, Diamond.condition_instruction };
+
+    // Control: the counter call precedes the producer, so with every gap pure the projection stands.
+    var pure_gap_report = try validation.validate(std.testing.allocator, &program, .core);
+    defer pure_gap_report.deinit();
+    try std.testing.expect(pure_gap_report.isClean());
+    var pure_gap = try pack_plan.Plan.init(std.testing.allocator, &program);
+    defer pure_gap.deinit();
+    try std.testing.expectEqual(
+        std.meta.Tag(pack_plan.InstructionRole).fused_invocation_producer,
+        std.meta.activeTag(pure_gap.role(Diamond.produce)),
+    );
+
+    instructions[Diamond.join_gap.index()].operation = .{ .place_read = p0 };
+    instructions[Diamond.join_gap.index()].effects = .place_read;
+    values[Diamond.join_value.index()].type = .dynamic;
+
+    var core_report = try validation.validate(std.testing.allocator, &program, .core);
+    defer core_report.deinit();
+    try std.testing.expect(core_report.isClean());
+
+    var plan = try pack_plan.Plan.init(std.testing.allocator, &program);
+    defer plan.deinit();
+    try std.testing.expectEqual(
+        std.meta.Tag(pack_plan.InstructionRole).stored_invocation_producer,
+        std.meta.activeTag(plan.role(Diamond.produce)),
+    );
+}
