@@ -23,7 +23,7 @@ test('disassembly preserves register data and inverted branch polarity', () => {
 });
 
 test('unsupported operations cannot silently become no-ops', () => {
-  assert.throws(() => parseDisassembly(listing.replace('ADD R2 R2 R3', 'GETGLOBAL R2 K1')), /unsupported opcode GETGLOBAL/);
+  assert.throws(() => parseDisassembly(listing.replace('ADD R2 R2 R3', 'GETUPVAL R2 0')), /unsupported opcode GETUPVAL/);
   assert.throws(() => parseDisassembly(listing.replace('ADD R2 R2 R3', 'FORNPREP R2 L1')), /unsupported opcode FORNPREP/);
 });
 
@@ -153,4 +153,31 @@ test('the handoff is v2 with a caller-declared is_variadic', () => {
   assert.equal(parseDisassembly(listing, { is_variadic: true }).is_variadic, true);
   assert.throws(() => parseDisassembly(listing, { is_variadic: 'yes' }),
     (error) => error.name === 'DisassemblyRefusal' && error.code === 'invalid_options');
+});
+
+// Globals. Excerpts are verbatim listing lines of author-owned programs:
+// a globals program at -O0 (Function 0) and an import program at -O1 (lines 1-4 and 8, plus a return) for the GETIMPORT pin.
+test('globals lower to named environment accesses', () => {
+  const { instructions } = parseDisassembly(excerpt("K0: 'counter'", 'ADD R2 R0 R1', "SETGLOBAL R2 K0 ['counter']",
+    "GETGLOBAL R2 K0 ['counter']", 'RETURN R2 1'));
+  const fields = (instruction) => Object.fromEntries(['op', 'kind', 'name', 'reads', 'writes']
+    .map((key) => [key, instruction[key]]));
+  assert.deepEqual(fields(instructions[1]), { op: 'SETGLOBAL', kind: 'environment_set', name: 'counter', reads: [2], writes: [] });
+  assert.deepEqual(fields(instructions[2]), { op: 'GETGLOBAL', kind: 'environment_get', name: 'counter', reads: [], writes: [2] });
+});
+
+test('global names must be identifier string constants', () => {
+  assert.throws(() => parseDisassembly(listing.replace('ADD R2 R2 R3', 'GETGLOBAL R2 K1')),
+    (error) => error.name === 'DisassemblyRefusal' && error.code === 'constant_kind_mismatch'
+      && /GETGLOBAL: K1 is not a string/.test(error.message));
+  assert.throws(() => parseDisassembly(excerpt("K0: 'my-name'", "GETGLOBAL R2 K0 ['my-name']", 'RETURN R2 1')),
+    (error) => error.name === 'DisassemblyRefusal' && error.code === 'non_identifier_name'
+      && /GETGLOBAL: K0 is not an identifier/.test(error.message));
+});
+
+test('imports stay refused at the pinned level', () => {
+  assert.throws(() => parseDisassembly(excerpt("K0: 'math'", "K1: 'floor'", 'K2: math.floor', 'GETIMPORT R2 2 [math.floor]',
+    'RETURN R2 1')),
+    (error) => error.name === 'DisassemblyRefusal' && error.code === 'unsupported_opcode' && error.opcode === 'GETIMPORT'
+      && /unsupported opcode GETIMPORT at disassembly line 5/.test(error.message));
 });

@@ -55,7 +55,7 @@ for index, instruction in handoff.instructions do
 end
 builder:finalizeBlock(entry, IR.Terminator.jump(IR.Edge(blocks[1])))
 for index, instruction in handoff.instructions do
-    assert(table.find({ "constant", "move", "binary", "unary", "concat", "jump", "branch", "return" }, instruction.kind) ~= nil,
+    assert(table.find({ "constant", "move", "binary", "unary", "concat", "jump", "branch", "return", "environment_get", "environment_set" }, instruction.kind) ~= nil,
         "unsupported handoff instruction kind")
     local block = blocks[index]
     local blockEvidence = builder.program.blocks[block + 1].evidence
@@ -98,6 +98,12 @@ for index, instruction in handoff.instructions do
             folded = value(IR.Operation.binary("concat", reads[slot], folded), IR.Types.dynamic(), IR.Effects.dynamicCall())
         end
         result = folded
+    elseif instruction.kind == "environment_get" then
+        -- An ambient global in semantic mode, the construct the source frontend emits (luau/ast_frontend_expressions.luau:810-822).
+        result = value(IR.Operation.environmentGet(IR.EnvironmentTarget.ambient(), instruction.name), IR.Types.dynamic(), IR.Effects.semanticTableRead())
+    elseif instruction.kind == "environment_set" then
+        -- A global assignment has no result; its value is the per-instruction place read of the source register.
+        builder:addInstruction(block, IR.Operation.environmentSet(IR.EnvironmentTarget.ambient(), instruction.name, reads[1]), {}, { effects = IR.Effects.semanticTableWrite(), evidence = blockEvidence })
     end
     if result ~= nil and places[instruction.writes[1]] ~= nil then
         builder:addInstruction(block, IR.Operation.placeWrite(places[instruction.writes[1]], result), {}, { effects = IR.Effects.placeWrite(), evidence = blockEvidence })
