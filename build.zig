@@ -1838,6 +1838,7 @@ fn addDispatcherLocalBudgetConformance(
     emit_192_dispatcher.addFileArg(dispatcher_192_seed);
     emit_192_dispatcher.addArgs(&.{ "standard-luau", "dispatcher" });
     emit_192_dispatcher.expectExitCode(1);
+    emit_192_dispatcher.expectStdErrMatch("diagnostic=unsupported_readable_register_pressure entity=1\n");
 
     const json_191 = addLuauSourceIr(b, "luau/fixtures/dispatcher_local_budget_191_source.luau", null, "dispatcher-local-budget-191");
     const resolve_191 = b.addRunArtifact(exe);

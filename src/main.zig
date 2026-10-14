@@ -35,8 +35,8 @@ const usage_text =
     \\  semantic-lifter emit-admitted-readable-luau-raw <input.json> <output.luau> <standard-luau|direct-locals-luau>
     \\      checks nothing; the caller must already have admitted the input
     \\  semantic-lifter emit-readable-luau-strategy <normalized.json> <output.luau> <standard-luau|direct-locals-luau> <automatic|dispatcher>
-    \\      checks readable-luau admission of the input only; no resolution, no compile check,
-    \\      no diagnostic lines on refusal (exit 1, error: InvalidIr)
+    \\      checks readable-luau admission of the input only; no resolution, no compile check;
+    \\      an admission refusal prints its diagnostic= lines and writes no output (exit 1)
     \\  semantic-lifter emit-function-probe <input.json> <output.luau> <function-index>
     \\      one function, standard-luau only; checks nothing
     \\  semantic-lifter resolve-exact-control-ir <input.json> <output.json> <internal|z3>
@@ -945,10 +945,23 @@ pub fn main(init: std.process.Init) !void {
         defer allocator.free(source);
         var parsed = try lifter.codec.parse(allocator, source);
         defer parsed.deinit();
-        const emitted = try lifter.emit_luau.emitAllocForTargetWithOptions(
+        const target = try emissionTarget(args[4]);
+        // The admission emit_luau.emitAllocForTargetWithOptions runs, with the
+        // report printed instead of collapsed into error.InvalidIr.
+        var report = try lifter.validate.validateForTargetWithStrategy(
             allocator,
             &parsed.value,
-            try emissionTarget(args[4]),
+            .readable_luau,
+            target,
+            if (force_dispatcher) .dispatcher else .automatic,
+        );
+        defer report.deinit();
+        printDiagnostics(allocator, &report, &parsed.value);
+        if (!report.isClean()) return error.ValidationFailed;
+        const emitted = try lifter.emit_luau.emitAdmittedAllocForTargetWithOptions(
+            allocator,
+            &parsed.value,
+            target,
             .{ .force_dispatcher = force_dispatcher },
         );
         defer allocator.free(emitted);
@@ -1413,4 +1426,6 @@ test "diagnostic-only commands are labelled in the usage text" {
         try std.testing.expect(command_pos != null);
         try std.testing.expect(command_pos.? > header_pos.?);
     }
+    // emit-readable-luau-strategy names its admission refusals as typed diagnostics.
+    try std.testing.expect(std.mem.indexOf(u8, usage_text, "no diagnostic lines on refusal") == null);
 }
