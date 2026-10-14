@@ -2491,3 +2491,181 @@ test "loop terminal omits only a structurally empty natural continue arm" {
     defer std.testing.allocator.free(parameterized);
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, parameterized, "else\n"));
 }
+
+test "a frame-local register read between an open call and its return fuses into the return" {
+    const fixture = lifter.fixtures.open_pack_adjust_module;
+    const register_place = ir.PlaceId.fromIndex(0);
+    // `i_adjust` is dropped, so the new instructions take ids from its slot on.
+    const i_seed = ir.InstructionId.fromIndex(2);
+    const i_write = ir.InstructionId.fromIndex(3);
+    const i_read = ir.InstructionId.fromIndex(4);
+    const v_seed = ir.ValueId.fromIndex(1);
+    const v_read = ir.ValueId.fromIndex(2);
+    const places = [_]ir.Place{.{
+        .id = register_place,
+        .function = fixture.f_entry,
+        .type = .dynamic,
+        .name_hint = "r1",
+        .origin = .{ .local = 0 },
+        .evidence = &.{fixture.proof},
+    }};
+    const values = [_]ir.Value{
+        fixture.values[fixture.v_callee.index()],
+        .{ .id = v_seed, .function = fixture.f_entry, .type = .dynamic, .origin = .{ .instruction_result = .{ .instruction = i_seed, .index = 0 } } },
+        .{ .id = v_read, .function = fixture.f_entry, .type = .dynamic, .origin = .{ .instruction_result = .{ .instruction = i_read, .index = 0 } } },
+    };
+    const instructions = [_]ir.Instruction{
+        fixture.instructions[fixture.i_get.index()],
+        fixture.instructions[fixture.i_call.index()],
+        .{
+            .id = i_seed,
+            .block = fixture.b_entry,
+            .operation = .{ .environment_get = .{ .target = .{ .ambient = {} }, .name = "seed" } },
+            .results = &.{v_seed},
+            .effects = .semantic_environment_read,
+            .evidence = &.{fixture.proof},
+        },
+        .{
+            .id = i_write,
+            .block = fixture.b_entry,
+            .operation = .{ .place_write = .{ .place = register_place, .value = v_seed } },
+            .results = &.{},
+            .effects = .place_write,
+            .evidence = &.{fixture.proof},
+        },
+        .{
+            .id = i_read,
+            .block = fixture.b_entry,
+            .operation = .{ .place_read = register_place },
+            .results = &.{v_read},
+            .effects = .place_read,
+            .evidence = &.{fixture.proof},
+        },
+    };
+    // A6's block order (T2-IR-GAPS A6): the callee read sits next to the open call.
+    const block_instructions = [_]ir.InstructionId{ i_seed, i_write, fixture.i_get, fixture.i_call, i_read };
+    var blocks = fixture.blocks;
+    blocks[fixture.b_entry.index()].instructions = &block_instructions;
+    blocks[fixture.b_entry.index()].terminator = .{ .return_expanded = .{
+        .values = &.{v_read},
+        .pack = fixture.p_results,
+    } };
+    var functions = fixture.functions;
+    functions[fixture.f_entry.index()].local_places = &.{register_place};
+    var program = fixture.program;
+    program.functions = &functions;
+    program.blocks = &blocks;
+    program.instructions = &instructions;
+    program.values = &values;
+    program.places = &places;
+
+    var core_report = try lifter.validate.validate(std.testing.allocator, &program, .core);
+    defer core_report.deinit();
+    try std.testing.expect(core_report.isClean());
+    var readable_report = try lifter.validate.validate(std.testing.allocator, &program, .readable_luau);
+    defer readable_report.deinit();
+    try std.testing.expect(readable_report.isClean());
+
+    const source = try emitAlloc(std.testing.allocator, &program);
+    defer std.testing.allocator.free(source);
+    try std.testing.expect(std.mem.indexOf(u8, source, "__lifter_stored_values_") == null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "produce()"));
+}
+
+/// True when `source` holds `return r1, ` directly followed by `produce()` or by
+/// `value_<digits>()`: the pattern `return r1, (produce|value_[0-9]+)()` with
+/// literal parentheses, a return statement that calls the open producer itself.
+fn returnFusesOpenCall(source: []const u8) bool {
+    const prefix = "return r1, ";
+    var start: usize = 0;
+    while (std.mem.indexOfPos(u8, source, start, prefix)) |at| {
+        start = at + 1;
+        const rest = source[at + prefix.len ..];
+        if (std.mem.startsWith(u8, rest, "produce()")) return true;
+        if (!std.mem.startsWith(u8, rest, "value_")) continue;
+        var end: usize = "value_".len;
+        while (end < rest.len and std.ascii.isDigit(rest[end])) end += 1;
+        if (end > "value_".len and std.mem.startsWith(u8, rest[end..], "()")) return true;
+    }
+    return false;
+}
+
+test "a frame-local register read between an open call and its return fuses into the return when an ambient read separates the callee read from the call" {
+    const fixture = lifter.fixtures.open_pack_adjust_module;
+    const register_place = ir.PlaceId.fromIndex(0);
+    // `i_adjust` is dropped, so the new instructions take ids from its slot on.
+    const i_seed = ir.InstructionId.fromIndex(2);
+    const i_write = ir.InstructionId.fromIndex(3);
+    const i_read = ir.InstructionId.fromIndex(4);
+    const v_seed = ir.ValueId.fromIndex(1);
+    const v_read = ir.ValueId.fromIndex(2);
+    const places = [_]ir.Place{.{
+        .id = register_place,
+        .function = fixture.f_entry,
+        .type = .dynamic,
+        .name_hint = "r1",
+        .origin = .{ .local = 0 },
+        .evidence = &.{fixture.proof},
+    }};
+    const values = [_]ir.Value{
+        fixture.values[fixture.v_callee.index()],
+        .{ .id = v_seed, .function = fixture.f_entry, .type = .dynamic, .origin = .{ .instruction_result = .{ .instruction = i_seed, .index = 0 } } },
+        .{ .id = v_read, .function = fixture.f_entry, .type = .dynamic, .origin = .{ .instruction_result = .{ .instruction = i_read, .index = 0 } } },
+    };
+    const instructions = [_]ir.Instruction{
+        fixture.instructions[fixture.i_get.index()],
+        fixture.instructions[fixture.i_call.index()],
+        .{
+            .id = i_seed,
+            .block = fixture.b_entry,
+            .operation = .{ .environment_get = .{ .target = .{ .ambient = {} }, .name = "seed" } },
+            .results = &.{v_seed},
+            .effects = .semantic_environment_read,
+            .evidence = &.{fixture.proof},
+        },
+        .{
+            .id = i_write,
+            .block = fixture.b_entry,
+            .operation = .{ .place_write = .{ .place = register_place, .value = v_seed } },
+            .results = &.{},
+            .effects = .place_write,
+            .evidence = &.{fixture.proof},
+        },
+        .{
+            .id = i_read,
+            .block = fixture.b_entry,
+            .operation = .{ .place_read = register_place },
+            .results = &.{v_read},
+            .effects = .place_read,
+            .evidence = &.{fixture.proof},
+        },
+    };
+    // The listed order: the ambient `seed` read separates the callee read from the open call.
+    const block_instructions = [_]ir.InstructionId{ fixture.i_get, i_seed, i_write, fixture.i_call, i_read };
+    var blocks = fixture.blocks;
+    blocks[fixture.b_entry.index()].instructions = &block_instructions;
+    blocks[fixture.b_entry.index()].terminator = .{ .return_expanded = .{
+        .values = &.{v_read},
+        .pack = fixture.p_results,
+    } };
+    var functions = fixture.functions;
+    functions[fixture.f_entry.index()].local_places = &.{register_place};
+    var program = fixture.program;
+    program.functions = &functions;
+    program.blocks = &blocks;
+    program.instructions = &instructions;
+    program.values = &values;
+    program.places = &places;
+
+    var core_report = try lifter.validate.validate(std.testing.allocator, &program, .core);
+    defer core_report.deinit();
+    try std.testing.expect(core_report.isClean());
+    var readable_report = try lifter.validate.validate(std.testing.allocator, &program, .readable_luau);
+    defer readable_report.deinit();
+    try std.testing.expect(readable_report.isClean());
+
+    const source = try emitAlloc(std.testing.allocator, &program);
+    defer std.testing.allocator.free(source);
+    try std.testing.expect(std.mem.indexOf(u8, source, "__lifter_stored_values_") == null);
+    try std.testing.expect(returnFusesOpenCall(source));
+}

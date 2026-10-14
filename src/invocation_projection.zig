@@ -282,7 +282,7 @@ fn regionAlloc(
         for (block_gaps) |gap_id| {
             if (!validId(gap_id, program.instructions.len) or seen_gaps[gap_id.index()]) return null;
             const gap = program.instructions[gap_id.index()];
-            if (gap.block != block_id or !gapIsMovable(gap)) return null;
+            if (gap.block != block_id or !projection_witness.invocationGapIsMovable(program, gap)) return null;
             seen_gaps[gap_id.index()] = true;
             try gaps.append(allocator, gap_id);
         }
@@ -476,7 +476,7 @@ fn gapSliceIsMovable(program: *const ir.Program, gaps: []const ir.InstructionId,
     for (gaps) |gap_id| {
         if (!validId(gap_id, program.instructions.len)) return false;
         const gap = program.instructions[gap_id.index()];
-        if (gap.block != owner or !gapIsMovable(gap)) return false;
+        if (gap.block != owner or !projection_witness.invocationGapIsMovable(program, gap)) return false;
     }
     return true;
 }

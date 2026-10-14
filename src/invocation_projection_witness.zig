@@ -94,13 +94,49 @@ pub fn isMovable(program: *const ir.Program, projection: anytype) bool {
     for (projection.gaps) |gap_id| {
         if (!validId(gap_id, program.instructions.len)) return false;
         const gap = program.instructions[gap_id.index()];
-        if (gap.id != gap_id or !blockListed(projection.blocks, gap.block) or !gapIsMovable(gap)) return false;
+        if (gap.id != gap_id or !blockListed(projection.blocks, gap.block) or !invocationGapIsMovable(program, gap)) return false;
     }
     return true;
 }
 
 pub fn gapIsMovable(instruction: ir.Instruction) bool {
     return instruction.operation != .make_closure and isExactPure(instruction.effects);
+}
+
+/// A gap an open invocation may move past: an exact-pure instruction, or an
+/// exact read of a frame-local place, which the invoked code cannot write
+/// because no closure binds the place and no repeated-call counter mutates it.
+pub fn invocationGapIsMovable(program: *const ir.Program, instruction: ir.Instruction) bool {
+    if (gapIsMovable(instruction)) return true;
+    const place_id = switch (instruction.operation) {
+        .place_read => |read_place| read_place,
+        else => return false,
+    };
+    if (!std.meta.eql(instruction.effects, ir.EffectSummary.place_read) or
+        !validId(instruction.block, program.blocks.len)) return false;
+    return placeIsFrameLocal(program, place_id, program.blocks[instruction.block.index()].function);
+}
+
+fn placeIsFrameLocal(program: *const ir.Program, place_id: ir.PlaceId, function_id: ir.FunctionId) bool {
+    if (!validId(place_id, program.places.len) or !validId(function_id, program.functions.len)) return false;
+    const place = program.places[place_id.index()];
+    if (place.id != place_id or place.origin != .local or place.function != function_id) return false;
+    var listed: usize = 0;
+    for (program.functions[function_id.index()].local_places) |local_place| {
+        if (local_place == place_id) listed += 1;
+    }
+    if (listed != 1) return false;
+    for (program.instructions) |candidate| switch (candidate.operation) {
+        .make_closure => |closure| for (closure.bindings) |binding| switch (binding) {
+            .value => {},
+            .place => |bound| if (bound == place_id) return false,
+        },
+        .call_repeated_table_get => |call| if (call.counter) |counter| {
+            if (counter == place_id) return false;
+        },
+        else => {},
+    };
+    return true;
 }
 
 fn endpointsMatchProgram(
