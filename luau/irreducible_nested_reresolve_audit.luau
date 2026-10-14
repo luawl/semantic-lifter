@@ -1,6 +1,6 @@
 --!strict
 
--- Re-resolution fixed-point audit for `resolve-ir` (Task T1.8 of docs/lifter/PLAN-T1.md, K14).
+-- Re-resolution fixed-point audit for `resolve-ir` (K14).
 --
 -- Usage: lune run luau/irreducible_nested_reresolve_audit.luau <resolved> <reresolved> <third> <renormalized>
 --
@@ -15,8 +15,7 @@
 --   (c) <renormalized> has the same block count and the    (the resolver's output is already a
 --       same edge_rewrites count as <resolved>              normalizer fixed point).
 -- It compares bytes, not a canonical form: resolve-ir is deterministic across builds and modes, and
--- the differences K14 records are additions, not renumberings, so a canonical form would hide them
--- (diagnosis note tmp/build-phase2/diag/T1-RERESOLVE.md, sections 4 and 5.0).
+-- the differences K14 records are additions, not renumberings, so a canonical form would hide them.
 
 local fs = require("@lune/fs")
 local process = require("@lune/process")

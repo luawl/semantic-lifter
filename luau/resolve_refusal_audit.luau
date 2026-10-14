@@ -1,6 +1,6 @@
 --!strict
 
--- Refusal audit for `resolve-admitted-readable-ir` (Task T1.2 of docs/lifter/PLAN-T1.md).
+-- Refusal audit for `resolve-admitted-readable-ir`.
 --
 -- Usage: lune run luau/resolve_refusal_audit.luau <semantic-lifter.exe> <fixture.json> <output-dir>
 --
