@@ -64,8 +64,12 @@ builder:finalizeBlock(entry, IR.Terminator.jump(IR.Edge(blocks[1])))
 -- variadic results, or open varargs) is pending from the producer's block to the next block only, whose instruction
 -- consumes it; packs never cross a label, so no block parameter is needed (T2-ADAPTER.md 5.3).
 local pendingPack: number? = nil
+-- Constructor windows (T2-ADAPTER step 5, T2-ADAPTER.md 5.5 5b), keyed by the 0-based index of their NEWTABLE: an
+-- ordered window carries its make_table value (`table`) through the window; a literal window collects its fields in
+-- store order (`fields`) and its tail pack (`tail`) for the completing member.
+local windows: { [number]: any } = {}
 for index, instruction in handoff.instructions do
-    assert(table.find({ "constant", "move", "binary", "unary", "concat", "jump", "branch", "return", "environment_get", "environment_set", "call", "namecall", "varargs" }, instruction.kind) ~= nil,
+    assert(table.find({ "constant", "move", "binary", "unary", "concat", "jump", "branch", "return", "environment_get", "environment_set", "call", "namecall", "varargs", "new_table", "table_get", "table_set", "set_list" }, instruction.kind) ~= nil,
         "unsupported handoff instruction kind")
     assert((pendingPack ~= nil) == (instruction.consumes_pack_from ~= nil), "open pack not adjacent to its consumer")
     local consumed: number? = pendingPack
@@ -164,6 +168,71 @@ for index, instruction in handoff.instructions do
             end
             local _, values = builder:addInstruction(block, IR.Operation.adjustPack(varargPack), resultSpecs, { effects = IR.Effects.pure(), evidence = blockEvidence })
             results = values
+        end
+    elseif instruction.kind == "new_table" then
+        -- The source frontend's table constructs (luau/ast_frontend_tables.luau). A literal window emits nothing at its
+        -- NEWTABLE (lowerLiteral, :145-191); a plain NEWTABLE, or the NEWTABLE of an ordered window (lowerOrdered,
+        -- :87-143), is make_table, typed table, with tableConstructor effects.
+        local window = instruction.constructor
+        if window ~= nil and window.mode == "literal" then
+            windows[window.create] = { fields = {} }
+        else
+            assert(window == nil or window.mode == "ordered", "unknown constructor window mode")
+            result = value(IR.Operation.makeTable(), IR.Types.table(), IR.Effects.tableConstructor())
+            if window ~= nil then
+                windows[window.create] = { table = result }
+            end
+        end
+    elseif instruction.kind == "table_get" then
+        -- A semantic read (never the raw form, T2-IR-GAPS.md 3.3 item 3): reads[1] is the table, the key is reads[2]
+        -- or a KS key's string constant (pure).
+        local key = if instruction.key_constant ~= nil
+            then value(IR.Operation.constant(IR.Literal.string(instruction.key_constant.string)), IR.Types.string(), IR.Effects.pure())
+            else reads[2]
+        result = value(IR.Operation.tableGet(reads[1], key), IR.Types.dynamic(), IR.Effects.semanticTableRead())
+    elseif instruction.kind == "table_set" then
+        -- A semantic write. A plain store reads the table first; a window member reads only its key and value registers
+        -- and stores into the window: a keyed field of a literal window, or a table_set on the carried make_table value.
+        local window = instruction.constructor
+        local state = if window ~= nil then windows[window.create] else nil
+        local key = if instruction.key_constant ~= nil
+            then value(IR.Operation.constant(IR.Literal.string(instruction.key_constant.string)), IR.Types.string(), IR.Effects.pure())
+            else reads[if window ~= nil then 1 else 2]
+        local stored = reads[#reads]
+        if window ~= nil and window.mode == "literal" then
+            table.insert(state.fields, IR.TableConstructorField.keyed(key, stored))
+        else
+            local tableValue = if state ~= nil then state.table else reads[1]
+            builder:addInstruction(block, IR.Operation.tableSet(tableValue, key, stored), {}, { effects = IR.Effects.semanticTableWrite(), evidence = blockEvidence })
+        end
+    elseif instruction.kind == "set_list" then
+        -- SETLIST is always a window member (the adapter refuses it elsewhere); reads are its values in index order. A
+        -- literal window takes them as list fields and the consumed pack as its tail; an ordered window writes each on
+        -- its integer key and the consumed pack with table_set_pack (rawTableWrite, as lowerOrdered does).
+        local window = instruction.constructor
+        local state = windows[window.create]
+        if window.mode == "literal" then
+            for _, item in reads do
+                table.insert(state.fields, IR.TableConstructorField.list(item))
+            end
+            state.tail = consumed
+        else
+            for slot, item in reads do
+                local key = value(IR.Operation.constant(IR.Literal.integer(tostring(instruction.first_index + slot - 1))), IR.Types.integer(), IR.Effects.pure())
+                builder:addInstruction(block, IR.Operation.tableSet(state.table, key, item), {}, { effects = IR.Effects.semanticTableWrite(), evidence = blockEvidence })
+            end
+            if consumed ~= nil then
+                builder:addInstruction(block, IR.Operation.tableSetPack(state.table, instruction.first_index + #reads, consumed), {}, { effects = IR.Effects.rawTableWrite(), evidence = blockEvidence })
+            end
+        end
+    end
+    if instruction.complete and instruction.constructor.mode == "literal" then
+        -- The completing member of a literal window builds the constructor from its fields in store order and the tail
+        -- pack, with tableConstructor effects, and writes R(t) there (only where R(t) has a place, decision D3).
+        local state = windows[instruction.constructor.create]
+        local constructed = value(IR.Operation.makeTableLiteral(state.fields, state.tail), IR.Types.table(), IR.Effects.tableConstructor())
+        if places[instruction.table] ~= nil then
+            builder:addInstruction(block, IR.Operation.placeWrite(places[instruction.table], constructed), {}, { effects = IR.Effects.placeWrite(), evidence = blockEvidence })
         end
     end
     if result ~= nil and places[instruction.writes[1]] ~= nil then

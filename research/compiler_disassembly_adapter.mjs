@@ -14,13 +14,16 @@ const COMPARE = {
 const UNARY = {
   MINUS: 'negate', NOT: 'logical_not', LENGTH: 'length',
 };
-// Operand counts per accepted opcode; LOADB takes an optional third operand, its relative skip.
+// Operand counts per accepted opcode; LOADB takes an optional third operand, its relative skip. SETLIST's fourth
+// operand is its bracketed start index, parsed by its own pattern (it is never a comment).
 const OPERAND_COUNTS = new Map([
   ['LOADK', [2]], ['LOADN', [2]], ['LOADNIL', [1]], ['LOADB', [3, 2]], ['MOVE', [2]],
   ['MINUS', [2]], ['NOT', [2]], ['LENGTH', [2]], ['CONCAT', [3]],
   ['JUMP', [1]], ['JUMPBACK', [1]], ['JUMPIF', [2]], ['JUMPIFNOT', [2]], ['RETURN', [2]],
   ['GETGLOBAL', [2]], ['SETGLOBAL', [2]],
   ['CALL', [3]], ['NAMECALL', [3]], ['GETVARARGS', [2]],
+  ['NEWTABLE', [3]], ['GETTABLE', [3]], ['SETTABLE', [3]], ['GETTABLEKS', [3]], ['SETTABLEKS', [3]], ['SETLIST', [4]],
+  ['DUPTABLE', [2]],
   ...Object.keys(BINARY).map((op) => [op, [3]]),
   ...['', 'NOT'].flatMap((not) => Object.keys(COMPARE).map((test) => [`JUMPIF${not}${test}`, [3]])),
 ]);
@@ -170,7 +173,9 @@ export function parseDisassembly(text, { function_index = 0, parameter_count = 2
     const site = { line_number: record.line_number, op };
     const counts = OPERAND_COUNTS.get(op);
     if (!counts) refuse('unsupported_opcode', `unsupported opcode ${op} at disassembly line ${record.line_number}`, record.line_number, op);
-    const args = operands(match[2] ?? '', counts) ?? refuseAt(site, 'operand_form', `${op}: operand count`);
+    // `SETLIST R<a> R<b> <c> [<s>]`: the bracket is the start-index operand (T2-ADAPTER.md 3.4), kept as args[3].
+    const args = (op === 'SETLIST' ? /^(\S+)\s+(\S+)\s+(\S+)\s+\[([^\]]*)\]$/.exec(match[2] ?? '')?.slice(1)
+      : operands(match[2] ?? '', counts)) ?? refuseAt(site, 'operand_form', `${op}: operand count`);
     const instruction = { op, args, line_number: record.line_number, reads: [], writes: [] };
     if (op === 'LOADK') {
       if (!/^K\d+$/.test(args[1])) refuseAt(site, 'operand_form', 'invalid constant operand');
@@ -331,6 +336,70 @@ export function parseDisassembly(text, { function_index = 0, parameter_count = 2
         instruction.count = count;
         instruction.writes = Array.from({ length: count }, (_, i) => base + i);
       }
+    } else if (op === 'NEWTABLE') {
+      // `NEWTABLE R<a> <h> <n>` (T2-ADAPTER step 5): a fresh table in R<a>; the hash and array size hints are not kept.
+      if (!/^\d+$/.test(args[1]) || !/^\d+$/.test(args[2])) refuseAt(site, 'operand_form', 'invalid table size hint');
+      instruction.kind = 'new_table';
+      instruction.writes = [register(args[0], site)];
+    } else if (op === 'GETTABLE' || op === 'SETTABLE') {
+      // Keyed access; operand roles differ: `GETTABLE R<a> R<b> R<c>` is R<a> = R<b>[R<c>], `SETTABLE R<a> R<b> R<c>`
+      // is R<b>[R<c>] = R<a> (value, table, key).
+      const target = register(args[0], site);
+      instruction.table = register(args[1], site);
+      instruction.key = register(args[2], site);
+      if (op === 'GETTABLE') {
+        instruction.kind = 'table_get';
+        instruction.reads = [instruction.table, instruction.key];
+        instruction.writes = [target];
+      } else {
+        instruction.kind = 'table_set';
+        instruction.value = target;
+        instruction.reads = [instruction.table, instruction.key, target];
+      }
+    } else if (op === 'GETTABLEKS' || op === 'SETTABLEKS') {
+      // Named access: the key is the string constant K<k>, read through the lazy decoder; the roles are as for
+      // GETTABLE/SETTABLE (SETTABLEKS reads its source R<a>).
+      if (!/^K\d+$/.test(args[2])) refuseAt(site, 'operand_form', 'invalid constant operand');
+      const key = Number(args[2].slice(1));
+      if (!constants.has(key)) refuseAt(site, 'operand_form', 'constant is absent');
+      const { string: name } = constantValue(key, constants.get(key), site);
+      if (typeof name !== 'string') refuseAt(site, 'constant_kind_mismatch', `${op}: K${key} is not a string`);
+      const target = register(args[0], site);
+      instruction.table = register(args[1], site);
+      instruction.key_constant = { string: name };
+      if (op === 'GETTABLEKS') {
+        instruction.kind = 'table_get';
+        instruction.reads = [instruction.table];
+        instruction.writes = [target];
+      } else {
+        instruction.kind = 'table_set';
+        instruction.value = target;
+        instruction.reads = [instruction.table, target];
+      }
+    } else if (op === 'SETLIST') {
+      // `SETLIST R<a> R<b> <c> [<s>]` stores R<b..b+c-1> at R<a>[s..]; c = -1 is an open consumer that stores
+      // R<b..p-1> and then the pack the previous instruction left at R<p>. A SETLIST is accepted only as a member of a
+      // constructor window (below).
+      const table = register(args[0], site);
+      const first = register(args[1], site);
+      if (!/^[1-9]\d*$/.test(args[3])) refuseAt(site, 'operand_form', 'invalid SETLIST start index');
+      instruction.kind = 'set_list';
+      instruction.table = table;
+      if (args[2] === '-1') {
+        const pack = consume(site, first, 'open SETLIST has no adjacent producer');
+        instruction.values = Array.from({ length: pack - first }, (_, i) => first + i);
+        instruction.consumes_pack_from = pack;
+      } else {
+        if (!/^\d+$/.test(args[2])) refuseAt(site, 'operand_form', 'invalid SETLIST count');
+        const count = Number(args[2]);
+        if (!(first + count <= 255)) refuseAt(site, 'operand_form', 'invalid SETLIST range');
+        instruction.values = Array.from({ length: count }, (_, i) => first + i);
+      }
+      instruction.first_index = Number(args[3]);
+      instruction.reads = [table, ...instruction.values];
+    } else if (op === 'DUPTABLE') {
+      // Decision D4: the template constant prints as `{...}`, so its keys are not in the listing (T2-ADAPTER.md 5.5 5c).
+      refuseAt(site, 'table_template_opaque', 'DUPTABLE template keys are not in the listing');
     } else {
       refuse('unsupported_opcode', `unsupported opcode ${op} at disassembly line ${record.line_number}`, record.line_number, op);
     }
@@ -360,6 +429,71 @@ export function parseDisassembly(text, { function_index = 0, parameter_count = 2
           : skip ? [index + 2] : [index + 1];
     if (!instruction.successors.every((target) => target < instructions.length)) {
       refuseAt(instruction, 'listing_structure', 'function falls off end');
+    }
+  }
+  // Constructor windows (T2-ADAPTER.md 5.5 5b). A `NEWTABLE R<t>` opens a window when a `SETLIST R<t>` follows: the
+  // window runs to the last store into R<t> (SETLIST, SETTABLE/SETTABLEKS with table R<t>) before the first instruction
+  // that reads or writes R<t> in any other way (a call frame that kills R<t> included), carries a label, or jumps,
+  // branches or returns (a LOADB skip included). The NEWTABLE and every member carry `constructor`, the last member also
+  // `complete`; a member reads only its key and value registers, never R<t>. Field order is the listing's store order,
+  // which at -O0 is source order (T2-ADAPTER.md 2.7).
+  const storeRegisters = (store) => (store.kind === 'set_list' ? store.values
+    : [...(store.key === undefined ? [] : [store.key]), store.value]);
+  for (const [create, table] of instructions.entries()) {
+    if (table.kind !== 'new_table') continue;
+    const [t] = table.writes;
+    const members = [];
+    for (let index = create + 1; index < instructions.length; index += 1) {
+      const instruction = instructions[index];
+      const transfers = ['jump', 'branch', 'return'].includes(instruction.kind) || instruction.successors[0] !== index + 1;
+      if (labelled.has(index) || transfers) break;
+      const store = (instruction.kind === 'set_list' || instruction.kind === 'table_set') && instruction.table === t;
+      const touched = store ? storeRegisters(instruction) : [...instruction.reads, ...instruction.writes];
+      if (touched.includes(t) || (instruction.clobbers_from ?? Infinity) <= t) break;
+      if (store) members.push(index);
+    }
+    if (!members.some((index) => instructions[index].kind === 'set_list')) continue;
+    const last = members[members.length - 1];
+    // List items continue from 1 (`[1]`, then the previous start plus the previous count); an open tail is last.
+    let next = 1;
+    for (const index of members) {
+      const member = instructions[index];
+      if (member.kind !== 'set_list') continue;
+      if (member.first_index !== next) {
+        refuseAt(member, 'setlist_index_gap', `SETLIST start index ${member.first_index} does not continue the list at ${next}`);
+      }
+      if (member.consumes_pack_from !== undefined && index !== last) {
+        refuseAt(member, 'constructor_window_unsupported', 'open SETLIST is not the last member of its constructor');
+      }
+      next = member.first_index + member.values.length;
+    }
+    // `literal` when every keyed member except the last has a definitely valid key: a SETTABLEKS, or a key register
+    // last written inside the window by LOADK of a string or non-NaN number or by LOADB; mirroring
+    // requiresOrderedWrites (luau/ast_frontend_tables.luau:56-67). Otherwise `ordered`.
+    const definitelyValidKey = (index) => {
+      const { key } = instructions[index];
+      if (key === undefined) return true;
+      for (let at = index - 1; at > create; at -= 1) {
+        const writer = instructions[at];
+        if (writer.writes.includes(key) || (writer.clobbers_from ?? Infinity) <= key) {
+          return writer.op === 'LOADB'
+            || (writer.op === 'LOADK' && (typeof writer.value.string === 'string' || Number.isFinite(writer.value.number)));
+        }
+      }
+      return false;
+    };
+    const mode = members.every((index) => index === last || instructions[index].kind !== 'table_set'
+      || definitelyValidKey(index)) ? 'literal' : 'ordered';
+    table.constructor = { create, mode };
+    for (const index of members) {
+      instructions[index].constructor = { create, mode };
+      instructions[index].reads = storeRegisters(instructions[index]);
+    }
+    instructions[last].complete = true;
+  }
+  for (const instruction of instructions) {
+    if (instruction.kind === 'set_list' && !Object.hasOwn(instruction, 'constructor')) {
+      refuseAt(instruction, 'constructor_window_unsupported', 'SETLIST outside a constructor window');
     }
   }
   const registers = [...new Set([

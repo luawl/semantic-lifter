@@ -278,3 +278,207 @@ test('an open pack must be consumed immediately', () => {
   assert.throws(() => parseDisassembly(listing.replace('RETURN R2 1', 'RETURN R2 -1')),
     (error) => refusedAs('open_consumer_without_producer')(error) && /open return/.test(error.message));
 });
+
+// Task T2.5 (T2-ADAPTER step 5). The three program listings are verbatim -O0 Function 0 listings (REMARK lines
+// included) of the author-owned diagnosis programs p06_table_access (lines 1-27), p13_long_list (lines 1-57) and
+// p17_ctor_order (lines 1-37). The ordered probe is the author-owned program written for this plan,
+// research/fixtures/disassembly/ordered_constructor_probe.luau (`local t = {[selector] = 1, budget}`), Function 0
+// listing lines 1-10. The template excerpt is p07_table_ctor lines 5 and 18 plus a return.
+const p06TableAccess = `Function 0 (??):
+K0: 1
+K1: 'b'
+K2: 2
+K3: 300
+K4: 7
+REMARK allocation: table hash 0
+NEWTABLE R2 0 0
+LOADK R3 K0 [1]
+SETTABLE R0 R2 R3
+SETTABLEKS R1 R2 K1 ['b']
+LOADK R3 K2 [2]
+ADD R4 R0 R1
+SETTABLE R4 R2 R3
+LOADK R4 K3 [300]
+LOADK R5 K4 [7]
+SETTABLE R5 R2 R4
+LOADK R8 K0 [1]
+GETTABLE R7 R2 R8
+GETTABLEKS R8 R2 K1 ['b']
+ADD R6 R7 R8
+GETTABLE R7 R2 R3
+ADD R5 R6 R7
+LOADK R7 K3 [300]
+GETTABLE R6 R2 R7
+ADD R4 R5 R6
+RETURN R4 1
+`;
+const p13LongList = `Function 0 (??):
+K0: 1
+K1: 2
+K2: 3
+K3: 4
+K4: 5
+K5: 6
+K6: 7
+K7: 8
+K8: 9
+K9: 10
+K10: 11
+K11: 12
+K12: 13
+K13: 14
+K14: 15
+K15: 16
+K16: 17
+K17: 18
+K18: 19
+K19: 20
+REMARK allocation: table array 22
+NEWTABLE R2 0 22
+LOADK R3 K0 [1]
+LOADK R4 K1 [2]
+LOADK R5 K2 [3]
+LOADK R6 K3 [4]
+LOADK R7 K4 [5]
+LOADK R8 K5 [6]
+LOADK R9 K6 [7]
+LOADK R10 K7 [8]
+LOADK R11 K8 [9]
+LOADK R12 K9 [10]
+LOADK R13 K10 [11]
+LOADK R14 K11 [12]
+LOADK R15 K12 [13]
+LOADK R16 K13 [14]
+LOADK R17 K14 [15]
+LOADK R18 K15 [16]
+SETLIST R2 R3 16 [1]
+LOADK R3 K16 [17]
+LOADK R4 K17 [18]
+LOADK R5 K18 [19]
+LOADK R6 K19 [20]
+MOVE R7 R0
+MOVE R8 R1
+SETLIST R2 R3 6 [17]
+REMARK allocation: table array 2
+NEWTABLE R3 0 2
+MOVE R4 R0
+MOVE R5 R1
+GETVARARGS R6 -1
+SETLIST R3 R4 -1 [1]
+LENGTH R5 R2
+LENGTH R6 R3
+ADD R4 R5 R6
+RETURN R4 1
+`;
+const p17CtorOrder = `Function 0 (??):
+K0: 'b'
+K1: 'math'
+K2: 'abs'
+K3: 'max'
+K4: 1
+K5: 'c'
+K6: 7
+K7: 2
+REMARK allocation: table hash 2 array 2
+NEWTABLE R2 2 2
+LOADK R5 K0 ['b']
+GETGLOBAL R6 K1 ['math']
+GETTABLEKS R6 R6 K2 ['abs']
+MOVE R7 R1
+CALL R6 1 1
+SETTABLE R6 R2 R5
+GETGLOBAL R3 K1 ['math']
+GETTABLEKS R3 R3 K3 ['max']
+MOVE R4 R0
+LOADK R5 K4 [1]
+CALL R3 2 1
+SETLIST R2 R3 1 [1]
+LOADK R5 K5 ['c']
+SETTABLE R0 R2 R5
+LOADK R3 K6 [7]
+SETLIST R2 R3 1 [2]
+LOADK R7 K4 [1]
+GETTABLE R6 R2 R7
+LOADK R8 K7 [2]
+GETTABLE R7 R2 R8
+ADD R5 R6 R7
+GETTABLEKS R6 R2 K0 ['b']
+ADD R4 R5 R6
+GETTABLEKS R5 R2 K5 ['c']
+ADD R3 R4 R5
+RETURN R3 1
+`;
+const orderedConstructorProbe = `Function 0 (??):
+K0: 1
+REMARK allocation: table hash 1 array 1
+NEWTABLE R2 1 1
+LOADK R4 K0 [1]
+SETTABLE R4 R2 R0
+MOVE R3 R1
+SETLIST R2 R3 1 [1]
+LENGTH R3 R2
+RETURN R3 1
+`;
+// Every object inherits `constructor`, so window membership is tested as an own property.
+const windowMembers = (instructions) => instructions.flatMap((instruction, index) =>
+  (Object.hasOwn(instruction, 'constructor') ? [index] : []));
+
+test('tables without SETLIST lower to new_table and ordered stores', () => {
+  const { instructions } = parseDisassembly(p06TableAccess);
+  assertFields(instructions, {
+    0: { op: 'NEWTABLE', kind: 'new_table', writes: [2] },
+    2: { op: 'SETTABLE', kind: 'table_set', table: 2, key: 3, value: 0, reads: [2, 3, 0], writes: [] },
+    3: { op: 'SETTABLEKS', kind: 'table_set', table: 2, key_constant: { string: 'b' }, value: 1, reads: [2, 1] },
+    11: { op: 'GETTABLE', kind: 'table_get', table: 2, key: 8, reads: [2, 8], writes: [7] },
+    12: { op: 'GETTABLEKS', kind: 'table_get', table: 2, key_constant: { string: 'b' }, reads: [2], writes: [8] },
+  });
+  assert.equal(Object.hasOwn(instructions[0], 'constructor'), false);
+  assert.deepEqual(windowMembers(instructions), []);
+});
+
+test('SETLIST rebuilds the list constructor', () => {
+  const { instructions } = parseDisassembly(p13LongList, { parameter_count: 2, is_variadic: true });
+  assertFields(instructions, {
+    17: { op: 'SETLIST', kind: 'set_list', table: 2, values: [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18],
+      first_index: 1, constructor: { create: 0, mode: 'literal' } },
+    24: { op: 'SETLIST', values: [3, 4, 5, 6, 7, 8], first_index: 17, constructor: { create: 0, mode: 'literal' },
+      complete: true },
+    29: { op: 'SETLIST', table: 3, values: [4, 5], first_index: 1, consumes_pack_from: 6,
+      constructor: { create: 25, mode: 'literal' }, complete: true },
+  });
+  assert.equal(Object.hasOwn(instructions[17], 'complete'), false);
+});
+
+test('constructor windows keep source order and choose their mode', () => {
+  const { instructions } = parseDisassembly(p17CtorOrder);
+  // The NEWTABLE and its members in store order: b, the first list item, c, the second list item.
+  assert.deepEqual(windowMembers(instructions), [0, 6, 12, 14, 16]);
+  assertFields(instructions, {
+    6: { op: 'SETTABLE', kind: 'table_set', table: 2, key: 5, value: 6, reads: [5, 6],
+      constructor: { create: 0, mode: 'literal' } },
+    12: { op: 'SETLIST', values: [3], first_index: 1, constructor: { create: 0, mode: 'literal' } },
+    14: { op: 'SETTABLE', key: 5, value: 0, constructor: { create: 0, mode: 'literal' } },
+    16: { op: 'SETLIST', values: [3], first_index: 2, complete: true, constructor: { create: 0, mode: 'literal' } },
+  });
+  // The probe's key R0 is not definitely valid and its member is not the last, so the window is ordered.
+  assertFields(parseDisassembly(orderedConstructorProbe).instructions, {
+    2: { op: 'SETTABLE', kind: 'table_set', table: 2, key: 0, value: 4, constructor: { create: 0, mode: 'ordered' } },
+    4: { op: 'SETLIST', kind: 'set_list', values: [3], first_index: 1, constructor: { create: 0, mode: 'ordered' },
+      complete: true },
+  });
+});
+
+test('SETLIST outside a recognisable constructor is refused', () => {
+  const gap = p17CtorOrder.replace('SETLIST R2 R3 1 [2]', 'SETLIST R2 R3 1 [3]');
+  assert.notEqual(gap, p17CtorOrder);
+  assert.throws(() => parseDisassembly(gap), refusedAs('setlist_index_gap'));
+  // The label ends the window before the c store and the second SETLIST.
+  const labelled = p17CtorOrder.replace("LOADK R5 K5 ['c']", "L9: LOADK R5 K5 ['c']");
+  assert.notEqual(labelled, p17CtorOrder);
+  assert.throws(() => parseDisassembly(labelled), refusedAs('constructor_window_unsupported'));
+});
+
+test('record templates stay refused', () => {
+  assert.throws(() => parseDisassembly(excerpt('K3: {...}', 'DUPTABLE R3 3', 'RETURN R3 1')),
+    (error) => refusedAs('table_template_opaque')(error) && error.opcode === 'DUPTABLE' && error.line_number === 3);
+});
