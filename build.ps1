@@ -10,6 +10,7 @@
 #   adds the option when the tool exists in the maintainers' workspace layout (lune.exe and
 #   tools\luau-0.720\ in the directory four levels above this repository).
 # - Never sets --prefix or the cache directories; callers pass them.
+# - Passes every other argument, such as -Dz3=true -Dz3-dir=<path>, to zig build unchanged.
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
@@ -17,6 +18,7 @@ Set-StrictMode -Version 2.0
 # PowerShell splits an argument such as -Dlune=C:\tools\lune.exe at the drive colon (from a prompt:
 # '-Dlune=C:' and '\tools\lune.exe'; through pwsh -File: '-Dlune=C' and '\tools\lune.exe'). Join the
 # two pieces again so zig receives the argument as it was typed.
+# PowerShell also ends such a token at its first '.' ('-Dz3-dir=..\z3\z3-4.16.0-x64-win' arrives as '-Dz3-dir=' and '..\z3\z3-4.16.0-x64-win'); a piece that starts with '.' is joined back the same way.
 $zigArgs = New-Object System.Collections.Generic.List[string]
 for ($i = 0; $i -lt $args.Count; $i++) {
     $arg = [string]$args[$i]
@@ -29,6 +31,11 @@ for ($i = 0; $i -lt $args.Count; $i++) {
         }
         if ($arg -match '^-D[^=]+=[A-Za-z]$' -and $next -match '^[\\/]') {
             $zigArgs.Add($arg + ':' + $next)
+            $i++
+            continue
+        }
+        if ($arg -match '^-D[^=]+=' -and $next -match '^\.') {
+            $zigArgs.Add($arg + $next)
             $i++
             continue
         }

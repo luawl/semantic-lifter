@@ -26,6 +26,25 @@ fn resolveExternalTool(b: *std.Build, option_value: ?[]const u8, name: []const u
     return b.findProgram(&.{name}, &.{}) catch failMissingTool(name);
 }
 
+const z3_dir_hint = "pass -Dz3-dir=<path> (an unpacked Z3 4.16.0 release with include/z3.h, bin/libz3.lib and bin/libz3.dll)";
+
+fn failMissingZ3(comptime detail: []const u8, args: anytype) noreturn {
+    std.debug.print("semantic-lifter: " ++ detail ++ "; " ++ z3_dir_hint ++ "\n", args);
+    std.process.exit(1);
+}
+
+// -Dz3=true needs -Dz3-dir, and the three files the build consumes must exist, checked at configure time
+// like the external tools. The value is returned as given (absolute, or relative to the build root);
+// every use resolves it with b.pathFromRoot, as the addPathDir(b.pathFromRoot(z3_bin)) sites do.
+fn checkZ3Dir(b: *std.Build, option_value: ?[]const u8) []const u8 {
+    const value = option_value orelse failMissingZ3("-Dz3=true needs the Z3 C API", .{});
+    for ([_][]const u8{ "include/z3.h", "bin/libz3.lib", "bin/libz3.dll" }) |entry| {
+        const file = b.pathFromRoot(b.pathJoin(&.{ value, entry }));
+        std.Io.Dir.cwd().access(b.graph.io, file, .{}) catch failMissingZ3("Z3 file {s} not found", .{file});
+    }
+    return value;
+}
+
 fn luneExe(b: *std.Build) []const u8 {
     _ = b;
     return resolved_lune;
@@ -64,6 +83,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const z3_enabled = b.option(bool, "z3", "Enable the direct Z3 C API backend") orelse false;
+    const z3_dir_option = b.option([]const u8, "z3-dir", "Path to an unpacked Z3 4.16.0 release (include/z3.h, bin/libz3.lib, bin/libz3.dll); required with -Dz3=true");
     const install_proof_attest = b.option(
         bool,
         "install-proof-attest",
@@ -89,9 +109,10 @@ pub fn build(b: *std.Build) void {
     resolved_luau_ast = resolveExternalTool(b, luau_ast_option, "luau-ast");
     resolved_luau_analyze = resolveExternalTool(b, luau_analyze_option, "luau-analyze");
 
-    const z3_include = "../../../dep/z3/z3-4.16.0-x64-win/include";
-    const z3_library = "../../../dep/z3/z3-4.16.0-x64-win/bin/libz3.lib";
-    const z3_bin = "../../../dep/z3/z3-4.16.0-x64-win/bin";
+    const z3_dir = if (z3_enabled) checkZ3Dir(b, z3_dir_option) else "";
+    const z3_include = b.pathJoin(&.{ z3_dir, "include" });
+    const z3_library = b.pathJoin(&.{ z3_dir, "bin", "libz3.lib" });
+    const z3_bin = b.pathJoin(&.{ z3_dir, "bin" });
 
     const build_options = b.addOptions();
     build_options.addOption(bool, "z3_enabled", z3_enabled);
@@ -104,8 +125,9 @@ pub fn build(b: *std.Build) void {
     });
     module.addOptions("build_options", build_options);
     if (z3_enabled) {
-        module.addIncludePath(b.path(z3_include));
-        module.addObjectFile(b.path(z3_library));
+        module.link_libc = true; // z3.h includes <stdio.h>, so the C import needs the libc headers
+        module.addIncludePath(.{ .cwd_relative = b.pathFromRoot(z3_include) });
+        module.addObjectFile(.{ .cwd_relative = b.pathFromRoot(z3_library) });
     }
 
     const exe = b.addExecutable(.{
