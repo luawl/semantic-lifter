@@ -49,7 +49,7 @@ alias class explicit, and a class is refined only when all of its writes agree o
   those the backend derives from control facts. Only proved facts change the program, as replayable
   CFG rewrites; an unknown answer leaves its obligation open, and admission re-checks certificates,
   models and digests rather than trusting the run that produced them. The internal engine is the
-  default; an optional Z3 backend is built with `-Dz3=true`.
+  default; an optional Z3 backend is built with `-Dz3=true -Dz3-dir=<path>` (see Requirements).
 - **Restructuring.** Planned regions become nested `if` statements, `while` loops with `break` and
   `continue`, and native numeric and generic `for` loops. Irreducible control, such as a loop
   entered at two points, goes through guarded node splitting within a growth budget; each
@@ -310,8 +310,13 @@ Manuscripts, run records and evidence archives will be published with the prepri
   ([luau-lang/luau releases, tag `0.720`](https://github.com/luau-lang/luau/releases/tag/0.720)).
 - Node 24, only for the disassembly adapter and its test
   (`node --test research/compiler_disassembly_adapter.test.mjs`).
-- Z3, optional and maintainers-only for now: `-Dz3=true` (off by default) links the Z3 4.16.0 C API
-  from a fixed location outside the repository that `build.zig` names; 61 tests compile only with it.
+- Z3 4.16.0, optional ([Z3Prover/z3 releases](https://github.com/Z3Prover/z3/releases)):
+  `-Dz3=true -Dz3-dir=<path>` (off by default) compiles the Z3 backend against the C API in `<path>`,
+  an unpacked Z3 4.16.0 release for Windows x64 that holds `include/z3.h`, `bin/libz3.lib` and
+  `bin/libz3.dll`; a relative `<path>` resolves against the repository root, and 61 tests compile
+  only with it. Without `-Dz3-dir`, or when one of those files is missing, `zig build` stops at
+  configure time with a message that names `-Dz3-dir`. No build against a real Z3 release is on
+  record yet, and other platforms' Z3 archives are not wired.
 
 ## Build and test
 
@@ -333,7 +338,9 @@ On Windows, `build.ps1 <step> [zig build args]` runs the same build, for example
 `tools\zig-x86_64-windows-0.16.0\` when that directory exists and `zig` from `PATH` otherwise, runs
 in the repository root, and adds each of the four tool options that the caller did not pass when it
 finds that tool in the maintainers' workspace layout. It never sets `--prefix` or the cache
-directories; pass them as arguments when you need them.
+directories; pass them as arguments when you need them. Every other argument, such as
+`-Dz3=true -Dz3-dir=<path>`, reaches `zig build` unchanged, and a `-D` value that PowerShell splits
+at a drive colon or at a dot is joined again.
 
 With `--summary all`, `test` reports a `Build Summary` in which every step succeeded and
 every test passed, and `conformance` one in which every step succeeded; a failing step is named in the step tree that follows the summary line.
