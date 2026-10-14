@@ -20,6 +20,7 @@ const OPERAND_COUNTS = new Map([
   ['MINUS', [2]], ['NOT', [2]], ['LENGTH', [2]], ['CONCAT', [3]],
   ['JUMP', [1]], ['JUMPBACK', [1]], ['JUMPIF', [2]], ['JUMPIFNOT', [2]], ['RETURN', [2]],
   ['GETGLOBAL', [2]], ['SETGLOBAL', [2]],
+  ['CALL', [3]], ['NAMECALL', [3]],
   ...Object.keys(BINARY).map((op) => [op, [3]]),
   ...['', 'NOT'].flatMap((not) => Object.keys(COMPARE).map((test) => [`JUMPIF${not}${test}`, [3]])),
 ]);
@@ -88,6 +89,19 @@ function operands(text, counts) {
   return null;
 }
 
+// `CALL R<a> <n> <m>` prints B-1 and C-1: n arguments R<a+1..a+n> after the callee R<a> and m
+// results written from R<a>. A count of -1 is the open protocol, refused for now.
+function callCounts(args, site) {
+  const base = register(args[0], site);
+  const [count, results] = args.slice(1).map((text) => {
+    if (text === '-1') refuseAt(site, 'open_protocol_unsupported', 'open call protocol is unsupported');
+    if (!/^\d+$/.test(text)) refuseAt(site, 'operand_form', 'invalid call count');
+    return Number(text);
+  });
+  if (!(base + count < 255 && base + results <= 255)) refuseAt(site, 'operand_form', 'invalid call range');
+  return { base, count, results };
+}
+
 // The compiler owns bytecode decoding. This adapter accepts its pinned text
 // format, not arbitrary binary bytecode or original source ASTs.
 export function parseDisassembly(text, { function_index = 0, parameter_count = 2, is_variadic = false } = {}) {
@@ -118,7 +132,9 @@ export function parseDisassembly(text, { function_index = 0, parameter_count = 2
   const constants = new Map();
   const labels = new Map();
   const instructions = [];
-  for (const record of functions.get(function_index)) {
+  const records = functions.get(function_index);
+  for (let position = 0; position < records.length; position += 1) {
+    const record = records[position];
     let { line } = record;
     if (line.startsWith('REMARK ')) continue;
     const constant = /^K(\d+): (.+)$/.exec(line);
@@ -220,6 +236,47 @@ export function parseDisassembly(text, { function_index = 0, parameter_count = 2
       instruction.name = name;
       if (op === 'GETGLOBAL') instruction.writes = [register(args[0], site)];
       else instruction.reads = [register(args[0], site)];
+    } else if (op === 'CALL') {
+      // A call with fixed counts: it reads the callee R<a> and the arguments R<a+1..a+n>,
+      // writes the results R<a..a+m-1> and kills its frame from R<a+m> up (clobbers_from).
+      const { base, count, results } = callCounts(args, site);
+      instruction.kind = 'call';
+      instruction.callee = base;
+      instruction.arguments = Array.from({ length: count }, (_, i) => base + 1 + i);
+      instruction.result_count = results;
+      instruction.reads = [base, ...instruction.arguments];
+      instruction.writes = Array.from({ length: results }, (_, i) => base + i);
+      instruction.clobbers_from = base + results;
+    } else if (op === 'NAMECALL') {
+      // A method call: `NAMECALL R<a> R<b> K<k>` sets R<a+1> = R<b> and R<a> = R<b>[K<k>] for
+      // the `CALL R<a> <n> <m>` on the next line (n counts self). The pair is ONE namecall instruction that reads
+      // the receiver R<b> and the arguments R<a+2..a+n>; R<a> and R<a+1> are never materialised.
+      const base = register(args[0], site);
+      const receiver = register(args[1], site);
+      if (!/^K\d+$/.test(args[2])) refuseAt(site, 'operand_form', 'invalid constant operand');
+      const key = Number(args[2].slice(1));
+      if (!constants.has(key)) refuseAt(site, 'operand_form', 'constant is absent');
+      const { string: method } = constantValue(key, constants.get(key), site);
+      if (typeof method !== 'string') refuseAt(site, 'constant_kind_mismatch', `${op}: K${key} is not a string`);
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(method)) refuseAt(site, 'non_identifier_name', `${op}: K${key} is not an identifier`);
+      const next = records[position + 1];
+      const call = /^(?:(L\d+):\s*)?CALL(?:\s+(.*))?$/.exec(next?.line ?? '');
+      const callArgs = call && operands(call[2] ?? '', OPERAND_COUNTS.get('CALL'));
+      if (!callArgs || callArgs[0] !== args[0]) refuseAt(site, 'namecall_without_call', `NAMECALL is not followed by CALL ${args[0]}`);
+      const callSite = { line_number: next.line_number, op: 'CALL' };
+      if (call[1]) refuseAt(callSite, 'label_inside_namecall', `label ${call[1]} inside NAMECALL`);
+      const { count, results } = callCounts(callArgs, callSite);
+      if (count < 1) refuseAt(callSite, 'operand_form', 'NAMECALL: CALL argument count must include self');
+      instruction.kind = 'namecall';
+      instruction.receiver = receiver;
+      instruction.method = method;
+      instruction.arguments = Array.from({ length: count - 1 }, (_, i) => base + 2 + i);
+      instruction.result_count = results;
+      instruction.reads = [receiver, ...instruction.arguments];
+      instruction.writes = Array.from({ length: results }, (_, i) => base + i);
+      instruction.clobbers_from = base + results;
+      instruction.line_numbers = [record.line_number, next.line_number];
+      position += 1;
     } else {
       refuse('unsupported_opcode', `unsupported opcode ${op} at disassembly line ${record.line_number}`, record.line_number, op);
     }
@@ -274,7 +331,9 @@ export function parseDisassembly(text, { function_index = 0, parameter_count = 2
       const sources = predecessors[index].map((parent) => outgoing[parent]);
       if (index === 0) sources.push(initial);
       const next = new Set(registers.filter((reg) => sources.every((source) => source.has(reg))));
-      const after = new Set([...next, ...instructions[index].writes]);
+      // A call kills its frame: outgoing = (incoming - {r >= clobbers_from}) + writes.
+      const clobbers = instructions[index].clobbers_from ?? Infinity;
+      const after = new Set([...[...next].filter((reg) => reg < clobbers), ...instructions[index].writes]);
       if (next.size !== incoming[index].size || after.size !== outgoing[index].size) changed = true;
       incoming[index] = next;
       outgoing[index] = after;
