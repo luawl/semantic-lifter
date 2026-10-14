@@ -20,7 +20,7 @@ const OPERAND_COUNTS = new Map([
   ['MINUS', [2]], ['NOT', [2]], ['LENGTH', [2]], ['CONCAT', [3]],
   ['JUMP', [1]], ['JUMPBACK', [1]], ['JUMPIF', [2]], ['JUMPIFNOT', [2]], ['RETURN', [2]],
   ['GETGLOBAL', [2]], ['SETGLOBAL', [2]],
-  ['CALL', [3]], ['NAMECALL', [3]],
+  ['CALL', [3]], ['NAMECALL', [3]], ['GETVARARGS', [2]],
   ...Object.keys(BINARY).map((op) => [op, [3]]),
   ...['', 'NOT'].flatMap((not) => Object.keys(COMPARE).map((test) => [`JUMPIF${not}${test}`, [3]])),
 ]);
@@ -90,15 +90,16 @@ function operands(text, counts) {
 }
 
 // `CALL R<a> <n> <m>` prints B-1 and C-1: n arguments R<a+1..a+n> after the callee R<a> and m
-// results written from R<a>. A count of -1 is the open protocol, refused for now.
+// results written from R<a>. A count of -1 is the open protocol, returned as null: n = -1 takes
+// the arguments up to the pack the previous instruction left, m = -1 leaves the results as a pack at R<a>.
 function callCounts(args, site) {
   const base = register(args[0], site);
   const [count, results] = args.slice(1).map((text) => {
-    if (text === '-1') refuseAt(site, 'open_protocol_unsupported', 'open call protocol is unsupported');
+    if (text === '-1') return null;
     if (!/^\d+$/.test(text)) refuseAt(site, 'operand_form', 'invalid call count');
     return Number(text);
   });
-  if (!(base + count < 255 && base + results <= 255)) refuseAt(site, 'operand_form', 'invalid call range');
+  if (!(base + (count ?? 0) < 255 && base + (results ?? 0) <= 255)) refuseAt(site, 'operand_form', 'invalid call range');
   return { base, count, results };
 }
 
@@ -133,6 +134,18 @@ export function parseDisassembly(text, { function_index = 0, parameter_count = 2
   const labels = new Map();
   const instructions = [];
   const records = functions.get(function_index);
+  // The adjacent-only open protocol: an open producer leaves its values as a pack at R<p> and
+  // kills R<p..>; only the next instruction may consume that pack, and only when no label sits on it (packs never
+  // cross a label). `openPack` is the pack of the instruction just read ({ at: p, site }).
+  let openPack = null;
+  // An open consumer reads R<..p-1> as places and the pack at R<p>, which must lie at or above R<first>.
+  const consume = (site, first, message) => {
+    if (!(openPack && openPack.at >= first)) refuseAt(site, 'open_consumer_without_producer', message);
+    if ([...labels.values()].includes(instructions.length)) refuseAt(site, 'open_pack_crosses_label', 'open pack crosses a label');
+    const { at } = openPack;
+    openPack = null;
+    return at;
+  };
   for (let position = 0; position < records.length; position += 1) {
     const record = records[position];
     let { line } = record;
@@ -216,6 +229,13 @@ export function parseDisassembly(text, { function_index = 0, parameter_count = 2
       instruction.reads = [register(args[0], site), register(args[1], site)];
       instruction.inverted = op.startsWith('JUMPIFNOT');
       instruction.label = args[2];
+    } else if (op === 'RETURN' && args[1] === '-1') {
+      // `RETURN R<a> -1` returns R<a..p-1> and then the pack the previous instruction left at R<p>.
+      const first = register(args[0], site);
+      const pack = consume(site, first, 'open return protocol is unsupported');
+      instruction.kind = 'return';
+      instruction.reads = Array.from({ length: pack - first }, (_, i) => first + i);
+      instruction.consumes_pack_from = pack;
     } else if (op === 'RETURN') {
       if (!/^\d+$/.test(args[1])) refuseAt(site, 'open_protocol_unsupported', 'open return protocol is unsupported');
       const first = register(args[0], site);
@@ -238,15 +258,24 @@ export function parseDisassembly(text, { function_index = 0, parameter_count = 2
       else instruction.reads = [register(args[0], site)];
     } else if (op === 'CALL') {
       // A call with fixed counts: it reads the callee R<a> and the arguments R<a+1..a+n>,
-      // writes the results R<a..a+m-1> and kills its frame from R<a+m> up (clobbers_from).
+      // writes the results R<a..a+m-1> and kills its frame from R<a+m> up (clobbers_from). Open counts:
+      // n = -1 reads the arguments R<a+1..p-1> and passes the pending pack; m = -1 writes nothing and leaves its
+      // results as a pack at R<a> (produces_pack_at), killing R<a..>.
       const { base, count, results } = callCounts(args, site);
       instruction.kind = 'call';
       instruction.callee = base;
-      instruction.arguments = Array.from({ length: count }, (_, i) => base + 1 + i);
+      if (count === null) {
+        const pack = consume(site, base + 1, 'open call arguments have no adjacent producer');
+        instruction.arguments = Array.from({ length: pack - base - 1 }, (_, i) => base + 1 + i);
+        instruction.consumes_pack_from = pack;
+      } else {
+        instruction.arguments = Array.from({ length: count }, (_, i) => base + 1 + i);
+      }
       instruction.result_count = results;
       instruction.reads = [base, ...instruction.arguments];
-      instruction.writes = Array.from({ length: results }, (_, i) => base + i);
-      instruction.clobbers_from = base + results;
+      instruction.writes = Array.from({ length: results ?? 0 }, (_, i) => base + i);
+      if (results === null) instruction.produces_pack_at = base;
+      instruction.clobbers_from = base + (results ?? 0);
     } else if (op === 'NAMECALL') {
       // A method call: `NAMECALL R<a> R<b> K<k>` sets R<a+1> = R<b> and R<a> = R<b>[K<k>] for
       // the `CALL R<a> <n> <m>` on the next line (n counts self). The pair is ONE namecall instruction that reads
@@ -266,22 +295,51 @@ export function parseDisassembly(text, { function_index = 0, parameter_count = 2
       const callSite = { line_number: next.line_number, op: 'CALL' };
       if (call[1]) refuseAt(callSite, 'label_inside_namecall', `label ${call[1]} inside NAMECALL`);
       const { count, results } = callCounts(callArgs, callSite);
-      if (count < 1) refuseAt(callSite, 'operand_form', 'NAMECALL: CALL argument count must include self');
+      if (count !== null && count < 1) refuseAt(callSite, 'operand_form', 'NAMECALL: CALL argument count must include self');
       instruction.kind = 'namecall';
       instruction.receiver = receiver;
       instruction.method = method;
-      instruction.arguments = Array.from({ length: count - 1 }, (_, i) => base + 2 + i);
+      // Open counts as for CALL: the open arguments are R<a+2..p-1> (self is R<a+1>, so p >= a+2).
+      if (count === null) {
+        const pack = consume(site, base + 2, 'open call arguments have no adjacent producer');
+        instruction.arguments = Array.from({ length: pack - base - 2 }, (_, i) => base + 2 + i);
+        instruction.consumes_pack_from = pack;
+      } else {
+        instruction.arguments = Array.from({ length: count - 1 }, (_, i) => base + 2 + i);
+      }
       instruction.result_count = results;
       instruction.reads = [receiver, ...instruction.arguments];
-      instruction.writes = Array.from({ length: results }, (_, i) => base + i);
-      instruction.clobbers_from = base + results;
+      instruction.writes = Array.from({ length: results ?? 0 }, (_, i) => base + i);
+      if (results === null) instruction.produces_pack_at = base;
+      instruction.clobbers_from = base + (results ?? 0);
       instruction.line_numbers = [record.line_number, next.line_number];
       position += 1;
+    } else if (op === 'GETVARARGS') {
+      // `GETVARARGS R<a> <n>` copies n of the function's varargs into R<a..a+n-1>; n = -1 leaves
+      // them all as a pack at R<a> (an open producer that kills R<a..>). Only a declared variadic function has them.
+      if (!is_variadic) refuseAt(site, 'varargs_in_non_variadic_function', 'GETVARARGS in a function not declared variadic');
+      const base = register(args[0], site);
+      instruction.kind = 'varargs';
+      if (args[1] === '-1') {
+        instruction.count = null;
+        instruction.produces_pack_at = base;
+        instruction.clobbers_from = base;
+      } else {
+        if (!/^[1-9]\d*$/.test(args[1])) refuseAt(site, 'operand_form', 'invalid varargs count');
+        const count = Number(args[1]);
+        if (!(base + count <= 255)) refuseAt(site, 'operand_form', 'invalid varargs range');
+        instruction.count = count;
+        instruction.writes = Array.from({ length: count }, (_, i) => base + i);
+      }
     } else {
       refuse('unsupported_opcode', `unsupported opcode ${op} at disassembly line ${record.line_number}`, record.line_number, op);
     }
+    // A pack still pending here was not consumed by this instruction, the one right after its producer.
+    if (openPack) refuseAt(openPack.site, 'open_pack_not_consumed', 'open pack is not consumed by the next instruction');
+    if (instruction.produces_pack_at !== undefined) openPack = { at: instruction.produces_pack_at, site };
     instructions.push(instruction);
   }
+  if (openPack) refuseAt(openPack.site, 'open_pack_not_consumed', 'open pack is not consumed by the next instruction');
   if (instructions.length === 0) refuse('listing_structure', 'empty selected function');
   const labelled = new Set(labels.values());
   for (const [index, instruction] of instructions.entries()) {
