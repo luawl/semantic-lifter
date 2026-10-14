@@ -44,9 +44,10 @@ for reg = 0, handoff.parameter_count - 1 do
         builder:addInstruction(entry, IR.Operation.placeWrite(places[reg], parameter), {}, { effects = IR.Effects.placeWrite(), evidence = { evidence } })
     end
 end
+local varargPack: number? = nil
 if isVariadic then
     -- The source frontend's rule (luau/ast_frontend.luau:961-962): a variadic function owns its vararg pack.
-    builder:addVarargPack(worker, { evidence })
+    varargPack = builder:addVarargPack(worker, { evidence })
 end
 local blocks = {}
 for index, instruction in handoff.instructions do
@@ -59,9 +60,16 @@ for index, instruction in handoff.instructions do
     blocks[index] = builder:reserveBlock(worker, { name_hint = `instruction_{index}`, evidence = cited })
 end
 builder:finalizeBlock(entry, IR.Terminator.jump(IR.Edge(blocks[1])))
+-- The adjacent-only open protocol (T2-ADAPTER step 4): the pack of an open producer (a call or namecall with
+-- variadic results, or open varargs) is pending from the producer's block to the next block only, whose instruction
+-- consumes it; packs never cross a label, so no block parameter is needed (T2-ADAPTER.md 5.3).
+local pendingPack: number? = nil
 for index, instruction in handoff.instructions do
-    assert(table.find({ "constant", "move", "binary", "unary", "concat", "jump", "branch", "return", "environment_get", "environment_set", "call", "namecall" }, instruction.kind) ~= nil,
+    assert(table.find({ "constant", "move", "binary", "unary", "concat", "jump", "branch", "return", "environment_get", "environment_set", "call", "namecall", "varargs" }, instruction.kind) ~= nil,
         "unsupported handoff instruction kind")
+    assert((pendingPack ~= nil) == (instruction.consumes_pack_from ~= nil), "open pack not adjacent to its consumer")
+    local consumed: number? = pendingPack
+    pendingPack = nil
     local block = blocks[index]
     local blockEvidence = builder.program.blocks[block + 1].evidence
     local function value(operation: any, resultType: any, effects: any): number
@@ -118,23 +126,51 @@ for index, instruction in handoff.instructions do
         for slot = 2, #reads do
             table.insert(arguments, reads[slot])
         end
-        local resultSpecs = {}
-        for _ = 1, instruction.result_count do
-            table.insert(resultSpecs, { type = IR.Types.dynamic() })
-        end
-        local arity = IR.ResultArity.fixed(instruction.result_count)
-        local operation = if instruction.kind == "namecall"
-            then IR.Operation.namecall(reads[1], instruction.method, arguments, arity)
-            else IR.Operation.call(reads[1], arguments, arity)
         local effects = if instruction.kind == "namecall" then IR.Effects.namecall() else IR.Effects.dynamicCall()
-        local _, values = builder:addInstruction(block, operation, resultSpecs, { effects = effects, evidence = blockEvidence })
-        results = values
+        if instruction.produces_pack_at ~= nil then
+            -- Open results (T2-ADAPTER step 4): variadic result arity and an open pack, which the builder gives the
+            -- producer block's evidence (an unevidenced pack is refused, T2-IR-GAPS.md 2.5 E8); a consumed pack is
+            -- the argument pack. The new pack is pending for the next block.
+            local options = { effects = effects, evidence = blockEvidence }
+            local _, pack
+            if instruction.kind == "namecall" then
+                _, pack = builder:addOpenNamecall(block, reads[1], instruction.method, arguments, options, consumed)
+            else
+                _, pack = builder:addOpenCall(block, reads[1], arguments, options, consumed)
+            end
+            pendingPack = pack
+        else
+            local resultSpecs = {}
+            for _ = 1, instruction.result_count do
+                table.insert(resultSpecs, { type = IR.Types.dynamic() })
+            end
+            local arity = IR.ResultArity.fixed(instruction.result_count)
+            local operation = if instruction.kind == "namecall"
+                then IR.Operation.namecall(reads[1], instruction.method, arguments, arity, consumed)
+                else IR.Operation.call(reads[1], arguments, arity, consumed)
+            local _, values = builder:addInstruction(block, operation, resultSpecs, { effects = effects, evidence = blockEvidence })
+            results = values
+        end
+    elseif instruction.kind == "varargs" then
+        -- GETVARARGS (T2-ADAPTER step 4) reads the worker's vararg pack: open, that pack becomes the pending pack
+        -- without an instruction; fixed, adjust_pack takes its first `count` values (dynamic results, effects pure).
+        assert(varargPack ~= nil, "varargs outside a variadic worker")
+        if instruction.produces_pack_at ~= nil then
+            pendingPack = varargPack
+        else
+            local resultSpecs = {}
+            for _ = 1, instruction.count do
+                table.insert(resultSpecs, { type = IR.Types.dynamic() })
+            end
+            local _, values = builder:addInstruction(block, IR.Operation.adjustPack(varargPack), resultSpecs, { effects = IR.Effects.pure(), evidence = blockEvidence })
+            results = values
+        end
     end
     if result ~= nil and places[instruction.writes[1]] ~= nil then
         builder:addInstruction(block, IR.Operation.placeWrite(places[instruction.writes[1]], result), {}, { effects = IR.Effects.placeWrite(), evidence = blockEvidence })
     end
     if results ~= nil then
-        -- call and namecall: result i goes to writes[i], only where that register has a place (decision D3).
+        -- call, namecall and fixed varargs: result i goes to writes[i], only where that register has a place (decision D3).
         for slot, reg in instruction.writes do
             if places[reg] ~= nil then
                 builder:addInstruction(block, IR.Operation.placeWrite(places[reg], results[slot]), {}, { effects = IR.Effects.placeWrite(), evidence = blockEvidence })
@@ -142,7 +178,14 @@ for index, instruction in handoff.instructions do
         end
     end
     if instruction.kind == "return" then
-        builder:finalizeBlock(block, IR.Terminator.returnValues(reads))
+        -- An open return (T2-ADAPTER step 4) returns its prefix reads and then the consumed pack.
+        if consumed == nil then
+            builder:finalizeBlock(block, IR.Terminator.returnValues(reads))
+        elseif #reads == 0 then
+            builder:finalizeBlock(block, IR.Terminator.returnPack(consumed))
+        else
+            builder:finalizeBlock(block, IR.Terminator.returnExpanded(reads, consumed))
+        end
     elseif instruction.kind == "jump" then
         builder:finalizeBlock(block, IR.Terminator.jump(IR.Edge(blocks[instruction.target + 1])))
     elseif instruction.kind == "branch" then

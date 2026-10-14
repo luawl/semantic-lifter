@@ -132,7 +132,7 @@ test('refusals are typed and keep their messages', () => {
     (error) => error.name === 'DisassemblyRefusal' && error.code === 'listing_structure' && error.line_number === 5
       && /unknown label L9/.test(error.message));
   assert.throws(() => parseDisassembly(listing.replace('RETURN R2 1', 'RETURN R2 -1')),
-    (error) => error.name === 'DisassemblyRefusal' && error.code === 'open_protocol_unsupported' && error.line_number === 9
+    (error) => error.name === 'DisassemblyRefusal' && error.code === 'open_consumer_without_producer' && error.line_number === 9
       && /open return/.test(error.message));
   assert.throws(() => parseDisassembly(`Function 0 (worker):
 JUMPIF R0 L1
@@ -219,4 +219,62 @@ test('NAMECALL fuses with its CALL', () => {
     { parameter_count: 6 }), refused('label_inside_namecall'));
   assert.throws(() => parseDisassembly(excerpt(...namecallExcerpt.map((line) => line.replaceAll("'rep'", "'r p'"))),
     { parameter_count: 6 }), refused('non_identifier_name'));
+});
+
+// Task T2.4 (T2-ADAPTER step 4). Excerpts are verbatim -O0 listing lines of the author-owned diagnosis programs
+// p04_call_open (lines 15-16 and 24-25), open_result_return (lines 7-8 and 18-23), p16_edges (lines 10 and 24-26, plus a
+// fixed return) and varargs_select_sum (Function 0, lines 1-26); the declared parameter_count makes the registers the
+// full listing initialises elsewhere parameters of the excerpt.
+const openCallExcerpt = ['CALL R2 1 -1', 'RETURN R2 -1'];
+const varargsSelectSum = ["K0: 'select'", "K1: '#'", 'K2: 0', 'K3: 1', "GETGLOBAL R0 K0 ['select']", "LOADK R1 K1 ['#']",
+  'GETVARARGS R2 -1', 'CALL R0 -1 1', 'GETVARARGS R1 2', 'LOADK R3 K2 [0]', 'LOADK R4 K3 [1]', 'L0: JUMPIFNOTLE R4 R0 L1',
+  "GETGLOBAL R5 K0 ['select']", 'MOVE R6 R4', 'GETVARARGS R7 -1', 'CALL R5 -1 1', 'ADD R3 R3 R5', 'LOADK R5 K3 [1]',
+  'ADD R4 R4 R5', 'JUMPBACK L0', 'L1: MOVE R5 R0', 'MOVE R6 R3', 'MOVE R7 R1', 'MOVE R8 R2', 'RETURN R5 4'];
+const refusedAs = (code) => (error) => error.name === 'DisassemblyRefusal' && error.code === code;
+const assertFields = (instructions, expected) => {
+  for (const [index, fields] of Object.entries(expected)) assert.deepEqual(project(instructions[index], fields), fields);
+};
+
+test('open results flow to the adjacent consumer', () => {
+  assertFields(parseDisassembly(excerpt(...openCallExcerpt), { parameter_count: 4 }).instructions, {
+    0: { kind: 'call', callee: 2, arguments: [3], result_count: null, produces_pack_at: 2, reads: [2, 3], writes: [],
+      clobbers_from: 2 },
+    1: { kind: 'return', reads: [], consumes_pack_from: 2 },
+  });
+  assertFields(parseDisassembly(excerpt('CALL R3 1 -1', 'RETURN R2 -1'), { parameter_count: 5 }).instructions, {
+    1: { kind: 'return', reads: [2], consumes_pack_from: 3 },
+  });
+  assertFields(parseDisassembly(excerpt("K5: 'select'", "K6: '#'", "GETGLOBAL R5 K5 ['select']", "LOADK R6 K6 ['#']",
+    'GETVARARGS R7 -1', 'CALL R5 -1 -1', 'CALL R2 -1 -1', 'RETURN R1 -1'), { parameter_count: 5, is_variadic: true }).instructions, {
+    2: { kind: 'varargs', count: null, produces_pack_at: 7 },
+    3: { kind: 'call', callee: 5, arguments: [6], consumes_pack_from: 7, result_count: null, produces_pack_at: 5 },
+    4: { kind: 'call', callee: 2, arguments: [3, 4], consumes_pack_from: 5, result_count: null, produces_pack_at: 2 },
+    5: { kind: 'return', reads: [1], consumes_pack_from: 2 },
+  });
+  assertFields(parseDisassembly(excerpt("K8: 'rep'", 'CALL R10 1 -1', "NAMECALL R8 R6 K8 ['rep']", 'CALL R8 -1 1', 'RETURN R8 1'),
+    { parameter_count: 12 }).instructions, {
+    0: { kind: 'call', callee: 10, arguments: [11], produces_pack_at: 10 },
+    1: { kind: 'namecall', receiver: 6, method: 'rep', arguments: [], consumes_pack_from: 10, result_count: 1, writes: [8],
+      clobbers_from: 9 },
+  });
+});
+
+test('varargs need a declared variadic signature', () => {
+  assertFields(parseDisassembly(excerpt(...varargsSelectSum), { parameter_count: 0, is_variadic: true }).instructions, {
+    2: { op: 'GETVARARGS', kind: 'varargs', count: null, produces_pack_at: 2, writes: [], clobbers_from: 2 },
+    3: { op: 'CALL', kind: 'call', callee: 0, arguments: [1], consumes_pack_from: 2, result_count: 1, writes: [0],
+      clobbers_from: 1 },
+    4: { op: 'GETVARARGS', kind: 'varargs', count: 2, writes: [1, 2] },
+  });
+  assert.throws(() => parseDisassembly(excerpt(...varargsSelectSum), { parameter_count: 0 }),
+    refusedAs('varargs_in_non_variadic_function'));
+});
+
+test('an open pack must be consumed immediately', () => {
+  assert.throws(() => parseDisassembly(excerpt(openCallExcerpt[0], 'MOVE R9 R0', openCallExcerpt[1]), { parameter_count: 4 }),
+    refusedAs('open_pack_not_consumed'));
+  assert.throws(() => parseDisassembly(excerpt(openCallExcerpt[0], `L0: ${openCallExcerpt[1]}`), { parameter_count: 4 }),
+    refusedAs('open_pack_crosses_label'));
+  assert.throws(() => parseDisassembly(listing.replace('RETURN R2 1', 'RETURN R2 -1')),
+    (error) => refusedAs('open_consumer_without_producer')(error) && /open return/.test(error.message));
 });
