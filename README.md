@@ -1,20 +1,21 @@
 # Semantic-Lifter
 
-Semantic-Lifter is a checked lifting backend for Luau, built for lifting pipelines over protected
-Luau. It takes a program that a frontend has recovered as `lifter_ir_v1`, a typed intermediate
-representation, and produces readable Luau that the official Luau compiler accepts; whatever it
-cannot justify, it refuses with a typed diagnostic. It works under a typed evidence contract: output
-is published only for a program that passes an admission profile, `core` for the IR and `emission`
-for readable Luau output (`readable-luau` on the command line), and every refusal is a code plus
-the index of the IR entity it concerns. The design is tested on paired representations: one program
-is lifted through the source path (the Luau parser's syntax tree) and through the
-compiler-disassembly path (the official compiler's text listing), and the results are compared
-under the official Luau VM.
+Semantic-Lifter is a checked lifting backend for Luau. It takes a program that a frontend has
+recovered as `lifter_ir_v1`, a typed intermediate representation, and produces readable Luau that
+the official Luau compiler accepts; whatever it cannot justify, it refuses with a typed diagnostic.
+It works under a typed evidence contract: output is published only for a program that passes an
+admission profile, `core` for the IR and `emission` for readable Luau output (`readable-luau` on the
+command line), and every refusal is a code plus the index of the IR entity it concerns. The preprint
+tests the design on paired representations: one program is lifted through the source path (the Luau
+parser's syntax tree) and through the compiler-disassembly path (the official compiler's text
+listing), and each result is run against the original under the official Luau VM.
 
-This repository ships the backend, the source frontend, which lifts Luau source to `lifter_ir_v1`,
-and the compiler-disassembly adapter that serves as the second path of the paired tests. A frontend
-is any component that writes a `lifter_ir_v1` handoff: a lifting or analysis tool supplies the
-frontend for the artefact it targets, and the contract is what that frontend has to satisfy.
+This repository ships the backend and two frontends: the source frontend, which lifts Luau source to
+`lifter_ir_v1`, and the compiler-disassembly frontend, which lifts the compiled function that
+`function_index` selects from a `luau-compile --text` listing. Both start from a program whose
+source is at hand, so that the original can serve as the reference. A frontend is any component that
+writes a `lifter_ir_v1` handoff: a lifting or analysis tool supplies the frontend for the artefact
+it targets, and the contract is what that frontend has to satisfy.
 
 The backend is about 148,000 lines of Zig across 159 files, with over 800 unit tests. The source
 frontend, the IR library and codec, and the conformance suite take about 55,000 lines across 168
@@ -77,6 +78,66 @@ checks that the official compiler accepts a program at each limit above and reje
 past; a lexical oracle checks with `luau-analyze` that emitted code introduces no global the source
 did not use. In the release build, every unit test and every conformance step passes.
 
+## Example
+
+The tracked fixture `luau/fixtures/loop_control_source.luau`:
+
+```luau
+return function(limit)
+	local total = 0
+	local index = 0
+	while index < limit do
+		index = index + 1
+		if index == 3 then
+			continue
+		end
+		if index == 6 then
+			break
+		end
+		total = total + index
+	end
+	return total
+end
+```
+
+lifted through the source path and emitted (the two commands are explained under "Command-line use"):
+
+```sh
+lune run luau/lift_source.luau <path to luau-ast> luau/fixtures/loop_control_source.luau loop_control loop_control.ir.json
+semantic-lifter emit-luau loop_control.ir.json loop_control.luau standard-luau <path to luau-compile>
+```
+
+```luau
+local value_18 = function(limit)
+  local total = 0
+  local index = 0
+  while true do
+    if index < limit then
+      index += 1
+      if not (index == 3) then
+        if index == 6 then
+          do
+            break
+          end
+        else
+          total += index
+        end
+      end
+    else
+      do
+        break
+      end
+    end
+  end
+  return total
+end
+return value_18
+```
+
+The output is what the backend published after the official compiler accepted it. The backend rebuilt
+the loop from the control-flow graph in the IR, not from the source text, so the result is a structured
+rendering of the program rather than a copy of it.
+
 ## How it works
 
 ![The lifter_ir_v1 contract: frontends, the handoff, and the backend gates](figures/evidence-contract.svg)
@@ -85,7 +146,7 @@ A frontend hands the backend a `lifter_ir_v1` program with evidence on every ent
 
 ![Two paths from one source program into one backend, compared under the official Luau VM](figures/two-paths.svg)
 
-The same program is lifted twice, once from its syntax tree and once from the official compiler's disassembly listing, through the same backend; both outputs and a forced-dispatcher control are executed against the original under the official Luau VM over an input grid. A disagreement is a finding, never silenced.
+In the preprint's paired tests, the same program is lifted twice, once from its syntax tree and once from the official compiler's disassembly listing, through the same backend; both outputs and a forced-dispatcher control are executed against the original under the official Luau VM over an input grid. A disagreement is a finding, never silenced.
 
 ![The piecewise_chain control-flow graph on the disassembly path and the source path](figures/piecewise-chain-cfg.svg)
 
@@ -97,7 +158,7 @@ repository.
 
 ## Release note
 
-This repository is the implementation behind the forthcoming preprint *Checked, Not Trusted: Typed Evidence Contracts and Paired-Representation Testing for Luau Lifting Backends*: the backend and the frontends in this repository, cleaned up for release and verified as the build section below describes (every unit test and conformance step passes, and a fresh clone builds with the documented tool options). The preprint reports the evaluation and the issue tracker holds the open items; anything else is welcome as an issue.
+This repository is the implementation behind the forthcoming preprint *Checked, Not Trusted: Typed Evidence Contracts and Paired-Representation Testing for Luau Lifting Backends*: the backend and the frontends in this repository, cleaned up for release. The build section below verifies the backend and the source frontend (every unit test and conformance step passes, and a fresh clone builds with the documented tool options), and `node --test` runs the compiler-disassembly frontend's tests. The preprint reports the evaluation and the issue tracker holds the open items; anything else is welcome as an issue.
 
 ## Repository contents
 
@@ -145,8 +206,7 @@ finds that tool in the maintainers' workspace layout. It never sets `--prefix` o
 directories; pass them as arguments when you need them.
 
 With `--summary all`, `test` reports a `Build Summary` in which every step succeeded and
-every test passed, and `conformance` one in which every step succeeded; the summary names any
-step that fails.
+every test passed, and `conformance` one in which every step succeeded; a failing step is named in the step tree that follows the summary line.
 
 ## Command-line use
 
@@ -159,16 +219,17 @@ Source path (Luau source, parsed by `luau-ast`):
 lune run luau/lift_source.luau <path to luau-ast> <input.luau> <program-id> <program.ir.json>
 ```
 
-Compiler-disassembly path (the `luau-compile --text` listing of one compiled function, turned into
-a handoff document by the adapter, then into IR):
+Compiler-disassembly path (the frontend reads the `luau-compile --text` listing, turns the function
+that `function_index` selects into a handoff document, then into IR; the one-liner below runs the
+compiler and the adapter in one step):
 
 ```sh
 node --input-type=module -e "import { execFileSync } from 'node:child_process'; import { writeFileSync } from 'node:fs'; import { parseDisassembly } from './research/compiler_disassembly_adapter.mjs'; const [compiler, source, out] = process.argv.slice(1); writeFileSync(out, JSON.stringify(parseDisassembly(execFileSync(compiler, ['--text', '--dump-constants', '-O0', '-g0', source], { encoding: 'utf8' }), { function_index: 0, parameter_count: 2 })));" <path to luau-compile> <input.luau> <handoff.json>
 lune run research/lift_compiler_disassembly.luau <handoff.json> <program.ir.json> <program-id>
 ```
 
-`function_index` selects the compiled function in the listing, and `parameter_count` declares its
-arity, which the text listing does not encode.
+`function_index` selects the compiled function in the listing; the caller declares its signature,
+`parameter_count` (default 2) and `is_variadic` (default `false`), which the text listing does not encode.
 
 Then validate, resolve and emit:
 
@@ -194,15 +255,13 @@ The usage text lists some commands under "diagnostic-only or unchecked (exit 0 i
 publication)", among them `emit-admitted-readable-luau-raw`, `emit-readable-luau-strategy`,
 `emit-function-probe` and `resolve-exact-control-ir`. Each skips admission or part of the checked
 pipeline, and the usage text says which. Unlike `emit-luau`, these commands do not gate their own
-output, so their output serves analysis, or a harness that gates it separately. The paired tests use
-`emit-readable-luau-strategy` this way: every file it emits must pass `luau-compile` and `luau-ast`
-before it runs against the original under the official Luau VM.
+output, so their output serves analysis, or a harness that gates it separately. In the preprint's paired tests, every file that `emit-readable-luau-strategy` emits must pass
+`luau-compile` and `luau-ast` before it runs against the original under the official Luau VM.
 
 ## Scope
 
-The backend and the source frontend are the maintained components, and the compiler-disassembly
-adapter under `research/` is the second path of the paired tests. The preprint reports the
-evaluation, and the issue tracker holds the open items.
+The backend, the source frontend and the compiler-disassembly frontend are the maintained components
+of this repository; an earlier version of the second frontend was the second path of the preprint's paired tests.
 
 ## Citation
 

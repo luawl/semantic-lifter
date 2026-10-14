@@ -6,7 +6,7 @@ authors:
 year: 2026
 license: MIT
 repository-code: "https://github.com/luawl/semantic-lifter"
-abstract: "A checked lifting backend for Luau that turns a frontend's lifter_ir_v1 program into readable Luau under a typed evidence contract, with admission profiles and typed diagnostics, plus a source frontend and paired-representation testing under the official Luau VM."
+abstract: "A checked lifting backend for Luau that turns a frontend's lifter_ir_v1 program into readable Luau under a typed evidence contract, with admission profiles and typed diagnostics, plus a source frontend and a compiler-disassembly frontend, the two paths of the preprint's paired-representation tests under the official Luau VM."
 preferred-citation:
   type: generic
   title: "Checked, Not Trusted: Typed Evidence Contracts and Paired-Representation Testing for Luau Lifting Backends"
