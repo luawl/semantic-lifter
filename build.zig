@@ -595,6 +595,14 @@ pub fn build(b: *std.Build) void {
     irreducible_iteration_audit.addFileArg(luau_irreducible_iteration_conformance.resolved_ir);
     irreducible_iteration_audit.addFileArg(irreducible_iteration_reresolved_ir);
     irreducible_iteration_audit.addFileArg(luau_irreducible_iteration_conformance.generated_luau);
+    const irreducible_iteration_dispatcher = addDispatcherRuntimeConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "irreducible-iteration-convergence",
+        luau_irreducible_iteration_conformance.resolved_ir,
+    );
     const source_frontend_conformance = addLuauSourceConformance(
         b,
         exe,
@@ -1083,6 +1091,7 @@ pub fn build(b: *std.Build) void {
     luau_irreducible_iteration_conformance.addTo(conformance_step);
     conformance_step.dependOn(&irreducible_iteration_audit.step);
     conformance_step.dependOn(&irreducible_iteration_structure_ast.step);
+    conformance_step.dependOn(irreducible_iteration_dispatcher);
     source_frontend_conformance.addTo(conformance_step);
     source_frontend_effectful_assignment_conformance.addTo(conformance_step);
     source_frontend_if_conformance.addTo(conformance_step);
@@ -1902,6 +1911,43 @@ fn addDispatcherLocalBudgetConformance(
         .dispatcher_refusal = &emit_192_dispatcher.step,
         .boundary_compile = &compile_191_dispatcher.step,
     };
+}
+
+// Track T5: a fixture's resolved IR emitted under the forced dispatcher (flat layout),
+// compiled at -O0, and executed by the runtime oracle case of the same name, the case
+// that already holds the fixture's structured output (and, for a source fixture, the
+// original program) to its behaviour.
+fn addDispatcherRuntimeConformance(
+    b: *std.Build,
+    exe: *std.Build.Step.Compile,
+    z3_enabled: bool,
+    z3_bin: []const u8,
+    fixture_name: []const u8,
+    resolved_ir: std.Build.LazyPath,
+) *std.Build.Step {
+    const emit_dispatcher = b.addRunArtifact(exe);
+    if (z3_enabled) emit_dispatcher.addPathDir(b.pathFromRoot(z3_bin));
+    emit_dispatcher.addArg("emit-readable-luau-strategy");
+    emit_dispatcher.addFileArg(resolved_ir);
+    const dispatcher_luau = emit_dispatcher.addOutputFileArg(b.fmt("{s}.dispatcher.luau", .{fixture_name}));
+    emit_dispatcher.addArgs(&.{ "standard-luau", "dispatcher" });
+    emit_dispatcher.expectExitCode(0);
+
+    const compile_dispatcher = b.addSystemCommand(&.{ luauCompileExe(b), "--null", "-O0" });
+    compile_dispatcher.addFileArg(dispatcher_luau);
+    compile_dispatcher.expectExitCode(0);
+
+    const runtime_dispatcher = b.addSystemCommand(&.{ luneExe(b), "run" });
+    runtime_dispatcher.addFileArg(b.path("luau/runtime_oracle.luau"));
+    runtime_dispatcher.addFileInput(b.path("luau/source_runtime_oracle.luau"));
+    runtime_dispatcher.addFileInput(b.path("luau/pack_multi_latch_runtime_oracle.luau"));
+    runtime_dispatcher.addFileInput(b.path("luau/pack_return_storage_runtime_oracle.luau"));
+    runtime_dispatcher.addFileInput(b.path("luau/iteration_exit_transfer_runtime_oracle.luau"));
+    runtime_dispatcher.addArg(fixture_name);
+    runtime_dispatcher.addFileArg(dispatcher_luau);
+    runtime_dispatcher.expectExitCode(0);
+    runtime_dispatcher.step.dependOn(&compile_dispatcher.step);
+    return &runtime_dispatcher.step;
 }
 
 fn addLuauSourceRecoveryObligationConformance(

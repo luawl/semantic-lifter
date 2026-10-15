@@ -183,6 +183,89 @@ test "forced dispatcher lowers generic iteration protocol" {
     try std.testing.expect(std.mem.indexOf(u8, source, "first, second =") != null);
 }
 
+test "forced dispatcher lowers luau numeric iteration protocol" {
+    // T5-DISPATCHER-NUMERIC-LOOP: the flat layout renders the default `luau_numeric` mode itself. A one-shot native
+    // `for` coerces the three operands on the initial entry (FORNPREP's order and messages), a later entry advances by
+    // the coerced step, and the test reads the step's sign without advancing first.
+    const proof = ir.EvidenceId.fromIndex(0);
+    const function_id = ir.FunctionId.fromIndex(0);
+    const block_id = ir.BlockId.fromIndex(0);
+    const instruction_id = ir.InstructionId.fromIndex(0);
+    const control = ir.ValueId.fromIndex(0);
+    const limit = ir.ValueId.fromIndex(1);
+    const step = ir.ValueId.fromIndex(2);
+    const initial = ir.ValueId.fromIndex(3);
+    const has_value = ir.ValueId.fromIndex(4);
+    const next_limit = ir.ValueId.fromIndex(5);
+    const next_step = ir.ValueId.fromIndex(6);
+    const next_control = ir.ValueId.fromIndex(7);
+    const values = [_]ir.Value{
+        .{ .id = control, .function = function_id, .type = .dynamic, .name_hint = "control", .origin = .{ .parameter = 0 } },
+        .{ .id = limit, .function = function_id, .type = .dynamic, .name_hint = "limit", .origin = .{ .parameter = 1 } },
+        .{ .id = step, .function = function_id, .type = .dynamic, .name_hint = "step", .origin = .{ .parameter = 2 } },
+        .{ .id = initial, .function = function_id, .type = .boolean, .name_hint = "initial", .origin = .{ .parameter = 3 } },
+        .{ .id = has_value, .function = function_id, .type = .boolean, .name_hint = "has_value", .origin = .{ .instruction_result = .{ .instruction = instruction_id, .index = 0 } } },
+        .{ .id = next_limit, .function = function_id, .type = .number, .name_hint = "next_limit", .origin = .{ .instruction_result = .{ .instruction = instruction_id, .index = 1 } } },
+        .{ .id = next_step, .function = function_id, .type = .number, .name_hint = "next_step", .origin = .{ .instruction_result = .{ .instruction = instruction_id, .index = 2 } } },
+        .{ .id = next_control, .function = function_id, .type = .number, .name_hint = "next_control", .origin = .{ .instruction_result = .{ .instruction = instruction_id, .index = 3 } } },
+    };
+    const instructions = [_]ir.Instruction{.{
+        .id = instruction_id,
+        .block = block_id,
+        .operation = .{ .numeric_for_next = .{
+            .control = control,
+            .limit = limit,
+            .step = step,
+            .initial = initial,
+        } },
+        .results = &.{ has_value, next_limit, next_step, next_control },
+        .effects = .numeric_for_next,
+        .evidence = &.{proof},
+    }};
+    const blocks = [_]ir.Block{.{
+        .id = block_id,
+        .function = function_id,
+        .instructions = &.{instruction_id},
+        .terminator = .{ .return_values = &.{ has_value, next_limit, next_step, next_control } },
+        .evidence = &.{proof},
+    }};
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .parameters = &.{ control, limit, step, initial },
+        .blocks = &.{block_id},
+        .entry_block = block_id,
+        .evidence = &.{proof},
+    }};
+    const evidence = [_]ir.Evidence{.{ .id = proof, .kind = .dynamic_fixture, .locator = "fixture:luau-numeric-dispatch-emission" }};
+    const program: ir.Program = .{
+        .program_id = "luau-numeric-dispatch-emission",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+        .evidence = &evidence,
+    };
+
+    const source = try lifter.emit_luau.emitAdmittedAllocForTargetWithOptions(
+        std.testing.allocator,
+        &program,
+        .standard_luau,
+        .{ .force_dispatcher = true },
+    );
+    defer std.testing.allocator.free(source);
+    try std.testing.expect(std.mem.indexOf(u8, source, "if initial then") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, " = control, limit, step do break end") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "next_limit = limit * 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "next_step = step * 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "next_control = control * 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "next_control = control + next_step") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "if next_step > 0 then") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "has_value = next_control <= next_limit") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "has_value = next_limit <= next_control") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "next_step <= 0") == null);
+}
+
 test "repeated table reads preserve fixed result calls and nil positions" {
     const proof = ir.EvidenceId.fromIndex(0);
     const function_id = ir.FunctionId.fromIndex(0);

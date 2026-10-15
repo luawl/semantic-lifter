@@ -514,6 +514,13 @@ const Recorder = struct {
             {
                 self.note(saturatingAdd(depth, 1));
             }
+            // An unsuppressed `luau_numeric` transition renders its coercion guard's `for` inside `if <initial>`.
+            if (instruction.operation == .numeric_for_next and
+                instruction.operation.numeric_for_next.mode == .luau_numeric and
+                !self.scopes.instructionSuppressedByControl(instruction.id))
+            {
+                self.note(saturatingAdd(depth, 2));
+            }
             if (instruction.operation == .table_set_pack or
                 self.plan.emission.packs.role(instruction.id) == .stored_invocation_producer)
             {

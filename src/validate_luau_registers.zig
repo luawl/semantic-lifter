@@ -178,6 +178,23 @@ fn validatePrepared(
             );
             effective_locals = @max(effective_locals, flat_locals);
             effective_total = @max(effective_total, saturatingAdd(flat_locals, pressure.total -| pressure.locals));
+            // A `luau_numeric` transition renders a one-shot native `for` as its coercion guard. The guard's loop
+            // variable is one more local and is FORNPREP's index register, so the limit, step and index frame of 3
+            // includes that local rather than adding to it.
+            const holds_luau_numeric = holds: for (function.blocks) |block_id| {
+                if (block_id.index() >= program.blocks.len) continue;
+                for (program.blocks[block_id.index()].instructions) |instruction_id| {
+                    if (instruction_id.index() >= program.instructions.len or emission.dead.contains(instruction_id)) continue;
+                    switch (program.instructions[instruction_id.index()].operation) {
+                        .numeric_for_next => |operation| if (operation.mode == .luau_numeric) break :holds true,
+                        else => {},
+                    }
+                }
+            } else false;
+            if (holds_luau_numeric) {
+                effective_locals = @max(effective_locals, saturatingAdd(flat_locals, 1));
+                effective_total = @max(effective_total, saturatingAdd(flat_locals, 3));
+            }
         }
         if (stage_trace.enabled) std.debug.print("register_pressure function={} base={} locals={} total={} scopes={}\n", .{
             function.id.index(),
