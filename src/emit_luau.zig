@@ -565,14 +565,17 @@ fn emitArbitraryDispatch(
     try output.appendSlice(allocator, "end\n");
 }
 
-/// Count exactly the root-level `local` names `emitArbitraryCfgDeclarations`
-/// declares for the arbitrary-CFG (dispatcher) layout of `function`: every
-/// non-storage, non-capture local place, every named non-storage
-/// block-parameter/instruction-result value, and every named value pack. The
-/// register validator budgets this flat count (plus the `__lifter_pc` slot)
-/// against the compiler's local-register limit so a forced-dispatcher layout is
-/// certified consistently with what is emitted. Keep this in lockstep
-/// with `emitArbitraryCfgDeclarations` below.
+/// Count the root list plus the places declared at their allocation leaf, an
+/// upper bound on the `local` names declared for the arbitrary-CFG
+/// (dispatcher) layout of `function`: every non-storage, non-capture local
+/// place (one that `emission_scope.Plan.arbitraryLeafDeclaresPlace` marks is
+/// declared at its allocation inside its block's leaf instead of in the root
+/// list of `emitArbitraryCfgDeclarations`, and keeps its slot here), every
+/// named non-storage block-parameter/instruction-result value, and every named
+/// value pack. The register validator budgets this flat count (plus the
+/// `__lifter_pc` slot) against the compiler's local-register limit so a
+/// forced-dispatcher layout is certified consistently with what is emitted
+/// (the dispatcher budget). Keep this in lockstep with `emitArbitraryCfgDeclarations` below.
 pub fn arbitraryDeclarationCount(
     program: *const ir.Program,
     emission_plan: *const EmissionPlan,
@@ -621,6 +624,8 @@ fn emitArbitraryCfgDeclarations(
             .local, .instruction => {},
             .capture => continue,
         }
+        // Declared at its allocation, inside the allocating block's leaf.
+        if (scopes.arbitraryLeafDeclaresPlace(place_id)) continue;
         const name = emission_plan.names.place(place_id) orelse return error.UnsupportedOperation;
         if (scopes.placeMovedLiteralInitializer(place_id)) |literal| {
             try flushBareDeclarations(output, allocator, &bare_count);
@@ -667,6 +672,13 @@ fn emitArbitraryBlockInstructions(
 ) (EmitError || std.mem.Allocator.Error)!void {
     for (block.instructions) |instruction_id| {
         if (instruction_id.index() >= program.instructions.len) return error.UnsupportedOperation;
+        const instruction = program.instructions[instruction_id.index()];
+        const declares_place = switch (instruction.operation) {
+            .place_write => |write| scopes.arbitraryLeafDeclaresPlace(write.place) and
+                program.places[write.place.index()].origin == .instruction and
+                program.places[write.place.index()].origin.instruction == instruction_id,
+            else => false,
+        };
         emitInstruction(
             output,
             allocator,
@@ -676,7 +688,7 @@ fn emitArbitraryBlockInstructions(
             program.instructions[instruction_id.index()],
             indent,
             false,
-            false,
+            declares_place,
             place_aliases,
             null,
         ) catch |err| {
