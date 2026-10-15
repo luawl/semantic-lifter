@@ -369,6 +369,22 @@ pub const State = struct {
         return false;
     }
 
+    /// Whether `edge` is an arm edge of a block whose arm truth facts are deferred (the
+    /// predicate of `hasDeferredBranchArms`). No claim is planned over such an edge before the release, even
+    /// from facts already on it: a proof that rewrote the arm now would not assume the arm facts released
+    /// later, which would then fall outside its edge scope.
+    fn armEdgeOfDeferredBlock(self: *const State, program: *const ir.Program, edge: ir.CfgEdgeRef) bool {
+        if (!self.defer_base_branch_arms or edge.kind == .jump or edge.source.index() >= program.blocks.len) return false;
+        const source = program.blocks[edge.source.index()];
+        const branch = switch (source.terminator) {
+            .branch => |value| value,
+            else => return false,
+        };
+        const promoted = findValueDefinition(program.solver_terms, branch.condition);
+        return exactBranchTruth(program, branch.condition, promoted) == .unknown and
+            hasRelevantBaseConstraint(program, source, branch.condition, promoted);
+    }
+
     fn deriveEdgeFacts(self: *State, program: *const ir.Program, scope: *const readable_scope.Scope) !void {
         var working = program.*;
         var history_cache = try edge_path.HistoryCache.init(self.allocator, program);
@@ -387,8 +403,13 @@ pub const State = struct {
                     const promoted = try solver_promotion.ensureDefinition(self.allocator, &working, &self.terms, branch.condition);
                     working.solver_terms = self.terms.items;
                     const has_exact_truth = exactBranchTruth(&working, branch.condition, promoted) != .unknown;
-                    break :blk !has_exact_truth and
-                        (!self.defer_base_branch_arms or !hasRelevantBaseConstraint(&working, block, branch.condition, promoted));
+                    // A block whose arm truth facts wait for its base claims derives no fact on its arm
+                    // edges until they are released: the arm facts decide the arm edges' argument facts
+                    // (replay, validate_proofs.zig:60) and must be carried by every proof that rewrites an
+                    // arm (edge scope, :73), so the block's facts are all derived in one call.
+                    if (!has_exact_truth and self.defer_base_branch_arms and
+                        hasRelevantBaseConstraint(&working, block, branch.condition, promoted)) continue;
+                    break :blk !has_exact_truth;
                 },
                 else => true,
             };
@@ -521,6 +542,7 @@ pub const State = struct {
                 }
                 const incoming = try incomingEdgesAlloc(self.allocator, working, &scope, block.id);
                 for (incoming) |edge| {
+                    if (self.armEdgeOfDeferredBlock(working, edge)) continue;
                     const path = try relevantEdgePathAlloc(self.allocator, working, edge, branch.condition, promoted) orelse continue;
                     const assumptions = try applicableConstraintsAlloc(self.allocator, working, block, .{ .edge = .{ .edge = edge, .path = path } });
                     try appendPairedClaims(self.allocator, working, block.id, goals, assumptions, path.rewrites, &self.queries, &self.claims);
