@@ -3,6 +3,11 @@ import { createHash } from 'node:crypto';
 // Supported input (decision D4): the text listing of `luau-compile --text --dump-constants -O0 -g0` from
 // Luau 0.720, the pinned compiler. Other optimization levels, binary bytecode and original source ASTs are not
 // inputs. Everything this adapter cannot represent faithfully is refused with a typed DisassemblyRefusal.
+// Iteration (T4-ADAPTER-ITERATION), at that -O0 -g0 level only: FORNPREP/FORGPREP become `iteration_prepare` and
+// FORNLOOP/FORGLOOP `iteration_loop` records that share one `loop` region (iteration, base, prepare, latch, exit,
+// variables). A loop shape outside that region form is refused as iteration_pair_mismatch, iteration_state_written,
+// iteration_state_read, iteration_region_entry or iteration_region_exit; the -O1 fast paths stay refused: the ipairs
+// marker `[inext]` as iteration_fast_path_unsupported, FORGPREP_NEXT and FORGPREP_INEXT as unsupported_opcode.
 
 const BINARY = {
   ADD: 'add', SUB: 'subtract', MUL: 'multiply', DIV: 'divide',
@@ -24,6 +29,8 @@ const OPERAND_COUNTS = new Map([
   ['CALL', [3]], ['NAMECALL', [3]], ['GETVARARGS', [2]],
   ['NEWTABLE', [3]], ['GETTABLE', [3]], ['SETTABLE', [3]], ['GETTABLEKS', [3]], ['SETTABLEKS', [3]], ['SETLIST', [4]],
   ['DUPTABLE', [2]],
+  // The -O0 iteration pair (T4-ADAPTER-ITERATION). FORGLOOP is parsed by its own exact pattern below.
+  ['FORNPREP', [2]], ['FORNLOOP', [2]], ['FORGPREP', [2]], ['FORGLOOP', [3]],
   ...Object.keys(BINARY).map((op) => [op, [3]]),
   ...['', 'NOT'].flatMap((not) => Object.keys(COMPARE).map((test) => [`JUMPIF${not}${test}`, [3]])),
 ]);
@@ -167,15 +174,21 @@ export function parseDisassembly(text, { function_index = 0, parameter_count = 2
       line = label[2];
       if (!line) continue;
     }
-    const match = /^([A-Z][A-Z0-9]*)(?:\s+(.*))?$/.exec(line);
+    // `_` admitted so FORGPREP_NEXT/FORGPREP_INEXT reach the typed unsupported_opcode refusal (D4).
+    const match = /^([A-Z][A-Z0-9_]*)(?:\s+(.*))?$/.exec(line);
     if (!match) refuse('listing_structure', `unrecognized disassembly at line ${record.line_number}`, record.line_number);
     const op = match[1];
     const site = { line_number: record.line_number, op };
     const counts = OPERAND_COUNTS.get(op);
     if (!counts) refuse('unsupported_opcode', `unsupported opcode ${op} at disassembly line ${record.line_number}`, record.line_number, op);
     // `SETLIST R<a> R<b> <c> [<s>]`: the bracket is the start-index operand (T2-ADAPTER.md 3.4), kept as args[3].
+    // `FORGLOOP R<a> L<x> <n>` takes no bracket; the -O1 ipairs marker ` [inext]` is refused, never ignored.
+    if (op === 'FORGLOOP' && /\[inext\]\s*$/.test(match[2] ?? '')) {
+      refuseAt(site, 'iteration_fast_path_unsupported', 'FORGLOOP [inext] is the -O1 ipairs fast path');
+    }
     const args = (op === 'SETLIST' ? /^(\S+)\s+(\S+)\s+(\S+)\s+\[([^\]]*)\]$/.exec(match[2] ?? '')?.slice(1)
-      : operands(match[2] ?? '', counts)) ?? refuseAt(site, 'operand_form', `${op}: operand count`);
+      : op === 'FORGLOOP' ? /^(\S+)\s+(\S+)\s+(\S+)$/.exec(match[2] ?? '')?.slice(1)
+        : operands(match[2] ?? '', counts)) ?? refuseAt(site, 'operand_form', `${op}: operand count`);
     const instruction = { op, args, line_number: record.line_number, reads: [], writes: [] };
     if (op === 'LOADK') {
       if (!/^K\d+$/.test(args[1])) refuseAt(site, 'operand_form', 'invalid constant operand');
@@ -397,6 +410,32 @@ export function parseDisassembly(text, { function_index = 0, parameter_count = 2
       }
       instruction.first_index = Number(args[3]);
       instruction.reads = [table, ...instruction.values];
+    } else if (op === 'FORNPREP' || op === 'FORGPREP') {
+      // `FORNPREP R<a> L<x>`: numeric loop state [limit R<a>, step R<a+1>, index R<a+2>], exit at L<x>.
+      // `FORGPREP R<a> L<x>`: generic loop state [generator R<a>, state R<a+1>, control R<a+2>], first call at L<x>.
+      // reads are the header's initial arguments in IR order: numeric (control, limit, step), generic (iterator, state, control).
+      const base = register(args[0], site);
+      if (!(base + 3 <= 255)) refuseAt(site, 'operand_form', 'invalid iteration base');
+      instruction.kind = 'iteration_prepare';
+      instruction.iteration = op === 'FORNPREP' ? 'numeric' : 'generic';
+      instruction.base = base;
+      instruction.label = args[1];
+      instruction.reads = op === 'FORNPREP' ? [base + 2, base, base + 1] : [base, base + 1, base + 2];
+    } else if (op === 'FORNLOOP' || op === 'FORGLOOP') {
+      // The loop's latch; it reads only hidden state, which the IR carries as SSA values, so reads stay empty.
+      const base = register(args[0], site);
+      instruction.kind = 'iteration_loop';
+      instruction.iteration = op === 'FORNLOOP' ? 'numeric' : 'generic';
+      instruction.base = base;
+      instruction.label = args[1];
+      if (op === 'FORGLOOP') {
+        if (!/^[1-9]\d*$/.test(args[2])) refuseAt(site, 'operand_form', 'invalid FORGLOOP variable count');
+        instruction.variable_count = Number(args[2]);
+        if (!(base + 3 + Math.max(instruction.variable_count, 2) <= 255)) refuseAt(site, 'operand_form', 'invalid FORGLOOP range');
+      } else {
+        if (!(base + 3 <= 255)) refuseAt(site, 'operand_form', 'invalid iteration base');
+        instruction.variable_count = 1;
+      }
     } else if (op === 'DUPTABLE') {
       // Decision D4: the template constant prints as `{...}`, so its keys are not in the listing (T2-ADAPTER.md 5.5 5c).
       refuseAt(site, 'table_template_opaque', 'DUPTABLE template keys are not in the listing');
@@ -423,12 +462,63 @@ export function parseDisassembly(text, { function_index = 0, parameter_count = 2
     if (skip && !(instruction.args[2] === '+1' && instructions[index + 1]?.op === 'LOADB' && labelled.has(index + 2))) {
       refuseAt(instruction, 'relative_skip_unsupported', `relative skip ${instruction.args[2]} is unsupported`);
     }
-    instruction.successors = instruction.kind === 'return' ? []
+    // Bytecode successors of the iteration pair (FORNPREP: exit, body; FORGPREP: its FORGLOOP;
+    // FORNLOOP/FORGLOOP: body, exit). The bridge does not lower these edges; it uses the loop record.
+    const iterationSuccessors = instruction.kind === 'iteration_prepare'
+      ? (instruction.iteration === 'numeric' ? [instruction.target, index + 1] : [instruction.target])
+      : instruction.kind === 'iteration_loop' ? [instruction.target, index + 1] : null;
+    instruction.successors = iterationSuccessors ?? (instruction.kind === 'return' ? []
       : instruction.kind === 'jump' ? [instruction.target]
         : instruction.kind === 'branch' ? [instruction.target, index + 1]
-          : skip ? [index + 2] : [index + 1];
+          : skip ? [index + 2] : [index + 1]);
     if (!instruction.successors.every((target) => target < instructions.length)) {
       refuseAt(instruction, 'listing_structure', 'function falls off end');
+    }
+  }
+  // Iteration regions. A PREP at p pairs with the LOOP at l (numeric: the PREP's exit target is l+1;
+  // generic: the PREP's target is l), the LOOP jumps back to p+1 with the same base. The region is (p, l]: entered only
+  // from the PREP, left only to l+1 (returns aside); no member writes, clobbers or reads the hidden registers.
+  for (const [p, prep] of instructions.entries()) {
+    if (prep.kind !== 'iteration_prepare') continue;
+    const l = prep.iteration === 'numeric' ? prep.target - 1 : prep.target;
+    const latch = instructions[l];
+    if (!(l > p && latch?.kind === 'iteration_loop' && latch.iteration === prep.iteration && latch.base === prep.base
+      && latch.target === p + 1 && latch.loop === undefined)) {
+      refuseAt(prep, 'iteration_pair_mismatch', `${prep.op} R${prep.base} has no matching loop instruction`);
+    }
+    const a = prep.base;
+    const hiddenReads = prep.iteration === 'numeric' ? [a, a + 1] : [a, a + 1, a + 2];
+    for (let index = p + 1; index < l; index += 1) {
+      const member = instructions[index];
+      if (member.writes.some((reg) => reg >= a && reg <= a + 2) || (member.clobbers_from ?? Infinity) <= a + 2) {
+        refuseAt(member, 'iteration_state_written', `loop state R${a}..R${a + 2} written inside its loop`);
+      }
+      if (member.reads.some((reg) => hiddenReads.includes(reg))) {
+        refuseAt(member, 'iteration_state_read', `hidden loop state of R${a} read inside its loop`);
+      }
+    }
+    for (const [index, instruction] of instructions.entries()) {
+      const inside = index > p && index <= l;
+      for (const target of instruction.successors) {
+        const into = target > p && target <= l;
+        if (!inside && into && index !== p) refuseAt(instruction, 'iteration_region_entry', 'jump into a loop body');
+        if (inside && !into && target !== l + 1) refuseAt(instruction, 'iteration_region_exit', 'jump out of a loop body');
+      }
+    }
+    const variables = prep.iteration === 'numeric' ? [a + 2]
+      : Array.from({ length: latch.variable_count }, (_, i) => a + 3 + i);
+    const loop = { iteration: prep.iteration, base: a, prepare: p, latch: l, exit: l + 1, variables };
+    prep.loop = loop;
+    latch.loop = loop;
+    // Per-edge definite assignment: the body edges define the loop variables (a generic LOOP is a call frame at a+3);
+    // every exit edge kills the loop's registers R<a..> (the compiler frees them at the loop's end).
+    const bodyEdge = prep.iteration === 'numeric' ? { writes: variables } : { kills_from: a + 3, writes: variables };
+    if (prep.iteration === 'numeric') prep.edge_effects = [{ kills_from: a }, bodyEdge];
+    latch.edge_effects = [bodyEdge, { kills_from: a }];
+  }
+  for (const instruction of instructions) {
+    if (instruction.kind === 'iteration_loop' && instruction.loop === undefined) {
+      refuseAt(instruction, 'iteration_pair_mismatch', `${instruction.op} R${instruction.base} has no matching prepare instruction`);
     }
   }
   // Constructor windows (T2-ADAPTER.md 5.5 5b). A `NEWTABLE R<t>` opens a window when a `SETLIST R<t>` follows: the
@@ -445,7 +535,8 @@ export function parseDisassembly(text, { function_index = 0, parameter_count = 2
     const members = [];
     for (let index = create + 1; index < instructions.length; index += 1) {
       const instruction = instructions[index];
-      const transfers = ['jump', 'branch', 'return'].includes(instruction.kind) || instruction.successors[0] !== index + 1;
+      const transfers = ['jump', 'branch', 'return', 'iteration_prepare', 'iteration_loop'].includes(instruction.kind)
+        || instruction.successors[0] !== index + 1;
       if (labelled.has(index) || transfers) break;
       const store = (instruction.kind === 'set_list' || instruction.kind === 'table_set') && instruction.table === t;
       const touched = store ? storeRegisters(instruction) : [...instruction.reads, ...instruction.writes];
@@ -498,7 +589,8 @@ export function parseDisassembly(text, { function_index = 0, parameter_count = 2
   }
   const registers = [...new Set([
     ...Array.from({ length: parameter_count }, (_, i) => i),
-    ...instructions.flatMap((instruction) => [...instruction.reads, ...instruction.writes]),
+    ...instructions.flatMap((instruction) => [...instruction.reads, ...instruction.writes,
+      ...(instruction.edge_effects ?? []).flatMap((effect) => effect.writes ?? [])]),
   ])].sort((a, b) => a - b);
   const reachable = new Set();
   const pending = [0];
@@ -511,8 +603,14 @@ export function parseDisassembly(text, { function_index = 0, parameter_count = 2
   // Reject reads not initialized on every incoming path, including back edges.
   const predecessors = instructions.map(() => []);
   for (const index of reachable) {
-    for (const target of instructions[index].successors) predecessors[target].push(index);
+    for (const [slot, target] of instructions[index].successors.entries()) predecessors[target].push([index, slot]);
   }
+  // An edge's set is its source's outgoing set with the edge's own effect (iteration edges only).
+  const edgeOut = (parent, slot) => {
+    const effect = instructions[parent].edge_effects?.[slot];
+    if (!effect) return outgoing[parent];
+    return new Set([...[...outgoing[parent]].filter((reg) => reg < (effect.kills_from ?? Infinity)), ...(effect.writes ?? [])]);
+  };
   const initial = new Set(Array.from({ length: parameter_count }, (_, i) => i));
   const incoming = instructions.map(() => new Set(registers));
   const outgoing = instructions.map(() => new Set(registers));
@@ -520,7 +618,7 @@ export function parseDisassembly(text, { function_index = 0, parameter_count = 2
   while (changed) {
     changed = false;
     for (const index of reachable) {
-      const sources = predecessors[index].map((parent) => outgoing[parent]);
+      const sources = predecessors[index].map(([parent, slot]) => edgeOut(parent, slot));
       if (index === 0) sources.push(initial);
       const next = new Set(registers.filter((reg) => sources.every((source) => source.has(reg))));
       // A call kills its frame (T2-ADAPTER.md 5.3): outgoing = (incoming - {r >= clobbers_from}) + writes.
