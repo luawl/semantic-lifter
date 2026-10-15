@@ -14,7 +14,9 @@
 
 # toolchains and working directories of the maintainers
 /tools/
-/docs/
+/docs/*
+!/docs/usage.md
+!/docs/design.md
 /testdata/
 /scratch/
 
