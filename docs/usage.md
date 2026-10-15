@@ -103,7 +103,7 @@ output, so their output serves analysis, or a harness that gates it separately. 
 
 ## Example
 
-The [README example](../README.md#example) lifts a tracked fixture through the source path and shows the published output.
+The [Getting Started example](README.md#example) lifts a tracked fixture through the source path and shows the published output.
 
 The output is what the backend published after the official compiler accepted it. The backend rebuilt
 the loop from the control-flow graph in the IR, not from the source text, so the result is a structured
