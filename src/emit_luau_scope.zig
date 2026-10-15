@@ -52,6 +52,7 @@ pub const Plan = struct {
     value_scopes: []ScopeId,
     pack_scopes: []ScopeId,
     place_scopes: []ScopeId,
+    arbitrary_leaf_places: []bool,
     place_initializers: []?ir.InstructionId,
     moved_literal_initializers: []?MovedLiteralInitializer,
     synthetic_value_declarations: []bool,
@@ -110,6 +111,9 @@ pub const Plan = struct {
         const place_scopes = try allocator.alloc(ScopeId, program.places.len);
         errdefer allocator.free(place_scopes);
         @memset(place_scopes, invalid_scope);
+        const arbitrary_leaf_places = try allocator.alloc(bool, program.places.len);
+        errdefer allocator.free(arbitrary_leaf_places);
+        @memset(arbitrary_leaf_places, false);
         const place_initializers = try allocator.alloc(?ir.InstructionId, program.places.len);
         errdefer allocator.free(place_initializers);
         @memset(place_initializers, null);
@@ -151,6 +155,7 @@ pub const Plan = struct {
             .value_scopes = value_scopes,
             .pack_scopes = pack_scopes,
             .place_scopes = place_scopes,
+            .arbitrary_leaf_places = arbitrary_leaf_places,
             .place_initializers = place_initializers,
             .moved_literal_initializers = moved_literal_initializers,
             .synthetic_value_declarations = synthetic_value_declarations,
@@ -179,6 +184,7 @@ pub const Plan = struct {
         try plan.collectNativeIterationInitializerUses(structured.root);
         plan.hoistFunctionPlacesOutOfLoops();
         plan.findLocalPlaceInitializers();
+        if (structured.root.arbitrary_cfg) plan.findArbitraryLeafPlaces();
 
         plan.declaration_counts = try allocator.alloc(usize, plan.parents.len);
         errdefer allocator.free(plan.declaration_counts);
@@ -206,6 +212,7 @@ pub const Plan = struct {
         self.allocator.free(self.synthetic_value_declarations);
         self.allocator.free(self.moved_literal_initializers);
         self.allocator.free(self.place_initializers);
+        self.allocator.free(self.arbitrary_leaf_places);
         self.allocator.free(self.place_scopes);
         self.allocator.free(self.pack_scopes);
         self.allocator.free(self.value_scopes);
@@ -394,6 +401,13 @@ pub const Plan = struct {
             else => return false,
         };
         return self.instructionDeclaresPlace(instruction_id, place_id);
+    }
+
+    /// Arbitrary-CFG (dispatcher) layout: whether `place_id` is declared
+    /// `local` at its allocating write inside the allocating block's leaf
+    /// instead of in the function's root list (`findArbitraryLeafPlaces`).
+    pub fn arbitraryLeafDeclaresPlace(self: *const Plan, place_id: ir.PlaceId) bool {
+        return place_id.index() < self.arbitrary_leaf_places.len and self.arbitrary_leaf_places[place_id.index()];
     }
 
     pub fn placeMovedLiteralInitializer(self: *const Plan, place_id: ir.PlaceId) ?ir.Literal {
@@ -779,6 +793,41 @@ pub const Plan = struct {
                 }
                 break;
             }
+        }
+    }
+
+    /// Arbitrary-CFG (dispatcher) layout only. Marks each instruction-origin
+    /// local place whose allocation `A` is a live instruction of this
+    /// function, that a live `make_closure` of this function binds, and whose
+    /// every live use (`operationUsesPlace`) lies in `A`'s block. A leaf is one
+    /// block, so such a place is declared at `A` inside that block's leaf and
+    /// every execution of `A` creates a fresh cell (Luau `local` semantics):
+    /// closures created in a loop keep one cell per iteration. Every other
+    /// place keeps its root declaration.
+    fn findArbitraryLeafPlaces(self: *Plan) void {
+        for (self.function.local_places) |place_id| {
+            if (place_id.index() >= self.program.places.len or place_id.index() >= self.arbitrary_leaf_places.len) continue;
+            const allocation = switch (self.program.places[place_id.index()].origin) {
+                .instruction => |allocation_id| allocation_id,
+                .local, .capture => continue,
+            };
+            if (allocation.index() >= self.program.instructions.len or self.dead.contains(allocation)) continue;
+            const allocation_block = self.program.instructions[allocation.index()].block;
+            if (allocation_block.index() >= self.program.blocks.len or
+                self.program.blocks[allocation_block.index()].function != self.function.id) continue;
+            var captured = false;
+            var single_block = true;
+            for (self.function.blocks) |block_id| {
+                if (block_id.index() >= self.program.blocks.len) continue;
+                for (self.program.blocks[block_id.index()].instructions) |instruction_id| {
+                    if (instruction_id.index() >= self.program.instructions.len or self.dead.contains(instruction_id)) continue;
+                    const operation = self.program.instructions[instruction_id.index()].operation;
+                    if (!operationUsesPlace(operation, place_id)) continue;
+                    if (block_id != allocation_block) single_block = false;
+                    if (closureBindsPlace(operation, place_id)) captured = true;
+                }
+            }
+            self.arbitrary_leaf_places[place_id.index()] = captured and single_block;
         }
     }
 
@@ -1309,6 +1358,20 @@ fn operationUsesPlace(operation: ir.Operation, target: ir.PlaceId) bool {
     var found = false;
     runtime_uses.visitOperationUses(operation, PlaceUseVisitor{ .target = target, .found = &found });
     return found;
+}
+
+fn closureBindsPlace(operation: ir.Operation, target: ir.PlaceId) bool {
+    const closure = switch (operation) {
+        .make_closure => |value| value,
+        else => return false,
+    };
+    for (closure.bindings) |binding| {
+        switch (binding) {
+            .place => |place_id| if (place_id == target) return true,
+            .value => {},
+        }
+    }
+    return false;
 }
 
 const PlaceUseVisitor = struct {

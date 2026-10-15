@@ -739,6 +739,22 @@ pub fn build(b: *std.Build) void {
         "luau/fixtures/per_iteration_capture_source.luau",
         "source-frontend-per-iteration-capture",
     );
+    const per_iteration_capture_dispatcher = addDispatcherRuntimeConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "source-frontend-per-iteration-capture",
+        source_frontend_iteration_capture_conformance.resolved_ir,
+    );
+    const repeat_loop_dispatcher = addDispatcherRuntimeConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "source-frontend-repeat-loop",
+        source_frontend_repeat_conformance.resolved_ir,
+    );
     const source_frontend_typed_block_conformance = addLuauSourceConformance(
         b,
         exe,
@@ -1106,9 +1122,11 @@ pub fn build(b: *std.Build) void {
     source_frontend_method_conformance.addTo(conformance_step);
     source_frontend_recursive_conformance.addTo(conformance_step);
     source_frontend_repeat_conformance.addTo(conformance_step);
+    conformance_step.dependOn(repeat_loop_dispatcher);
     source_frontend_compound_conformance.addTo(conformance_step);
     source_frontend_if_expression_conformance.addTo(conformance_step);
     source_frontend_iteration_capture_conformance.addTo(conformance_step);
+    conformance_step.dependOn(per_iteration_capture_dispatcher);
     source_frontend_typed_block_conformance.addTo(conformance_step);
     source_frontend_numeric_for_conformance.addTo(conformance_step);
     source_frontend_generic_for_conformance.addTo(conformance_step);
