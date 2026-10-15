@@ -8,6 +8,23 @@ import { createHash } from 'node:crypto';
 // variables). A loop shape outside that region form is refused as iteration_pair_mismatch, iteration_state_written,
 // iteration_state_read, iteration_region_entry or iteration_region_exit; the -O1 fast paths stay refused: the ipairs
 // marker `[inext]` as iteration_fast_path_unsupported, FORGPREP_NEXT and FORGPREP_INEXT as unsupported_opcode.
+// Closures, at that -O0 -g0 level only: `NEWCLOSURE R<a> P<k>` and the CAPTURE lines that follow
+// it become one `closure` record, GETUPVAL `upvalue_get`, SETUPVAL `upvalue_set` and CLOSEUPVALS `close_upvalues`. The
+// listing prints no function tree (P<k> indexes the creating function's own child list) and no arity, so the caller
+// declares every nested function to lift in the option `nested: { "<function index>": { parent, prototype,
+// parameter_count, is_variadic } }` (default {}; is_variadic default false): its creating function (`parent`: the
+// selected function or another declared nested function) and the k of the creator's `NEWCLOSURE R<a> P<k>` line
+// (`prototype`), declared as parameter_count and is_variadic are for the selected function (by design, the tree is
+// never recovered from the post-order function numbering). A selected function without closure opcodes yields the v2
+// handoff unchanged; otherwise the handoff is compiler_disassembly_handoff_v3: the v2 fields plus `functions`, the
+// declared tree in pre-order (children by prototype), each { function_index, parent_index, parameter_count,
+// is_variadic, upvalues: [{ class, line_number }], registers, instructions }. Typed refusals, in this order:
+// invalid_options (the map's shape); uninstantiated_function (the listing-wide census: a function after an
+// always-terminating statement keeps its number but gets no NEWCLOSURE line, and the text cannot tell which);
+// selected_function_captures; nested_map_mismatch; nested_function_undeclared; then, while parsing,
+// capture_count_mismatch, label_inside_closure, capture_without_closure, setupval_on_value_capture,
+// open_pack_crosses_label and DUPCLOSURE (an -O1 form) as unsupported_opcode; then captured_register_reused_after_close
+// and self_capture_in_loop.
 
 const BINARY = {
   ADD: 'add', SUB: 'subtract', MUL: 'multiply', DIV: 'divide',
@@ -33,9 +50,14 @@ const OPERAND_COUNTS = new Map([
   ['FORNPREP', [2]], ['FORNLOOP', [2]], ['FORGPREP', [2]], ['FORGLOOP', [3]],
   // The -O0 conditional moves. ANDK, ORK and GETIMPORT, -O1 forms, stay out of the table.
   ['AND', [3]], ['OR', [3]],
+  // Closures. CAPTURE is read only by the NEWCLOSURE case it follows; a CAPTURE anywhere else is
+  // refused. DUPCLOSURE, an -O1 form, stays out of the table.
+  ['GETUPVAL', [2]], ['SETUPVAL', [2]], ['NEWCLOSURE', [2]], ['CLOSEUPVALS', [1]], ['CAPTURE', [2]],
   ...Object.keys(BINARY).map((op) => [op, [3]]),
   ...['', 'NOT'].flatMap((not) => Object.keys(COMPARE).map((test) => [`JUMPIF${not}${test}`, [3]])),
 ]);
+// A selected function with one of these opcodes takes the closure path (handoff v3).
+const CLOSURE_OPCODES = new Set(['NEWCLOSURE', 'DUPCLOSURE', 'CAPTURE', 'GETUPVAL', 'SETUPVAL', 'CLOSEUPVALS']);
 
 export class DisassemblyRefusal extends Error {
   constructor(code, message, line_number = null, opcode = null) {
@@ -115,37 +137,37 @@ function callCounts(args, site) {
   return { base, count, results };
 }
 
-// The compiler owns bytecode decoding. This adapter accepts its pinned text
-// format, not arbitrary binary bytecode or original source ASTs.
-export function parseDisassembly(text, { function_index = 0, parameter_count = 2, is_variadic = false } = {}) {
-  if (!(Number.isInteger(function_index) && function_index >= 0)) {
-    refuse('invalid_options', 'function_index must be a non-negative integer');
-  }
-  if (!(Number.isInteger(parameter_count) && parameter_count >= 0 && parameter_count < 255)) {
-    refuse('invalid_options', 'parameter_count must be an integer from 0 to 254');
-  }
-  if (typeof is_variadic !== 'boolean') refuse('invalid_options', 'is_variadic must be a boolean');
-  const functions = new Map();
-  let current = null;
-  for (const [index, raw] of text.split(/\r?\n/).entries()) {
-    const line = raw.trim();
-    const site = { line_number: index + 1, op: null };
-    const header = /^Function (\d+) \(.*\):$/.exec(line);
-    if (header) {
-      const id = Number(header[1]);
-      if (functions.has(id)) refuseAt(site, 'listing_structure', 'duplicate function header');
-      current = [];
-      functions.set(id, current);
-    } else if (line) {
-      if (!current) refuseAt(site, 'listing_structure', 'text before function header');
-      current.push({ line, line_number: index + 1 });
-    }
-  }
-  if (!functions.has(function_index)) refuse('listing_structure', 'selected function is absent');
+// `GETUPVAL R<a> <u>`, `SETUPVAL R<a> <u>` and `CAPTURE UPVAL U<u>` name upvalue u; a Luau function has at most 200.
+function upvalueIndex(text, site) {
+  if (!/^\d+$/.test(text ?? '')) refuseAt(site, 'operand_form', 'invalid upvalue operand');
+  const value = Number(text);
+  if (!(value < 200)) refuseAt(site, 'operand_form', 'upvalue outside Luau upvalue range');
+  return value;
+}
+
+// The opcode, operand text and site of a listing record, its label removed; null for a constant or a label alone.
+function instructionOf(record) {
+  const match = /^(?:L\d+:\s*)?([A-Z][A-Z0-9_]*)(?:\s+(.*))?$/.exec(record.line);
+  return match ? { op: match[1], rest: match[2] ?? '', site: { line_number: record.line_number, op: match[1] } } : null;
+}
+
+// The well-formed `NEWCLOSURE R<a> P<k>` lines of a function body with their k (`prototype`); a malformed one is left
+// to the parse, which refuses it.
+function closureSites(records) {
+  return records.map(instructionOf).filter((entry) => entry?.op === 'NEWCLOSURE').flatMap(({ rest, site }) => {
+    const args = operands(rest, OPERAND_COUNTS.get('NEWCLOSURE'));
+    return args && /^P\d+$/.test(args[1]) ? [{ ...site, prototype: Number(args[1].slice(1)) }] : [];
+  });
+}
+
+// One function body: the selected function or a declared nested function. `upvalues` lists the classes ('value' |
+// 'place') of the function's upvalues, as its creating closure record decided them; `childIds` maps the k of each
+// `NEWCLOSURE R<a> P<k>` line of the body to the caller-declared index of the function it creates.
+function parseFunction(records, { parameter_count, is_variadic, upvalues, childIds }) {
   const constants = new Map();
   const labels = new Map();
   const instructions = [];
-  const records = functions.get(function_index);
+  const usedUpvalues = new Set();
   // The adjacent-only open protocol: an open producer leaves its values as a pack at R<p> and
   // kills R<p..>; only the next instruction may consume that pack, and only when no label sits on it (packs never
   // cross a label). `openPack` is the pack of the instruction just read ({ at: p, site }).
@@ -157,6 +179,12 @@ export function parseDisassembly(text, { function_index = 0, parameter_count = 2
     const { at } = openPack;
     openPack = null;
     return at;
+  };
+  // An upvalue use names one of the upvalues the creating closure captured; its class is the closure's.
+  const useUpvalue = (index, site) => {
+    if (!(index < upvalues.length)) refuseAt(site, 'capture_count_mismatch', `upvalue ${index} is not captured by the creating closure`);
+    usedUpvalues.add(index);
+    return upvalues[index];
   };
   for (let position = 0; position < records.length; position += 1) {
     const record = records[position];
@@ -454,11 +482,75 @@ export function parseDisassembly(text, { function_index = 0, parameter_count = 2
       // value nil), and at -O1 the template carries constant values the listing does not show while the listing cannot
       // prove its level.
       refuseAt(site, 'table_template_opaque', 'DUPTABLE template keys are not in the listing');
+    } else if (op === 'GETUPVAL') {
+      // `GETUPVAL R<a> <u>`: R<a> = upvalue u (a value capture's value, or a read of a place capture).
+      instruction.kind = 'upvalue_get';
+      instruction.upvalue = upvalueIndex(args[1], site);
+      instruction.upvalue_class = useUpvalue(instruction.upvalue, site);
+      instruction.writes = [register(args[0], site)];
+    } else if (op === 'SETUPVAL') {
+      // `SETUPVAL R<a> <u>`: upvalue u = R<a>; only a by-reference (place) capture is ever written.
+      instruction.kind = 'upvalue_set';
+      instruction.upvalue = upvalueIndex(args[1], site);
+      instruction.upvalue_class = useUpvalue(instruction.upvalue, site);
+      if (instruction.upvalue_class !== 'place') refuseAt(site, 'setupval_on_value_capture', `SETUPVAL writes value capture ${instruction.upvalue}`);
+      instruction.reads = [register(args[0], site)];
+    } else if (op === 'NEWCLOSURE') {
+      // `NEWCLOSURE R<a> P<k>` and the CAPTURE lines that follow it are ONE closure instruction (the NAMECALL + CALL
+      // precedent). The VM writes R<a> before it reads the captures, so `CAPTURE VAL R<a>` captures the new closure
+      // itself (a recursive local function): mode `self`, a place of its own in the bridge. The created function is the
+      // one the caller declared for this P<k>, never one derived from the function numbering.
+      if (!/^P\d+$/.test(args[1])) refuseAt(site, 'operand_form', 'invalid prototype operand');
+      const target = register(args[0], site);
+      const child = childIds.get(Number(args[1].slice(1)));
+      if (child === undefined) refuseAt(site, 'nested_function_undeclared', `NEWCLOSURE ${args[1]} has no declared nested function`);
+      const captures = [];
+      const lineNumbers = [record.line_number];
+      while (/^(?:L\d+:\s*)?CAPTURE\b/.test(records[position + 1]?.line ?? '')) {
+        position += 1;
+        const captureRecord = records[position];
+        const captureSite = { line_number: captureRecord.line_number, op: 'CAPTURE' };
+        if (/^L\d+:/.test(captureRecord.line)) refuseAt(captureSite, 'label_inside_closure', 'label on a CAPTURE line');
+        const form = /^CAPTURE\s+(VAL|REF|UPVAL)\s+(\S+)$/.exec(captureRecord.line);
+        if (!form) refuseAt(captureSite, 'operand_form', 'CAPTURE: operand form');
+        lineNumbers.push(captureRecord.line_number);
+        if (form[1] === 'UPVAL') {
+          if (!/^U\d+$/.test(form[2])) refuseAt(captureSite, 'operand_form', 'invalid upvalue operand');
+          const index = upvalueIndex(form[2].slice(1), captureSite);
+          const upvalueClass = useUpvalue(index, captureSite);
+          captures.push({ mode: 'upvalue', upvalue: index, class: upvalueClass, line_number: captureRecord.line_number });
+        } else {
+          const captured = register(form[2], captureSite);
+          const mode = form[1] === 'REF' ? 'reference' : captured === target ? 'self' : 'value';
+          captures.push({ mode, register: captured, class: mode === 'value' ? 'value' : 'place', line_number: captureRecord.line_number });
+        }
+      }
+      instruction.kind = 'closure';
+      instruction.function = child;
+      instruction.captures = captures;
+      instruction.reads = captures.filter((capture) => capture.mode === 'value').map((capture) => capture.register);
+      instruction.references = captures.filter((capture) => capture.mode === 'reference').map((capture) => capture.register);
+      instruction.writes = [target];
+      instruction.line_numbers = lineNumbers;
+    } else if (op === 'CAPTURE') {
+      refuseAt(site, 'capture_without_closure', 'CAPTURE outside a NEWCLOSURE');
+    } else if (op === 'CLOSEUPVALS') {
+      // `CLOSEUPVALS R<s>` detaches the open by-reference cells of R<s..>; nothing is lowered, and the reuse rule below
+      // refuses every later access of such a register (the bridge keeps one place per register).
+      instruction.kind = 'close_upvalues';
+      instruction.from = register(args[0], site);
+      // Transparent to the open protocol: `return f(x)` with a by-reference capture in scope compiles to the open
+      // producer, CLOSEUPVALS, then the open RETURN (values, closeLocals(0), RETURN). The pending pack passes through an
+      // unlabelled close; a label on the close would let another path reach the consumer without the pack.
+      if (openPack && [...labels.values()].includes(instructions.length)) {
+        refuseAt(site, 'open_pack_crosses_label', 'open pack crosses a label');
+      }
     } else {
       refuse('unsupported_opcode', `unsupported opcode ${op} at disassembly line ${record.line_number}`, record.line_number, op);
     }
-    // A pack still pending here was not consumed by this instruction, the one right after its producer.
-    if (openPack) refuseAt(openPack.site, 'open_pack_not_consumed', 'open pack is not consumed by the next instruction');
+    // A pack still pending here was not consumed by this instruction, the one right after its producer; an unlabelled
+    // close_upvalues passes it on to the instruction after it.
+    if (openPack && instruction.kind !== 'close_upvalues') refuseAt(openPack.site, 'open_pack_not_consumed', 'open pack is not consumed by the next instruction');
     if (instruction.produces_pack_at !== undefined) openPack = { at: instruction.produces_pack_at, site };
     instructions.push(instruction);
   }
@@ -554,7 +646,8 @@ export function parseDisassembly(text, { function_index = 0, parameter_count = 2
         || instruction.successors[0] !== index + 1;
       if (labelled.has(index) || transfers) break;
       const store = (instruction.kind === 'set_list' || instruction.kind === 'table_set') && instruction.table === t;
-      const touched = store ? storeRegisters(instruction) : [...instruction.reads, ...instruction.writes];
+      const touched = store ? storeRegisters(instruction)
+        : [...instruction.reads, ...instruction.writes, ...(instruction.references ?? [])];
       if (touched.includes(t) || (instruction.clobbers_from ?? Infinity) <= t) break;
       if (store) members.push(index);
     }
@@ -620,9 +713,51 @@ export function parseDisassembly(text, { function_index = 0, parameter_count = 2
       refuseAt(instruction, 'constructor_window_unsupported', 'SETLIST outside a constructor window');
     }
   }
+  // Reuse rule (closures): the bridge binds a by-reference capture to the register's one place, so after a
+  // `CLOSEUPVALS R<s>` no instruction reachable from it (back edges included) may read, write or capture a register
+  // x >= s that is captured by reference anywhere in the function; only a RETURN right after the close may read it
+  // (the compiler's `return` computes its values, closes, then returns). Per-iteration or reused cells stay refused.
+  const byReference = new Set(instructions.flatMap((instruction) => instruction.references ?? []));
+  for (const [index, close] of instructions.entries()) {
+    if (close.kind !== 'close_upvalues') continue;
+    const detached = [...byReference].filter((reg) => reg >= close.from);
+    if (detached.length === 0) continue;
+    const seen = new Set();
+    const pending = [...close.successors];
+    while (pending.length) {
+      const at = pending.pop();
+      if (seen.has(at)) continue;
+      seen.add(at);
+      const reached = instructions[at];
+      const exitRead = at === index + 1 && reached.kind === 'return';
+      const touched = [...(exitRead ? [] : reached.reads), ...reached.writes, ...(reached.references ?? [])];
+      const hit = detached.find((reg) => touched.includes(reg));
+      if (hit !== undefined) {
+        refuseAt(reached, 'captured_register_reused_after_close',
+          `R${hit} is used after CLOSEUPVALS R${close.from} (line ${close.line_number}) detached its by-reference capture`);
+      }
+      pending.push(...reached.successors);
+    }
+  }
+  // Self rule (closures): in the VM a self capture is a value taken at each creation, but the bridge models it as one
+  // place of the creating function (closure_self_<i>) that every creation overwrites, so a
+  // NEWCLOSURE with a `self` capture must not lie on a cycle; refused until each creation can have a place of its own
+  // (an instruction-origin place, which the frozen dispatcher hoists).
+  for (const [index, closure] of instructions.entries()) {
+    if (closure.kind !== 'closure' || !closure.captures.some((capture) => capture.mode === 'self')) continue;
+    const seen = new Set();
+    const pending = [...closure.successors];
+    while (pending.length) {
+      const at = pending.pop();
+      if (at === index) refuseAt(closure, 'self_capture_in_loop', 'a closure that captures itself is created inside a loop');
+      if (seen.has(at)) continue;
+      seen.add(at);
+      pending.push(...instructions[at].successors);
+    }
+  }
   const registers = [...new Set([
     ...Array.from({ length: parameter_count }, (_, i) => i),
-    ...instructions.flatMap((instruction) => [...instruction.reads, ...instruction.writes,
+    ...instructions.flatMap((instruction) => [...instruction.reads, ...instruction.writes, ...(instruction.references ?? []),
       ...(instruction.edge_effects ?? []).flatMap((effect) => effect.writes ?? [])]),
   ])].sort((a, b) => a - b);
   const reachable = new Set();
@@ -663,18 +798,165 @@ export function parseDisassembly(text, { function_index = 0, parameter_count = 2
     }
   }
   for (const index of reachable) {
-    for (const reg of instructions[index].reads) {
+    const instruction = instructions[index];
+    // A by-reference capture is a use of the register too, except of the closure's own target, which the closure
+    // itself initializes.
+    const referenced = (instruction.references ?? []).filter((reg) => reg !== instruction.writes[0]);
+    for (const reg of [...instruction.reads, ...referenced]) {
       if (!incoming[index].has(reg)) {
-        refuse('uninitialized_register', `uninitialized R${reg} at disassembly line ${instructions[index].line_number}`,
-          instructions[index].line_number, instructions[index].op);
+        refuse('uninitialized_register', `uninitialized R${reg} at disassembly line ${instruction.line_number}`,
+          instruction.line_number, instruction.op);
       }
     }
   }
-  return {
+  return { registers, instructions, usedUpvalues };
+}
+
+// The shape of the `nested` option: { "<function index>": { parent, prototype, parameter_count, is_variadic } }.
+function nestedDeclarations(nested) {
+  const invalid = (message) => refuse('invalid_options', message);
+  const isRecord = (value) => typeof value === 'object' && value !== null && !Array.isArray(value);
+  if (!isRecord(nested)) invalid('nested must map function indices to declarations');
+  return Object.entries(nested).map(([key, entry]) => {
+    if (!/^(?:0|[1-9]\d*)$/.test(key)) invalid(`nested key ${key} is not a function index`);
+    if (!isRecord(entry)) invalid(`nested function ${key} must be a declaration`);
+    const { parent, prototype, parameter_count, is_variadic = false } = entry;
+    if (!(Number.isInteger(parent) && parent >= 0)) invalid(`nested function ${key}: parent must be a non-negative integer`);
+    if (!(Number.isInteger(prototype) && prototype >= 0)) invalid(`nested function ${key}: prototype must be a non-negative integer`);
+    if (!(Number.isInteger(parameter_count) && parameter_count >= 0 && parameter_count < 255)) {
+      invalid(`nested function ${key}: parameter_count must be an integer from 0 to 254`);
+    }
+    if (typeof is_variadic !== 'boolean') invalid(`nested function ${key}: is_variadic must be a boolean`);
+    return { index: Number(key), parent, prototype, parameter_count, is_variadic };
+  }).sort((a, b) => a.index - b.index);
+}
+
+// The compiler owns bytecode decoding. This adapter accepts its pinned text
+// format, not arbitrary binary bytecode or original source ASTs.
+export function parseDisassembly(text, { function_index = 0, parameter_count = 2, is_variadic = false, nested = {} } = {}) {
+  if (!(Number.isInteger(function_index) && function_index >= 0)) {
+    refuse('invalid_options', 'function_index must be a non-negative integer');
+  }
+  if (!(Number.isInteger(parameter_count) && parameter_count >= 0 && parameter_count < 255)) {
+    refuse('invalid_options', 'parameter_count must be an integer from 0 to 254');
+  }
+  if (typeof is_variadic !== 'boolean') refuse('invalid_options', 'is_variadic must be a boolean');
+  const declared = nestedDeclarations(nested);
+  const functions = new Map();
+  let current = null;
+  for (const [index, raw] of text.split(/\r?\n/).entries()) {
+    const line = raw.trim();
+    const site = { line_number: index + 1, op: null };
+    const header = /^Function (\d+) \(.*\):$/.exec(line);
+    if (header) {
+      const id = Number(header[1]);
+      if (functions.has(id)) refuseAt(site, 'listing_structure', 'duplicate function header');
+      current = [];
+      functions.set(id, current);
+    } else if (line) {
+      if (!current) refuseAt(site, 'listing_structure', 'text before function header');
+      current.push({ line, line_number: index + 1 });
+    }
+  }
+  if (!functions.has(function_index)) refuse('listing_structure', 'selected function is absent');
+  const records = functions.get(function_index);
+  const closures = records.some((record) => CLOSURE_OPCODES.has(instructionOf(record)?.op));
+  const childIds = (parent) => new Map(declared.filter((entry) => entry.parent === parent)
+    .map((entry) => [entry.prototype, entry.index]));
+  if (closures) {
+    // The census: every function but the main chunk is created by exactly one NEWCLOSURE line.
+    // A function after an always-terminating statement keeps its number but gets no NEWCLOSURE line, the text does not
+    // mark it, and a declared map could then bind a live NEWCLOSURE line to its body; so the whole listing is refused,
+    // without naming a function, since the text cannot tell which one is never instantiated.
+    const creations = [...functions.values()].flat().filter((record) => instructionOf(record)?.op === 'NEWCLOSURE').length;
+    if (creations !== functions.size - 1) {
+      refuse('uninstantiated_function', `${creations} NEWCLOSURE lines for ${functions.size} functions: every function but the main chunk must be created by exactly one, and the listing cannot tell which one is not`);
+    }
+    // The selected function is lifted under a synthetic module that binds nothing, so it must capture nothing.
+    for (const record of records) {
+      const entry = instructionOf(record);
+      const upvalue = entry?.op === 'GETUPVAL' || entry?.op === 'SETUPVAL' ? operands(entry.rest, [2])?.[1]
+        : entry?.op === 'CAPTURE' ? /^UPVAL\s+U(\d+)$/.exec(entry.rest)?.[1] : undefined;
+      if (upvalue !== undefined) {
+        refuseAt(entry.site, 'selected_function_captures',
+          `the selected function captures upvalue ${upvalueIndex(upvalue, entry.site)}; it is lifted under a synthetic module and must capture nothing`);
+      }
+    }
+    // The declared map against the listing: each declared function exists, is not the selected function, hangs below the
+    // selected function through declared parents, and is created by exactly one `NEWCLOSURE R<a> P<prototype>` line of
+    // its parent, which no other declaration names.
+    const mismatch = (message) => refuse('nested_map_mismatch', message);
+    for (const entry of declared) {
+      if (entry.index === function_index) mismatch(`nested function ${entry.index} is the selected function`);
+      if (!functions.has(entry.index)) mismatch(`nested function ${entry.index} is absent from the listing`);
+    }
+    const lifted = new Set([function_index]);
+    for (let grown = true; grown;) {
+      grown = false;
+      for (const entry of declared) {
+        if (!lifted.has(entry.index) && lifted.has(entry.parent)) {
+          lifted.add(entry.index);
+          grown = true;
+        }
+      }
+    }
+    const closureLines = new Map([...lifted].map((index) => [index, closureSites(functions.get(index))]));
+    for (const entry of declared) {
+      if (!lifted.has(entry.index)) mismatch(`nested function ${entry.index}: its parent ${entry.parent} is not lifted`);
+      const lines = closureLines.get(entry.parent).filter((site) => site.prototype === entry.prototype);
+      if (lines.length !== 1) {
+        mismatch(`nested function ${entry.index}: function ${entry.parent} has ${lines.length} NEWCLOSURE lines with P${entry.prototype}, not one`);
+      }
+      const twin = declared.find((other) => other !== entry && other.parent === entry.parent && other.prototype === entry.prototype);
+      if (twin) mismatch(`nested functions ${entry.index} and ${twin.index} share parent ${entry.parent} and prototype P${entry.prototype}`);
+    }
+    // Every NEWCLOSURE line of a lifted function creates a declared function.
+    for (const [index, sites] of closureLines) {
+      for (const site of sites) {
+        if (!childIds(index).has(site.prototype)) {
+          refuseAt(site, 'nested_function_undeclared', `NEWCLOSURE P${site.prototype} of function ${index} has no declared nested function`);
+        }
+      }
+    }
+  }
+  const selected = parseFunction(records, { parameter_count, is_variadic, upvalues: [], childIds: childIds(function_index) });
+  const result = {
     schema_version: 'compiler_disassembly_handoff_v2',
     listing_sha256: createHash('sha256').update(text).digest('hex'),
-    function_index, parameter_count, is_variadic, registers, instructions,
+    function_index, parameter_count, is_variadic, registers: selected.registers, instructions: selected.instructions,
     signature_origin: 'caller-declared; text disassembly does not encode arity',
     scope: 'selected capture-free function; remaining compiled functions are not lifted',
+  };
+  if (!closures) return result;
+  // The declared tree in pre-order, children by prototype; each function's upvalue classes come from its creating
+  // closure record.
+  const nestedFunctions = [];
+  const visit = (parentIndex, parentInstructions) => {
+    for (const entry of declared.filter((candidate) => candidate.parent === parentIndex).sort((a, b) => a.prototype - b.prototype)) {
+      const closure = parentInstructions.find((instruction) => instruction.kind === 'closure' && instruction.function === entry.index);
+      const upvalues = closure.captures.map((capture) => capture.class);
+      const body = parseFunction(functions.get(entry.index), {
+        parameter_count: entry.parameter_count, is_variadic: entry.is_variadic, upvalues, childIds: childIds(entry.index),
+      });
+      // The compiler captures exactly the upvalues a function references, in first-reference order.
+      if (body.usedUpvalues.size !== upvalues.length) {
+        refuse('capture_count_mismatch', `nested function ${entry.index} references ${body.usedUpvalues.size} upvalues but its closure captures ${upvalues.length} at disassembly line ${closure.line_number}`);
+      }
+      nestedFunctions.push({
+        function_index: entry.index, parent_index: parentIndex, parameter_count: entry.parameter_count,
+        is_variadic: entry.is_variadic,
+        upvalues: closure.captures.map(({ class: upvalueClass, line_number }) => ({ class: upvalueClass, line_number })),
+        registers: body.registers, instructions: body.instructions,
+      });
+      visit(entry.index, body.instructions);
+    }
+  };
+  visit(function_index, selected.instructions);
+  return {
+    ...result,
+    schema_version: 'compiler_disassembly_handoff_v3',
+    functions: nestedFunctions,
+    signature_origin: 'caller-declared for the selected function and every nested function; text disassembly does not encode arity',
+    scope: 'selected function and its nested closures; the selected function captures nothing; remaining compiled functions are not lifted',
   };
 }
