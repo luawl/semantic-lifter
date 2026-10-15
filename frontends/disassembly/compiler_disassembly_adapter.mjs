@@ -31,6 +31,8 @@ const OPERAND_COUNTS = new Map([
   ['DUPTABLE', [2]],
   // The -O0 iteration pair (T4-ADAPTER-ITERATION). FORGLOOP is parsed by its own exact pattern below.
   ['FORNPREP', [2]], ['FORNLOOP', [2]], ['FORGPREP', [2]], ['FORGLOOP', [3]],
+  // The -O0 conditional moves (T4-ADAPTER-ANDOR-IMPORT-DUPTABLE). ANDK, ORK and GETIMPORT, -O1 forms, stay out of the table.
+  ['AND', [3]], ['OR', [3]],
   ...Object.keys(BINARY).map((op) => [op, [3]]),
   ...['', 'NOT'].flatMap((not) => Object.keys(COMPARE).map((test) => [`JUMPIF${not}${test}`, [3]])),
 ]);
@@ -233,6 +235,14 @@ export function parseDisassembly(text, { function_index = 0, parameter_count = 2
       const last = register(args[2], site);
       if (first > last) refuseAt(site, 'operand_form', 'invalid concat range');
       instruction.reads = Array.from({ length: last - first + 1 }, (_, i) => first + i);
+    } else if (op === 'AND' || op === 'OR') {
+      // `AND R<a> R<b> R<c>` sets R<a> = R<b> when R<b> is falsy (nil or false), else R<c>; `OR` the reverse. A conditional
+      // move (T4-ADAPTER-ANDOR-IMPORT-DUPTABLE): no metamethod, no error, no transfer. At -O0 the right operand is always a
+      // register; the constant forms ANDK and ORK need -O1 constant folding and stay unsupported_opcode.
+      instruction.kind = 'logical';
+      instruction.operator = op === 'AND' ? 'and' : 'or';
+      instruction.writes = [register(args[0], site)];
+      instruction.reads = [register(args[1], site), register(args[2], site)];
     } else if (op === 'JUMP' || op === 'JUMPBACK') {
       instruction.kind = 'jump';
       instruction.label = args[0];
@@ -438,6 +448,11 @@ export function parseDisassembly(text, { function_index = 0, parameter_count = 2
       }
     } else if (op === 'DUPTABLE') {
       // Decision D4: the template constant prints as `{...}`, so its keys are not in the listing (T2-ADAPTER.md 5.5 5c).
+      // It stays refused (T4-ADAPTER-ANDOR-IMPORT-DUPTABLE, PLAN-T4 decision D1): a lifted record constructor with register
+      // or bracketed keys recompiles to NEWTABLE, whose `next` order differs from the template's when a field holds nil
+      // (Luau 0.720, 400 generated key sets: 174 with the first value nil, 169 with every odd value nil, 67 with the middle
+      // value nil), and at -O1 the template carries constant values the listing does not show while the listing cannot
+      // prove its level.
       refuseAt(site, 'table_template_opaque', 'DUPTABLE template keys are not in the listing');
     } else {
       refuse('unsupported_opcode', `unsupported opcode ${op} at disassembly line ${record.line_number}`, record.line_number, op);
@@ -576,6 +591,24 @@ export function parseDisassembly(text, { function_index = 0, parameter_count = 2
     const mode = members.every((index) => index === last || instructions[index].kind !== 'table_set'
       || definitelyValidKey(index)) ? 'literal' : 'ordered';
     table.constructor = { create, mode };
+    // A SETTABLE member whose key register was last written inside the window by LOADK of a string keeps that string as
+    // its key (T4-ADAPTER-ANDOR-IMPORT-DUPTABLE, skeptic objection 2): `key_constant` and no `key`, as for SETTABLEKS, so the
+    // bridge emits a constant key and the member reads only its value. The scan is definitelyValidKey's: the last writer
+    // after the NEWTABLE, a clobbering call ends it.
+    for (const index of members) {
+      const member = instructions[index];
+      if (member.kind !== 'table_set' || !Object.hasOwn(member, 'key')) continue;
+      for (let at = index - 1; at > create; at -= 1) {
+        const writer = instructions[at];
+        if (writer.writes.includes(member.key) || (writer.clobbers_from ?? Infinity) <= member.key) {
+          if (writer.op === 'LOADK' && typeof writer.value.string === 'string') {
+            member.key_constant = { string: writer.value.string };
+            delete member.key;
+          }
+          break;
+        }
+      }
+    }
     for (const index of members) {
       instructions[index].constructor = { create, mode };
       instructions[index].reads = storeRegisters(instructions[index]);

@@ -92,7 +92,7 @@ local pendingPack: number? = nil
 -- store order (`fields`) and its tail pack (`tail`) for the completing member.
 local windows: { [number]: any } = {}
 for index, instruction in handoff.instructions do
-    assert(table.find({ "constant", "move", "binary", "unary", "concat", "jump", "branch", "return", "environment_get", "environment_set", "call", "namecall", "varargs", "new_table", "table_get", "table_set", "set_list", "iteration_prepare", "iteration_loop" }, instruction.kind) ~= nil,
+    assert(table.find({ "constant", "move", "binary", "unary", "concat", "jump", "branch", "return", "environment_get", "environment_set", "call", "namecall", "varargs", "new_table", "table_get", "table_set", "set_list", "iteration_prepare", "iteration_loop", "logical" }, instruction.kind) ~= nil,
         "unsupported handoff instruction kind")
     assert((pendingPack ~= nil) == (instruction.consumes_pack_from ~= nil), "open pack not adjacent to its consumer")
     local consumed: number? = pendingPack
@@ -139,6 +139,23 @@ for index, instruction in handoff.instructions do
             folded = value(IR.Operation.binary("concat", reads[slot], folded), IR.Types.dynamic(), IR.Effects.dynamicCall())
         end
         result = folded
+    elseif instruction.kind == "logical" then
+        -- AND/OR (T4-ADAPTER-ANDOR-IMPORT-DUPTABLE): R(a) = R(b) when R(b) is falsy, else R(c) (`or`: the reverse). The source
+        -- frontend's short-circuit form (luau/ast_frontend_control.luau:144-194): a branch on R(b) into logical_right (edge
+        -- argument R(c)) or logical_short (edge argument R(b)), joined by logical_join, whose one parameter is the result.
+        -- The join becomes this instruction's block, so the tail below writes R(a) there and jumps to the next instruction's
+        -- block. The helper blocks carry this instruction's decoded_record evidence.
+        local isAnd = instruction.operator == "and"
+        local right = builder:reserveBlock(worker, { name_hint = "logical_right", evidence = blockEvidence })
+        local short = builder:reserveBlock(worker, { name_hint = "logical_short", evidence = blockEvidence })
+        local join = builder:reserveBlock(worker, { name_hint = "logical_join", evidence = blockEvidence })
+        local joined = builder:addBlockParameter(join, IR.Types.dynamic(), "logical_result")
+        builder:finalizeBlock(block, IR.Terminator.branch(reads[1],
+            IR.Edge(if isAnd then right else short), IR.Edge(if isAnd then short else right)))
+        builder:finalizeBlock(right, IR.Terminator.jump(IR.Edge(join, { reads[2] })))
+        builder:finalizeBlock(short, IR.Terminator.jump(IR.Edge(join, { reads[1] })))
+        block = join
+        result = joined
     elseif instruction.kind == "environment_get" then
         -- An ambient global in semantic mode, the construct the source frontend emits (luau/ast_frontend_expressions.luau:810-822).
         result = value(IR.Operation.environmentGet(IR.EnvironmentTarget.ambient(), instruction.name), IR.Types.dynamic(), IR.Effects.semanticTableRead())
