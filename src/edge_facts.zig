@@ -214,7 +214,10 @@ pub fn deriveBlockWithHistory(
 /// The part of the derivation lists an arm edge's argument facts read: the lists as they stood once
 /// the block's arm truth facts were appended. The lists keep growing while the argument facts are
 /// appended, and a list that grows can move its buffer, so a slice kept from an earlier point may
-/// point at freed memory; `armViewAt` re-slices the lists at each read instead.
+/// point at freed memory; `armViewAt` re-slices the lists at each read instead. An edge whose arm
+/// facts this call does not derive reads `program`'s own lengths the same way, so the caller's
+/// `solver_terms`, `constraints` and `evidence` must be prefixes of the three lists (the planner's
+/// per-block view aliases them; every `derive` caller seeds the lists with the program's records).
 const ArmView = struct {
     terms: usize,
     constraints: usize,
@@ -259,9 +262,14 @@ fn deriveEdge(
     for (target.parameters, edge.arguments) |parameter_id, argument_id| {
         if (parameter_id.index() >= program.values.len or argument_id.index() >= program.values.len) continue;
         const sort = commonSort(program.values[parameter_id.index()].type, program.values[argument_id.index()].type) orelse continue;
-        // An arm edge's view is taken here, at the read: the facts of the other arm edge and of
-        // this edge's earlier parameters may have moved the lists since the arm facts were appended.
-        const view = if (arm_view) |lengths| armViewAt(program, terms, constraints, evidence, lengths) else program.*;
+        // Every edge's view is taken here, at the read: the facts of the other arm edge and of this
+        // edge's earlier parameters may have moved the lists since `program` or the arm facts were
+        // taken. Without arm facts of this call the view keeps `program`'s own lengths.
+        const view = armViewAt(program, terms, constraints, evidence, arm_view orelse .{
+            .terms = program.solver_terms.len,
+            .constraints = program.constraints.len,
+            .evidence = program.evidence.len,
+        });
         const predicate = try edgePredicate(allocator, &view, terms, parameter_id, argument_id, sort, history.root, history.rewrites, structural_cache);
         if (hasConstraint(constraints.items, predicate, history.root, history.rewrites)) continue;
         const evidence_id = try ensureEvidence(allocator, evidence, argument_evidence_locator);
@@ -905,4 +913,188 @@ test "path-normalized Boolean edge facts replay only through their authenticated
         .{ .id = ir.EvidenceId.fromIndex(2), .kind = .dynamic_fixture, .locator = "fixture:contradictory-path-truth" },
     };
     try std.testing.expect(!replaysConstraint(&conflicting, conflicting_constraints[1]));
+}
+
+// T5-VIEW-ALIAS-WINDOWS: the planner passes `program` as a view whose solver_terms, constraints and
+// evidence are slices of the very lists a derivation call appends to (control_query_plan.deriveEdgeFacts).
+// These lists hold exactly their seeded records and no spare capacity, so the first append of a call
+// moves each of them. Debug and ReleaseSafe fill a moved-from buffer with undefined bytes and ReleaseFast
+// does not, so a read through a slice kept across those appends fails these tests only in the first two.
+const FullCapacityLists = struct {
+    terms: std.ArrayList(ir.SolverTerm) = .empty,
+    constraints: std.ArrayList(ir.Constraint) = .empty,
+    evidence: std.ArrayList(ir.Evidence) = .empty,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        terms: []const ir.SolverTerm,
+        constraints: []const ir.Constraint,
+        evidence: []const ir.Evidence,
+    ) !FullCapacityLists {
+        var lists: FullCapacityLists = .{};
+        try lists.terms.ensureTotalCapacityPrecise(allocator, terms.len);
+        lists.terms.appendSliceAssumeCapacity(terms);
+        try lists.constraints.ensureTotalCapacityPrecise(allocator, constraints.len);
+        lists.constraints.appendSliceAssumeCapacity(constraints);
+        try lists.evidence.ensureTotalCapacityPrecise(allocator, evidence.len);
+        lists.evidence.appendSliceAssumeCapacity(evidence);
+        return lists;
+    }
+
+    /// The planner's per-block view: the lists' current slices.
+    fn view(self: *const FullCapacityLists, program: *const ir.Program) ir.Program {
+        var result = program.*;
+        result.solver_terms = self.terms.items;
+        result.constraints = self.constraints.items;
+        result.evidence = self.evidence.items;
+        return result;
+    }
+};
+
+/// Every structural fact replays, and the boolean join parameter has exactly one value fact on each
+/// expected root (the truth the seeded fact gives its argument), never `flag == selector`.
+fn expectFlagFacts(
+    derived: *const ir.Program,
+    flag: ir.ValueId,
+    true_root: ?ir.CfgEdgeRef,
+    false_root: ?ir.CfgEdgeRef,
+) !void {
+    var true_facts: usize = 0;
+    var false_facts: usize = 0;
+    for (derived.constraints) |constraint| {
+        if (constraint.evidence.len != 1 or !isStructuralEvidence(derived.evidence[constraint.evidence[0].index()])) continue;
+        try std.testing.expect(replaysConstraint(derived, constraint));
+        const scoped = switch (constraint.scope) {
+            .edge => |edge| edge,
+            else => continue,
+        };
+        if (termIsValue(derived, constraint.predicate, flag, .{ .kind = .boolean })) {
+            try std.testing.expect(true_root != null and std.meta.eql(true_root.?, scoped));
+            true_facts += 1;
+        } else if (termIsNotValue(derived, constraint.predicate, flag)) {
+            try std.testing.expect(false_root != null and std.meta.eql(false_root.?, scoped));
+            false_facts += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, if (true_root == null) 0 else 1), true_facts);
+    try std.testing.expectEqual(@as(usize, if (false_root == null) 0 else 1), false_facts);
+}
+
+test "a jump edge's later parameter reads the planner lists at the point of use" {
+    // Window W1: the entry jumps to `join(joined_count, flag)` with `(count, selector)`, and an input
+    // fact says `selector` on that edge. The integer parameter's facts move all three lists; the boolean
+    // parameter must still see the input fact and be written as `flag`.
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry_id = ir.BlockId.fromIndex(0);
+    const join_id = ir.BlockId.fromIndex(1);
+    const selector_id = ir.ValueId.fromIndex(0);
+    const count_id = ir.ValueId.fromIndex(1);
+    const joined_count_id = ir.ValueId.fromIndex(2);
+    const flag_id = ir.ValueId.fromIndex(3);
+    const root: ir.CfgEdgeRef = .{ .source = entry_id, .kind = .jump, .target = join_id };
+    const blocks = [_]ir.Block{
+        .{ .id = entry_id, .function = function_id, .terminator = .{ .jump = .{ .target = join_id, .arguments = &.{ count_id, selector_id } } } },
+        .{ .id = join_id, .function = function_id, .parameters = &.{ joined_count_id, flag_id }, .terminator = .{ .return_values = &.{} } },
+    };
+    const values = [_]ir.Value{
+        .{ .id = selector_id, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = count_id, .function = function_id, .type = .integer, .origin = .{ .parameter = 1 } },
+        .{ .id = joined_count_id, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = join_id, .index = 0 } } },
+        .{ .id = flag_id, .function = function_id, .type = .boolean, .origin = .{ .block_parameter = .{ .block = join_id, .index = 1 } } },
+    };
+    const program: ir.Program = .{
+        .program_id = "view-alias-jump-later-parameter",
+        .entry_function = function_id,
+        .functions = &.{.{
+            .id = function_id,
+            .parameters = &.{ selector_id, count_id },
+            .entry_block = entry_id,
+            .blocks = &.{ entry_id, join_id },
+        }},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+    };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var lists = try FullCapacityLists.init(
+        allocator,
+        &.{.{ .id = ir.SolverTermId.fromIndex(0), .sort = .{ .kind = .boolean }, .operation = .{ .value = selector_id } }},
+        &.{.{ .id = ir.ConstraintId.fromIndex(0), .predicate = ir.SolverTermId.fromIndex(0), .evidence = &.{ir.EvidenceId.fromIndex(0)}, .scope = .{ .edge = root } }},
+        &.{.{ .id = ir.EvidenceId.fromIndex(0), .kind = .dynamic_fixture, .locator = "fixture:view-alias-jump" }},
+    );
+    var scope = try readable_scope.Scope.init(allocator, &program);
+    defer scope.deinit();
+    const planner_view = lists.view(&program);
+    try deriveBlock(allocator, &planner_view, &scope, &lists.terms, &lists.constraints, &lists.evidence, blocks[0], true);
+    const derived = lists.view(&program);
+    try expectFlagFacts(&derived, flag_id, root, null);
+}
+
+test "branch arm edges whose arm facts the call does not derive read the planner lists at the point of use" {
+    // Windows W2 and W3: the planner defers a branch's arm facts while a relevant base constraint applies,
+    // so the call gets derive_branch_arms = false and both arm edges read `program`. The arm truth facts
+    // are already in the lists. The then-edge's integer fact moves all three lists before the then-edge's
+    // boolean parameter (W2) and before the else-edge (W3) are derived.
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry_id = ir.BlockId.fromIndex(0);
+    const join_id = ir.BlockId.fromIndex(1);
+    const selector_id = ir.ValueId.fromIndex(0);
+    const count_id = ir.ValueId.fromIndex(1);
+    const joined_count_id = ir.ValueId.fromIndex(2);
+    const flag_id = ir.ValueId.fromIndex(3);
+    const then_root: ir.CfgEdgeRef = .{ .source = entry_id, .kind = .branch_then, .target = join_id };
+    const else_root: ir.CfgEdgeRef = .{ .source = entry_id, .kind = .branch_else, .target = join_id };
+    const blocks = [_]ir.Block{
+        .{ .id = entry_id, .function = function_id, .terminator = .{ .branch = .{
+            .condition = selector_id,
+            .then_edge = .{ .target = join_id, .arguments = &.{ count_id, selector_id } },
+            .else_edge = .{ .target = join_id, .arguments = &.{ count_id, selector_id } },
+        } } },
+        .{ .id = join_id, .function = function_id, .parameters = &.{ joined_count_id, flag_id }, .terminator = .{ .return_values = &.{} } },
+    };
+    const values = [_]ir.Value{
+        .{ .id = selector_id, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = count_id, .function = function_id, .type = .integer, .origin = .{ .parameter = 1 } },
+        .{ .id = joined_count_id, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = join_id, .index = 0 } } },
+        .{ .id = flag_id, .function = function_id, .type = .boolean, .origin = .{ .block_parameter = .{ .block = join_id, .index = 1 } } },
+    };
+    const program: ir.Program = .{
+        .program_id = "view-alias-deferred-arm-edges",
+        .entry_function = function_id,
+        .functions = &.{.{
+            .id = function_id,
+            .parameters = &.{ selector_id, count_id },
+            .entry_block = entry_id,
+            .blocks = &.{ entry_id, join_id },
+        }},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+    };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const arm_evidence = ir.EvidenceId.fromIndex(0);
+    var lists = try FullCapacityLists.init(
+        allocator,
+        &.{
+            .{ .id = ir.SolverTermId.fromIndex(0), .sort = .{ .kind = .boolean }, .operation = .{ .value = selector_id } },
+            .{ .id = ir.SolverTermId.fromIndex(1), .sort = .{ .kind = .boolean }, .operation = .{ .logical_not = ir.SolverTermId.fromIndex(0) } },
+        },
+        &.{
+            .{ .id = ir.ConstraintId.fromIndex(0), .predicate = ir.SolverTermId.fromIndex(0), .evidence = &.{arm_evidence}, .scope = .{ .edge = then_root } },
+            .{ .id = ir.ConstraintId.fromIndex(1), .predicate = ir.SolverTermId.fromIndex(1), .evidence = &.{arm_evidence}, .scope = .{ .edge = else_root } },
+        },
+        &.{.{ .id = arm_evidence, .kind = .structural_derivation, .locator = branch_evidence_locator }},
+    );
+    var scope = try readable_scope.Scope.init(allocator, &program);
+    defer scope.deinit();
+    const planner_view = lists.view(&program);
+    try deriveBlock(allocator, &planner_view, &scope, &lists.terms, &lists.constraints, &lists.evidence, blocks[0], false);
+    const derived = lists.view(&program);
+    try expectFlagFacts(&derived, flag_id, then_root, else_root);
 }

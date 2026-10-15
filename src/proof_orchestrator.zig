@@ -2513,3 +2513,141 @@ test "frontend facts on both arms of a block that is not deferred prove the join
     const fixture = deferred_arm_fixture;
     try fixture.expectResolved(&fixture.input_fact_terms, &fixture.input_facts_without_base);
 }
+
+// T5-VIEW-ALIAS-WINDOWS: the edge-fact derivation reads a per-block view whose slices alias the planner's
+// lists; edges whose arm facts the call does not derive used to keep that view across the call's appends.
+// Both shapes seed solver state so that a list moves inside such a window when resolveAlloc derives the
+// entry block's edge facts: one seeded term (capacity 3) moves on the integer parameter's third term
+// (jump edge, window W1); three seeded terms (capacity 6) move on the then-edge's last term, before the
+// else-edge is derived (deferred arm facts, window W3). Debug and ReleaseSafe fill moved-from memory with
+// undefined bytes and ReleaseFast does not, so this test can catch such a view only in the first two modes.
+const view_alias_fixture = struct {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry_id = ir.BlockId.fromIndex(0);
+    const join_id = ir.BlockId.fromIndex(1);
+    const true_id = ir.BlockId.fromIndex(2);
+    const false_id = ir.BlockId.fromIndex(3);
+    const selector = ir.ValueId.fromIndex(0);
+    const count = ir.ValueId.fromIndex(1);
+    const joined_count = ir.ValueId.fromIndex(2);
+    const flag = ir.ValueId.fromIndex(3);
+    const proof = ir.EvidenceId.fromIndex(0);
+    const arm_proof = ir.EvidenceId.fromIndex(1);
+    const values = [_]ir.Value{
+        .{ .id = selector, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = count, .function = function_id, .type = .integer, .origin = .{ .parameter = 1 } },
+        .{ .id = joined_count, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = join_id, .index = 0 } } },
+        .{ .id = flag, .function = function_id, .type = .boolean, .origin = .{ .block_parameter = .{ .block = join_id, .index = 1 } } },
+    };
+    const join_arguments = [_]ir.ValueId{ count, selector };
+    const tail = [_]ir.Block{
+        .{ .id = join_id, .function = function_id, .parameters = &.{ joined_count, flag }, .terminator = .{ .branch = .{
+            .condition = flag,
+            .then_edge = .{ .target = true_id },
+            .else_edge = .{ .target = false_id },
+        } }, .evidence = &.{proof} },
+        .{ .id = true_id, .function = function_id, .terminator = .{ .return_values = &.{} }, .evidence = &.{proof} },
+        .{ .id = false_id, .function = function_id, .terminator = .{ .return_values = &.{} }, .evidence = &.{proof} },
+    };
+    const jump_blocks = [_]ir.Block{
+        .{ .id = entry_id, .function = function_id, .terminator = .{ .jump = .{ .target = join_id, .arguments = &join_arguments } }, .evidence = &.{proof} },
+    } ++ tail;
+    const branch_blocks = [_]ir.Block{
+        .{ .id = entry_id, .function = function_id, .terminator = .{ .branch = .{
+            .condition = selector,
+            .then_edge = .{ .target = join_id, .arguments = &join_arguments },
+            .else_edge = .{ .target = join_id, .arguments = &join_arguments },
+        } }, .evidence = &.{proof} },
+    } ++ tail;
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .parameters = &.{ selector, count },
+        .blocks = &.{ entry_id, join_id, true_id, false_id },
+        .entry_block = entry_id,
+        .evidence = &.{proof},
+    }};
+    const evidence = [_]ir.Evidence{
+        .{ .id = proof, .kind = .dynamic_fixture, .locator = "fixture:view-alias-windows" },
+        .{ .id = arm_proof, .kind = .structural_derivation, .locator = "backend:cfg-branch-arm-truth:v1" },
+    };
+    // W1: an input fact `selector` on the entry's jump edge decides the second argument.
+    const jump_terms = [_]ir.SolverTerm{
+        .{ .id = ir.SolverTermId.fromIndex(0), .sort = .{ .kind = .boolean }, .operation = .{ .value = selector } },
+    };
+    const jump_constraints = [_]ir.Constraint{.{
+        .id = ir.ConstraintId.fromIndex(0),
+        .predicate = ir.SolverTermId.fromIndex(0),
+        .evidence = &.{proof},
+        .scope = .{ .edge = .{ .source = entry_id, .kind = .jump, .target = join_id } },
+    }};
+    const jump_program: ir.Program = .{
+        .program_id = "view-alias-jump-later-parameter",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &jump_blocks,
+        .instructions = &.{},
+        .values = &values,
+        .evidence = &evidence,
+        .solver_terms = &jump_terms,
+        .constraints = &jump_constraints,
+    };
+    // W3: the entry's arm truth facts are given, and a block-scoped base constraint that mentions the
+    // condition without deciding it makes the planner defer the entry's arm facts.
+    const branch_terms = [_]ir.SolverTerm{
+        .{ .id = ir.SolverTermId.fromIndex(0), .sort = .{ .kind = .boolean }, .operation = .{ .value = selector } },
+        .{ .id = ir.SolverTermId.fromIndex(1), .sort = .{ .kind = .boolean }, .operation = .{ .logical_not = ir.SolverTermId.fromIndex(0) } },
+        .{ .id = ir.SolverTermId.fromIndex(2), .sort = .{ .kind = .boolean }, .operation = .{ .binary = .{
+            .operator = .logical_or,
+            .left = ir.SolverTermId.fromIndex(0),
+            .right = ir.SolverTermId.fromIndex(1),
+        } } },
+    };
+    const branch_constraints = [_]ir.Constraint{
+        .{
+            .id = ir.ConstraintId.fromIndex(0),
+            .predicate = ir.SolverTermId.fromIndex(0),
+            .evidence = &.{arm_proof},
+            .scope = .{ .edge = .{ .source = entry_id, .kind = .branch_then, .target = join_id } },
+        },
+        .{
+            .id = ir.ConstraintId.fromIndex(1),
+            .predicate = ir.SolverTermId.fromIndex(1),
+            .evidence = &.{arm_proof},
+            .scope = .{ .edge = .{ .source = entry_id, .kind = .branch_else, .target = join_id } },
+        },
+        .{
+            .id = ir.ConstraintId.fromIndex(2),
+            .predicate = ir.SolverTermId.fromIndex(2),
+            .evidence = &.{proof},
+            .scope = .{ .block = entry_id },
+        },
+    };
+    const branch_program: ir.Program = .{
+        .program_id = "view-alias-deferred-arm-edges",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &branch_blocks,
+        .instructions = &.{},
+        .values = &values,
+        .evidence = &evidence,
+        .solver_terms = &branch_terms,
+        .constraints = &branch_constraints,
+    };
+
+    fn expectAdmitted(resolved: *const ResolvedProgram) !void {
+        var report = try @import("validate.zig").validate(std.testing.allocator, &resolved.program, .core);
+        defer report.deinit();
+        try std.testing.expect(!report.contains(.invalid_structural_derivation));
+        try std.testing.expect(report.isClean());
+        try std.testing.expect(!resolved.solve_report.contains(.invalid_structural_derivation));
+    }
+};
+
+test "edge facts read the planner lists at the point of use on edges without derived arm facts" {
+    const fixture = view_alias_fixture;
+    for ([_]*const ir.Program{ &fixture.jump_program, &fixture.branch_program }) |program| {
+        var resolved = try resolveAlloc(std.testing.allocator, program, solver_backend.internalFacts());
+        defer resolved.deinit();
+        try fixture.expectAdmitted(&resolved);
+    }
+}
