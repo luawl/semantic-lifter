@@ -23,7 +23,7 @@ test('disassembly preserves register data and inverted branch polarity', () => {
 });
 
 test('unsupported operations cannot silently become no-ops', () => {
-  assert.throws(() => parseDisassembly(listing.replace('ADD R2 R2 R3', 'GETUPVAL R2 0')), /unsupported opcode GETUPVAL/);
+  assert.throws(() => parseDisassembly(listing.replace('ADD R2 R2 R3', 'DUPCLOSURE R2 K0')), /unsupported opcode DUPCLOSURE/);
   assert.throws(() => parseDisassembly(listing.replace('ADD R2 R2 R3', 'FORGPREP_NEXT R2 L1')), /unsupported opcode FORGPREP_NEXT/);
 });
 
@@ -850,4 +850,697 @@ test('a -O0 record template stays refused with its remark and its stores', () =>
   // recorded at the adapter's refusal.
   assert.throws(() => parseDisassembly(tableRecordFields),
     (error) => refusedAs('table_template_opaque')(error) && error.opcode === 'DUPTABLE' && error.line_number === 11);
+});
+
+// Task T4.6 (T4-ADAPTER-CLOSURES). Each listing is the whole -O0 -g0 listing of an author-owned program, embedded verbatim
+// with CRLF removed: c1-c15 from the diagnosis directory tmp/build-phase2/diag/T4-ADAPTER-CLOSURES/listings/, the skeptic's
+// dead-function probes k1, k4 and k5 from its skeptic/probes/, and research/fixtures/disassembly/closure_loop_reference.O0.txt.
+// The caller declares every nested function to lift (decision D1: the function tree is never recovered from the post-order
+// numbering); the supported level is -O0 -g0 (decision D3), where no DUPCLOSURE is emitted.
+const c1CounterRef = `Function 0 (??):
+GETUPVAL R2 0
+ADD R1 R2 R0
+SETUPVAL R1 0
+GETUPVAL R1 0
+RETURN R1 1
+
+Function 1 (??):
+K0: 1
+MOVE R2 R0
+REMARK allocation: closure with 1 upvalues
+NEWCLOSURE R3 P0
+CAPTURE REF R2
+MOVE R4 R3
+MOVE R5 R1
+CALL R4 1 0
+MOVE R4 R3
+LOADK R5 K0 [1]
+CALL R4 1 0
+CLOSEUPVALS R2
+RETURN R2 1
+
+Function 2 (??):
+REMARK allocation: closure with 0 upvalues
+NEWCLOSURE R0 P0
+RETURN R0 1
+
+`;
+const c2ParamValue = `Function 0 (??):
+GETUPVAL R3 0
+MUL R2 R0 R3
+GETUPVAL R3 1
+ADD R1 R2 R3
+RETURN R1 1
+
+Function 1 (??):
+K0: 2
+K1: 3
+REMARK allocation: closure with 2 upvalues
+NEWCLOSURE R2 P0
+CAPTURE VAL R0
+CAPTURE VAL R1
+MOVE R4 R2
+LOADK R5 K0 [2]
+CALL R4 1 1
+MOVE R5 R2
+LOADK R6 K1 [3]
+CALL R5 1 1
+ADD R3 R4 R5
+RETURN R3 1
+
+Function 2 (??):
+REMARK allocation: closure with 0 upvalues
+NEWCLOSURE R0 P0
+RETURN R0 1
+
+`;
+const c3ReturnedClosure = `Function 0 (??):
+GETUPVAL R2 0
+ADD R1 R2 R0
+RETURN R1 1
+
+Function 1 (??):
+REMARK allocation: closure with 1 upvalues
+NEWCLOSURE R1 P0
+CAPTURE VAL R0
+RETURN R1 1
+
+Function 2 (??):
+GETUPVAL R2 0
+MOVE R3 R0
+CALL R2 1 1
+MOVE R3 R2
+MOVE R4 R1
+CALL R3 1 -1
+RETURN R3 -1
+
+Function 3 (??):
+REMARK allocation: closure with 0 upvalues
+NEWCLOSURE R0 P0
+REMARK allocation: closure with 1 upvalues
+NEWCLOSURE R1 P1
+CAPTURE VAL R0
+RETURN R1 1
+
+`;
+const c4LoopClose = `Function 0 (??):
+GETUPVAL R1 0
+GETUPVAL R2 1
+ADD R0 R1 R2
+SETUPVAL R0 0
+RETURN R0 0
+
+Function 1 (??):
+K0: 0
+K1: 1
+LOADK R2 K0 [0]
+LOADK R3 K0 [0]
+L0: JUMPIFNOTLT R3 R1 L1
+LOADK R4 K1 [1]
+ADD R3 R3 R4
+MOVE R4 R3
+REMARK allocation: closure with 2 upvalues
+NEWCLOSURE R5 P0
+CAPTURE REF R4
+CAPTURE VAL R0
+MOVE R6 R5
+CALL R6 0 0
+ADD R2 R2 R4
+CLOSEUPVALS R4
+JUMPBACK L0
+L1: RETURN R2 1
+
+Function 2 (??):
+REMARK allocation: closure with 0 upvalues
+NEWCLOSURE R0 P0
+RETURN R0 1
+
+`;
+const c5UpvalueChain = `Function 0 (??):
+GETUPVAL R3 0
+GETUPVAL R4 1
+ADD R2 R3 R4
+ADD R1 R2 R0
+RETURN R1 1
+
+Function 1 (??):
+REMARK allocation: closure with 2 upvalues
+NEWCLOSURE R1 P0
+CAPTURE UPVAL U0
+CAPTURE VAL R0
+MOVE R2 R1
+GETUPVAL R3 1
+CALL R2 1 -1
+RETURN R2 -1
+
+Function 2 (??):
+K0: 1
+REMARK allocation: closure with 2 upvalues
+NEWCLOSURE R2 P0
+CAPTURE VAL R0
+CAPTURE VAL R1
+MOVE R3 R2
+LOADK R4 K0 [1]
+CALL R3 1 -1
+RETURN R3 -1
+
+Function 3 (??):
+REMARK allocation: closure with 0 upvalues
+NEWCLOSURE R0 P0
+RETURN R0 1
+
+`;
+const c6RecursiveLocal = `Function 0 (??):
+K0: 1
+LOADK R1 K0 [1]
+JUMPIFNOTLT R0 R1 L0
+GETUPVAL R1 0
+RETURN R1 1
+L0: GETUPVAL R2 1
+LOADK R4 K0 [1]
+SUB R3 R0 R4
+CALL R2 1 1
+LOADK R3 K0 [1]
+ADD R1 R2 R3
+RETURN R1 1
+
+Function 1 (??):
+REMARK allocation: closure with 2 upvalues
+NEWCLOSURE R2 P0
+CAPTURE VAL R0
+CAPTURE VAL R2
+MOVE R3 R2
+MOVE R4 R1
+CALL R3 1 -1
+RETURN R3 -1
+
+Function 2 (??):
+REMARK allocation: closure with 0 upvalues
+NEWCLOSURE R0 P0
+RETURN R0 1
+
+`;
+const c8Siblings = `Function 0 (??):
+GETUPVAL R2 0
+ADD R1 R0 R2
+RETURN R1 1
+
+Function 1 (??):
+GETUPVAL R2 0
+MUL R1 R0 R2
+RETURN R1 1
+
+Function 2 (??):
+K0: 1
+REMARK allocation: closure with 1 upvalues
+NEWCLOSURE R1 P0
+CAPTURE UPVAL U0
+MOVE R3 R1
+MOVE R4 R0
+CALL R3 1 1
+LOADK R4 K0 [1]
+SUB R2 R3 R4
+RETURN R2 1
+
+Function 3 (??):
+REMARK allocation: closure with 1 upvalues
+NEWCLOSURE R2 P0
+CAPTURE VAL R0
+REMARK allocation: closure with 1 upvalues
+NEWCLOSURE R3 P1
+CAPTURE VAL R1
+MOVE R5 R3
+MOVE R6 R2
+MOVE R7 R1
+CALL R6 1 -1
+CALL R5 -1 1
+MOVE R6 R2
+MOVE R7 R0
+CALL R6 1 1
+ADD R4 R5 R6
+RETURN R4 1
+
+Function 4 (??):
+REMARK allocation: closure with 0 upvalues
+NEWCLOSURE R0 P0
+RETURN R0 1
+
+`;
+const c10DoBlockReuse = `Function 0 (??):
+K0: 1
+GETUPVAL R1 0
+LOADK R2 K0 [1]
+ADD R0 R1 R2
+SETUPVAL R0 0
+GETUPVAL R0 0
+RETURN R0 1
+
+Function 1 (??):
+LOADNIL R2
+MOVE R3 R0
+REMARK allocation: closure with 1 upvalues
+NEWCLOSURE R2 P0
+CAPTURE REF R3
+CLOSEUPVALS R3
+MOVE R3 R1
+MOVE R4 R2
+CALL R4 0 0
+MOVE R5 R2
+CALL R5 0 1
+ADD R4 R5 R3
+RETURN R4 1
+
+Function 2 (??):
+REMARK allocation: closure with 0 upvalues
+NEWCLOSURE R0 P0
+RETURN R0 1
+
+`;
+const c12TreeOrder = `Function 0 (??):
+K0: 1
+LOADK R2 K0 [1]
+ADD R1 R0 R2
+RETURN R1 1
+
+Function 1 (??):
+K0: 2
+LOADK R2 K0 [2]
+MUL R1 R0 R2
+RETURN R1 1
+
+Function 2 (??):
+K0: 3
+LOADK R2 K0 [3]
+SUB R1 R0 R2
+RETURN R1 1
+
+Function 3 (??):
+GETUPVAL R2 0
+ADD R1 R0 R2
+RETURN R1 1
+
+Function 4 (??):
+GETUPVAL R2 0
+SUB R1 R0 R2
+RETURN R1 1
+
+Function 5 (??):
+MOVE R2 R0
+MOVE R3 R1
+CALL R2 1 -1
+RETURN R2 -1
+
+Function 6 (??):
+GETUPVAL R2 0
+MUL R1 R0 R2
+RETURN R1 1
+
+Function 7 (??):
+K0: 'key'
+K1: 1
+K2: 2
+REMARK allocation: closure with 0 upvalues
+NEWCLOSURE R2 P0
+REMARK allocation: table hash 1 array 1
+NEWTABLE R3 1 1
+REMARK allocation: closure with 0 upvalues
+NEWCLOSURE R4 P1
+SETLIST R3 R4 1 [1]
+LOADK R5 K0 ['key']
+REMARK allocation: closure with 0 upvalues
+NEWCLOSURE R6 P2
+SETTABLE R6 R3 R5
+JUMPIFNOTLT R1 R0 L0
+REMARK allocation: closure with 1 upvalues
+NEWCLOSURE R4 P3
+CAPTURE VAL R0
+JUMP L1
+REMARK allocation: closure with 1 upvalues
+L0: NEWCLOSURE R4 P4
+CAPTURE VAL R1
+L1: MOVE R8 R2
+MOVE R9 R0
+CALL R8 1 1
+LOADK R10 K1 [1]
+GETTABLE R9 R3 R10
+MOVE R10 R1
+CALL R9 1 1
+ADD R7 R8 R9
+GETTABLEKS R8 R3 K0 ['key']
+MOVE R9 R0
+CALL R8 1 1
+ADD R6 R7 R8
+MOVE R7 R4
+MOVE R8 R1
+CALL R7 1 1
+ADD R5 R6 R7
+REMARK allocation: closure with 0 upvalues
+NEWCLOSURE R6 P5
+MOVE R7 R6
+REMARK allocation: closure with 1 upvalues
+NEWCLOSURE R8 P6
+CAPTURE VAL R1
+LOADK R9 K2 [2]
+CALL R7 2 1
+ADD R5 R5 R7
+RETURN R5 1
+
+Function 8 (??):
+REMARK allocation: closure with 0 upvalues
+NEWCLOSURE R0 P0
+RETURN R0 1
+
+`;
+const c13RecursiveInLoop = `Function 0 (??):
+K0: 1
+LOADK R1 K0 [1]
+JUMPIFNOTLT R0 R1 L0
+GETUPVAL R1 0
+RETURN R1 1
+L0: GETUPVAL R2 1
+LOADK R4 K0 [1]
+SUB R3 R0 R4
+CALL R2 1 1
+LOADK R3 K0 [1]
+ADD R1 R2 R3
+RETURN R1 1
+
+Function 1 (??):
+K0: 0
+K1: 1
+REMARK allocation: table hash 0
+NEWTABLE R2 0 0
+LOADK R3 K0 [0]
+L0: JUMPIFNOTLT R3 R1 L1
+LOADK R4 K1 [1]
+ADD R3 R3 R4
+MOVE R4 R3
+REMARK allocation: closure with 2 upvalues
+NEWCLOSURE R5 P0
+CAPTURE VAL R4
+CAPTURE VAL R5
+SETTABLE R5 R2 R3
+JUMPBACK L0
+L1: LOADK R4 K0 [0]
+LOADK R5 K0 [0]
+L2: JUMPIFNOTLT R5 R1 L3
+LOADK R6 K1 [1]
+ADD R5 R5 R6
+GETTABLE R6 R2 R5
+MOVE R7 R0
+CALL R6 1 1
+ADD R4 R4 R6
+JUMPBACK L2
+L3: RETURN R4 1
+
+Function 2 (??):
+REMARK allocation: closure with 0 upvalues
+NEWCLOSURE R0 P0
+RETURN R0 1
+
+`;
+const c15OpenReturnClose = `Function 0 (??):
+GETUPVAL R2 0
+ADD R1 R2 R0
+SETUPVAL R1 0
+GETUPVAL R1 0
+RETURN R1 1
+
+Function 1 (??):
+K0: 1
+MOVE R2 R0
+REMARK allocation: closure with 1 upvalues
+NEWCLOSURE R3 P0
+CAPTURE REF R2
+MOVE R4 R3
+LOADK R5 K0 [1]
+CALL R4 1 0
+MOVE R4 R3
+MOVE R5 R1
+CALL R4 1 -1
+CLOSEUPVALS R2
+RETURN R4 -1
+
+Function 2 (??):
+REMARK allocation: closure with 0 upvalues
+NEWCLOSURE R0 P0
+RETURN R0 1
+
+`;
+const k1DeadAfterDoReturn = `Function 0 (??):
+GETUPVAL R0 0
+RETURN R0 1
+
+Function 1 (??):
+K0: 100
+GETUPVAL R1 0
+LOADK R2 K0 [100]
+MUL R0 R1 R2
+RETURN R0 1
+
+Function 2 (??):
+REMARK allocation: closure with 1 upvalues
+NEWCLOSURE R2 P0
+CAPTURE VAL R0
+MOVE R4 R2
+CALL R4 0 1
+ADD R3 R4 R1
+RETURN R3 1
+
+Function 3 (??):
+REMARK allocation: closure with 0 upvalues
+NEWCLOSURE R0 P0
+RETURN R0 1
+
+`;
+const k4DeadBetweenSiblings = `Function 0 (??):
+GETUPVAL R0 0
+RETURN R0 1
+
+Function 1 (??):
+K0: 100
+GETUPVAL R1 0
+LOADK R2 K0 [100]
+MUL R0 R1 R2
+RETURN R0 1
+
+Function 2 (??):
+GETUPVAL R0 0
+RETURN R0 1
+
+Function 3 (??):
+REMARK allocation: closure with 1 upvalues
+NEWCLOSURE R2 P0
+CAPTURE VAL R0
+JUMPIFNOTLT R1 R0 L0
+MOVE R4 R2
+CALL R4 0 1
+SUB R3 R4 R1
+RETURN R3 1
+REMARK allocation: closure with 1 upvalues
+L0: NEWCLOSURE R3 P1
+CAPTURE VAL R1
+MOVE R5 R2
+CALL R5 0 1
+MOVE R6 R3
+CALL R6 0 1
+ADD R4 R5 R6
+RETURN R4 1
+
+Function 4 (??):
+REMARK allocation: closure with 0 upvalues
+NEWCLOSURE R0 P0
+RETURN R0 1
+
+`;
+const k5DeadAfterIfElseReturn = `Function 0 (??):
+GETUPVAL R0 0
+RETURN R0 1
+
+Function 1 (??):
+K0: 100
+GETUPVAL R1 0
+LOADK R2 K0 [100]
+MUL R0 R1 R2
+RETURN R0 1
+
+Function 2 (??):
+REMARK allocation: closure with 1 upvalues
+NEWCLOSURE R2 P0
+CAPTURE VAL R0
+JUMPIFNOTLT R1 R0 L0
+MOVE R4 R2
+CALL R4 0 1
+SUB R3 R4 R1
+RETURN R3 1
+L0: MOVE R4 R2
+CALL R4 0 1
+ADD R3 R4 R1
+RETURN R3 1
+
+Function 3 (??):
+REMARK allocation: closure with 0 upvalues
+NEWCLOSURE R0 P0
+RETURN R0 1
+
+`;
+const closureLoopReference = `Function 0 (??):
+GETUPVAL R1 0
+GETUPVAL R2 1
+ADD R0 R1 R2
+SETUPVAL R0 0
+GETUPVAL R0 0
+RETURN R0 1
+
+Function 1 (??):
+K0: 1
+K1: 0
+REMARK allocation: table hash 0
+NEWTABLE R2 0 0
+LOADK R5 K0 [1]
+MOVE R3 R1
+LOADN R4 1
+FORNPREP R3 L1
+L0: MOVE R6 R5
+REMARK allocation: closure with 2 upvalues
+NEWCLOSURE R7 P0
+CAPTURE REF R6
+CAPTURE VAL R0
+SETTABLE R7 R2 R5
+CLOSEUPVALS R6
+FORNLOOP R3 L0
+L1: LOADK R3 K1 [0]
+LOADK R6 K0 [1]
+LENGTH R4 R2
+LOADN R5 1
+FORNPREP R4 L3
+L2: GETTABLE R8 R2 R6
+CALL R8 0 1
+ADD R7 R3 R8
+GETTABLE R8 R2 R6
+CALL R8 0 1
+ADD R3 R7 R8
+FORNLOOP R4 L2
+L3: RETURN R3 1
+
+Function 2 (??):
+REMARK allocation: closure with 0 upvalues
+NEWCLOSURE R0 P0
+RETURN R0 1
+
+`;
+
+const one = (pc) => ({ 0: { parent: 1, prototype: 0, parameter_count: pc } });
+const closureOf = (fn) => fn.instructions.find((instruction) => instruction.kind === 'closure');
+
+test('closures fuse NEWCLOSURE with its CAPTURE lines and lift nested functions', () => {
+  const handoff = parseDisassembly(c1CounterRef, { function_index: 1, parameter_count: 2, nested: one(1) });
+  assert.equal(handoff.schema_version, 'compiler_disassembly_handoff_v3');
+  assertFields(handoff.instructions, {
+    1: { op: 'NEWCLOSURE', kind: 'closure', function: 0,
+      captures: [{ mode: 'reference', register: 2, class: 'place', line_number: 13 }],
+      reads: [], references: [2], writes: [3], line_numbers: [12, 13] },
+    8: { kind: 'close_upvalues', from: 2 },
+  });
+  assertFields(handoff.functions, {
+    0: { function_index: 0, parent_index: 1, parameter_count: 1, is_variadic: false,
+      upvalues: [{ class: 'place', line_number: 13 }] },
+  });
+  assertFields(handoff.functions[0].instructions, {
+    0: { kind: 'upvalue_get', upvalue: 0, writes: [2] },
+    2: { kind: 'upvalue_set', upvalue: 0, reads: [1] },
+  });
+});
+
+test('capture classes come from the creating closure', () => {
+  const values = closureOf(parseDisassembly(c2ParamValue, { function_index: 1, parameter_count: 2, nested: one(1) }));
+  assert.deepEqual(values.captures, [{ mode: 'value', register: 0, class: 'value', line_number: 13 },
+    { mode: 'value', register: 1, class: 'value', line_number: 14 }]);
+  assert.deepEqual(values.reads, [0, 1]);
+  const recursive = closureOf(parseDisassembly(c6RecursiveLocal, { function_index: 1, parameter_count: 2, nested: one(1) }));
+  assert.deepEqual(recursive.captures, [{ mode: 'value', register: 0, class: 'value', line_number: 18 },
+    { mode: 'self', register: 2, class: 'place', line_number: 19 }]);
+  assert.deepEqual(recursive.reads, [0]);
+  const chain = parseDisassembly(c5UpvalueChain, { function_index: 2, parameter_count: 2, nested: {
+    1: { parent: 2, prototype: 0, parameter_count: 1 }, 0: { parent: 1, prototype: 0, parameter_count: 1 } } });
+  assert.equal(chain.functions[0].function_index, 1);
+  assert.deepEqual(chain.functions[0].upvalues.map((upvalue) => upvalue.class), ['value', 'value']);
+  assert.deepEqual(closureOf(chain.functions[0]).captures[0], { mode: 'upvalue', upvalue: 0, class: 'value', line_number: 11 });
+});
+
+test('the declared function tree is checked against the NEWCLOSURE lines', () => {
+  const tree = (handoff) => handoff.functions.map((f) => [f.function_index, f.parent_index]);
+  const siblings = { 0: { parent: 3, prototype: 0, parameter_count: 1 }, 2: { parent: 3, prototype: 1, parameter_count: 1 },
+    1: { parent: 2, prototype: 0, parameter_count: 1 } };
+  assert.deepEqual(tree(parseDisassembly(c8Siblings, { function_index: 3, parameter_count: 2, nested: siblings })),
+    [[0, 3], [2, 3], [1, 2]]);
+  const order = Object.fromEntries([1, 1, 1, 1, 1, 2, 1].map((pc, k) => [k, { parent: 7, prototype: k, parameter_count: pc }]));
+  assert.deepEqual(tree(parseDisassembly(c12TreeOrder, { function_index: 7, parameter_count: 2, nested: order })),
+    [[0, 7], [1, 7], [2, 7], [3, 7], [4, 7], [5, 7], [6, 7]]);
+  const withoutGrandchild = Object.fromEntries(Object.entries(siblings).filter(([index]) => index !== '1'));
+  assert.throws(() => parseDisassembly(c8Siblings, { function_index: 3, parameter_count: 2, nested: withoutGrandchild }),
+    refusedAs('nested_function_undeclared'));
+  assert.throws(() => parseDisassembly(c8Siblings, { function_index: 3, parameter_count: 2,
+    nested: { ...siblings, 1: { parent: 2, prototype: 1, parameter_count: 1 } } }), refusedAs('nested_map_mismatch'));
+});
+
+test('closure refusals are typed', () => {
+  // [listing, options, code, line_number where pinned]: the splices and options of
+  // tmp/build-phase2/diag/T4-ADAPTER-CLOSURES/u4_refusals.mjs, with the declared maps of decision D1.
+  const cases = [
+    [c3ReturnedClosure, { function_index: 2, parameter_count: 2 }, 'selected_function_captures', 13],
+    [c10DoBlockReuse, { function_index: 1, parameter_count: 2, nested: one(0) }, 'captured_register_reused_after_close', 17],
+    [c4LoopClose, { function_index: 1, parameter_count: 2, nested: one(0) }, 'captured_register_reused_after_close', 14],
+    [c13RecursiveInLoop, { function_index: 1, parameter_count: 2, nested: one(1) }, 'self_capture_in_loop', 26],
+    [c1CounterRef, { function_index: 1, parameter_count: 2 }, 'nested_function_undeclared'],
+    [splice(c1CounterRef, 'CAPTURE REF R2\n', ''), { function_index: 1, parameter_count: 2, nested: one(1) },
+      'capture_count_mismatch'],
+    [splice(c1CounterRef, 'CAPTURE REF R2', 'L9: CAPTURE REF R2'), { function_index: 1, parameter_count: 2, nested: one(1) },
+      'label_inside_closure'],
+    ['Function 0 (??):\nCAPTURE VAL R0\nRETURN R0 1\n', {}, 'capture_without_closure'],
+    [splice(c2ParamValue, 'ADD R1 R2 R3\n', 'ADD R1 R2 R3\nSETUPVAL R1 0\n'),
+      { function_index: 1, parameter_count: 2, nested: one(1) }, 'setupval_on_value_capture'],
+    ['Function 0 (??):\nK0: 0\nDUPCLOSURE R0 K0\nRETURN R0 1\n', {}, 'unsupported_opcode'],
+  ];
+  for (const [text, options, code, line_number] of cases) {
+    assert.throws(() => parseDisassembly(text, options), (error) => error.name === 'DisassemblyRefusal' && error.code === code
+      && (line_number === undefined || error.line_number === line_number));
+  }
+});
+
+test('an open pack passes through CLOSEUPVALS', () => {
+  const options = { function_index: 1, parameter_count: 2, nested: one(1) };
+  const { instructions } = parseDisassembly(c15OpenReturnClose, options);
+  const call = instructions.findIndex((instruction) => instruction.line_number === 19);
+  assert.ok(call >= 0, 'the CALL at line 19 is an instruction');
+  assertFields(instructions, {
+    [call]: { op: 'CALL', produces_pack_at: 4 },
+    [call + 1]: { kind: 'close_upvalues', from: 2 },
+    [call + 2]: { op: 'RETURN', line_number: 21, consumes_pack_from: 4, reads: [] },
+  });
+  assert.throws(() => parseDisassembly(splice(c15OpenReturnClose, 'CLOSEUPVALS R2', 'L9: CLOSEUPVALS R2'), options),
+    refusedAs('open_pack_crosses_label'));
+});
+
+test('closure trees with an uninstantiated function are refused', () => {
+  // Skeptic objection A: a function after an always-terminating statement keeps its post-order slot but no NEWCLOSURE
+  // line. The census runs first: 4 functions and 2 NEWCLOSURE lines in k1 and k5, 5 and 3 in k4.
+  const cases = [
+    [k1DeadAfterDoReturn, { function_index: 2, parameter_count: 2,
+      nested: { 0: { parent: 2, prototype: 0, parameter_count: 0 } } }],
+    [k1DeadAfterDoReturn, { function_index: 2, parameter_count: 2,
+      nested: { 0: { parent: 2, prototype: 0, parameter_count: 0 }, 1: { parent: 2, prototype: 1, parameter_count: 0 } } }],
+    [k4DeadBetweenSiblings, { function_index: 3, parameter_count: 2,
+      nested: { 0: { parent: 3, prototype: 0, parameter_count: 0 }, 2: { parent: 3, prototype: 1, parameter_count: 0 } } }],
+    [k5DeadAfterIfElseReturn, { function_index: 2, parameter_count: 2,
+      nested: { 0: { parent: 2, prototype: 0, parameter_count: 0 } } }],
+  ];
+  for (const [text, options] of cases) {
+    assert.throws(() => parseDisassembly(text, options), refusedAs('uninstantiated_function'));
+  }
+});
+
+test('a by-reference capture inside a numeric for loop is refused', () => {
+  assert.throws(() => parseDisassembly(closureLoopReference, { function_index: 1, parameter_count: 2, nested: one(0) }),
+    refusedAs('captured_register_reused_after_close'));
 });
