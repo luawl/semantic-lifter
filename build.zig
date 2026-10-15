@@ -1021,6 +1021,7 @@ pub fn build(b: *std.Build) void {
     });
     legacy_unchecked_preserved_output.step.dependOn(&legacy_unchecked_rejection.step);
     const resolve_refusal_audit = b.addSystemCommand(&.{ luneExe(b), "run" });
+    if (z3_enabled) resolve_refusal_audit.addPathDir(b.pathFromRoot(z3_bin));
     resolve_refusal_audit.addFileArg(b.path("luau/resolve_refusal_audit.luau"));
     resolve_refusal_audit.addArtifactArg(exe);
     resolve_refusal_audit.addFileArg(b.path("luau/fixtures/resolve_refusal_b3.lifter-ir.json"));
@@ -1029,21 +1030,25 @@ pub fn build(b: *std.Build) void {
     // resolve-ir iterates to a fixed point (src/proof_orchestrator.zig), so re-resolving the resolved
     // IR is byte-idempotent and the resolved IR is already a normalizer fixed point.
     const nested_reresolve_resolve = b.addRunArtifact(exe);
+    if (z3_enabled) nested_reresolve_resolve.addPathDir(b.pathFromRoot(z3_bin));
     nested_reresolve_resolve.addArg("resolve-ir");
     nested_reresolve_resolve.addFileArg(b.path("luau/fixtures/nested_inner_cycle_w1.lifter-ir.json"));
     const nested_reresolve_resolved_ir = nested_reresolve_resolve.addOutputFileArg("nested-inner-cycle-w1.resolved.lifter-ir.json");
     nested_reresolve_resolve.addArg("internal");
     const nested_reresolve_reresolve = b.addRunArtifact(exe);
+    if (z3_enabled) nested_reresolve_reresolve.addPathDir(b.pathFromRoot(z3_bin));
     nested_reresolve_reresolve.addArg("resolve-ir");
     nested_reresolve_reresolve.addFileArg(nested_reresolve_resolved_ir);
     const nested_reresolve_reresolved_ir = nested_reresolve_reresolve.addOutputFileArg("nested-inner-cycle-w1.reresolved.lifter-ir.json");
     nested_reresolve_reresolve.addArg("internal");
     const nested_reresolve_third = b.addRunArtifact(exe);
+    if (z3_enabled) nested_reresolve_third.addPathDir(b.pathFromRoot(z3_bin));
     nested_reresolve_third.addArg("resolve-ir");
     nested_reresolve_third.addFileArg(nested_reresolve_reresolved_ir);
     const nested_reresolve_third_ir = nested_reresolve_third.addOutputFileArg("nested-inner-cycle-w1.third.lifter-ir.json");
     nested_reresolve_third.addArg("internal");
     const nested_reresolve_renormalize = b.addRunArtifact(exe);
+    if (z3_enabled) nested_reresolve_renormalize.addPathDir(b.pathFromRoot(z3_bin));
     nested_reresolve_renormalize.addArg("normalize-ir");
     nested_reresolve_renormalize.addFileArg(nested_reresolve_resolved_ir);
     const nested_reresolve_renormalized_ir = nested_reresolve_renormalize.addOutputFileArg("nested-inner-cycle-w1.renormalized.lifter-ir.json");
