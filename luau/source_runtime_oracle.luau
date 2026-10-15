@@ -252,6 +252,26 @@ function SourceRuntimeOracle.run(caseName: string, source: string, exported: any
 		assert(first() == 1 and first() == 2, "source frontend lost the first iteration cell")
 		assert(second() == 1, "source frontend aliased the second iteration cell")
 		assert(first() == 3, "source frontend shared independent iteration cells")
+	elseif caseName == "source-frontend-always-return-iteration" then
+		local forLines = 0
+		for line in string.gmatch(source, "[^\n]+") do
+			if string.match(line, "^%s*for .+ do%s*$") ~= nil then
+				forLines += 1
+			end
+		end
+		assert(forLines == 5, "source frontend lost an always-returning native for loop")
+		assert(string.find(source, "break", 1, true) == nil, "an always-returning loop kept a break after its return")
+		local function check(initial: any, limit: any, expected: { any })
+			local results = table.pack(exported(initial, limit))
+			assert(results.n == 7, "always-returning loops changed the result count")
+			for index = 1, 7 do
+				assert(results[index] == expected[index], "always-returning loops changed a result")
+			end
+		end
+		check(1, 3, { 1, true, false, 2, 1, 6, 1 })
+		check(3, 1, { 0, true, false, 1, 1, 6, 1 })
+		check(3, 3, { 3, true, false, 4, 1, 6, 3 })
+		check(10, 3, { 0, true, false, 6, 1, 6, 0 })
 	elseif caseName == "source-frontend-typed-block" then
 		assert(exported(7) == 7, "source frontend changed typed block runtime behavior")
 	elseif caseName == "source-frontend-numeric-for" then

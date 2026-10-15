@@ -40,6 +40,9 @@ pub const Acyclic = struct {
     body_region: *const structure.Region,
     body_edge: ir.Edge,
     exit_edge: ir.Edge,
+    /// The exit arm's region when the header has no join (T5-ALWAYS-RETURN-LOOP: the body arm reaches neither the
+    /// exit nor the region stop, and the exit arm is written after the loop); `null` for the join form.
+    exit_region: ?*const structure.Region = null,
 };
 
 pub fn transitionForHeader(program: *const ir.Program, header: ir.Block) ?ir.Instruction {
@@ -173,6 +176,14 @@ pub fn matchAcyclicBranch(
     };
     defer analysis.deinit();
     if (try analysis.canReach(shape.body_edge.target, header.id)) return null;
+    if (shape.exit_region != null) {
+        // A header without a join: the body arm must leave the function or never finish, so `for ... do <body> end`
+        // followed by the exit arm is the source's own control flow (an always-`break` body stays refused).
+        if (try analysis.canReach(shape.body_edge.target, shape.exit_edge.target)) return null;
+        if (shape.body_region.stop) |stop| {
+            if (try analysis.canReach(shape.body_edge.target, stop)) return null;
+        }
+    }
 
     const identity = try allocator.alloc(ir.ValueId, program.values.len);
     defer allocator.free(identity);
@@ -213,6 +224,7 @@ pub fn matchAcyclicBranch(
         .body_region = shape.body_region,
         .body_edge = shape.body_edge,
         .exit_edge = shape.exit_edge,
+        .exit_region = shape.exit_region,
     };
 }
 
@@ -220,9 +232,38 @@ const AcyclicShape = struct {
     body_region: *const structure.Region,
     body_edge: ir.Edge,
     exit_edge: ir.Edge,
+    exit_region: ?*const structure.Region = null,
 };
 
 fn acyclicShape(program: *const ir.Program, plan: structure.Branch) ?AcyclicShape {
+    if (plan.join == null) {
+        // T5-ALWAYS-RETURN-LOOP: a header without a join. The native protocol branches on the transition's first
+        // result with the loop variables on the then edge, so the then arm is the body arm and must be direct; the
+        // exit arm may carry an override or a shared re-entry, which the emitter writes like a join-less else arm.
+        if (plan.block.index() >= program.blocks.len or
+            plan.then_edge_override != null or plan.then_shared_reentry != null)
+        {
+            return null;
+        }
+        const branch = switch (program.blocks[plan.block.index()].terminator) {
+            .branch => |value| value,
+            else => return null,
+        };
+        const body_region = plan.then_region;
+        if (body_region.nodes.len == 0 or body_region.nodes[0].blockId() != branch.then_edge.target or
+            body_region.loop_exit != null or body_region.continue_target != null or
+            body_region.terminal_projection != null or body_region.continue_projection != null or
+            body_region.stop_forwarding != null)
+        {
+            return null;
+        }
+        return .{
+            .body_region = body_region,
+            .body_edge = branch.then_edge,
+            .exit_edge = branch.else_edge,
+            .exit_region = plan.else_region,
+        };
+    }
     if (plan.block.index() >= program.blocks.len or plan.join == null or
         plan.then_edge_override != null or plan.else_edge_override != null or
         plan.then_shared_reentry != null or plan.else_shared_reentry != null)
@@ -1321,4 +1362,34 @@ test "numeric iteration protocol rejects observable hidden state" {
     defer report.deinit();
     try validateFunction(std.testing.allocator, &report, &program, &analysis, &plan);
     try std.testing.expect(report.contains(.unsupported_readable_iteration_protocol));
+}
+
+test "acyclic iteration whose body always returns is recognized without an enclosing stop" {
+    // T5-ALWAYS-RETURN-LOOP form (i): the body returns, so neither arm reaches a join and the header branch is
+    // planned with `join = null` at the root. The acyclic matcher still recognizes the transition (the body arm is
+    // the edge that carries the loop variable; the exit arm is emitted after the loop), and admission is clean.
+    const fixture = numeric_test_fixture;
+    var blocks = fixture.blocks;
+    blocks[fixture.b_body.index()].terminator = .{ .return_values = &.{fixture.v_body_index} };
+    var program = fixture.program;
+    program.blocks = &blocks;
+
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, fixture.functions[0]);
+    defer analysis.deinit();
+    var plan = try structure.Plan.init(std.testing.allocator, &analysis);
+    defer plan.deinit();
+    const branch = firstBranch(&plan) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(branch.join == null);
+    const acyclic = (try matchAcyclicBranch(std.testing.allocator, &program, branch)) orelse return error.TestUnexpectedResult;
+    const numeric = switch (acyclic.protocol) {
+        .numeric => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(fixture.b_body, acyclic.body_edge.target);
+    try std.testing.expectEqual(fixture.b_exit, acyclic.exit_edge.target);
+    try std.testing.expectEqual(fixture.v_body_index, numeric.body_parameter);
+    var report = diagnostics.Report.init(std.testing.allocator);
+    defer report.deinit();
+    try validateFunction(std.testing.allocator, &report, &program, &analysis, &plan);
+    try std.testing.expect(report.isClean());
 }

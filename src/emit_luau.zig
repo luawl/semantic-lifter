@@ -2082,6 +2082,57 @@ fn emitAcyclicNativeIteration(
     indent: []const u8,
     place_aliases: []const PlaceAlias,
 ) (EmitError || std.mem.Allocator.Error)!void {
+    if (acyclic.exit_region) |exit_region| {
+        // T5-ALWAYS-RETURN-LOOP: a header without a join is the last node of its region, as a join-less branch is.
+        // Its loop gets no exit edge (no exit placement check, no exit parameters before the loop); the exit arm
+        // follows the loop and is written as the else arm of a join-less branch whose arms both terminate.
+        if (node_index + 1 != enclosing_region.nodes.len) return error.UnsupportedControlFlow;
+        const branch_plan = switch (enclosing_region.nodes[node_index]) {
+            .branch => |value| value,
+            else => return error.UnsupportedControlFlow,
+        };
+        const else_edge = try branch_statement.validatedStructuredEdgeAlloc(
+            allocator,
+            program,
+            .{ .source = branch_plan.block, .kind = .branch_else, .target = acyclic.exit_edge.target },
+            acyclic.exit_edge,
+            branch_plan.else_edge_override,
+            branch_plan.else_shared_reentry,
+        );
+        switch (acyclic.protocol) {
+            .numeric => |numeric| try emitNumericForLoop(
+                output,
+                allocator,
+                program,
+                emission_plan,
+                scopes,
+                enclosing_region,
+                node_index,
+                acyclic.body_region,
+                null,
+                numeric,
+                true,
+                indent,
+                place_aliases,
+            ),
+            .generic => |generic| try emitGenericForLoop(
+                output,
+                allocator,
+                program,
+                emission_plan,
+                scopes,
+                enclosing_region,
+                node_index,
+                acyclic.body_region,
+                null,
+                generic,
+                true,
+                indent,
+                place_aliases,
+            ),
+        }
+        return emitBranchArm(output, allocator, program, emission_plan, scopes, else_edge, exit_region, null, indent, place_aliases);
+    }
     return switch (acyclic.protocol) {
         .numeric => |numeric| emitNumericForLoop(
             output,
@@ -2125,7 +2176,7 @@ fn emitNumericForLoop(
     enclosing_region: *const structure.Region,
     node_index: usize,
     body_region: *const structure.Region,
-    exit_edge: ir.Edge,
+    exit_edge: ?ir.Edge,
     numeric: iteration_protocol.NumericLoop,
     break_after_body: bool,
     indent: []const u8,
@@ -2148,19 +2199,19 @@ fn emitNumericForLoop(
             place_aliases,
         );
     }
-    try prepareLoopExit(output, allocator, program, emission_plan, enclosing_region, node_index, exit_edge.target, indent);
+    if (exit_edge) |edge| try prepareLoopExit(output, allocator, program, emission_plan, enclosing_region, node_index, edge.target, indent);
     const results = numeric.transition.results;
     if (results.len != 4) return error.UnsupportedControlFlow;
 
-    if (break_after_body) {
+    if (break_after_body and exit_edge != null) {
         try emitEdgeParametersUnlessConsumed(
             output,
             allocator,
             program,
             emission_plan,
             scopes,
-            program.blocks[exit_edge.target.index()],
-            exit_edge.arguments,
+            program.blocks[exit_edge.?.target.index()],
+            exit_edge.?.arguments,
             indent,
             false,
             place_aliases,
@@ -2181,21 +2232,21 @@ fn emitNumericForLoop(
     const loop_indent = try allocDeeperIndent(allocator, indent);
     defer allocator.free(loop_indent);
     try emitRegion(output, allocator, program, emission_plan, scopes, body_region, loop_indent, place_aliases);
-    if (break_after_body) {
+    if (break_after_body and !regionAlwaysFunctionTerminates(program, body_region)) {
         try emitBreakStatement(output, allocator, loop_indent);
     }
 
     try output.appendSlice(allocator, indent);
     try output.appendSlice(allocator, "end\n");
-    if (!break_after_body) {
+    if (!break_after_body and exit_edge != null) {
         try emitEdgeParametersUnlessConsumed(
             output,
             allocator,
             program,
             emission_plan,
             scopes,
-            program.blocks[exit_edge.target.index()],
-            exit_edge.arguments,
+            program.blocks[exit_edge.?.target.index()],
+            exit_edge.?.arguments,
             indent,
             false,
             place_aliases,
@@ -2212,7 +2263,7 @@ fn emitSemanticNormalizedNumericLoop(
     enclosing_region: *const structure.Region,
     node_index: usize,
     body_region: *const structure.Region,
-    exit_edge: ir.Edge,
+    exit_edge: ?ir.Edge,
     numeric: iteration_protocol.NumericLoop,
     break_after_body: bool,
     indent: []const u8,
@@ -2220,17 +2271,17 @@ fn emitSemanticNormalizedNumericLoop(
 ) (EmitError || std.mem.Allocator.Error)!void {
     const results = numeric.transition.results;
     if (results.len != 4 or numeric.initial_arguments.len != 4) return error.UnsupportedControlFlow;
-    try prepareLoopExit(output, allocator, program, emission_plan, enclosing_region, node_index, exit_edge.target, indent);
+    if (exit_edge) |edge| try prepareLoopExit(output, allocator, program, emission_plan, enclosing_region, node_index, edge.target, indent);
 
-    if (break_after_body) {
+    if (break_after_body and exit_edge != null) {
         try emitEdgeParametersUnlessConsumed(
             output,
             allocator,
             program,
             emission_plan,
             scopes,
-            program.blocks[exit_edge.target.index()],
-            exit_edge.arguments,
+            program.blocks[exit_edge.?.target.index()],
+            exit_edge.?.arguments,
             indent,
             false,
             place_aliases,
@@ -2304,21 +2355,21 @@ fn emitSemanticNormalizedNumericLoop(
     try render.valueName(output, allocator, &emission_plan.names, numeric.operation.control);
     try output.appendSlice(allocator, "\n");
     try emitRegion(output, allocator, program, emission_plan, scopes, body_region, loop_indent, place_aliases);
-    if (break_after_body) {
+    if (break_after_body and !regionAlwaysFunctionTerminates(program, body_region)) {
         try emitBreakStatement(output, allocator, loop_indent);
     }
 
     try output.appendSlice(allocator, indent);
     try output.appendSlice(allocator, "end\n");
-    if (!break_after_body) {
+    if (!break_after_body and exit_edge != null) {
         try emitEdgeParametersUnlessConsumed(
             output,
             allocator,
             program,
             emission_plan,
             scopes,
-            program.blocks[exit_edge.target.index()],
-            exit_edge.arguments,
+            program.blocks[exit_edge.?.target.index()],
+            exit_edge.?.arguments,
             indent,
             false,
             place_aliases,
@@ -2335,25 +2386,25 @@ fn emitGenericForLoop(
     enclosing_region: *const structure.Region,
     node_index: usize,
     body_region: *const structure.Region,
-    exit_edge: ir.Edge,
+    exit_edge: ?ir.Edge,
     generic: iteration_protocol.GenericLoop,
     break_after_body: bool,
     indent: []const u8,
     place_aliases: []const PlaceAlias,
 ) (EmitError || std.mem.Allocator.Error)!void {
-    try prepareLoopExit(output, allocator, program, emission_plan, enclosing_region, node_index, exit_edge.target, indent);
+    if (exit_edge) |edge| try prepareLoopExit(output, allocator, program, emission_plan, enclosing_region, node_index, edge.target, indent);
     const results = generic.transition.results;
     if (results.len < 4 or results.len != @as(usize, generic.operation.variable_count) + 3) return error.UnsupportedControlFlow;
 
-    if (break_after_body) {
+    if (break_after_body and exit_edge != null) {
         try emitEdgeParametersUnlessConsumed(
             output,
             allocator,
             program,
             emission_plan,
             scopes,
-            program.blocks[exit_edge.target.index()],
-            exit_edge.arguments,
+            program.blocks[exit_edge.?.target.index()],
+            exit_edge.?.arguments,
             indent,
             false,
             place_aliases,
@@ -2397,21 +2448,21 @@ fn emitGenericForLoop(
     const loop_indent = try allocDeeperIndent(allocator, indent);
     defer allocator.free(loop_indent);
     try emitRegion(output, allocator, program, emission_plan, scopes, body_region, loop_indent, place_aliases);
-    if (break_after_body) {
+    if (break_after_body and !regionAlwaysFunctionTerminates(program, body_region)) {
         try emitBreakStatement(output, allocator, loop_indent);
     }
 
     try output.appendSlice(allocator, indent);
     try output.appendSlice(allocator, "end\n");
-    if (!break_after_body) {
+    if (!break_after_body and exit_edge != null) {
         try emitEdgeParametersUnlessConsumed(
             output,
             allocator,
             program,
             emission_plan,
             scopes,
-            program.blocks[exit_edge.target.index()],
-            exit_edge.arguments,
+            program.blocks[exit_edge.?.target.index()],
+            exit_edge.?.arguments,
             indent,
             false,
             place_aliases,
