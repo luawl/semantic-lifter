@@ -60,6 +60,29 @@ for index, instruction in handoff.instructions do
     blocks[index] = builder:reserveBlock(worker, { name_hint = `instruction_{index}`, evidence = cited })
 end
 builder:finalizeBlock(entry, IR.Terminator.jump(IR.Edge(blocks[1])))
+-- Iteration regions: each region gets the source frontend's native form
+-- (luau/ast_frontend_iteration.luau): a header with the four state parameters and exactly one transition, and a body
+-- entry whose parameters are the loop variables. Keyed by the 0-based index of the region's prepare instruction.
+local loops: { [number]: any } = {}
+for index, instruction in handoff.instructions do
+    if instruction.kind == "iteration_prepare" then
+        local loop = instruction.loop
+        local numeric = loop.iteration == "numeric"
+        local cited = builder.program.blocks[blocks[index] + 1].evidence
+        local header = builder:reserveBlock(worker, { name_hint = if numeric then "numeric_for_header" else "generic_for_header", evidence = cited })
+        local body = builder:reserveBlock(worker, { name_hint = if numeric then "numeric_for_body" else "generic_for_body", evidence = cited })
+        local state = {}
+        for _, name in (if numeric then { "numeric_control", "numeric_limit", "numeric_step" } else { "generic_iterator", "generic_state", "generic_control" }) do
+            table.insert(state, builder:addBlockParameter(header, IR.Types.dynamic(), name))
+        end
+        table.insert(state, builder:addBlockParameter(header, IR.Types.boolean(), if numeric then "numeric_initial_transition" else "generic_initial_transition"))
+        local variables = {}
+        for _, reg in loop.variables do
+            table.insert(variables, builder:addBlockParameter(body, if numeric then IR.Types.number() else IR.Types.dynamic(), `r{reg}`))
+        end
+        loops[loop.prepare] = { loop = loop, numeric = numeric, header = header, body = body, state = state, variables = variables, evidence = cited }
+    end
+end
 -- The adjacent-only open protocol: the pack of an open producer (a call or namecall with
 -- variadic results, or open varargs) is pending from the producer's block to the next block only, whose instruction
 -- consumes it; packs never cross a label, so no block parameter is needed.
@@ -69,7 +92,7 @@ local pendingPack: number? = nil
 -- store order (`fields`) and its tail pack (`tail`) for the completing member.
 local windows: { [number]: any } = {}
 for index, instruction in handoff.instructions do
-    assert(table.find({ "constant", "move", "binary", "unary", "concat", "jump", "branch", "return", "environment_get", "environment_set", "call", "namecall", "varargs", "new_table", "table_get", "table_set", "set_list" }, instruction.kind) ~= nil,
+    assert(table.find({ "constant", "move", "binary", "unary", "concat", "jump", "branch", "return", "environment_get", "environment_set", "call", "namecall", "varargs", "new_table", "table_get", "table_set", "set_list", "iteration_prepare", "iteration_loop" }, instruction.kind) ~= nil,
         "unsupported handoff instruction kind")
     assert((pendingPack ~= nil) == (instruction.consumes_pack_from ~= nil), "open pack not adjacent to its consumer")
     local consumed: number? = pendingPack
@@ -246,7 +269,51 @@ for index, instruction in handoff.instructions do
             end
         end
     end
-    if instruction.kind == "return" then
+    if instruction.kind == "iteration_prepare" then
+        -- The prepare block reads the initial state (reads are already in header order) and enters the header
+        -- with the initial transition flag `true`; the later flag `false` is made here too, as the source frontend does.
+        local state = loops[index - 1]
+        local first = value(IR.Operation.constant(IR.Literal.boolean(true)), IR.Types.boolean(), IR.Effects.pure())
+        state.later = value(IR.Operation.constant(IR.Literal.boolean(false)), IR.Types.boolean(), IR.Effects.pure())
+        builder:finalizeBlock(block, IR.Terminator.jump(IR.Edge(state.header, { reads[1], reads[2], reads[3], first })))
+        -- The header: exactly one transition, branching on has_value to the body entry or the region's exit.
+        local p = state.state
+        local resultSpecs
+        local operation
+        if state.numeric then
+            operation = IR.Operation.numericForNext(p[1], p[2], p[3], p[4])
+            resultSpecs = { { type = IR.Types.boolean() }, { type = IR.Types.number() }, { type = IR.Types.number() }, { type = IR.Types.number() } }
+        else
+            operation = IR.Operation.genericForNext(p[1], p[2], p[3], p[4], #state.variables)
+            resultSpecs = { { type = IR.Types.boolean() }, { type = IR.Types.dynamic() }, { type = IR.Types.dynamic() } }
+            for _ = 1, #state.variables do
+                table.insert(resultSpecs, { type = IR.Types.dynamic() })
+            end
+        end
+        local effects = if state.numeric then IR.Effects.numericForNext() else IR.Effects.genericForNext()
+        local _, transition = builder:addInstruction(state.header, operation, resultSpecs, { effects = effects, evidence = state.evidence })
+        state.transition = transition
+        local bodyArguments = {}
+        for slot = 1, #state.variables do
+            table.insert(bodyArguments, transition[3 + slot])
+        end
+        builder:finalizeBlock(state.header, IR.Terminator.branch(transition[1],
+            IR.Edge(state.body, bodyArguments), IR.Edge(blocks[state.loop.exit + 1])))
+        -- The body entry writes each loop variable to its register's place (only where a place exists).
+        for slot, reg in state.loop.variables do
+            if places[reg] ~= nil then
+                builder:addInstruction(state.body, IR.Operation.placeWrite(places[reg], state.variables[slot]), {}, { effects = IR.Effects.placeWrite(), evidence = state.evidence })
+            end
+        end
+        builder:finalizeBlock(state.body, IR.Terminator.jump(IR.Edge(blocks[index + 1])))
+    elseif instruction.kind == "iteration_loop" then
+        -- The latch re-enters the header with the transition's own state and the later flag:
+        -- numeric [control, limit, step] = results 4, 2, 3; generic [iterator, state, control] = results 2, 3, 4.
+        local state = loops[instruction.loop.prepare]
+        local t = state.transition
+        local arguments = if state.numeric then { t[4], t[2], t[3], state.later } else { t[2], t[3], t[4], state.later }
+        builder:finalizeBlock(block, IR.Terminator.jump(IR.Edge(state.header, arguments)))
+    elseif instruction.kind == "return" then
         -- An open return returns its prefix reads and then the consumed pack.
         if consumed == nil then
             builder:finalizeBlock(block, IR.Terminator.returnValues(reads))

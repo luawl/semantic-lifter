@@ -24,7 +24,7 @@ test('disassembly preserves register data and inverted branch polarity', () => {
 
 test('unsupported operations cannot silently become no-ops', () => {
   assert.throws(() => parseDisassembly(listing.replace('ADD R2 R2 R3', 'GETUPVAL R2 0')), /unsupported opcode GETUPVAL/);
-  assert.throws(() => parseDisassembly(listing.replace('ADD R2 R2 R3', 'FORNPREP R2 L1')), /unsupported opcode FORNPREP/);
+  assert.throws(() => parseDisassembly(listing.replace('ADD R2 R2 R3', 'FORGPREP_NEXT R2 L1')), /unsupported opcode FORGPREP_NEXT/);
 });
 
 test('missing constants, labels, and open return protocols are rejected', () => {
@@ -123,8 +123,8 @@ test('a LOADB skip resolves to its labelled target', () => {
 
 test('refusals are typed and keep their messages', () => {
   assert.throws(() => parseDisassembly(listing.replace('ADD R2 R2 R3', 'FORNPREP R2 L1')),
-    (error) => error.name === 'DisassemblyRefusal' && error.code === 'unsupported_opcode' && error.opcode === 'FORNPREP'
-      && error.line_number === 7 && /unsupported opcode FORNPREP at disassembly line 7/.test(error.message));
+    (error) => error.name === 'DisassemblyRefusal' && error.code === 'iteration_pair_mismatch' && error.opcode === 'FORNPREP'
+      && error.line_number === 7 && /FORNPREP R2 has no matching loop instruction at disassembly line 7/.test(error.message));
   assert.throws(() => parseDisassembly(listing.replace('LOADK R2 K0', 'LOADK R2 K9')),
     (error) => error.name === 'DisassemblyRefusal' && error.code === 'operand_form' && error.line_number === 4
       && /constant is absent/.test(error.message));
@@ -481,4 +481,286 @@ test('SETLIST outside a recognisable constructor is refused', () => {
 test('record templates stay refused', () => {
   assert.throws(() => parseDisassembly(excerpt('K3: {...}', 'DUPTABLE R3 3', 'RETURN R3 1')),
     (error) => refusedAs('table_template_opaque')(error) && error.opcode === 'DUPTABLE' && error.line_number === 3);
+});
+
+// Iteration. Each excerpt is the verbatim Function 0 of the -O0 -g0 listing of an author-owned
+// program, from its `Function 0 (??):` line, CRLF removed, so listing line
+// numbers are unchanged. A spliced variant applies exactly the listed `from -> to` replacements; the measured codes and
+// lines are the ones the adapter reports for them. The supported level is -O0 -g0.
+const it01NumericStep = `Function 0 (??):
+K0: 0
+K1: 2
+LOADK R2 K0 [0]
+MOVE R5 R0
+MOVE R3 R1
+LOADK R4 K1 [2]
+FORNPREP R3 L1
+L0: ADD R2 R2 R5
+FORNLOOP R3 L0
+L1: RETURN R2 1
+`;
+const it02NumericWritten = `Function 0 (??):
+K0: 0
+K1: 1
+LOADK R2 K0 [0]
+MOVE R5 R1
+LOADK R3 K1 [1]
+LOADK R7 K1 [1]
+MINUS R4 R7
+FORNPREP R3 L1
+L0: MOVE R6 R5
+MUL R6 R6 R0
+ADD R2 R2 R6
+FORNLOOP R3 L0
+L1: RETURN R2 1
+`;
+const it03Pairs = `Function 0 (??):
+K0: 0
+K1: 'pairs'
+REMARK allocation: table array 3
+NEWTABLE R2 0 3
+MOVE R3 R0
+MOVE R4 R1
+ADD R5 R0 R1
+SETLIST R2 R3 3 [1]
+LOADK R3 K0 [0]
+GETGLOBAL R4 K1 ['pairs']
+MOVE R5 R2
+CALL R4 1 3
+FORGPREP R4 L1
+L0: MUL R9 R7 R8
+ADD R3 R3 R9
+L1: FORGLOOP R4 L0 2
+RETURN R3 1
+`;
+const it04Ipairs = `Function 0 (??):
+K0: 7
+K1: 0
+K2: 'ipairs'
+REMARK allocation: table array 3
+NEWTABLE R2 0 3
+MOVE R3 R0
+MOVE R4 R1
+LOADK R5 K0 [7]
+SETLIST R2 R3 3 [1]
+LOADK R3 K1 [0]
+GETGLOBAL R4 K2 ['ipairs']
+MOVE R5 R2
+CALL R4 1 3
+FORGPREP R4 L1
+L0: MUL R9 R7 R8
+ADD R3 R3 R9
+L1: FORGLOOP R4 L0 2
+RETURN R3 1
+`;
+const it05BreakContinue = `Function 0 (??):
+K0: 0
+K1: 1
+K2: 5
+LOADK R2 K0 [0]
+LOADK R5 K1 [1]
+MOVE R3 R1
+LOADN R4 1
+FORNPREP R3 L2
+L0: JUMPIFEQ R5 R0 L1
+LOADK R6 K2 [5]
+JUMPIFLT R6 R5 L2
+ADD R2 R2 R5
+L1: FORNLOOP R3 L0
+L2: RETURN R2 1
+`;
+const it06GenericBreakContinue = `Function 0 (??):
+K0: 3
+K1: 4
+K2: 0
+K3: 'ipairs'
+REMARK allocation: table array 4
+NEWTABLE R2 0 4
+LOADK R3 K0 [3]
+MOVE R4 R0
+MOVE R5 R1
+LOADK R6 K1 [4]
+SETLIST R2 R3 4 [1]
+LOADK R3 K2 [0]
+GETGLOBAL R4 K3 ['ipairs']
+MOVE R5 R2
+CALL R4 1 3
+FORGPREP R4 L1
+L0: LOADK R9 K2 [0]
+JUMPIFEQ R8 R9 L1
+LOADK R9 K1 [4]
+JUMPIFEQ R7 R9 L2
+ADD R3 R3 R8
+L1: FORGLOOP R4 L0 2
+L2: RETURN R3 1
+`;
+const it07GeneralizedNext = `Function 0 (??):
+K0: 0
+K1: 'next'
+REMARK allocation: table array 2
+NEWTABLE R2 0 2
+MOVE R3 R0
+MOVE R4 R1
+SETLIST R2 R3 2 [1]
+LOADK R3 K0 [0]
+MOVE R4 R2
+LOADNIL R5
+LOADNIL R6
+FORGPREP R4 L1
+L0: ADD R9 R3 R7
+ADD R3 R9 R8
+L1: FORGLOOP R4 L0 2
+GETGLOBAL R4 K1 ['next']
+MOVE R5 R2
+LOADNIL R6
+FORGPREP R4 L3
+L2: ADD R3 R3 R7
+L3: FORGLOOP R4 L2 1
+RETURN R3 1
+`;
+const it08Nested = `Function 0 (??):
+K0: 5
+K1: 0
+K2: 'ipairs'
+K3: 1
+K4: 2
+REMARK allocation: table array 3
+NEWTABLE R2 0 3
+MOVE R3 R0
+MOVE R4 R1
+LOADK R5 K0 [5]
+SETLIST R2 R3 3 [1]
+LOADK R3 K1 [0]
+GETGLOBAL R4 K2 ['ipairs']
+MOVE R5 R2
+CALL R4 1 3
+FORGPREP R4 L2
+L0: LOADK R11 K3 [1]
+MOVE R9 R8
+LOADK R10 K4 [2]
+FORNPREP R9 L2
+L1: JUMPIFEQ R11 R0 L2
+MUL R12 R7 R11
+ADD R3 R3 R12
+FORNLOOP R9 L1
+L2: FORGLOOP R4 L0 2
+RETURN R3 1
+`;
+const it09ReturnInside = `Function 0 (??):
+K0: 0
+K1: 1
+LOADK R2 K0 [0]
+LOADK R5 K1 [1]
+MOVE R3 R1
+LOADN R4 1
+FORNPREP R3 L2
+L0: JUMPIFNOTEQ R5 R0 L1
+MOVE R6 R2
+MOVE R7 R5
+RETURN R6 2
+L1: ADD R2 R2 R5
+FORNLOOP R3 L0
+L2: MOVE R3 R2
+MOVE R4 R1
+RETURN R3 2
+`;
+const iterationOptions = { function_index: 0, parameter_count: 2 };
+const splice = (text, from, to) => {
+  assert.ok(text.includes(from), `splice source absent: ${from}`);
+  return text.replace(from, to);
+};
+const loopsOf = (instructions) => instructions.filter((instruction) => instruction.kind === 'iteration_prepare')
+  .map((instruction) => instruction.loop);
+const bounds = ({ prepare, latch, exit }) => ({ prepare, latch, exit });
+
+test('numeric for lowers to an iteration region', () => {
+  const loop = { iteration: 'numeric', base: 3, prepare: 4, latch: 6, exit: 7, variables: [5] };
+  assertFields(parseDisassembly(it01NumericStep, iterationOptions).instructions, {
+    4: { op: 'FORNPREP', kind: 'iteration_prepare', iteration: 'numeric', base: 3, reads: [5, 3, 4], writes: [],
+      successors: [7, 5], loop },
+    6: { op: 'FORNLOOP', kind: 'iteration_loop', variable_count: 1, reads: [], writes: [], successors: [5, 7], loop },
+  });
+  // The body copy `L0: MOVE R6 R5` reads the loop variable that the body edge defines.
+  const written = parseDisassembly(it02NumericWritten, iterationOptions).instructions;
+  assert.deepEqual(written[5].loop, { iteration: 'numeric', base: 3, prepare: 5, latch: 9, exit: 10, variables: [5] });
+  assertFields(written, { 6: { op: 'MOVE', reads: [5], writes: [6] } });
+});
+
+test('generic for over pairs, ipairs and next lowers to an iteration region', () => {
+  const loop = { iteration: 'generic', base: 4, prepare: 9, latch: 12, exit: 13, variables: [7, 8] };
+  const region = {
+    9: { op: 'FORGPREP', kind: 'iteration_prepare', iteration: 'generic', base: 4, reads: [4, 5, 6], successors: [12], loop },
+    12: { op: 'FORGLOOP', kind: 'iteration_loop', variable_count: 2, reads: [], successors: [10, 13] },
+  };
+  assertFields(parseDisassembly(it03Pairs, iterationOptions).instructions, region);
+  assertFields(parseDisassembly(it04Ipairs, iterationOptions).instructions, region);
+  const next = parseDisassembly(it07GeneralizedNext, iterationOptions).instructions;
+  assert.deepEqual(loopsOf(next), [
+    { iteration: 'generic', base: 4, prepare: 8, latch: 11, exit: 12, variables: [7, 8] },
+    { iteration: 'generic', base: 4, prepare: 15, latch: 17, exit: 18, variables: [7] },
+  ]);
+  assert.equal(next[17].variable_count, 1);
+});
+
+test('continue, break, nesting and return stay inside one region', () => {
+  // it05: `continue` branches to the latch, `break` to the exit.
+  const breakContinue = parseDisassembly(it05BreakContinue, iterationOptions).instructions;
+  assert.deepEqual(loopsOf(breakContinue).map(bounds), [{ prepare: 4, latch: 9, exit: 10 }]);
+  assertFields(breakContinue, {
+    5: { op: 'JUMPIFEQ', line_number: 10, target: 9 },
+    7: { op: 'JUMPIFLT', line_number: 12, target: 10 },
+  });
+  assert.deepEqual(loopsOf(parseDisassembly(it06GenericBreakContinue, iterationOptions).instructions).map(bounds),
+    [{ prepare: 10, latch: 16, exit: 17 }]);
+  // it08: the inner numeric loop lies inside the outer generic region and exits to the outer latch.
+  const nested = loopsOf(parseDisassembly(it08Nested, iterationOptions).instructions);
+  assert.deepEqual(nested, [
+    { iteration: 'generic', base: 4, prepare: 9, latch: 18, exit: 19, variables: [7, 8] },
+    { iteration: 'numeric', base: 9, prepare: 13, latch: 17, exit: 18, variables: [11] },
+  ]);
+  assert.equal(nested[1].exit, nested[0].latch);
+  assert.deepEqual(loopsOf(parseDisassembly(it09ReturnInside, iterationOptions).instructions).map(bounds),
+    [{ prepare: 4, latch: 10, exit: 11 }]);
+});
+
+test('loop registers are dead after the loop; the body edge defines only the loop variables', () => {
+  const uninitialized = (message) => (error) => error.name === 'DisassemblyRefusal'
+    && error.code === 'uninitialized_register' && error.message === message;
+  const afterLoop = splice(it01NumericStep, 'L1: RETURN R2 1', 'L1: RETURN R5 1');
+  assert.throws(() => parseDisassembly(afterLoop, iterationOptions), uninitialized('uninitialized R5 at disassembly line 11'));
+  const previousIteration = splice(splice(it01NumericStep, 'L0: ADD R2 R2 R5', 'L0: ADD R2 R2 R6'),
+    'FORNLOOP R3 L0', 'LOADN R6 1\nFORNLOOP R3 L0');
+  assert.throws(() => parseDisassembly(previousIteration, iterationOptions),
+    uninitialized('uninitialized R6 at disassembly line 9'));
+  const secondRegister = splice(it07GeneralizedNext, 'L2: ADD R3 R3 R7', 'L2: ADD R3 R3 R8');
+  assert.throws(() => parseDisassembly(secondRegister, iterationOptions),
+    uninitialized('uninitialized R8 at disassembly line 21'));
+});
+
+test('iteration shapes the compiler never emits are typed refusals', () => {
+  // [variant, code, line_number, opcode where pinned]
+  const cases = [
+    // numeric hidden write; numeric hidden read (limit)
+    [splice(it01NumericStep, 'L0: ADD R2 R2 R5', 'L0: ADD R5 R2 R5'), 'iteration_state_written', 9],
+    [splice(it01NumericStep, 'L0: ADD R2 R2 R5', 'L0: ADD R2 R2 R3'), 'iteration_state_read', 9],
+    // numeric base mismatch; loop without prepare
+    [splice(it01NumericStep, 'FORNLOOP R3 L0', 'FORNLOOP R4 L0'), 'iteration_pair_mismatch', 8, 'FORNPREP'],
+    [splice(it01NumericStep, 'FORNPREP R3 L1', 'JUMPIF R0 L1'), 'iteration_pair_mismatch', 10, 'FORNLOOP'],
+    // jump into the body; jump out of the body (not to the exit)
+    [splice(it01NumericStep, 'FORNPREP R3 L1', 'JUMPIF R0 L0\nFORNPREP R3 L1'), 'iteration_region_entry', 8],
+    [splice(splice(it01NumericStep, 'MOVE R3 R1', 'L2: MOVE R3 R1'), 'L0: ADD R2 R2 R5', 'L0: JUMPIF R0 L2\nADD R2 R2 R5'),
+      'iteration_region_exit', 9],
+    // generic hidden read (control); generic call frame over the state; generic zero variables
+    [splice(it03Pairs, 'L0: MUL R9 R7 R8', 'L0: MUL R9 R6 R8'), 'iteration_state_read', 15],
+    [splice(it03Pairs, 'L0: MUL R9 R7 R8', 'L0: CALL R5 0 1'), 'iteration_state_written', 15],
+    [splice(it03Pairs, 'L1: FORGLOOP R4 L0 2', 'L1: FORGLOOP R4 L0 0'), 'operand_form', 17],
+    // the -O1 fast paths: the ipairs marker, FORGPREP_NEXT and FORGPREP_INEXT
+    [splice(it04Ipairs, 'L1: FORGLOOP R4 L0 2', 'L1: FORGLOOP R4 L0 2 [inext]'), 'iteration_fast_path_unsupported', 18],
+    [splice(it03Pairs, 'FORGPREP R4 L1', 'FORGPREP_NEXT R4 L1'), 'unsupported_opcode', 14, 'FORGPREP_NEXT'],
+    [splice(it04Ipairs, 'FORGPREP R4 L1', 'FORGPREP_INEXT R4 L1'), 'unsupported_opcode', 15, 'FORGPREP_INEXT'],
+  ];
+  for (const [variant, code, line_number, opcode] of cases) {
+    assert.throws(() => parseDisassembly(variant, iterationOptions), (error) => error.name === 'DisassemblyRefusal'
+      && error.code === code && error.line_number === line_number && (opcode === undefined || error.opcode === opcode));
+  }
 });
