@@ -19,9 +19,9 @@ source is at hand, so that the original can serve as the reference. A frontend i
 writes a `lifter_ir_v1` handoff: a lifting or analysis tool supplies the frontend for the artefact
 it targets, and the contract is what that frontend has to satisfy.
 
-The backend is about 148,000 lines of Zig across 159 files, with over 800 unit tests. The source
-frontend, the IR library and codec, and the conformance suite take about 55,000 lines across 168
-files under `luau/`. The suite holds 48 fixture files, 28 conformance scripts, 9 audits and 7
+The backend is about 148,000 lines of Zig across 159 files, with over 850 unit tests. The source
+frontend, the IR library and codec, and the conformance suite take about 55,000 lines across 169
+files under `luau/`. The suite holds 49 fixture files, 29 conformance scripts, 9 audits and 7
 oracles; it compiles the emitted programs with the official Luau compiler and runs its oracles under
 Lune, a standalone Luau runtime.
 
@@ -212,7 +212,7 @@ alias class explicit, and a class is refined only when all of its writes agree o
   values. The official compiler is the final gate: `emit-luau` publishes its output only after the
   given `luau-compile` accepts it.
 
-**Verification.** Over 800 unit tests cover the backend. The conformance suite lifts its source
+**Verification.** Over 850 unit tests cover the backend. The conformance suite lifts its source
 fixtures and builds IR from its conformance scripts, then resolves, validates, emits and compiles
 the programs; runtime oracles execute the output, and for source fixtures the original program too,
 against the results each case expects. The irreducible-control audits check what resolution and

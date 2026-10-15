@@ -5,7 +5,7 @@
 1. Write the failing test first (a Zig `test` block, a conformance fixture, or for the compiler-disassembly adapter a `node:test` case in `frontends/disassembly/compiler_disassembly_adapter.test.mjs`) and run it to show that it fails for the reason you are fixing.
 2. Make the minimal change that turns it green: no unrelated refactors, renames or reformatting.
 3. Run `zig fmt` on every Zig file you touch; `zig fmt --check <file>` must pass.
-4. Keep `zig build test` and `zig build conformance` green in ReleaseFast (`-Doptimize=ReleaseFast` plus the five tool options, see `README.md`; Node is among them because `zig build test` runs the adapter's tests); a change to `src/structure.zig`, `src/emit_luau.zig`, `src/proof_orchestrator.zig` or `src/irreducible_normalize.zig` must pass both steps in all three modes (`Debug`, `ReleaseSafe` and `ReleaseFast`).
+4. Keep `zig build test` and `zig build conformance` green in ReleaseFast (`-Doptimize=ReleaseFast` plus the five tool options, see `docs/usage.md`; Node is among them because `zig build test` runs the adapter's tests); a change to `src/structure.zig`, `src/emit_luau.zig`, `src/proof_orchestrator.zig` or `src/irreducible_normalize.zig` must pass both steps in all three modes (`Debug`, `ReleaseSafe` and `ReleaseFast`).
 
 ## Scope of `src/`
 

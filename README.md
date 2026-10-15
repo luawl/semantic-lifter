@@ -1,142 +1,81 @@
 # Semantic-Lifter
 
-**A checked lifting backend for Luau.**
+**An IR Lifting Backend for Luau**
 
-A frontend hands Semantic-Lifter a program as `lifter_ir_v1`, a typed intermediate representation. The backend validates, resolves and restructures it, then emits readable Luau that the official Luau compiler accepts. Anything it cannot justify is refused with a typed diagnostic. The repository ships the backend, a source frontend (Luau source to IR) and a compiler-disassembly frontend (a `luau-compile` text listing to IR).
+Semantic-Lifter is a lifting backend for Luau made to validate, resolve, and restructure a typed intermediate representation into readable Luau that compiles under the official Luau compiler.
 
-## Quick start
+By separating frontend lifting from the core checks, the backend allows you to develop custom frontends for other Luau representations, each producing the same typed handoff, while reusing the unified checked pipeline.
 
-Requirements: [Zig 0.16.0](https://ziglang.org/download/), [Lune 0.10.4](https://github.com/lune-org/lune/releases), [Luau 0.720](https://github.com/luau-lang/luau/releases/tag/0.720) tools (`luau-compile`, `luau-ast`, `luau-analyze`), [Node 24](https://nodejs.org/).
+***This repository serves as the implementation of the forthcoming preprint "Checked, Not Trusted" and contains the backend, a source frontend, and a compiler-disassembly frontend.***
 
-Build (an option can be left out when that tool is on `PATH` under its own name):
+## Documentation Hub
 
-```sh
-zig build -Doptimize=ReleaseFast -Dlune=<path> -Dluau-compile=<path> -Dluau-ast=<path> -Dluau-analyze=<path> -Dnode=<path>
-```
+To maintain clarity, everything is separated from one another. **If you are new to Semantic-Lifter, please visit the links below**:
 
-Lift a Luau file and emit it (`semantic-lifter` is installed under `zig-out/bin/`):
+* **[Getting Started & Introduction](docs/README.md)** - Architecture overview, features, and short guides for building, lifting, and emitting.
 
-```sh
-lune run luau/lift_source.luau <path to luau-ast> <input.luau> <program-id> <program.ir.json>
-semantic-lifter emit-luau <program.ir.json> <output.luau> standard-luau <path to luau-compile>
-```
+## Roadmap
 
-See [docs/usage.md](docs/usage.md) for tests, the disassembly path, other commands, exit codes and `build.ps1`.
+To track active milestones, upcoming constructs, and the release of run records, visit our roadmap:
 
-## Features
-
-- **Typed evidence contract**: 7 evidence kinds, 12 obligation kinds, 241 typed diagnostics, 2 admission profiles (`core`, `readable-luau`).
-- **Checked resolution**: only proved facts change the program, as replayable CFG rewrites; internal engine, optional [Z3 backend](docs/usage.md#requirements).
-- **Restructuring**: `if`, `while`, `break`, `continue`, native numeric and generic `for`; guarded node splitting, within a growth budget, for irreducible control.
-- **Compiler-limit admission**: 200 live locals, 255 registers, 200 upvalues per nested function, jump budget, syntax depth, child prototypes.
-- **Compile-gated output**: `standard-luau` or `direct-locals-luau`, published only after `luau-compile` accepts it.
-- **Source frontend**: declarations, plain and compound assignment, `if`, `while`, `repeat`, both `for` forms, `break`, `continue`, open returns, closures, varargs, tables, method calls, string interpolation, `and`/`or` and `if` expressions.
-- **Compiler-disassembly frontend**: lifts a selected function from a `luau-compile --text` listing; the caller declares its signature.
-- **Tests**: over 800 unit tests; 48 fixture files, 28 conformance scripts, 9 audits, 7 oracles; emitted programs are compiled and run.
+* **[Development Roadmap](docs/roadmap.md)** - Tracking of active milestones, upcoming constructs, solver work, and evidence publication.
 
 ## Pipeline
 
+Semantic-Lifter separates frontend lifting from the core backend pipeline, allowing new frontends to reuse the existing admission, checked resolution, structuring, and emission.
+
 ```mermaid
-%% The lifter_ir_v1 contract: frontends, handoff, and backend gates
 flowchart LR
-    subgraph FE["frontends"]
-        O["any other frontend"]
-        subgraph DF["compiler-disassembly frontend"]
-            direction TB
-            D1["listing<br/>luau-compile<br/>--text"] --> D2["adapter<br/>compiler_disassembly_adapter.mjs"] --> D3["bridge<br/>lift_compiler_disassembly.luau"]
-        end
-        subgraph SF["source frontend"]
-            direction TB
-            S1["parser<br/>luau-ast"] --> S2["lift<br/>luau/lift_source.luau"]
-        end
-    end
-    FE --> H["lifter_ir_v1 handoff<br/>evidence (7 kinds),<br/>obligations (12 kinds)"]
-    H --> BE
-    subgraph BE["backend"]
-        direction TB
-        G1["core admission<br/>validate &lt;ir&gt; core"] --> G2["checked resolution<br/>resolve-admitted-<br/>readable-ir"]
-        G2 --> G3["emission admission<br/>validate &lt;admitted&gt;<br/>readable-luau"]
-        G3 --> G4["normalization<br/>normalize-ir"]
-        G4 --> G5["structuring<br/>(the planner)"]
-        G5 --> G6["emission<br/>emit-luau"]
-        G6 --> G7["compile check<br/>luau-compile<br/>--null"]
-        G7 --> P[["published Luau"]]
-        G4 -.->|refuse| T["typed diagnostic<br/>code + entity"]
-        G1 -.->|refuse| T
-        G7 -.->|refuse| T
-    end
-    style O stroke-dasharray: 5 5
+    A["Luau Source / Disassembly Listing"]
+        --> B["Frontend"]
+        --> C["Typed Intermediate Representation (IR)"]
+        --> D["Admission"]
+        --> E["Checked Resolution"]
+        --> F["Structuring"]
+        --> G["Compile-Gated Emission"]
+        --> H["Readable Luau"]
 ```
 
-## Example
+## Building and Testing Semantic-Lifter
 
-The tracked fixture `luau/fixtures/loop_control_source.luau`:
+Each Semantic-Lifter build requires Zig and finds Lune, the Luau tools, and Node through build options or `PATH`.
 
-```luau
-return function(limit)
-	local total = 0
-	local index = 0
-	while index < limit do
-		index = index + 1
-		if index == 3 then
-			continue
-		end
-		if index == 6 then
-			break
-		end
-		total = total + index
-	end
-	return total
-end
-```
+Detailed building and testing instructions can be found here: [Build and test](docs/usage.md#build-and-test).
 
-lifted through the source path and emitted (see [docs/usage.md](docs/usage.md#command-line-use)):
+## Scripts
 
-```sh
-lune run luau/lift_source.luau <path to luau-ast> luau/fixtures/loop_control_source.luau loop_control loop_control.ir.json
-semantic-lifter emit-luau loop_control.ir.json loop_control.luau standard-luau <path to luau-compile>
-```
+Semantic-Lifter includes a PowerShell wrapper, `build.ps1`, for the common build and test invocations on Windows.
 
-```luau
-local value_18 = function(limit)
-  local total = 0
-  local index = 0
-  while true do
-    if index < limit then
-      index += 1
-      if not (index == 3) then
-        if index == 6 then
-          do
-            break
-          end
-        else
-          total += index
-        end
-      end
-    else
-      do
-        break
-      end
-    end
-  end
-  return total
-end
-return value_18
-```
+More information and usage examples can be found in [build.ps1](build.ps1) and [Build and test](docs/usage.md#build-and-test).
 
-The backend rebuilt the loop from the control-flow graph in the IR, not from the source text.
+## Testing
 
-## Repository
+**Every program that `emit-luau` publishes is first compiled by the official Luau compiler, and the conformance suite compiles every program it emits and checks what it computes. Two build steps, `test` and `conformance`, run every check.**
 
-- `src/`: the backend and the `semantic-lifter` CLI.
-- `luau/`: the source frontend, IR library and codec, and conformance suite.
-- `frontends/disassembly/`: the compiler-disassembly frontend with its tests.
-- `build.zig`, `build.ps1`: the build graph and its Windows wrapper.
-- [`docs/usage.md`](docs/usage.md): requirements, build and command-line use.
-- [`docs/design.md`](docs/design.md): how it works and what it handles.
-- `LICENSE`, `CONTRIBUTING.md`, `CITATION.cff`, `.gitattributes`.
+### Backend
 
-The issue tracker holds the open items; anything else is welcome as an issue.
+The **src** directory contains the backend with its unit tests beside the sources.
+
+- [src/](src/) - Backend and its unit tests
+
+### Conformance
+
+The **luau** directory contains the source frontend's tests and the conformance scripts, audits, and oracles that exercise the backend on its fixtures and generated programs.
+
+- [luau/](luau/) - Source frontend tests, conformance scripts, audits, and oracles
+- [luau/fixtures/](luau/fixtures/) - Fixtures (Luau sources, manifests, and IR)
+
+### Frontends
+
+The **frontends** directory contains the compiler-disassembly frontend with its Node tests; the source frontend lives in `luau/`.
+
+- [frontends/disassembly/](frontends/disassembly/) - Compiler-disassembly frontend and adapter tests
+
+## Examples
+
+An example lift of a Luau loop, with its emitted output, can be found in [Example](docs/README.md#example).
+
+Command-line usage for both frontends is in [Using Semantic-Lifter](docs/usage.md#command-line-use).
 
 ## Citation
 
@@ -150,7 +89,3 @@ This repository implements the forthcoming preprint *Checked, Not Trusted: Typed
   note   = {Preprint. Code: https://github.com/luawl/semantic-lifter},
 }
 ```
-
-## Licence
-
-PolyForm Strict License 1.0.0 (`LICENSE`), copyright Luawl.
