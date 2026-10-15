@@ -454,12 +454,14 @@ test('constructor windows keep source order and choose their mode', () => {
   // The NEWTABLE and its members in store order: b, the first list item, c, the second list item.
   assert.deepEqual(windowMembers(instructions), [0, 6, 12, 14, 16]);
   assertFields(instructions, {
-    6: { op: 'SETTABLE', kind: 'table_set', table: 2, key: 5, value: 6, reads: [5, 6],
+    6: { op: 'SETTABLE', kind: 'table_set', table: 2, key_constant: { string: 'b' }, value: 6, reads: [6],
       constructor: { create: 0, mode: 'literal' } },
     12: { op: 'SETLIST', values: [3], first_index: 1, constructor: { create: 0, mode: 'literal' } },
-    14: { op: 'SETTABLE', key: 5, value: 0, constructor: { create: 0, mode: 'literal' } },
+    14: { op: 'SETTABLE', key_constant: { string: 'c' }, value: 0, reads: [0], constructor: { create: 0, mode: 'literal' } },
     16: { op: 'SETLIST', values: [3], first_index: 2, complete: true, constructor: { create: 0, mode: 'literal' } },
   });
+  assert.equal(Object.hasOwn(instructions[6], 'key'), false);
+  assert.equal(Object.hasOwn(instructions[14], 'key'), false);
   // The probe's key R0 is not definitely valid and its member is not the last, so the window is ordered.
   assertFields(parseDisassembly(orderedConstructorProbe).instructions, {
     2: { op: 'SETTABLE', kind: 'table_set', table: 2, key: 0, value: 4, constructor: { create: 0, mode: 'ordered' } },
@@ -763,4 +765,89 @@ test('iteration shapes the compiler never emits are typed refusals', () => {
     assert.throws(() => parseDisassembly(variant, iterationOptions), (error) => error.name === 'DisassemblyRefusal'
       && error.code === code && error.line_number === line_number && (opcode === undefined || error.opcode === opcode));
   }
+});
+
+// Conditional moves and record templates. Excerpts are verbatim -O0 -g0 listing lines of author-owned programs,
+// CRLF removed: the Function 0 of the p18Logic listing (lines 1-10), `AND R2 R2 R3` (the
+// and/or program at -O0, line 25 without its label: the target is the left operand), the -O1 constant
+// forms of that program (O1 listing lines 2-3 and 10-11, each plus a return) and the Function 0 of
+// the tableRecordFields listing (lines 1-39). The supported level is -O0 -g0.
+const p18Logic = `Function 0 (??):
+K0: 0
+AND R2 R0 R1
+OR R3 R0 R1
+LOADK R5 K0 [0]
+JUMPIFNOTLT R5 R0 L0
+MOVE R4 R1
+JUMPIF R4 L1
+L0: MINUS R4 R1
+L1: RETURN R2 3
+`;
+const tableRecordFields = `Function 0 (??):
+K0: 'count'
+K1: 'total'
+K2: {...}
+K3: 0
+K4: 1
+K5: 'done'
+K6: 'label'
+K7: 'missing'
+REMARK allocation: table template 2
+DUPTABLE R2 2
+LOADK R3 K0 ['count']
+LOADK R4 K3 [0]
+SETTABLE R4 R2 R3
+LOADK R3 K1 ['total']
+SETTABLE R0 R2 R3
+L0: GETTABLEKS R3 R2 K0 ['count']
+JUMPIFNOTLT R3 R1 L1
+GETTABLEKS R4 R2 K1 ['total']
+GETTABLEKS R5 R2 K0 ['count']
+ADD R3 R4 R5
+SETTABLEKS R3 R2 K1 ['total']
+GETTABLEKS R4 R2 K0 ['count']
+LOADK R5 K4 [1]
+ADD R3 R4 R5
+SETTABLEKS R3 R2 K0 ['count']
+JUMPBACK L0
+L1: LOADK R3 K5 ['done']
+SETTABLEKS R3 R2 K6 ['label']
+GETTABLEKS R3 R2 K0 ['count']
+GETTABLEKS R4 R2 K1 ['total']
+GETTABLEKS R6 R2 K6 ['label']
+LENGTH R5 R6
+GETTABLEKS R7 R2 K7 ['missing']
+LOADNIL R8
+JUMPIFEQ R7 R8 L2
+LOADB R6 0 +1
+L2: LOADB R6 1
+L3: RETURN R3 4
+`;
+
+test('AND and OR lower to logical conditional moves', () => {
+  assertFields(parseDisassembly(p18Logic, { parameter_count: 2 }).instructions, {
+    0: { op: 'AND', kind: 'logical', operator: 'and', reads: [0, 1], writes: [2] },
+    1: { op: 'OR', kind: 'logical', operator: 'or', reads: [0, 1], writes: [3] },
+  });
+  assertFields(parseDisassembly(excerpt('AND R2 R2 R3', 'RETURN R2 1'), { parameter_count: 4 }).instructions, {
+    0: { reads: [2, 3], writes: [2] },
+  });
+});
+
+test('constant-operand AND/OR stay refused at the pinned level', () => {
+  // ANDK and ORK need a constant right operand, which only -O1 constant folding supplies; like GETIMPORT
+  // (`imports stay refused at the pinned level`), they are not in the opcode table.
+  assert.throws(() => parseDisassembly(excerpt('K0: 7', 'ANDK R4 R0 K0 [7]', 'RETURN R4 1'), { parameter_count: 2 }),
+    (error) => error.name === 'DisassemblyRefusal' && error.code === 'unsupported_opcode' && error.opcode === 'ANDK'
+      && /unsupported opcode ANDK at disassembly line 3/.test(error.message));
+  assert.throws(() => parseDisassembly(excerpt('K1: false', 'ORK R5 R1 K1 [false]', 'RETURN R5 1'), { parameter_count: 2 }),
+    (error) => error.name === 'DisassemblyRefusal' && error.code === 'unsupported_opcode' && error.opcode === 'ORK'
+      && /unsupported opcode ORK at disassembly line 3/.test(error.message));
+});
+
+test('a -O0 record template stays refused with its remark and its stores', () => {
+  // By design, DUPTABLE stays refused even where the -O0 listing shows its remark and its key stores; the reason is
+  // recorded at the adapter's refusal.
+  assert.throws(() => parseDisassembly(tableRecordFields),
+    (error) => refusedAs('table_template_opaque')(error) && error.opcode === 'DUPTABLE' && error.line_number === 11);
 });
