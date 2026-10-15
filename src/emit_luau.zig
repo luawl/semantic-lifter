@@ -3922,17 +3922,30 @@ fn emitInstruction(
             indent,
             values,
         ),
-        .numeric_for_next => |operation| return emitSemanticNormalizedTransition(
-            output,
-            allocator,
-            program,
-            emission_plan,
-            instruction,
-            operation,
-            indent,
-            declare_results,
-            values,
-        ),
+        .numeric_for_next => |operation| switch (operation.mode) {
+            .semantic_normalized => return emitSemanticNormalizedTransition(
+                output,
+                allocator,
+                program,
+                emission_plan,
+                instruction,
+                operation,
+                indent,
+                declare_results,
+                values,
+            ),
+            .luau_numeric => return emitLuauNumericTransition(
+                output,
+                allocator,
+                program,
+                emission_plan,
+                instruction,
+                operation,
+                indent,
+                declare_results,
+                values,
+            ),
+        },
         .call_repeated_table_get => |operation| return emitCallRepeatedTableGetInstruction(
             output,
             allocator,
@@ -4146,6 +4159,120 @@ fn emitSemanticNormalizedTransition(
     try render.valueName(output, allocator, &emission_plan.names, next_control);
     try output.appendSlice(allocator, " <= ");
     try render.valueName(output, allocator, &emission_plan.names, normalized_limit);
+    try output.append(allocator, '\n');
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "end\n");
+}
+
+fn emitLuauNumericTransition(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    instruction: ir.Instruction,
+    operation: ir.NumericForNext,
+    indent: []const u8,
+    declare_results: bool,
+    values: render.ValuePlan,
+) !void {
+    if (instruction.results.len != 4) return error.UnsupportedOperation;
+    const has_value = instruction.results[0];
+    const next_limit = instruction.results[1];
+    const next_step = instruction.results[2];
+    const next_control = instruction.results[3];
+
+    const any_storage = for (instruction.results) |res| {
+        if (emission_plan.names.valueUsesStorage(res)) break true;
+    } else false;
+    if (declare_results and !any_storage) {
+        try output.appendSlice(allocator, indent);
+        try output.appendSlice(allocator, "local ");
+        for (instruction.results, 0..) |result, index| {
+            if (index != 0) try output.appendSlice(allocator, ", ");
+            try render.valueName(output, allocator, &emission_plan.names, result);
+        }
+        try output.append(allocator, '\n');
+    }
+
+    const guard_name = try emission_plan.names.internalNameAlloc(allocator, program, "__lifter_numeric_guard");
+    defer allocator.free(guard_name);
+    const arm_indent = try allocDeeperIndent(allocator, indent);
+    defer allocator.free(arm_indent);
+
+    // The initial entry runs a one-shot native `for`, so the VM performs FORNPREP's coercion of the initial value,
+    // the limit and the step, in that order and with its own error messages; `* 1` then takes the coerced numbers
+    // and keeps -0, NaN and inf. A later entry advances by the coerced step. The test reads the step's sign without
+    // advancing first.
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "if ");
+    try render.valueUseScalar(output, allocator, program, values, operation.initial);
+    try output.appendSlice(allocator, " then\n");
+    try output.appendSlice(allocator, arm_indent);
+    try output.appendSlice(allocator, "for ");
+    try output.appendSlice(allocator, guard_name);
+    try output.appendSlice(allocator, " = ");
+    try render.valueUseScalar(output, allocator, program, values, operation.control);
+    try output.appendSlice(allocator, ", ");
+    try render.valueUseScalar(output, allocator, program, values, operation.limit);
+    try output.appendSlice(allocator, ", ");
+    try render.valueUseScalar(output, allocator, program, values, operation.step);
+    try output.appendSlice(allocator, " do break end\n");
+    try output.appendSlice(allocator, arm_indent);
+    try render.valueName(output, allocator, &emission_plan.names, next_limit);
+    try output.appendSlice(allocator, " = ");
+    try render.valueUseScalar(output, allocator, program, values, operation.limit);
+    try output.appendSlice(allocator, " * 1\n");
+    try output.appendSlice(allocator, arm_indent);
+    try render.valueName(output, allocator, &emission_plan.names, next_step);
+    try output.appendSlice(allocator, " = ");
+    try render.valueUseScalar(output, allocator, program, values, operation.step);
+    try output.appendSlice(allocator, " * 1\n");
+    try output.appendSlice(allocator, arm_indent);
+    try render.valueName(output, allocator, &emission_plan.names, next_control);
+    try output.appendSlice(allocator, " = ");
+    try render.valueUseScalar(output, allocator, program, values, operation.control);
+    try output.appendSlice(allocator, " * 1\n");
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "else\n");
+    try output.appendSlice(allocator, arm_indent);
+    try render.valueName(output, allocator, &emission_plan.names, next_limit);
+    try output.appendSlice(allocator, " = ");
+    try render.valueUseScalar(output, allocator, program, values, operation.limit);
+    try output.append(allocator, '\n');
+    try output.appendSlice(allocator, arm_indent);
+    try render.valueName(output, allocator, &emission_plan.names, next_step);
+    try output.appendSlice(allocator, " = ");
+    try render.valueUseScalar(output, allocator, program, values, operation.step);
+    try output.append(allocator, '\n');
+    try output.appendSlice(allocator, arm_indent);
+    try render.valueName(output, allocator, &emission_plan.names, next_control);
+    try output.appendSlice(allocator, " = ");
+    try render.valueUseScalar(output, allocator, program, values, operation.control);
+    try output.appendSlice(allocator, " + ");
+    try render.valueName(output, allocator, &emission_plan.names, next_step);
+    try output.append(allocator, '\n');
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "end\n");
+
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "if ");
+    try render.valueName(output, allocator, &emission_plan.names, next_step);
+    try output.appendSlice(allocator, " > 0 then\n");
+    try output.appendSlice(allocator, arm_indent);
+    try render.valueName(output, allocator, &emission_plan.names, has_value);
+    try output.appendSlice(allocator, " = ");
+    try render.valueName(output, allocator, &emission_plan.names, next_control);
+    try output.appendSlice(allocator, " <= ");
+    try render.valueName(output, allocator, &emission_plan.names, next_limit);
+    try output.append(allocator, '\n');
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "else\n");
+    try output.appendSlice(allocator, arm_indent);
+    try render.valueName(output, allocator, &emission_plan.names, has_value);
+    try output.appendSlice(allocator, " = ");
+    try render.valueName(output, allocator, &emission_plan.names, next_limit);
+    try output.appendSlice(allocator, " <= ");
+    try render.valueName(output, allocator, &emission_plan.names, next_control);
     try output.append(allocator, '\n');
     try output.appendSlice(allocator, indent);
     try output.appendSlice(allocator, "end\n");
