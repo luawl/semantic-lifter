@@ -2437,3 +2437,79 @@ test "a branch arm that carries its own condition resolves while the planner lis
         try fixture.expectResolvedThroughBothArms(&resolved);
     }
 }
+
+// T5-DEFERRED-ARM-FACTS (schedule 2 of T4-ARM-FACTS-ORDER): a block-scoped fact on the entry that mentions the
+// entry's condition without deciding it (`condition or not condition`) makes the planner defer the entry's
+// branch-arm truth facts to a later derivation pass. While they wait, no fact may be derived on the entry's
+// arm edges (v7: the arm facts decide the arm-edge argument facts) and no claim may be planned over those arm
+// edges from facts already on them (v11, v13: frontend edge facts would prove the join and rewrite the arms
+// before the arm facts exist). Without the base fact nothing is deferred (v12, a control).
+const deferred_arm_fixture = struct {
+    const base = own_condition_arm_fixture;
+    const deferring_terms = [_]ir.SolverTerm{
+        .{ .id = ir.SolverTermId.fromIndex(0), .sort = .{ .kind = .boolean }, .operation = .{ .value = base.condition } },
+        .{ .id = ir.SolverTermId.fromIndex(1), .sort = .{ .kind = .boolean }, .operation = .{ .logical_not = ir.SolverTermId.fromIndex(0) } },
+        .{ .id = ir.SolverTermId.fromIndex(2), .sort = .{ .kind = .boolean }, .operation = .{ .binary = .{
+            .operator = .logical_or,
+            .left = ir.SolverTermId.fromIndex(0),
+            .right = ir.SolverTermId.fromIndex(1),
+        } } },
+    };
+    const deferring_fact: ir.Constraint = .{
+        .id = ir.ConstraintId.fromIndex(0),
+        .predicate = ir.SolverTermId.fromIndex(2),
+        .evidence = &.{base.proof},
+        .scope = .{ .block = base.entry_id },
+    };
+    const deferring_constraints = [_]ir.Constraint{deferring_fact};
+    // Frontend facts on the entry's arm roots, both true on their arm: the entry passes its condition to the
+    // join parameter on both arms, so `joined` holds on the then-arm and `not joined` on the else-arm.
+    const input_fact_terms = deferring_terms ++ [_]ir.SolverTerm{
+        .{ .id = ir.SolverTermId.fromIndex(3), .sort = .{ .kind = .boolean }, .operation = .{ .value = base.joined } },
+        .{ .id = ir.SolverTermId.fromIndex(4), .sort = .{ .kind = .boolean }, .operation = .{ .logical_not = ir.SolverTermId.fromIndex(3) } },
+    };
+    const then_root: ir.CfgEdgeRef = .{ .source = base.entry_id, .kind = .branch_then, .target = base.join_id };
+    const else_root: ir.CfgEdgeRef = .{ .source = base.entry_id, .kind = .branch_else, .target = base.join_id };
+    const both_input_facts = [_]ir.Constraint{
+        deferring_fact,
+        .{ .id = ir.ConstraintId.fromIndex(1), .predicate = ir.SolverTermId.fromIndex(3), .evidence = &.{base.proof}, .scope = .{ .edge = then_root } },
+        .{ .id = ir.ConstraintId.fromIndex(2), .predicate = ir.SolverTermId.fromIndex(4), .evidence = &.{base.proof}, .scope = .{ .edge = else_root } },
+    };
+    const then_input_fact = [_]ir.Constraint{
+        deferring_fact,
+        .{ .id = ir.ConstraintId.fromIndex(1), .predicate = ir.SolverTermId.fromIndex(3), .evidence = &.{base.proof}, .scope = .{ .edge = then_root } },
+    };
+    const input_facts_without_base = [_]ir.Constraint{
+        .{ .id = ir.ConstraintId.fromIndex(0), .predicate = ir.SolverTermId.fromIndex(3), .evidence = &.{base.proof}, .scope = .{ .edge = then_root } },
+        .{ .id = ir.ConstraintId.fromIndex(1), .predicate = ir.SolverTermId.fromIndex(4), .evidence = &.{base.proof}, .scope = .{ .edge = else_root } },
+    };
+
+    fn expectResolved(terms: []const ir.SolverTerm, constraints: []const ir.Constraint) !void {
+        var program = base.program;
+        program.solver_terms = terms;
+        program.constraints = constraints;
+        var resolved = try resolveAlloc(std.testing.allocator, &program, solver_backend.internalFacts());
+        defer resolved.deinit();
+        try base.expectResolvedThroughBothArms(&resolved);
+    }
+};
+
+test "deferred branch-arm facts leave the arm argument facts replayable" {
+    const fixture = deferred_arm_fixture;
+    try fixture.expectResolved(&fixture.deferring_terms, &fixture.deferring_constraints);
+}
+
+test "frontend facts on both arms of a deferred block prove nothing before its arm facts" {
+    const fixture = deferred_arm_fixture;
+    try fixture.expectResolved(&fixture.input_fact_terms, &fixture.both_input_facts);
+}
+
+test "a frontend fact on one arm of a deferred block proves nothing before its arm facts" {
+    const fixture = deferred_arm_fixture;
+    try fixture.expectResolved(&fixture.input_fact_terms, &fixture.then_input_fact);
+}
+
+test "frontend facts on both arms of a block that is not deferred prove the join per arm" {
+    const fixture = deferred_arm_fixture;
+    try fixture.expectResolved(&fixture.input_fact_terms, &fixture.input_facts_without_base);
+}
