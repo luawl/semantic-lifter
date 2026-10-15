@@ -181,22 +181,27 @@ pub fn deriveBlockWithHistory(
 ) !void {
     if (!scope.block(block.id)) return;
     switch (block.terminator) {
-        .jump => |edge| try deriveEdge(allocator, program, terms, constraints, evidence, history_cache, structural_cache, .{
+        .jump => |edge| try deriveEdge(allocator, program, terms, constraints, evidence, history_cache, structural_cache, null, .{
             .source = block.id,
             .kind = .jump,
             .target = edge.target,
         }, edge),
         .branch => |branch| {
+            // The arm edges' argument facts are replayed (validate_proofs.zig:60) against every
+            // constraint of the published program, including the arm truth facts appended here, so
+            // they are derived over the lists as they stand once those facts are in.
+            var arm_view: ?ArmView = null;
             if (derive_branch_arms and solver.evaluateValue(program, branch.condition) != .boolean) {
                 try deriveBranchFact(allocator, program, terms, constraints, evidence, history_cache, block, branch, .branch_then);
                 try deriveBranchFact(allocator, program, terms, constraints, evidence, history_cache, block, branch, .branch_else);
+                arm_view = .{ .terms = terms.items.len, .constraints = constraints.items.len, .evidence = evidence.items.len };
             }
-            try deriveEdge(allocator, program, terms, constraints, evidence, history_cache, structural_cache, .{
+            try deriveEdge(allocator, program, terms, constraints, evidence, history_cache, structural_cache, arm_view, .{
                 .source = block.id,
                 .kind = .branch_then,
                 .target = branch.then_edge.target,
             }, branch.then_edge);
-            try deriveEdge(allocator, program, terms, constraints, evidence, history_cache, structural_cache, .{
+            try deriveEdge(allocator, program, terms, constraints, evidence, history_cache, structural_cache, arm_view, .{
                 .source = block.id,
                 .kind = .branch_else,
                 .target = branch.else_edge.target,
@@ -204,6 +209,30 @@ pub fn deriveBlockWithHistory(
         },
         else => {},
     }
+}
+
+/// The part of the derivation lists an arm edge's argument facts read: the lists as they stood once
+/// the block's arm truth facts were appended. The lists keep growing while the argument facts are
+/// appended, and a list that grows can move its buffer, so a slice kept from an earlier point may
+/// point at freed memory; `armViewAt` re-slices the lists at each read instead.
+const ArmView = struct {
+    terms: usize,
+    constraints: usize,
+    evidence: usize,
+};
+
+fn armViewAt(
+    program: *const ir.Program,
+    terms: *const std.ArrayList(ir.SolverTerm),
+    constraints: *const std.ArrayList(ir.Constraint),
+    evidence: *const std.ArrayList(ir.Evidence),
+    lengths: ArmView,
+) ir.Program {
+    var view = program.*;
+    view.solver_terms = terms.items[0..lengths.terms];
+    view.constraints = constraints.items[0..lengths.constraints];
+    view.evidence = evidence.items[0..lengths.evidence];
+    return view;
 }
 
 fn deriveEdge(
@@ -214,6 +243,7 @@ fn deriveEdge(
     evidence: *std.ArrayList(ir.Evidence),
     history_cache: ?*const edge_path.HistoryCache,
     structural_cache: ?*const StructuralCache,
+    arm_view: ?ArmView,
     reference: ir.CfgEdgeRef,
     edge: ir.Edge,
 ) !void {
@@ -229,7 +259,10 @@ fn deriveEdge(
     for (target.parameters, edge.arguments) |parameter_id, argument_id| {
         if (parameter_id.index() >= program.values.len or argument_id.index() >= program.values.len) continue;
         const sort = commonSort(program.values[parameter_id.index()].type, program.values[argument_id.index()].type) orelse continue;
-        const predicate = try edgePredicate(allocator, program, terms, parameter_id, argument_id, sort, history.root, history.rewrites, structural_cache);
+        // An arm edge's view is taken here, at the read: the facts of the other arm edge and of
+        // this edge's earlier parameters may have moved the lists since the arm facts were appended.
+        const view = if (arm_view) |lengths| armViewAt(program, terms, constraints, evidence, lengths) else program.*;
+        const predicate = try edgePredicate(allocator, &view, terms, parameter_id, argument_id, sort, history.root, history.rewrites, structural_cache);
         if (hasConstraint(constraints.items, predicate, history.root, history.rewrites)) continue;
         const evidence_id = try ensureEvidence(allocator, evidence, argument_evidence_locator);
         try constraints.append(allocator, .{
@@ -355,14 +388,17 @@ fn edgePredicate(
     path: []const ir.EdgeRewriteId,
     structural_cache: ?*const StructuralCache,
 ) !ir.SolverTermId {
-    const parameter = try ensureValueTerm(allocator, terms, parameter_id, sort);
-    if (sort.kind == .boolean) {
-        const truth = knownBooleanOnPath(program, parameter_id, argument_id, root, path, structural_cache) orelse switch (solver.evaluateValue(program, argument_id)) {
+    // Read the truth before any append: `program` may be a view of `terms`, whose buffer can move
+    // when it grows. The terms are still created in the same order, so every id is unchanged.
+    const truth: ?bool = if (sort.kind == .boolean)
+        knownBooleanOnPath(program, parameter_id, argument_id, root, path, structural_cache) orelse switch (solver.evaluateValue(program, argument_id)) {
             .boolean => |value| value,
             else => null,
-        };
-        if (truth) |value| return if (value) parameter else try ensureNotTerm(allocator, terms, parameter);
-    }
+        }
+    else
+        null;
+    const parameter = try ensureValueTerm(allocator, terms, parameter_id, sort);
+    if (truth) |value| return if (value) parameter else try ensureNotTerm(allocator, terms, parameter);
     const argument = try ensureValueTerm(allocator, terms, argument_id, sort);
     return ensureEqualityTerm(allocator, terms, parameter, argument);
 }

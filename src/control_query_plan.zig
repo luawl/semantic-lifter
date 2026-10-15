@@ -1901,6 +1901,81 @@ test "edge facts create path-specific dispatcher queries without predecessor lea
     for (expanded.claims) |claim| try std.testing.expectEqual(dispatch_id, claim.subject.block);
 }
 
+test "edge facts on a branch arm that carries its own condition replay against the arm truth" {
+    // T4-ARM-FACTS-ORDER: the dispatcher test above with its forwarders removed. Each arm of the
+    // entry branch passes the branch condition straight to the dispatch parameter, so the arm's own
+    // truth fact decides the argument. Every structural fact must replay as the validator replays it
+    // (validate_proofs.zig -> edge_facts.replaysConstraint): on the then-arm `dispatch_condition`, on
+    // the else-arm `not dispatch_condition`, not an equality with `entry_condition`.
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry_id = ir.BlockId.fromIndex(0);
+    const dispatch_id = ir.BlockId.fromIndex(1);
+    const true_id = ir.BlockId.fromIndex(2);
+    const false_id = ir.BlockId.fromIndex(3);
+    const entry_condition = ir.ValueId.fromIndex(0);
+    const dispatch_condition = ir.ValueId.fromIndex(1);
+    const blocks = [_]ir.Block{
+        .{ .id = entry_id, .function = function_id, .terminator = .{ .branch = .{
+            .condition = entry_condition,
+            .then_edge = .{ .target = dispatch_id, .arguments = &.{entry_condition} },
+            .else_edge = .{ .target = dispatch_id, .arguments = &.{entry_condition} },
+        } } },
+        .{ .id = dispatch_id, .function = function_id, .parameters = &.{dispatch_condition}, .terminator = .{ .branch = .{
+            .condition = dispatch_condition,
+            .then_edge = .{ .target = true_id },
+            .else_edge = .{ .target = false_id },
+        } } },
+        .{ .id = true_id, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = false_id, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const values = [_]ir.Value{
+        .{ .id = entry_condition, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = dispatch_condition, .function = function_id, .type = .boolean, .origin = .{ .block_parameter = .{ .block = dispatch_id, .index = 0 } } },
+    };
+    const program: ir.Program = .{
+        .program_id = "branch-arm-carries-own-condition",
+        .entry_function = function_id,
+        .functions = &.{.{
+            .id = function_id,
+            .parameters = &.{entry_condition},
+            .entry_block = entry_id,
+            .blocks = &.{ entry_id, dispatch_id, true_id, false_id },
+        }},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+    };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const expanded = try expandInArena(arena.allocator(), &program);
+    var arm_arguments: usize = 0;
+    for (expanded.constraints) |constraint| {
+        if (constraint.evidence.len != 1 or !edge_facts.isStructuralEvidence(expanded.evidence[constraint.evidence[0].index()])) continue;
+        try std.testing.expect(edge_facts.replaysConstraint(&expanded, constraint));
+        const scoped = switch (constraint.scope) {
+            .edge => |edge| edge,
+            else => continue,
+        };
+        if (scoped.source != entry_id) continue;
+        switch (expanded.solver_terms[constraint.predicate.index()].operation) {
+            .value => |value| if (value == dispatch_condition) {
+                try std.testing.expectEqual(ir.CfgEdgeKind.branch_then, scoped.kind);
+                arm_arguments += 1;
+            },
+            .logical_not => |operand| switch (expanded.solver_terms[operand.index()].operation) {
+                .value => |value| if (value == dispatch_condition) {
+                    try std.testing.expectEqual(ir.CfgEdgeKind.branch_else, scoped.kind);
+                    arm_arguments += 1;
+                },
+                else => {},
+            },
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), arm_arguments);
+}
+
 test "edge facts over numeric state plan queries for a derived dispatcher condition" {
     const fixture = @import("fixtures.zig").relational_dispatch_module;
 

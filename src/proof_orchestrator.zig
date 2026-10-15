@@ -2325,3 +2325,115 @@ test "exact branch specializes before an empty parameterized iteration forwardin
     defer regions.deinit();
     try std.testing.expectEqual(@as(usize, 0), regions.regions.len);
 }
+
+// T4-ARM-FACTS-ORDER: the edge-scoped-control shape with its forwarders removed. Each arm of the
+// entry branch passes the branch condition straight to the join parameter, and the join branches on
+// that parameter, so each arm is provable on its own path.
+const own_condition_arm_fixture = struct {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry_id = ir.BlockId.fromIndex(0);
+    const join_id = ir.BlockId.fromIndex(1);
+    const true_id = ir.BlockId.fromIndex(2);
+    const false_id = ir.BlockId.fromIndex(3);
+    const condition = ir.ValueId.fromIndex(0);
+    const joined = ir.ValueId.fromIndex(1);
+    const proof = ir.EvidenceId.fromIndex(0);
+    const evidence = [_]ir.Evidence{.{ .id = proof, .kind = .dynamic_fixture, .locator = "fixture:branch-arm-own-condition" }};
+    const values = [_]ir.Value{
+        .{ .id = condition, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = joined, .function = function_id, .type = .boolean, .origin = .{ .block_parameter = .{ .block = join_id, .index = 0 } } },
+    };
+    const blocks = [_]ir.Block{
+        .{ .id = entry_id, .function = function_id, .terminator = .{ .branch = .{
+            .condition = condition,
+            .then_edge = .{ .target = join_id, .arguments = &.{condition} },
+            .else_edge = .{ .target = join_id, .arguments = &.{condition} },
+        } }, .evidence = &.{proof} },
+        .{ .id = join_id, .function = function_id, .parameters = &.{joined}, .terminator = .{ .branch = .{
+            .condition = joined,
+            .then_edge = .{ .target = true_id },
+            .else_edge = .{ .target = false_id },
+        } }, .evidence = &.{proof} },
+        .{ .id = true_id, .function = function_id, .terminator = .{ .return_values = &.{} }, .evidence = &.{proof} },
+        .{ .id = false_id, .function = function_id, .terminator = .{ .return_values = &.{} }, .evidence = &.{proof} },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .parameters = &.{condition},
+        .blocks = &.{ entry_id, join_id, true_id, false_id },
+        .entry_block = entry_id,
+        .evidence = &.{proof},
+    }};
+    // Seeded solver state that decides nothing but moves the points where the planner's lists grow
+    // (T4-ARM-FACTS-ORDER skeptic, section 5). One seeded term (shape t1): the term list moves when the
+    // join parameter's value term is appended, right after the entry's arm truth facts. Two seeded
+    // terms and one program-scoped fact (shape d1): the constraint list moves when the then-arm's
+    // argument fact is appended, before the else-arm's argument fact is derived.
+    const one_seeded_term = [_]ir.SolverTerm{
+        .{ .id = ir.SolverTermId.fromIndex(0), .sort = .{ .kind = .boolean }, .operation = .{ .boolean_literal = true } },
+    };
+    const two_seeded_terms = [_]ir.SolverTerm{
+        .{ .id = ir.SolverTermId.fromIndex(0), .sort = .{ .kind = .boolean }, .operation = .{ .boolean_literal = true } },
+        .{ .id = ir.SolverTermId.fromIndex(1), .sort = .{ .kind = .boolean }, .operation = .{ .logical_not = ir.SolverTermId.fromIndex(0) } },
+    };
+    const one_program_fact = [_]ir.Constraint{.{
+        .id = ir.ConstraintId.fromIndex(0),
+        .predicate = ir.SolverTermId.fromIndex(0),
+        .evidence = &.{proof},
+        .scope = .{ .program = {} },
+    }};
+    const program: ir.Program = .{
+        .program_id = "branch-arm-own-condition",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+        .evidence = &evidence,
+    };
+
+    fn expectResolvedThroughBothArms(resolved: *const ResolvedProgram) !void {
+        var report = try @import("validate.zig").validate(std.testing.allocator, &resolved.program, .core);
+        defer report.deinit();
+        try std.testing.expect(!report.contains(.invalid_structural_derivation));
+        try std.testing.expect(report.isClean());
+        try std.testing.expect(!resolved.solve_report.contains(.invalid_structural_derivation));
+        var proved_branches: usize = 0;
+        for (resolved.program.edge_rewrites) |rewrite| {
+            if (rewrite.rule != .proved_branch) continue;
+            try std.testing.expectEqual(entry_id, rewrite.source);
+            proved_branches += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 2), proved_branches);
+        const entry_branch = resolved.program.blocks[entry_id.index()].terminator.branch;
+        try std.testing.expectEqual(true_id, entry_branch.then_edge.target);
+        try std.testing.expectEqual(false_id, entry_branch.else_edge.target);
+    }
+};
+
+test "a branch arm that carries its own condition into a join resolves without a forwarder" {
+    const fixture = own_condition_arm_fixture;
+    var resolved = try resolveAlloc(std.testing.allocator, &fixture.program, solver_backend.internalFacts());
+    defer resolved.deinit();
+    try fixture.expectResolvedThroughBothArms(&resolved);
+}
+
+test "a branch arm that carries its own condition resolves while the planner lists move" {
+    // T4-ARM-FACTS-ORDER skeptic, section 5: a derivation view that keeps slices of the planner's lists
+    // reads freed memory once they move. Debug and ReleaseSafe fill freed memory with undefined bytes
+    // and ReleaseFast does not, so this test can catch such a view only in the first two modes.
+    const fixture = own_condition_arm_fixture;
+    const Shape = struct { terms: []const ir.SolverTerm, constraints: []const ir.Constraint };
+    const shapes = [_]Shape{
+        .{ .terms = &fixture.one_seeded_term, .constraints = &.{} },
+        .{ .terms = &fixture.two_seeded_terms, .constraints = &fixture.one_program_fact },
+    };
+    for (shapes) |shape| {
+        var program = fixture.program;
+        program.solver_terms = shape.terms;
+        program.constraints = shape.constraints;
+        var resolved = try resolveAlloc(std.testing.allocator, &program, solver_backend.internalFacts());
+        defer resolved.deinit();
+        try fixture.expectResolvedThroughBothArms(&resolved);
+    }
+}
