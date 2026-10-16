@@ -252,6 +252,17 @@ function SourceRuntimeOracle.run(caseName: string, source: string, exported: any
 		assert(first() == 1 and first() == 2, "source frontend lost the first iteration cell")
 		assert(second() == 1, "source frontend aliased the second iteration cell")
 		assert(first() == 3, "source frontend shared independent iteration cells")
+	elseif caseName == "source-frontend-per-iteration-capture-branch" then
+		local getters, setters = exported(3)
+		assert(type(getters[1]) == "function" and type(setters[3]) == "function", "source frontend lost loop-created closures written across blocks")
+		assert(getters[1]() == 20, "source frontend lost the first iteration cell written across blocks")
+		assert(getters[2]() == 42, "source frontend lost the arm write of the second iteration cell")
+		assert(getters[3]() == 60, "source frontend lost the third iteration cell")
+		setters[1](5)
+		assert(getters[1]() == 25, "source frontend split the cell of one iteration between its closures")
+		assert(getters[2]() == 42 and getters[3]() == 60, "source frontend shared cells written across blocks between iterations")
+		local emptyGetters = exported(0)
+		assert(next(emptyGetters) == nil, "source frontend created a closure for an empty loop")
 	elseif caseName == "source-frontend-always-return-iteration" then
 		local forLines = 0
 		for line in string.gmatch(source, "[^\n]+") do

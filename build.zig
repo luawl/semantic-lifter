@@ -755,6 +755,34 @@ pub fn build(b: *std.Build) void {
         "source-frontend-repeat-loop",
         source_frontend_repeat_conformance.resolved_ir,
     );
+    const source_frontend_cell_branch_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/per_iteration_capture_branch_source.luau",
+        "source-frontend-per-iteration-capture-branch",
+    );
+    const per_execution_cell_dispatcher_refusal = addEmitRefusalConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        source_frontend_cell_branch_conformance.resolved_ir,
+        "source-frontend-per-iteration-capture-branch.dispatcher.luau",
+        "dispatcher",
+        "stage=per_execution_cell error=UnsupportedOperation",
+    );
+    const per_execution_cell_inherited_flat_refusal = addEmitRefusalConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        b.path("luau/fixtures/per_execution_cell_inherited_flat.lifter-ir.json"),
+        "per-execution-cell-inherited-flat.automatic.luau",
+        "automatic",
+        "stage=per_execution_cell error=UnsupportedOperation",
+    );
     const source_frontend_typed_block_conformance = addLuauSourceConformance(
         b,
         exe,
@@ -1140,6 +1168,9 @@ pub fn build(b: *std.Build) void {
     source_frontend_if_expression_conformance.addTo(conformance_step);
     source_frontend_iteration_capture_conformance.addTo(conformance_step);
     conformance_step.dependOn(per_iteration_capture_dispatcher);
+    source_frontend_cell_branch_conformance.addTo(conformance_step);
+    conformance_step.dependOn(per_execution_cell_dispatcher_refusal);
+    conformance_step.dependOn(per_execution_cell_inherited_flat_refusal);
     source_frontend_typed_block_conformance.addTo(conformance_step);
     source_frontend_numeric_for_conformance.addTo(conformance_step);
     source_frontend_generic_for_conformance.addTo(conformance_step);
@@ -1980,6 +2011,31 @@ fn addDispatcherRuntimeConformance(
     runtime_dispatcher.expectExitCode(0);
     runtime_dispatcher.step.dependOn(&compile_dispatcher.step);
     return &runtime_dispatcher.step;
+}
+
+// An emission that must be refused with a typed line, in the dispatcher-budget refusal form
+// (`addDispatcherLocalBudgetConformance`): the emitter writes no output, so the output argument is
+// an empty seed file, and the step expects exit 1 and the typed line on stderr.
+fn addEmitRefusalConformance(
+    b: *std.Build,
+    exe: *std.Build.Step.Compile,
+    z3_enabled: bool,
+    z3_bin: []const u8,
+    ir: std.Build.LazyPath,
+    seed_name: []const u8,
+    strategy: []const u8,
+    stderr_match: []const u8,
+) *std.Build.Step {
+    const emit = b.addRunArtifact(exe);
+    if (z3_enabled) emit.addPathDir(b.pathFromRoot(z3_bin));
+    emit.addArg("emit-readable-luau-strategy");
+    emit.addFileArg(ir);
+    const seed_files = b.addWriteFiles();
+    emit.addFileArg(seed_files.add(seed_name, ""));
+    emit.addArgs(&.{ "standard-luau", strategy });
+    emit.expectExitCode(1);
+    emit.expectStdErrMatch(stderr_match);
+    return &emit.step;
 }
 
 fn addLuauSourceRecoveryObligationConformance(
