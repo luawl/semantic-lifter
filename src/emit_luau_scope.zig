@@ -53,6 +53,7 @@ pub const Plan = struct {
     pack_scopes: []ScopeId,
     place_scopes: []ScopeId,
     arbitrary_leaf_places: []bool,
+    arbitrary_per_execution_cell_places: []bool,
     place_initializers: []?ir.InstructionId,
     moved_literal_initializers: []?MovedLiteralInitializer,
     synthetic_value_declarations: []bool,
@@ -114,6 +115,9 @@ pub const Plan = struct {
         const arbitrary_leaf_places = try allocator.alloc(bool, program.places.len);
         errdefer allocator.free(arbitrary_leaf_places);
         @memset(arbitrary_leaf_places, false);
+        const arbitrary_per_execution_cell_places = try allocator.alloc(bool, program.places.len);
+        errdefer allocator.free(arbitrary_per_execution_cell_places);
+        @memset(arbitrary_per_execution_cell_places, false);
         const place_initializers = try allocator.alloc(?ir.InstructionId, program.places.len);
         errdefer allocator.free(place_initializers);
         @memset(place_initializers, null);
@@ -156,6 +160,7 @@ pub const Plan = struct {
             .pack_scopes = pack_scopes,
             .place_scopes = place_scopes,
             .arbitrary_leaf_places = arbitrary_leaf_places,
+            .arbitrary_per_execution_cell_places = arbitrary_per_execution_cell_places,
             .place_initializers = place_initializers,
             .moved_literal_initializers = moved_literal_initializers,
             .synthetic_value_declarations = synthetic_value_declarations,
@@ -184,7 +189,7 @@ pub const Plan = struct {
         try plan.collectNativeIterationInitializerUses(structured.root);
         plan.hoistFunctionPlacesOutOfLoops();
         plan.findLocalPlaceInitializers();
-        if (structured.root.arbitrary_cfg) plan.findArbitraryLeafPlaces();
+        if (structured.root.arbitrary_cfg) try plan.findArbitraryLeafPlaces();
 
         plan.declaration_counts = try allocator.alloc(usize, plan.parents.len);
         errdefer allocator.free(plan.declaration_counts);
@@ -213,6 +218,7 @@ pub const Plan = struct {
         self.allocator.free(self.moved_literal_initializers);
         self.allocator.free(self.place_initializers);
         self.allocator.free(self.arbitrary_leaf_places);
+        self.allocator.free(self.arbitrary_per_execution_cell_places);
         self.allocator.free(self.place_scopes);
         self.allocator.free(self.pack_scopes);
         self.allocator.free(self.value_scopes);
@@ -408,6 +414,14 @@ pub const Plan = struct {
     /// instead of in the function's root list (`findArbitraryLeafPlaces`).
     pub fn arbitraryLeafDeclaresPlace(self: *const Plan, place_id: ir.PlaceId) bool {
         return place_id.index() < self.arbitrary_leaf_places.len and self.arbitrary_leaf_places[place_id.index()];
+    }
+
+    /// Arbitrary-CFG (dispatcher) layout: whether `place_id` needs a
+    /// per-execution cell the flat layout cannot declare (a nested function
+    /// reads it, it is used in several blocks, and its allocating block lies on
+    /// a CFG cycle; `findArbitraryLeafPlaces`). Such a place is refused.
+    pub fn arbitraryPlaceNeedsPerExecutionCell(self: *const Plan, place_id: ir.PlaceId) bool {
+        return place_id.index() < self.arbitrary_per_execution_cell_places.len and self.arbitrary_per_execution_cell_places[place_id.index()];
     }
 
     pub fn placeMovedLiteralInitializer(self: *const Plan, place_id: ir.PlaceId) ?ir.Literal {
@@ -804,7 +818,14 @@ pub const Plan = struct {
     /// every execution of `A` creates a fresh cell (Luau `local` semantics):
     /// closures created in a loop keep one cell per iteration. Every other
     /// place keeps its root declaration.
-    fn findArbitraryLeafPlaces(self: *Plan) void {
+    ///
+    /// Also marks (`arbitrary_per_execution_cell_places`) each place that a
+    /// nested function reads, that is used in several blocks, and whose
+    /// allocating block lies on a CFG cycle: it has no declaration site that is
+    /// both executed once per execution of the allocation and visible from
+    /// every use, so the flat emitter refuses it. On no cycle the root
+    /// declaration is one cell per activation, which is one per execution.
+    fn findArbitraryLeafPlaces(self: *Plan) std.mem.Allocator.Error!void {
         for (self.function.local_places) |place_id| {
             if (place_id.index() >= self.program.places.len or place_id.index() >= self.arbitrary_leaf_places.len) continue;
             const allocation = switch (self.program.places[place_id.index()].origin) {
@@ -828,6 +849,8 @@ pub const Plan = struct {
                 }
             }
             self.arbitrary_leaf_places[place_id.index()] = captured and single_block;
+            self.arbitrary_per_execution_cell_places[place_id.index()] = captured and !single_block and
+                try self.analysis.canReachNonEmptyPath(allocation_block, allocation_block);
         }
     }
 

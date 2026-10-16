@@ -624,6 +624,13 @@ fn emitArbitraryCfgDeclarations(
             .local, .instruction => {},
             .capture => continue,
         }
+        if (scopes.arbitraryPlaceNeedsPerExecutionCell(place_id)) {
+            std.debug.print("emit arbitrary place={} allocation={} stage=per_execution_cell error=UnsupportedOperation\n", .{
+                place_id.index(),
+                place.origin.instruction.index(),
+            });
+            return error.UnsupportedOperation;
+        }
         // Declared at its allocation, inside the allocating block's leaf.
         if (scopes.arbitraryLeafDeclaresPlace(place_id)) continue;
         const name = emission_plan.names.place(place_id) orelse return error.UnsupportedOperation;
