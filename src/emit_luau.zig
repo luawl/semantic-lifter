@@ -4203,7 +4203,7 @@ fn emitSemanticNormalizedTransition(
     try output.appendSlice(allocator, indent);
     try render.valueName(output, allocator, &emission_plan.names, next_control);
     try output.appendSlice(allocator, " = ");
-    try render.valueUseScalar(output, allocator, program, values, operation.control);
+    try render.valueUseGroupedScalar(output, allocator, program, values, operation.control);
     try output.appendSlice(allocator, " + ");
     try render.valueName(output, allocator, &emission_plan.names, normalized_step);
     try output.append(allocator, '\n');
@@ -4290,17 +4290,17 @@ fn emitLuauNumericTransition(
     try output.appendSlice(allocator, arm_indent);
     try render.valueName(output, allocator, &emission_plan.names, next_limit);
     try output.appendSlice(allocator, " = ");
-    try render.valueUseScalar(output, allocator, program, values, operation.limit);
+    try render.valueUseGroupedScalar(output, allocator, program, values, operation.limit);
     try output.appendSlice(allocator, " * 1\n");
     try output.appendSlice(allocator, arm_indent);
     try render.valueName(output, allocator, &emission_plan.names, next_step);
     try output.appendSlice(allocator, " = ");
-    try render.valueUseScalar(output, allocator, program, values, operation.step);
+    try render.valueUseGroupedScalar(output, allocator, program, values, operation.step);
     try output.appendSlice(allocator, " * 1\n");
     try output.appendSlice(allocator, arm_indent);
     try render.valueName(output, allocator, &emission_plan.names, next_control);
     try output.appendSlice(allocator, " = ");
-    try render.valueUseScalar(output, allocator, program, values, operation.control);
+    try render.valueUseGroupedScalar(output, allocator, program, values, operation.control);
     try output.appendSlice(allocator, " * 1\n");
     try output.appendSlice(allocator, indent);
     try output.appendSlice(allocator, "else\n");
@@ -4317,7 +4317,7 @@ fn emitLuauNumericTransition(
     try output.appendSlice(allocator, arm_indent);
     try render.valueName(output, allocator, &emission_plan.names, next_control);
     try output.appendSlice(allocator, " = ");
-    try render.valueUseScalar(output, allocator, program, values, operation.control);
+    try render.valueUseGroupedScalar(output, allocator, program, values, operation.control);
     try output.appendSlice(allocator, " + ");
     try render.valueName(output, allocator, &emission_plan.names, next_step);
     try output.append(allocator, '\n');

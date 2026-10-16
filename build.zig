@@ -783,6 +783,26 @@ pub fn build(b: *std.Build) void {
         "automatic",
         "stage=per_execution_cell error=UnsupportedOperation",
     );
+    const numeric_operand_flat_grouping = addNumericOperandGroupingConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/numeric_operand_flat_concat.lifter-ir.json",
+        "numeric-operand-flat-concat.automatic.luau",
+        "automatic",
+        "luau-numeric",
+    );
+    const numeric_operand_semantic_grouping = addNumericOperandGroupingConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/numeric_operand_semantic_concat.lifter-ir.json",
+        "numeric-operand-semantic-concat.automatic.luau",
+        "automatic",
+        "semantic-normalized",
+    );
     const source_frontend_typed_block_conformance = addLuauSourceConformance(
         b,
         exe,
@@ -1171,6 +1191,8 @@ pub fn build(b: *std.Build) void {
     source_frontend_cell_branch_conformance.addTo(conformance_step);
     conformance_step.dependOn(per_execution_cell_dispatcher_refusal);
     conformance_step.dependOn(per_execution_cell_inherited_flat_refusal);
+    conformance_step.dependOn(numeric_operand_flat_grouping);
+    conformance_step.dependOn(numeric_operand_semantic_grouping);
     source_frontend_typed_block_conformance.addTo(conformance_step);
     source_frontend_numeric_for_conformance.addTo(conformance_step);
     source_frontend_generic_for_conformance.addTo(conformance_step);
@@ -2036,6 +2058,39 @@ fn addEmitRefusalConformance(
     emit.expectExitCode(1);
     emit.expectStdErrMatch(stderr_match);
     return &emit.step;
+}
+
+// Track T6 (T6.2): an admitted crafted IR whose numeric transition has an inlined operand, emitted,
+// compiled at -O0 and audited for the grouped rendering of every operand an operator follows.
+fn addNumericOperandGroupingConformance(
+    b: *std.Build,
+    exe: *std.Build.Step.Compile,
+    z3_enabled: bool,
+    z3_bin: []const u8,
+    ir_path: []const u8,
+    output_name: []const u8,
+    strategy: []const u8,
+    audit_mode: []const u8,
+) *std.Build.Step {
+    const emit = b.addRunArtifact(exe);
+    if (z3_enabled) emit.addPathDir(b.pathFromRoot(z3_bin));
+    emit.addArg("emit-readable-luau-strategy");
+    emit.addFileArg(b.path(ir_path));
+    const emitted = emit.addOutputFileArg(output_name);
+    emit.addArgs(&.{ "standard-luau", strategy });
+    emit.expectExitCode(0);
+
+    const compile = b.addSystemCommand(&.{ luauCompileExe(b), "--null", "-O0" });
+    compile.addFileArg(emitted);
+    compile.expectExitCode(0);
+
+    const audit = b.addSystemCommand(&.{ luneExe(b), "run" });
+    audit.addFileArg(b.path("luau/numeric_operand_grouping_audit.luau"));
+    audit.addArg(audit_mode);
+    audit.addFileArg(emitted);
+    audit.expectExitCode(0);
+    audit.step.dependOn(&compile.step);
+    return &audit.step;
 }
 
 fn addLuauSourceRecoveryObligationConformance(
