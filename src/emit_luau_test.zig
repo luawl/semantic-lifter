@@ -2867,3 +2867,170 @@ test "acyclic native iteration whose body always returns emits no break after th
     try std.testing.expect(std.mem.indexOf(u8, source, "return") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "break") == null);
 }
+
+test "acyclic iteration in a loop boundary inside a while loop emits one native for loop" {
+    // A numeric loop whose body always returns, inside a `while` body, is planned as a
+    // loop boundary of the enclosing loop body. It is admitted and written as one native `for` whose body ends in
+    // its `return`, followed by the exit arm: no `if` form and no `break` inside the loop.
+    const proof = ir.EvidenceId.fromIndex(0);
+    const f = ir.FunctionId.fromIndex(0);
+    const b_entry = ir.BlockId.fromIndex(0);
+    const b_while = ir.BlockId.fromIndex(1);
+    const b_pre = ir.BlockId.fromIndex(2);
+    const b_header = ir.BlockId.fromIndex(3);
+    const b_body = ir.BlockId.fromIndex(4);
+    const b_next = ir.BlockId.fromIndex(5);
+    const b_done = ir.BlockId.fromIndex(6);
+    const i_cond = ir.InstructionId.fromIndex(0);
+    const i_control = ir.InstructionId.fromIndex(1);
+    const i_limit = ir.InstructionId.fromIndex(2);
+    const i_step = ir.InstructionId.fromIndex(3);
+    const i_true = ir.InstructionId.fromIndex(4);
+    const i_false = ir.InstructionId.fromIndex(5);
+    const i_next = ir.InstructionId.fromIndex(6);
+    const v_left = ir.ValueId.fromIndex(0);
+    const v_right = ir.ValueId.fromIndex(1);
+    const v_cond = ir.ValueId.fromIndex(2);
+    const v_control = ir.ValueId.fromIndex(3);
+    const v_limit = ir.ValueId.fromIndex(4);
+    const v_step = ir.ValueId.fromIndex(5);
+    const v_true = ir.ValueId.fromIndex(6);
+    const v_false = ir.ValueId.fromIndex(7);
+    const v_header_control = ir.ValueId.fromIndex(8);
+    const v_header_limit = ir.ValueId.fromIndex(9);
+    const v_header_step = ir.ValueId.fromIndex(10);
+    const v_header_initial = ir.ValueId.fromIndex(11);
+    const v_has = ir.ValueId.fromIndex(12);
+    const v_normalized_limit = ir.ValueId.fromIndex(13);
+    const v_normalized_step = ir.ValueId.fromIndex(14);
+    const v_index = ir.ValueId.fromIndex(15);
+    const v_body_index = ir.ValueId.fromIndex(16);
+    const values = [_]ir.Value{
+        .{ .id = v_left, .function = f, .type = .number, .origin = .{ .parameter = 0 } },
+        .{ .id = v_right, .function = f, .type = .number, .origin = .{ .parameter = 1 } },
+        .{ .id = v_cond, .function = f, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = i_cond, .index = 0 } } },
+        .{ .id = v_control, .function = f, .type = .number, .origin = .{ .instruction_result = .{ .instruction = i_control, .index = 0 } } },
+        .{ .id = v_limit, .function = f, .type = .number, .origin = .{ .instruction_result = .{ .instruction = i_limit, .index = 0 } } },
+        .{ .id = v_step, .function = f, .type = .number, .origin = .{ .instruction_result = .{ .instruction = i_step, .index = 0 } } },
+        .{ .id = v_true, .function = f, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = i_true, .index = 0 } } },
+        .{ .id = v_false, .function = f, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = i_false, .index = 0 } } },
+        .{ .id = v_header_control, .function = f, .origin = .{ .block_parameter = .{ .block = b_header, .index = 0 } } },
+        .{ .id = v_header_limit, .function = f, .origin = .{ .block_parameter = .{ .block = b_header, .index = 1 } } },
+        .{ .id = v_header_step, .function = f, .origin = .{ .block_parameter = .{ .block = b_header, .index = 2 } } },
+        .{ .id = v_header_initial, .function = f, .type = .boolean, .origin = .{ .block_parameter = .{ .block = b_header, .index = 3 } } },
+        .{ .id = v_has, .function = f, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = i_next, .index = 0 } } },
+        .{ .id = v_normalized_limit, .function = f, .type = .number, .origin = .{ .instruction_result = .{ .instruction = i_next, .index = 1 } } },
+        .{ .id = v_normalized_step, .function = f, .type = .number, .origin = .{ .instruction_result = .{ .instruction = i_next, .index = 2 } } },
+        .{ .id = v_index, .function = f, .type = .number, .origin = .{ .instruction_result = .{ .instruction = i_next, .index = 3 } } },
+        .{ .id = v_body_index, .function = f, .type = .number, .origin = .{ .block_parameter = .{ .block = b_body, .index = 0 } } },
+    };
+    const instructions = [_]ir.Instruction{
+        .{ .id = i_cond, .block = b_while, .operation = .{ .binary = .{ .operator = .less, .left = v_left, .right = v_right } }, .results = &.{v_cond}, .effects = .pure, .evidence = &.{proof} },
+        .{ .id = i_control, .block = b_pre, .operation = .{ .constant = .{ .integer = "1" } }, .results = &.{v_control}, .effects = .pure, .evidence = &.{proof} },
+        .{ .id = i_limit, .block = b_pre, .operation = .{ .constant = .{ .integer = "3" } }, .results = &.{v_limit}, .effects = .pure, .evidence = &.{proof} },
+        .{ .id = i_step, .block = b_pre, .operation = .{ .constant = .{ .integer = "1" } }, .results = &.{v_step}, .effects = .pure, .evidence = &.{proof} },
+        .{ .id = i_true, .block = b_pre, .operation = .{ .constant = .{ .boolean = true } }, .results = &.{v_true}, .effects = .pure, .evidence = &.{proof} },
+        .{ .id = i_false, .block = b_pre, .operation = .{ .constant = .{ .boolean = false } }, .results = &.{v_false}, .effects = .pure, .evidence = &.{proof} },
+        .{
+            .id = i_next,
+            .block = b_header,
+            .operation = .{ .numeric_for_next = .{
+                .control = v_header_control,
+                .limit = v_header_limit,
+                .step = v_header_step,
+                .initial = v_header_initial,
+            } },
+            .results = &.{ v_has, v_normalized_limit, v_normalized_step, v_index },
+            .effects = .numeric_for_next,
+            .evidence = &.{proof},
+        },
+    };
+    const blocks = [_]ir.Block{
+        .{ .id = b_entry, .function = f, .terminator = .{ .jump = .{ .target = b_while } }, .evidence = &.{proof} },
+        .{
+            .id = b_while,
+            .function = f,
+            .instructions = &.{i_cond},
+            .terminator = .{ .branch = .{
+                .condition = v_cond,
+                .then_edge = .{ .target = b_pre },
+                .else_edge = .{ .target = b_done },
+            } },
+            .evidence = &.{proof},
+        },
+        .{
+            .id = b_pre,
+            .function = f,
+            .instructions = &.{ i_control, i_limit, i_step, i_true, i_false },
+            .terminator = .{ .jump = .{ .target = b_header, .arguments = &.{ v_control, v_limit, v_step, v_true } } },
+            .evidence = &.{proof},
+        },
+        .{
+            .id = b_header,
+            .function = f,
+            .parameters = &.{ v_header_control, v_header_limit, v_header_step, v_header_initial },
+            .instructions = &.{i_next},
+            .terminator = .{ .branch = .{
+                .condition = v_has,
+                .then_edge = .{ .target = b_body, .arguments = &.{v_index} },
+                .else_edge = .{ .target = b_next },
+            } },
+            .evidence = &.{proof},
+        },
+        .{ .id = b_body, .function = f, .parameters = &.{v_body_index}, .terminator = .{ .return_values = &.{v_body_index} }, .evidence = &.{proof} },
+        .{ .id = b_next, .function = f, .terminator = .{ .jump = .{ .target = b_while } }, .evidence = &.{proof} },
+        .{ .id = b_done, .function = f, .terminator = .{ .return_values = &.{} }, .evidence = &.{proof} },
+    };
+    const functions = [_]ir.Function{.{
+        .id = f,
+        .parameters = &.{ v_left, v_right },
+        .blocks = &.{ b_entry, b_while, b_pre, b_header, b_body, b_next, b_done },
+        .entry_block = b_entry,
+        .evidence = &.{proof},
+    }};
+    const evidence = [_]ir.Evidence{.{ .id = proof, .kind = .dynamic_fixture, .locator = "fixture:always-returning-iteration-in-loop" }};
+    const program: ir.Program = .{
+        .program_id = "always-returning-iteration-in-loop",
+        .entry_function = f,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+        .evidence = &evidence,
+    };
+
+    const source = try emitAlloc(std.testing.allocator, &program);
+    defer std.testing.allocator.free(source);
+    var for_lines: usize = 0;
+    var for_indent: ?[]const u8 = null;
+    var loop_closed = false;
+    var body_returns = false;
+    var body_breaks = false;
+    var body_branches = false;
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t");
+        const indent = line[0 .. line.len - std.mem.trimStart(u8, line, " \t").len];
+        if (std.mem.startsWith(u8, trimmed, "for ") and std.mem.endsWith(u8, trimmed, " do")) {
+            for_lines += 1;
+            for_indent = indent;
+            continue;
+        }
+        const open = for_indent orelse continue;
+        if (loop_closed) continue;
+        if (std.mem.eql(u8, trimmed, "end") and std.mem.eql(u8, indent, open)) {
+            loop_closed = true;
+            continue;
+        }
+        if (std.mem.indexOf(u8, trimmed, "return") != null) body_returns = true;
+        if (std.mem.indexOf(u8, trimmed, "break") != null) body_breaks = true;
+        if (std.mem.startsWith(u8, trimmed, "if ") or std.mem.startsWith(u8, trimmed, "elseif ") or
+            std.mem.indexOf(u8, trimmed, " if ") != null) body_branches = true;
+    }
+    try std.testing.expectEqual(@as(usize, 1), for_lines);
+    try std.testing.expect(loop_closed);
+    try std.testing.expect(body_returns);
+    try std.testing.expect(!body_breaks);
+    try std.testing.expect(!body_branches);
+    try std.testing.expect(std.mem.indexOf(u8, source, "while ") != null);
+}

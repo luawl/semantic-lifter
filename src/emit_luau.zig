@@ -2225,16 +2225,7 @@ fn emitNumericForLoop(
         );
     }
 
-    try output.appendSlice(allocator, indent);
-    try output.appendSlice(allocator, "for ");
-    try render.valueName(output, allocator, &emission_plan.names, numeric.body_parameter);
-    try output.appendSlice(allocator, " = ");
-    try render.valueUseScalar(output, allocator, program, valuePlan(emission_plan, place_aliases), numeric.initial_arguments[0]);
-    try output.appendSlice(allocator, ", ");
-    try render.valueUseScalar(output, allocator, program, valuePlan(emission_plan, place_aliases), numeric.initial_arguments[1]);
-    try output.appendSlice(allocator, ", ");
-    try render.valueUseScalar(output, allocator, program, valuePlan(emission_plan, place_aliases), numeric.initial_arguments[2]);
-    try output.appendSlice(allocator, " do\n");
+    try emitNumericForOpen(output, allocator, program, emission_plan, numeric, indent, place_aliases);
 
     const loop_indent = try allocDeeperIndent(allocator, indent);
     defer allocator.free(loop_indent);
@@ -2259,6 +2250,28 @@ fn emitNumericForLoop(
             place_aliases,
         );
     }
+}
+
+/// The `for <index> = <start>, <limit>, <step> do` line of a native numeric loop.
+fn emitNumericForOpen(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    numeric: iteration_protocol.NumericLoop,
+    indent: []const u8,
+    place_aliases: []const PlaceAlias,
+) (EmitError || std.mem.Allocator.Error)!void {
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "for ");
+    try render.valueName(output, allocator, &emission_plan.names, numeric.body_parameter);
+    try output.appendSlice(allocator, " = ");
+    try render.valueUseScalar(output, allocator, program, valuePlan(emission_plan, place_aliases), numeric.initial_arguments[0]);
+    try output.appendSlice(allocator, ", ");
+    try render.valueUseScalar(output, allocator, program, valuePlan(emission_plan, place_aliases), numeric.initial_arguments[1]);
+    try output.appendSlice(allocator, ", ");
+    try render.valueUseScalar(output, allocator, program, valuePlan(emission_plan, place_aliases), numeric.initial_arguments[2]);
+    try output.appendSlice(allocator, " do\n");
 }
 
 fn emitSemanticNormalizedNumericLoop(
@@ -2418,6 +2431,44 @@ fn emitGenericForLoop(
         );
     }
 
+    try emitGenericForOpen(output, allocator, program, emission_plan, scopes, generic, indent, place_aliases);
+
+    const loop_indent = try allocDeeperIndent(allocator, indent);
+    defer allocator.free(loop_indent);
+    try emitRegion(output, allocator, program, emission_plan, scopes, body_region, loop_indent, place_aliases);
+    if (break_after_body and !regionAlwaysFunctionTerminates(program, body_region)) {
+        try emitBreakStatement(output, allocator, loop_indent);
+    }
+
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "end\n");
+    if (!break_after_body and exit_edge != null) {
+        try emitEdgeParametersUnlessConsumed(
+            output,
+            allocator,
+            program,
+            emission_plan,
+            scopes,
+            program.blocks[exit_edge.?.target.index()],
+            exit_edge.?.arguments,
+            indent,
+            false,
+            place_aliases,
+        );
+    }
+}
+
+/// The `for <bindings> in <initializers> do` line of a native generic loop, with its initializer fusion.
+fn emitGenericForOpen(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    scopes: *const emission_scope.Plan,
+    generic: iteration_protocol.GenericLoop,
+    indent: []const u8,
+    place_aliases: []const PlaceAlias,
+) (EmitError || std.mem.Allocator.Error)!void {
     try output.appendSlice(allocator, indent);
     try output.appendSlice(allocator, "for ");
     for (generic.body_parameters, 0..) |parameter, index| {
@@ -2451,30 +2502,6 @@ fn emitGenericForLoop(
         }
     }
     try output.appendSlice(allocator, " do\n");
-
-    const loop_indent = try allocDeeperIndent(allocator, indent);
-    defer allocator.free(loop_indent);
-    try emitRegion(output, allocator, program, emission_plan, scopes, body_region, loop_indent, place_aliases);
-    if (break_after_body and !regionAlwaysFunctionTerminates(program, body_region)) {
-        try emitBreakStatement(output, allocator, loop_indent);
-    }
-
-    try output.appendSlice(allocator, indent);
-    try output.appendSlice(allocator, "end\n");
-    if (!break_after_body and exit_edge != null) {
-        try emitEdgeParametersUnlessConsumed(
-            output,
-            allocator,
-            program,
-            emission_plan,
-            scopes,
-            program.blocks[exit_edge.?.target.index()],
-            exit_edge.?.arguments,
-            indent,
-            false,
-            place_aliases,
-        );
-    }
 }
 
 fn genericInitializerCount(program: *const ir.Program, emission_plan: *const EmissionPlan, arguments: []const ir.ValueId) usize {
@@ -3170,6 +3197,24 @@ fn emitLoopBoundaryControl(
             try loop_exit_shape.validateEntryAlloc(allocator, program, shared_exit);
         },
     }
+    if (scopes.nativeIterationConsumesParameters(control.block)) {
+        if (try iteration_protocol.matchAcyclicLoopBoundary(allocator, program, control)) |acyclic| {
+            return emitLoopBoundaryNativeIteration(
+                output,
+                allocator,
+                program,
+                emission_plan,
+                scopes,
+                region,
+                node_index,
+                control,
+                acyclic,
+                body_exit,
+                indent,
+                place_aliases,
+            );
+        }
+    }
     try emitBlockInstructions(output, allocator, program, emission_plan, scopes, block, indent, place_aliases);
 
     const arm_indent = try allocDeeperIndent(allocator, indent);
@@ -3206,6 +3251,77 @@ fn emitLoopBoundaryControl(
     }
     try output.appendSlice(allocator, indent);
     try output.appendSlice(allocator, "end\n");
+}
+
+/// A native iteration header planned as a loop boundary whose boundary arm is the
+/// iteration body. The header's own block is not written (its only instruction is the transition, which the native
+/// activation suppresses). The body is written inside `for <bindings> ... do ... end`, which binds the body
+/// parameters, and the exit arm follows the loop, so a `continue` or `break` it writes binds to the enclosing loop.
+fn emitLoopBoundaryNativeIteration(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    scopes: *const emission_scope.Plan,
+    region: *const structure.Region,
+    node_index: usize,
+    control: structure.LoopBoundaryControl,
+    acyclic: iteration_protocol.AcyclicBoundary,
+    body_exit: transparent_stop.LoopBoundaryBodyExit,
+    indent: []const u8,
+    place_aliases: []const PlaceAlias,
+) !void {
+    switch (control.boundary) {
+        .terminal => |terminal| {
+            switch (acyclic.protocol) {
+                .numeric => |numeric| try emitNumericForOpen(output, allocator, program, emission_plan, numeric, indent, place_aliases),
+                .generic => |generic| try emitGenericForOpen(output, allocator, program, emission_plan, scopes, generic, indent, place_aliases),
+            }
+            const loop_indent = try allocDeeperIndent(allocator, indent);
+            defer allocator.free(loop_indent);
+            // What `emitOwnedTerminalArm` writes, without its edge parameters: the `for` binds the body parameter.
+            const body = program.blocks[terminal.block.index()];
+            try emitBlockInstructions(output, allocator, program, emission_plan, scopes, body, loop_indent, place_aliases);
+            try call_emission.terminator(output, allocator, program, emission_plan, body, loop_indent, valuePlan(emission_plan, place_aliases));
+            try output.appendSlice(allocator, indent);
+            try output.appendSlice(allocator, "end\n");
+        },
+        .side_exit => |side_exit| switch (acyclic.protocol) {
+            .numeric => |numeric| try emitNumericForLoop(
+                output,
+                allocator,
+                program,
+                emission_plan,
+                scopes,
+                region,
+                node_index,
+                side_exit.region,
+                null,
+                numeric,
+                true,
+                indent,
+                place_aliases,
+            ),
+            .generic => |generic| try emitGenericForLoop(
+                output,
+                allocator,
+                program,
+                emission_plan,
+                scopes,
+                region,
+                node_index,
+                side_exit.region,
+                null,
+                generic,
+                true,
+                indent,
+                place_aliases,
+            ),
+        },
+        else => return error.UnsupportedControlFlow,
+    }
+    if (body_exit == .parent_stop and branchArmIsStructurallyEmpty(program, control.body_edge, control.body_region, null)) return;
+    try emitLoopBoundaryBody(output, allocator, program, emission_plan, scopes, control, body_exit, indent, place_aliases);
 }
 
 fn emitLoopBoundaryBodyImpl(

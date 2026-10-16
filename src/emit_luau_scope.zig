@@ -755,6 +755,16 @@ pub const Plan = struct {
                 }
             },
             .loop_boundary => |control| {
+                if (try iteration_protocol.matchAcyclicLoopBoundary(self.allocator, self.program, control)) |acyclic| {
+                    const scope = self.blockScope(control.block) orelse invalid_scope;
+                    const initial_arguments = switch (acyclic.protocol) {
+                        .numeric => |numeric| numeric.initial_arguments,
+                        .generic => |generic| generic.initial_arguments,
+                    };
+                    for (initial_arguments[0..@min(initial_arguments.len, 3)]) |value_id| {
+                        self.addRenderedValueUse(value_id, scope);
+                    }
+                }
                 try self.collectNativeIterationInitializerUses(control.body_region);
                 switch (control.boundary) {
                     .side_exit => |side_exit| try self.collectNativeIterationInitializerUses(side_exit.region),
@@ -964,6 +974,32 @@ pub const Plan = struct {
                 }
             },
             .loop_boundary => |control| {
+                if (try iteration_protocol.matchAcyclicLoopBoundary(self.allocator, self.program, control)) |acyclic| {
+                    const initial_flag = switch (acyclic.protocol) {
+                        .numeric => |numeric| numeric.initial_flag_instruction,
+                        .generic => |generic| generic.initial_flag_instruction,
+                    };
+                    const body_parameters = self.program.blocks[acyclic.body_edge.target.index()].parameters;
+                    const allow_aliased_header = switch (acyclic.protocol) {
+                        .numeric => |numeric| numeric.operation.mode == .luau_numeric,
+                        .generic => true,
+                    };
+                    const initial_arguments: ?[]const ir.ValueId = switch (acyclic.protocol) {
+                        .numeric => null,
+                        .generic => |generic| generic.initial_arguments[0..3],
+                    };
+                    const activated = try self.activateNativeIteration(
+                        control.block,
+                        acyclic.protocol.instructionId(),
+                        body_parameters,
+                        initial_flag,
+                        allow_aliased_header,
+                        initial_arguments,
+                    );
+                    if (activated) {
+                        self.native_iteration_headers[control.block.index()] = true;
+                    }
+                }
                 try self.markNativeIterationDeclarations(control.body_region);
                 switch (control.boundary) {
                     .side_exit => |side_exit| try self.markNativeIterationDeclarations(side_exit.region),
