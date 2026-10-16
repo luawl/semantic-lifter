@@ -1291,6 +1291,118 @@ fn isHistoricalForwardingTarget(
     return false;
 }
 
+/// The disassembly short-circuit `or` block.  When the collision's
+/// `previous` block E is a pure two-instruction `or` block (a constant and a
+/// place_write of that result, no parameters, a parameterless jump to the
+/// collided block) whose only two predecessors are branches that reach E on
+/// their else edge with no arguments and leave on their then edge, one
+/// dominating the other, return the inner (dominated) branch's else edge so
+/// the feedback phase clones E for it.  Null when the shape does not hold.
+fn shortCircuitElseCloneEdge(
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    previous: ir.BlockId,
+    collision: ir.BlockId,
+) ?ir.CfgEdgeRef {
+    if (previous.index() >= program.blocks.len) return null;
+    const or_block = program.blocks[previous.index()];
+    if (or_block.parameters.len != 0 or or_block.instructions.len != 2) return null;
+    const jump = switch (or_block.terminator) {
+        .jump => |edge| edge,
+        else => return null,
+    };
+    if (jump.target != collision or jump.arguments.len != 0) return null;
+    const constant_id = or_block.instructions[0];
+    const write_id = or_block.instructions[1];
+    if (constant_id.index() >= program.instructions.len or
+        write_id.index() >= program.instructions.len) return null;
+    const constant_instruction = program.instructions[constant_id.index()];
+    switch (constant_instruction.operation) {
+        .constant => {},
+        else => return null,
+    }
+    if (constant_instruction.results.len != 1) return null;
+    const constant_value = constant_instruction.results[0];
+    const write_instruction = program.instructions[write_id.index()];
+    switch (write_instruction.operation) {
+        .place_write => |write| if (write.value != constant_value) return null,
+        else => return null,
+    }
+    if (analysis.predecessorCount(previous) != 2) return null;
+    const first_predecessor = analysis.predecessorAt(previous, 0) orelse return null;
+    const second_predecessor = analysis.predecessorAt(previous, 1) orelse return null;
+    if (!branchReachesElseWithoutArguments(program, first_predecessor, previous)) return null;
+    if (!branchReachesElseWithoutArguments(program, second_predecessor, previous)) return null;
+    const inner = if (analysis.dominates(first_predecessor, second_predecessor))
+        second_predecessor
+    else if (analysis.dominates(second_predecessor, first_predecessor))
+        first_predecessor
+    else
+        return null;
+    return .{ .source = inner, .kind = .branch_else, .target = previous };
+}
+
+/// A `branch` whose else edge targets `block` with no arguments and
+/// whose then edge leaves it.
+fn branchReachesElseWithoutArguments(
+    program: *const ir.Program,
+    predecessor: ir.BlockId,
+    block: ir.BlockId,
+) bool {
+    if (predecessor.index() >= program.blocks.len) return false;
+    switch (program.blocks[predecessor.index()].terminator) {
+        .branch => |branch| return branch.else_edge.target == block and
+            branch.else_edge.arguments.len == 0 and
+            branch.then_edge.target != block,
+        else => return false,
+    }
+}
+
+/// The one-block split of a disassembly short-circuit `or` block,
+/// constructed directly for the inner branch's else edge `clone_edge`: the
+/// closure is exactly the `or` block and the incoming edge is that else edge.
+/// The candidate passes the preparation every structural split passes
+/// (`structural_overlap.prepareClosureWithReplayContext`, the admission of the
+/// authenticated one-block boundary projection); applyPlan then clones the
+/// block, keeps the clone's jump to the collided block, redirects the else
+/// edge to the clone and records the authenticated node_split.  The collision
+/// split finder is not used: its continuation extension pulls the collided
+/// tail back into the closure.  Null when the preparation refuses the block.
+fn shortCircuitElseSplitAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    function_index: usize,
+    clone_edge: ir.CfgEdgeRef,
+    replay_context: *structural_overlap.ReplayProjectionContext,
+) std.mem.Allocator.Error!?structural_overlap.Split {
+    const closure = try allocator.alloc(ir.BlockId, 1);
+    errdefer allocator.free(closure);
+    closure[0] = clone_edge.target;
+    const incoming = [_]ir.CfgEdgeRef{clone_edge};
+    if (!structural_overlap.prepareClosureWithReplayContext(
+        allocator,
+        program,
+        analysis,
+        closure,
+        &incoming,
+        replay_context,
+    )) {
+        allocator.free(closure);
+        return null;
+    }
+    const owned_incoming = try allocator.dupe(ir.CfgEdgeRef, &incoming);
+    return .{
+        .allocator = allocator,
+        .function_index = function_index,
+        .branch = clone_edge.source,
+        .entry = clone_edge.target,
+        .join = clone_edge.target,
+        .incoming = owned_incoming,
+        .closure = closure,
+    };
+}
+
 fn normalizeImpl(
     allocator: std.mem.Allocator,
     scratch_allocator: std.mem.Allocator,
@@ -1878,7 +1990,42 @@ fn normalizeImpl(
                                 // entire shared continuation and manufacture new
                                 // sibling collisions.
                                 if (obstruction.reason == .already_owned) {
-                                    const contextual = try structural_overlap.findContextualValueSplitForIncomingAllocWithReplayContext(
+                                    // A disassembly short-circuit `or`
+                                    // block taken as the outer branch's join leaves
+                                    // its tail an already-owned collision whose
+                                    // pack-returning terminator the node splitter
+                                    // cannot clone.  Clone the pure `or` block for
+                                    // the inner branch's else edge instead (a
+                                    // one-block split constructed directly), so the
+                                    // outer branch's arms converge at the collided
+                                    // block and no tail is cloned.  The structurer
+                                    // gave no visit context for that edge, so the
+                                    // split stays unseeded, as the predecessor
+                                    // fallback below.
+                                    if (obstruction.previous) |previous_block| {
+                                        if (shortCircuitElseCloneEdge(&result.program, &graph, previous_block, obstruction.block)) |clone_edge| {
+                                            if (try shortCircuitElseSplitAlloc(
+                                                feedback_allocator,
+                                                &result.program,
+                                                &graph,
+                                                function_index,
+                                                clone_edge,
+                                                replay_context,
+                                            )) |candidate| {
+                                                traceNormalize("feedback_short_circuit_split function={} or_block={} inner={} closure={}\n", .{
+                                                    function_index,
+                                                    previous_block.index(),
+                                                    clone_edge.source.index(),
+                                                    candidate.closure.len,
+                                                });
+                                                selected = candidate;
+                                                selected_context = null;
+                                                collision_seed = null;
+                                                seeded_fallback = true;
+                                            }
+                                        }
+                                    }
+                                    const contextual = if (selected == null) try structural_overlap.findContextualValueSplitForIncomingAllocWithReplayContext(
                                         feedback_allocator,
                                         &result.program,
                                         &graph,
@@ -1890,7 +2037,7 @@ fn normalizeImpl(
                                         else
                                             null,
                                         replay_context,
-                                    );
+                                    ) else null;
                                     if (contextual) |candidate| {
                                         traceNormalize("feedback_contextual_split function={} entry={} branch={} closure={} incoming={}\n", .{
                                             candidate.function_index,
