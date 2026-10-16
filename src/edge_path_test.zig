@@ -662,3 +662,90 @@ test "unique predecessor branch truth accepts depth 64 and rejects depth 65" {
         }
     }
 }
+
+test "an edge fact carried through an authenticated clone fold stays in scope" {
+    // A held-out chord program's shape: the arm is split into a clone, the clone is
+    // folded back into its original (an endpoint the arm's history already holds; only a clone fold may
+    // do that, validate_proofs.zig hasCanonicalRewritePrefix) and the original is split again. The arm
+    // truth fact derived before the first split is carried by all three structural rewrites to the live edge.
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const owner = ir.BlockId.fromIndex(1);
+    const clone = ir.BlockId.fromIndex(2);
+    const second_clone = ir.BlockId.fromIndex(3);
+    const exit = ir.BlockId.fromIndex(4);
+    const condition = ir.ValueId.fromIndex(0);
+    const fixture_evidence = ir.EvidenceId.fromIndex(0);
+    const arm_evidence = ir.EvidenceId.fromIndex(1);
+    const first_group = ir.NodeSplitGroupId.fromIndex(0);
+    const second_group = ir.NodeSplitGroupId.fromIndex(2);
+    const fold_blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = condition,
+            .then_edge = .{ .target = second_clone },
+            .else_edge = .{ .target = exit },
+        } }, .evidence = &.{fixture_evidence} },
+        .{ .id = owner, .function = function_id, .terminator = .{ .jump = .{ .target = exit } }, .evidence = &.{fixture_evidence} },
+        .{ .id = clone, .function = function_id, .terminator = .{ .jump = .{ .target = exit } }, .evidence = &.{fixture_evidence} },
+        .{ .id = second_clone, .function = function_id, .terminator = .{ .jump = .{ .target = exit } }, .evidence = &.{fixture_evidence} },
+        .{ .id = exit, .function = function_id, .terminator = .{ .return_values = &.{} }, .evidence = &.{fixture_evidence} },
+    };
+    const fold_functions = [_]ir.Function{.{
+        .id = function_id,
+        .parameters = &.{condition},
+        .blocks = &.{ entry, owner, clone, second_clone, exit },
+        .entry_block = entry,
+        .evidence = &.{fixture_evidence},
+    }};
+    const fold_values = [_]ir.Value{.{ .id = condition, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } }};
+    const fold_evidence = [_]ir.Evidence{
+        .{ .id = fixture_evidence, .kind = .dynamic_fixture, .locator = "fixture:clone-fold-reentry" },
+        .{ .id = arm_evidence, .kind = .structural_derivation, .locator = "backend:cfg-branch-arm-truth:v1" },
+    };
+    const fold_terms = [_]ir.SolverTerm{.{ .id = ir.SolverTermId.fromIndex(0), .sort = .{ .kind = .boolean }, .operation = .{ .value = condition } }};
+    const fold_constraints = [_]ir.Constraint{.{
+        .id = ir.ConstraintId.fromIndex(0),
+        .predicate = ir.SolverTermId.fromIndex(0),
+        .evidence = &.{arm_evidence},
+        .scope = .{ .edge = .{ .source = entry, .kind = .branch_then, .target = owner } },
+    }};
+    const history = [_]ir.CfgEdgeRewrite{
+        .{ .id = ir.EdgeRewriteId.fromIndex(0), .source = entry, .kind = .branch_then, .from = .{ .target = owner }, .to = .{ .target = clone }, .rule = .node_split, .node_split_group = first_group },
+        .{ .id = ir.EdgeRewriteId.fromIndex(1), .source = entry, .kind = .branch_then, .from = .{ .target = clone }, .to = .{ .target = owner }, .rule = .clone_fold, .node_split_group = first_group },
+        .{ .id = ir.EdgeRewriteId.fromIndex(2), .source = entry, .kind = .branch_then, .from = .{ .target = owner }, .to = .{ .target = second_clone }, .rule = .node_split, .node_split_group = second_group },
+    };
+    var program: ir.Program = .{
+        .program_id = "clone-fold-reentry",
+        .entry_function = function_id,
+        .functions = &fold_functions,
+        .blocks = &fold_blocks,
+        .instructions = &.{},
+        .values = &fold_values,
+        .evidence = &fold_evidence,
+        .solver_terms = &fold_terms,
+        .constraints = &fold_constraints,
+        .edge_rewrites = &history,
+    };
+
+    var report = try validation.validate(std.testing.allocator, &program, .core);
+    defer report.deinit();
+    // Hold today: the history is authenticated and the fact replays at its root edge.
+    try std.testing.expect(!report.contains(.invalid_edge_rewrite));
+    try std.testing.expect(!report.contains(.invalid_structural_derivation));
+    // Fail today: constraintEffectiveTarget returns null at the fold (edge_path.zig:221), entity 0 is refused.
+    try std.testing.expect(!report.contains(.invalid_constraint_scope));
+    try std.testing.expect(report.isClean());
+    try std.testing.expectEqual(@as(?ir.BlockId, second_clone), edge_path.constraintEffectiveTarget(&program, fold_constraints[0]));
+
+    // Only a clone fold may re-enter: with the fold replaced by a split back to the owner, the rewrite
+    // and the fact both stay refused.
+    var refold = history;
+    refold[1].rule = .node_split;
+    refold[1].node_split_group = ir.NodeSplitGroupId.fromIndex(1);
+    program.edge_rewrites = &refold;
+    var refold_report = try validation.validate(std.testing.allocator, &program, .core);
+    defer refold_report.deinit();
+    try std.testing.expect(refold_report.contains(.invalid_edge_rewrite));
+    try std.testing.expect(refold_report.contains(.invalid_constraint_scope));
+    try std.testing.expect(edge_path.constraintEffectiveTarget(&program, fold_constraints[0]) == null);
+}

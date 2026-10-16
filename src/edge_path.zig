@@ -218,7 +218,13 @@ pub fn constraintEffectiveTarget(program: *const ir.Program, constraint: ir.Cons
         if (rewrite.source != scoped.source or rewrite.kind != scoped.kind) continue;
         if (!sameEdge(rewrite.from, edge)) return null;
         if (!rewriteUsesConstraint(program, rewrite, constraint.id)) return edge.target;
-        if (targetAppearsInHistory(program.edge_rewrites[0..rewrite_index], scoped, rewrite.to.target)) return null;
+        // A clone fold may return to an endpoint the arm already visited, as rewrite admission allows
+        // (validate_proofs.zig hasCanonicalRewritePrefix, validCloneFoldBoundary); the walk follows
+        // positions (`sameEdge` above), so a fact the fold carries stays on the arm's history. The
+        // `scoped.source` comparison is defensive: admission refuses every rewrite whose target is its
+        // own source (validate_proofs.zig hasCanonicalRewritePrefix), a clone fold included.
+        if (targetAppearsInHistory(program.edge_rewrites[0..rewrite_index], scoped, rewrite.to.target) and
+            (rewrite.rule != .clone_fold or rewrite.to.target == scoped.source)) return null;
         edge = rewrite.to;
     }
     return edge.target;
