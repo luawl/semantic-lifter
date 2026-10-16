@@ -843,6 +843,14 @@ pub fn build(b: *std.Build) void {
         "luau/fixtures/always_return_iteration_in_loop_source.luau",
         "source-frontend-always-return-iteration-in-loop",
     );
+    const source_frontend_always_break_iteration_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/always_break_iteration_source.luau",
+        "source-frontend-always-break-iteration",
+    );
     const source_frontend_table_pack_conformance = addLuauSourceConformance(
         b,
         exe,
@@ -1208,6 +1216,7 @@ pub fn build(b: *std.Build) void {
     source_frontend_generic_for_conformance.addTo(conformance_step);
     source_frontend_always_return_iteration_conformance.addTo(conformance_step);
     source_frontend_always_return_iteration_in_loop_conformance.addTo(conformance_step);
+    source_frontend_always_break_iteration_conformance.addTo(conformance_step);
     source_frontend_table_pack_conformance.addTo(conformance_step);
     source_frontend_function_statement_conformance.addTo(conformance_step);
     source_frontend_interpolation_conformance.addTo(conformance_step);

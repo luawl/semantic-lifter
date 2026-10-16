@@ -304,6 +304,26 @@ function SourceRuntimeOracle.run(caseName: string, source: string, exported: any
 		check(10, 3, { 3, 6, 3, 1, 3, 3, 4 })
 		check(1, 7, { 1, 2, -1, 1, 3, 1, 2 })
 		check(10, 7, { 3, 6, 3, 1, 3, 3, 5 })
+	elseif caseName == "source-frontend-always-break-iteration" then
+		local forLines = 0
+		for line in string.gmatch(source, "[^\n]+") do
+			if string.match(line, "^%s*for .+ do%s*$") ~= nil then
+				forLines += 1
+			end
+		end
+		assert(forLines == 8, "an always-breaking loop lost its native for loop")
+		local function check(initial: any, limit: any, expected: { any })
+			local results = table.pack(exported(initial, limit))
+			assert(results.n == 8, "always-breaking loops changed the result count")
+			for index = 1, 8 do
+				assert(results[index] == expected[index], "always-breaking loops changed a result")
+			end
+		end
+		check(1, 3, { 4, 6, 9, 4, 2, 0, 3, 2 })
+		check(3, 1, { 3, 3, 3, 3, 2, 0, 3, 1 })
+		check(3, 3, { 4, 12, 9, 4, 2, 0, 4, 4 })
+		check(10, 3, { 3, 3, 3, 3, 2, 0, 3, 1 })
+		check(2.5, 7, { 4, 10.5, 9, 4, 2, 0, 4, 3.5 })
 	elseif caseName == "source-frontend-typed-block" then
 		assert(exported(7) == 7, "source frontend changed typed block runtime behavior")
 	elseif caseName == "source-frontend-numeric-for" then
