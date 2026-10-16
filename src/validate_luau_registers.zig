@@ -195,6 +195,33 @@ fn validatePrepared(
                 effective_locals = @max(effective_locals, saturatingAdd(flat_locals, 1));
                 effective_total = @max(effective_total, saturatingAdd(flat_locals, 3));
             }
+            // A `generic_for_next` transition is emitted flat by `emitGenericForNextTransition`
+            // (`src/emit_luau.zig`) as a `do` block with three private locals (`__lifter_generic_iterator`,
+            // `__lifter_generic_state`, `__lifter_generic_control`), two more under its `if <initial>` guard
+            // (`__lifter_generic_metatable`, `__lifter_generic_method`) around a three-result `__iter` call,
+            // and the loop values stored above the three privates. Budget the five private locals and the
+            // iterator call frame (three results above five locals, or the loop values' slots, whichever is
+            // larger) so a flat function holding the transition past the compiler's limit is refused at
+            // admission, in lockstep with `emitGenericForNextTransition`.
+            for (function.blocks) |block_id| {
+                if (block_id.index() >= program.blocks.len) continue;
+                for (program.blocks[block_id.index()].instructions) |instruction_id| {
+                    if (instruction_id.index() >= program.instructions.len or emission.dead.contains(instruction_id)) continue;
+                    const instruction = program.instructions[instruction_id.index()];
+                    switch (instruction.operation) {
+                        .generic_for_next => {
+                            if (instruction.results.len < 3) continue;
+                            var targets: usize = 0;
+                            for (instruction.results[3..]) |result| {
+                                targets = saturatingAdd(targets, if (emission.names.valueUsesStorage(result)) 2 else 1);
+                            }
+                            effective_locals = @max(effective_locals, saturatingAdd(flat_locals, 5));
+                            effective_total = @max(effective_total, saturatingAdd(flat_locals, saturatingAdd(3, @max(5, targets))));
+                        },
+                        else => {},
+                    }
+                }
+            }
         }
         if (stage_trace.enabled) std.debug.print("register_pressure function={} base={} locals={} total={} scopes={}\n", .{
             function.id.index(),

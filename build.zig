@@ -1020,6 +1020,7 @@ pub fn build(b: *std.Build) void {
 
     const register_budget_oracle = addRegisterBudgetOracle(b);
     const dispatcher_local_budget_conformance = addDispatcherLocalBudgetConformance(b, exe, z3_enabled, z3_bin);
+    const dispatcher_generic_budget_conformance = addDispatcherGenericBudgetConformance(b, exe, z3_enabled, z3_bin);
     const compile_check_positive = b.addRunArtifact(exe);
     if (z3_enabled) compile_check_positive.addPathDir(b.pathFromRoot(z3_bin));
     compile_check_positive.addArg("emit-luau");
@@ -1109,6 +1110,7 @@ pub fn build(b: *std.Build) void {
     const conformance_step = b.step("conformance", "Validate, emit, and compile Zig- and Luau-built generic fixtures");
     conformance_step.dependOn(&register_budget_oracle.step);
     dispatcher_local_budget_conformance.addTo(conformance_step);
+    dispatcher_generic_budget_conformance.addTo(conformance_step);
     conformance_step.dependOn(&compile_check_positive.step);
     conformance_step.dependOn(&compile_check_rejection.step);
     conformance_step.dependOn(&compile_check_preserved_output.step);
@@ -1996,6 +1998,125 @@ fn addDispatcherLocalBudgetConformance(
         .dispatcher_refusal = &emit_192_dispatcher.step,
         .boundary_compile = &compile_191_dispatcher.step,
     };
+}
+
+const DispatcherGenericBudgetConformance = struct {
+    local_automatic_compile: *std.Build.Step,
+    local_dispatcher_refusal: *std.Build.Step,
+    local_boundary_compile: *std.Build.Step,
+    register_dispatcher_refusal: *std.Build.Step,
+    register_boundary_compile: *std.Build.Step,
+
+    fn addTo(self: DispatcherGenericBudgetConformance, step: *std.Build.Step) void {
+        step.dependOn(self.local_automatic_compile);
+        step.dependOn(self.local_dispatcher_refusal);
+        step.dependOn(self.local_boundary_compile);
+        step.dependOn(self.register_dispatcher_refusal);
+        step.dependOn(self.register_boundary_compile);
+    }
+};
+
+// A flat function holding a generic
+// transition is budgeted for the transition's five private locals and its iterator call frame.
+// The 200-root-local fixture is refused under `dispatcher` (205 locals > 200) and emitted under
+// `automatic`; its 195-local sibling pins the local boundary (200 locals, dispatcher accepted and
+// O0-compilable). The 82-target fixture is refused (90 + 3 + 2 x 82 = 257 registers > 255); its
+// 81-target sibling pins the register boundary (254 registers, accepted and O0-compilable).
+fn addDispatcherGenericBudgetConformance(
+    b: *std.Build,
+    exe: *std.Build.Step.Compile,
+    z3_enabled: bool,
+    z3_bin: []const u8,
+) DispatcherGenericBudgetConformance {
+    const local_resolved = addGenericBudgetResolvedIr(b, exe, z3_enabled, z3_bin, "luau/fixtures/dispatcher_generic_local_budget_source.luau", "dispatcher-generic-local-budget");
+    const local_automatic = b.addRunArtifact(exe);
+    if (z3_enabled) local_automatic.addPathDir(b.pathFromRoot(z3_bin));
+    local_automatic.addArg("emit-readable-luau-strategy");
+    local_automatic.addFileArg(local_resolved);
+    const local_automatic_luau = local_automatic.addOutputFileArg("dispatcher-generic-local-budget.automatic.luau");
+    local_automatic.addArgs(&.{ "standard-luau", "automatic" });
+    local_automatic.expectExitCode(0);
+    const local_automatic_compile = b.addSystemCommand(&.{ luauCompileExe(b), "--null", "-O0" });
+    local_automatic_compile.addFileArg(local_automatic_luau);
+    local_automatic_compile.expectExitCode(0);
+    const local_refusal = addGenericBudgetRefusal(b, exe, z3_enabled, z3_bin, local_resolved, "dispatcher-generic-local-budget.dispatcher.luau", "diagnostic=unsupported_readable_register_pressure entity=1\n");
+
+    const local_boundary_resolved = addGenericBudgetResolvedIr(b, exe, z3_enabled, z3_bin, "luau/fixtures/dispatcher_generic_local_budget_170_source.luau", "dispatcher-generic-local-budget-170");
+    const local_boundary_compile = addGenericBudgetBoundary(b, exe, z3_enabled, z3_bin, local_boundary_resolved, "dispatcher-generic-local-budget-170.dispatcher.luau");
+
+    const register_resolved = addGenericBudgetResolvedIr(b, exe, z3_enabled, z3_bin, "luau/fixtures/dispatcher_generic_register_budget_source.luau", "dispatcher-generic-register-budget");
+    const register_refusal = addGenericBudgetRefusal(b, exe, z3_enabled, z3_bin, register_resolved, "dispatcher-generic-register-budget.dispatcher.luau", "diagnostic=unsupported_readable_temporary_register_pressure entity=1\n");
+
+    const register_boundary_resolved = addGenericBudgetResolvedIr(b, exe, z3_enabled, z3_bin, "luau/fixtures/dispatcher_generic_register_budget_81_source.luau", "dispatcher-generic-register-budget-81");
+    const register_boundary_compile = addGenericBudgetBoundary(b, exe, z3_enabled, z3_bin, register_boundary_resolved, "dispatcher-generic-register-budget-81.dispatcher.luau");
+
+    return .{
+        .local_automatic_compile = &local_automatic_compile.step,
+        .local_dispatcher_refusal = local_refusal,
+        .local_boundary_compile = local_boundary_compile,
+        .register_dispatcher_refusal = register_refusal,
+        .register_boundary_compile = register_boundary_compile,
+    };
+}
+
+fn addGenericBudgetResolvedIr(
+    b: *std.Build,
+    exe: *std.Build.Step.Compile,
+    z3_enabled: bool,
+    z3_bin: []const u8,
+    source_path: []const u8,
+    fixture_name: []const u8,
+) std.Build.LazyPath {
+    const json = addLuauSourceIr(b, source_path, null, fixture_name);
+    const resolve = b.addRunArtifact(exe);
+    if (z3_enabled) resolve.addPathDir(b.pathFromRoot(z3_bin));
+    resolve.addArg("resolve-ir");
+    resolve.addFileArg(json);
+    const resolved = resolve.addOutputFileArg(b.fmt("{s}.resolved.lifter-ir.json", .{fixture_name}));
+    resolve.addArg(if (z3_enabled) "z3" else "internal");
+    return resolved;
+}
+
+fn addGenericBudgetRefusal(
+    b: *std.Build,
+    exe: *std.Build.Step.Compile,
+    z3_enabled: bool,
+    z3_bin: []const u8,
+    resolved: std.Build.LazyPath,
+    seed_name: []const u8,
+    stderr_match: []const u8,
+) *std.Build.Step {
+    const emit = b.addRunArtifact(exe);
+    if (z3_enabled) emit.addPathDir(b.pathFromRoot(z3_bin));
+    emit.addArg("emit-readable-luau-strategy");
+    emit.addFileArg(resolved);
+    const seed_files = b.addWriteFiles();
+    emit.addFileArg(seed_files.add(seed_name, ""));
+    emit.addArgs(&.{ "standard-luau", "dispatcher" });
+    emit.expectExitCode(1);
+    emit.expectStdErrMatch(stderr_match);
+    return &emit.step;
+}
+
+fn addGenericBudgetBoundary(
+    b: *std.Build,
+    exe: *std.Build.Step.Compile,
+    z3_enabled: bool,
+    z3_bin: []const u8,
+    resolved: std.Build.LazyPath,
+    output_name: []const u8,
+) *std.Build.Step {
+    const emit = b.addRunArtifact(exe);
+    if (z3_enabled) emit.addPathDir(b.pathFromRoot(z3_bin));
+    emit.addArg("emit-readable-luau-strategy");
+    emit.addFileArg(resolved);
+    const emitted = emit.addOutputFileArg(output_name);
+    emit.addArgs(&.{ "standard-luau", "dispatcher" });
+    emit.expectExitCode(0);
+    const compile = b.addSystemCommand(&.{ luauCompileExe(b), "--null", "-O0" });
+    compile.addFileArg(emitted);
+    compile.expectExitCode(0);
+    return &compile.step;
 }
 
 // A fixture's resolved IR emitted under the forced dispatcher (flat layout),
