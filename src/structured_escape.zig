@@ -14,6 +14,10 @@ pub fn regionHasLoopBoundaryExitTo(region: *const structure.Region, target: ir.B
     return structure.regionHasLoopBoundaryExitTo(region, target);
 }
 
+pub fn regionHasLoopBoundaryContinueNotTo(region: *const structure.Region, stop: ir.BlockId) bool {
+    return structure.regionHasLoopBoundaryContinueNotTo(region, stop);
+}
+
 pub fn loopBoundaryExitTargetsAlloc(
     allocator: std.mem.Allocator,
     region: *const structure.Region,

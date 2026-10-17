@@ -444,6 +444,25 @@ pub fn regionHasLoopBoundaryExitTo(region: *const Region, target: ir.BlockId) bo
     return false;
 }
 
+/// Reports a loop-boundary body arm that the writer would end with a lexical
+/// `continue` to a block other than `stop`.
+///
+/// When a region owns an escape it is written inside a `repeat ... until true`
+/// transfer wrapper. A nested loop boundary whose body arm continues the
+/// enclosing loop is written as a lexical `continue`, which Luau binds to that
+/// `repeat` and so reaches `stop`, not the loop header. This is the
+/// escape-wrapper case the loop-boundary exit path already carries; keep it
+/// separate so the emitter can refuse and fall back to the flat layout. The
+/// node is reported on the `.continue_target` condition alone: its body region's
+/// stop is set, differs from the holding region's stop, and equals the holding
+/// region's continue target, whatever the body region's continue projection.
+pub fn regionHasLoopBoundaryContinueNotTo(region: *const Region, stop: ir.BlockId) bool {
+    for (region.nodes) |node| {
+        if (nodeHasLoopBoundaryContinueNotTo(node, stop, region.continue_target)) return true;
+    }
+    return false;
+}
+
 /// Returns the distinct loop-boundary exit targets in a structured region.
 /// These targets need function-scope signal locals so nested wrappers can
 /// communicate with the loop that owns each exit.
@@ -16473,6 +16492,44 @@ fn nodeHasLoopBoundaryExitTo(node: Node, target: ir.BlockId) bool {
 fn sharedSideExitHasLoopBoundaryExitTo(side_exit: SharedSideExit, target: ir.BlockId) bool {
     for (side_exit.entries) |entry| {
         if (regionHasLoopBoundaryExitTo(entry.region, target)) return true;
+    }
+    return false;
+}
+
+fn nodeHasLoopBoundaryContinueNotTo(node: Node, region_stop: ir.BlockId, region_continue_target: ?ir.BlockId) bool {
+    return switch (node) {
+        .block, .loop_control, .loop_terminal => false,
+        .branch => |branch| nestedRegionHasLoopBoundaryContinueNotTo(branch.then_region) or
+            nestedRegionHasLoopBoundaryContinueNotTo(branch.else_region),
+        .loop, .latch_loop => false,
+        .infinite_loop => |loop| loop.shared_side_exit != null and
+            sharedSideExitHasLoopBoundaryContinueNotTo(loop.shared_side_exit.?),
+        .loop_boundary => |control| blk: {
+            if (control.body_region.stop) |body| {
+                if (body != region_stop) {
+                    if (region_continue_target) |continue_target| {
+                        if (body == continue_target) break :blk true;
+                    }
+                }
+            }
+            if (nestedRegionHasLoopBoundaryContinueNotTo(control.body_region)) break :blk true;
+            break :blk switch (control.boundary) {
+                .side_exit => |side| nestedRegionHasLoopBoundaryContinueNotTo(side.region),
+                .side_escape => |side| nestedRegionHasLoopBoundaryContinueNotTo(side.region),
+                .exit, .escape, .terminal, .shared_exit => false,
+            };
+        },
+    };
+}
+
+fn nestedRegionHasLoopBoundaryContinueNotTo(region: *const Region) bool {
+    const stop = region.stop orelse return false;
+    return regionHasLoopBoundaryContinueNotTo(region, stop);
+}
+
+fn sharedSideExitHasLoopBoundaryContinueNotTo(side_exit: SharedSideExit) bool {
+    for (side_exit.entries) |entry| {
+        if (nestedRegionHasLoopBoundaryContinueNotTo(entry.region)) return true;
     }
     return false;
 }
