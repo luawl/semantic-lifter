@@ -2779,3 +2779,45 @@ test "arm truth facts on a consumed branch replay against its witness, and only 
     defer unwitnessed_report.deinit();
     try std.testing.expect(unwitnessed_report.contains(.invalid_structural_derivation));
 }
+
+// T7-DEAD-ARM-DIGEST (the plain-input face, g1): an unreachable block whose arm enters the function's entry block
+// made the predecessor walk read that arm's truth at the entry, so the resolver proved the join's branch false on
+// the entry's edge and rewrote the entry to the false target: a function that returns per its argument became a
+// constant. The entry is also entered from the function start, so nothing may be decided there by such an arm.
+const entry_arm_fixture = struct {
+    const base = own_condition_arm_fixture;
+    const stray_id = ir.BlockId.fromIndex(4);
+    const blocks = [_]ir.Block{
+        .{ .id = base.entry_id, .function = base.function_id, .terminator = .{ .jump = .{ .target = base.join_id, .arguments = &.{base.condition} } }, .evidence = &.{base.proof} },
+        base.blocks[1],
+        base.blocks[2],
+        base.blocks[3],
+        .{ .id = stray_id, .function = base.function_id, .terminator = .{ .branch = .{
+            .condition = base.condition,
+            .then_edge = .{ .target = base.true_id },
+            .else_edge = .{ .target = base.entry_id },
+        } }, .evidence = &.{base.proof} },
+    };
+    const functions = [_]ir.Function{.{
+        .id = base.function_id,
+        .parameters = &.{base.condition},
+        .blocks = &.{ base.entry_id, base.join_id, base.true_id, base.false_id, stray_id },
+        .entry_block = base.entry_id,
+        .evidence = &.{base.proof},
+    }};
+};
+
+test "an unreachable arm into the entry block does not specialize the entry's edge" {
+    const fixture = entry_arm_fixture;
+    var program = fixture.base.program;
+    program.blocks = &fixture.blocks;
+    program.functions = &fixture.functions;
+    var resolved = try resolveAlloc(std.testing.allocator, &program, solver_backend.internalFacts());
+    defer resolved.deinit();
+    var report = try @import("validate.zig").validate(std.testing.allocator, &resolved.program, .core);
+    defer report.deinit();
+    try std.testing.expect(report.isClean());
+    for (resolved.program.edge_rewrites) |rewrite| try std.testing.expect(rewrite.source != fixture.base.entry_id);
+    const entry_jump = resolved.program.blocks[fixture.base.entry_id.index()].terminator.jump;
+    try std.testing.expectEqual(fixture.base.join_id, entry_jump.target);
+}

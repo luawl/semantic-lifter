@@ -518,6 +518,11 @@ fn uniqueStructuralPredecessor(
     if (target_id.index() >= program.blocks.len) return null;
     const target = program.blocks[target_id.index()];
     if (target.id != target_id) return null;
+    // A function's entry block is also entered from the function start, which no jump or branch edge records,
+    // so no edge into it is its unique predecessor: a live arm of an unreachable block, or the witnessed dead arm of
+    // a branch an authenticated selection consumed, would otherwise decide the entry's values (T7-DEAD-ARM-DIGEST).
+    if (target.function.index() >= program.functions.len or
+        program.functions[target.function.index()].entry_block == target_id) return null;
 
     var found: ?StructuralPredecessor = null;
     for (program.blocks, 0..) |block, block_index| {
@@ -1117,4 +1122,164 @@ test "branch arm edges whose arm facts the call does not derive read the planner
     try deriveBlock(allocator, &planner_view, &scope, &lists.terms, &lists.constraints, &lists.evidence, blocks[0], false);
     const derived = lists.view(&program);
     try expectFlagFacts(&derived, flag_id, then_root, else_root);
+}
+
+// T7-DEAD-ARM-DIGEST: a function's entry block is also entered from the function start, which no jump or branch
+// edge records. An edge into the entry, whether a live arm of an unreachable block or the witnessed dead arm of a
+// branch an authenticated selection consumed, must not become the entry's unique structural predecessor: the walk
+// would read that arm's truth at the entry, where the function start does not establish it.
+const entry_predecessor_fixture = struct {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry_id = ir.BlockId.fromIndex(0);
+    const join_id = ir.BlockId.fromIndex(1);
+    const left_id = ir.BlockId.fromIndex(2);
+    const right_id = ir.BlockId.fromIndex(3);
+    const stray_id = ir.BlockId.fromIndex(4); // no edge reaches it from the entry
+    const selector = ir.ValueId.fromIndex(0); // the function's boolean parameter
+    const joined = ir.ValueId.fromIndex(1); // the join's boolean parameter
+    const root: ir.CfgEdgeRef = .{ .source = entry_id, .kind = .jump, .target = join_id };
+    const values = [_]ir.Value{
+        .{ .id = selector, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = joined, .function = function_id, .type = .boolean, .origin = .{ .block_parameter = .{ .block = join_id, .index = 0 } } },
+    };
+    const joined_term = ir.SolverTermId.fromIndex(0);
+    const not_joined_term = ir.SolverTermId.fromIndex(1);
+    const selector_term = ir.SolverTermId.fromIndex(2);
+    const equality_term = ir.SolverTermId.fromIndex(3);
+    const terms = [_]ir.SolverTerm{
+        .{ .id = joined_term, .sort = .{ .kind = .boolean }, .operation = .{ .value = joined } },
+        .{ .id = not_joined_term, .sort = .{ .kind = .boolean }, .operation = .{ .logical_not = joined_term } },
+        .{ .id = selector_term, .sort = .{ .kind = .boolean }, .operation = .{ .value = selector } },
+        .{ .id = equality_term, .sort = .{ .kind = .boolean }, .operation = .{ .binary = .{ .operator = .equal, .left = joined_term, .right = selector_term } } },
+    };
+    const proof = ir.EvidenceId.fromIndex(0);
+    const argument_record = ir.EvidenceId.fromIndex(1);
+    const evidence = [_]ir.Evidence{
+        .{ .id = proof, .kind = .dynamic_fixture, .locator = "fixture:t7-entry-predecessor" },
+        .{ .id = argument_record, .kind = .structural_derivation, .locator = argument_evidence_locator },
+    };
+    // The stray block's branch: its else arm enters the function's entry block.
+    const into_entry: ir.Branch = .{ .condition = selector, .then_edge = .{ .target = left_id }, .else_edge = .{ .target = entry_id } };
+    const into_right: ir.Branch = .{ .condition = selector, .then_edge = .{ .target = left_id }, .else_edge = .{ .target = right_id } };
+
+    fn blocks(stray: ir.Terminator) [5]ir.Block {
+        return .{
+            .{ .id = entry_id, .function = function_id, .terminator = .{ .jump = .{ .target = join_id, .arguments = &.{selector} } } },
+            .{ .id = join_id, .function = function_id, .parameters = &.{joined}, .terminator = .{ .branch = .{
+                .condition = joined,
+                .then_edge = .{ .target = left_id },
+                .else_edge = .{ .target = right_id },
+            } } },
+            .{ .id = left_id, .function = function_id, .terminator = .{ .return_values = &.{} } },
+            .{ .id = right_id, .function = function_id, .terminator = .{ .return_values = &.{} } },
+            .{ .id = stray_id, .function = function_id, .terminator = stray },
+        };
+    }
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .parameters = &.{selector},
+        .blocks = &.{ entry_id, join_id, left_id, right_id, stray_id },
+        .entry_block = entry_id,
+    }};
+    // The witness of a stray branch an authenticated selection consumed (then arm kept): a block-scoped fact that
+    // decides it, the query, a proved certificate and the discharged obligation `edge_path.witnessedControlBranch`
+    // reads (replay reads the witness only; the digest is checked elsewhere).
+    const deciding_fact: ir.Constraint = .{ .id = ir.ConstraintId.fromIndex(0), .predicate = selector_term, .evidence = &.{proof}, .scope = .{ .block = stray_id } };
+    const queries = [_]ir.SolverQuery{.{ .id = ir.QueryId.fromIndex(0), .kind = .prove_true, .assumptions = &.{ir.ConstraintId.fromIndex(0)}, .goal = selector_term }};
+    const certificates = [_]ir.SolverCertificate{.{ .id = ir.CertificateId.fromIndex(0), .query = ir.QueryId.fromIndex(0), .engine = .internal_facts, .resolution = .proved, .evidence = &.{proof} }};
+    fn witness(branch: ir.Branch) [1]ir.Obligation {
+        return .{.{
+            .id = ir.ObligationId.fromIndex(0),
+            .kind = .control_structure,
+            .subject = .{ .control_branch = .{ .block = stray_id, .branch = branch } },
+            .status = .discharged,
+            .blocks_profile = .readable_luau,
+            .detail = "authenticated proved branch selection",
+            .evidence = &.{proof},
+            .requirement = .{ .kind = .prove_true, .predicate = selector_term },
+            .query = ir.QueryId.fromIndex(0),
+            .certificate = ir.CertificateId.fromIndex(0),
+        }};
+    }
+    fn probe(predicate: ir.SolverTermId) ir.Constraint {
+        return .{ .id = ir.ConstraintId.fromIndex(1), .predicate = predicate, .evidence = &.{argument_record}, .scope = .{ .edge = root } };
+    }
+    fn program(block_list: []const ir.Block, obligations: []const ir.Obligation, constraints: []const ir.Constraint) ir.Program {
+        return .{
+            .program_id = "t7-entry-predecessor",
+            .entry_function = function_id,
+            .functions = &functions,
+            .blocks = block_list,
+            .instructions = &.{},
+            .values = &values,
+            .evidence = &evidence,
+            .solver_terms = &terms,
+            .constraints = constraints,
+            .queries = &queries,
+            .certificates = &certificates,
+            .obligations = obligations,
+        };
+    }
+    // `not joined` on the entry's jump is false on the live program (selector = true runs entry -> join with
+    // joined = true); `joined == selector` is the fact the entry's jump supports.
+    fn expectEntryUndecided(block_list: []const ir.Block, obligations: []const ir.Obligation) !void {
+        const false_fact = [_]ir.Constraint{ deciding_fact, probe(not_joined_term) };
+        const false_program = program(block_list, obligations, &false_fact);
+        try std.testing.expect(!replaysConstraint(&false_program, false_fact[1]));
+        const equality = [_]ir.Constraint{ deciding_fact, probe(equality_term) };
+        const equality_program = program(block_list, obligations, &equality);
+        try std.testing.expect(replaysConstraint(&equality_program, equality[1]));
+    }
+};
+
+test "an arm into the function's entry block does not decide the entry's values" {
+    const fixture = entry_predecessor_fixture;
+    // A live arm of an unreachable block (no witness, no digest involved).
+    const live = fixture.blocks(.{ .branch = fixture.into_entry });
+    try fixture.expectEntryUndecided(&live, &.{});
+    // The witnessed dead arm of a consumed branch.
+    const consumed = fixture.blocks(.{ .jump = .{ .target = fixture.left_id } });
+    const witness = fixture.witness(fixture.into_entry);
+    try fixture.expectEntryUndecided(&consumed, &witness);
+    // Control: the same stray branch with its else arm elsewhere (holds today and after the fix).
+    const elsewhere = fixture.blocks(.{ .branch = fixture.into_right });
+    try fixture.expectEntryUndecided(&elsewhere, &.{});
+}
+
+test "derivation on the entry's edge ignores an arm into the entry" {
+    const fixture = entry_predecessor_fixture;
+    const live = fixture.blocks(.{ .branch = fixture.into_entry });
+    var program = fixture.program(&live, &.{}, &.{});
+    program.queries = &.{};
+    program.certificates = &.{};
+
+    var terms: std.ArrayList(ir.SolverTerm) = .empty;
+    defer terms.deinit(std.testing.allocator);
+    try terms.appendSlice(std.testing.allocator, program.solver_terms);
+    var constraints: std.ArrayList(ir.Constraint) = .empty;
+    defer constraints.deinit(std.testing.allocator);
+    defer for (constraints.items) |constraint| {
+        std.testing.allocator.free(@constCast(constraint.evidence));
+        std.testing.allocator.free(@constCast(constraint.path_rewrites));
+    };
+    var evidence: std.ArrayList(ir.Evidence) = .empty;
+    defer evidence.deinit(std.testing.allocator);
+    try evidence.appendSlice(std.testing.allocator, program.evidence);
+
+    try derive(std.testing.allocator, &program, &terms, &constraints, &evidence);
+    var derived = program;
+    derived.solver_terms = terms.items;
+    derived.constraints = constraints.items;
+    derived.evidence = evidence.items;
+    var found = false;
+    for (constraints.items) |constraint| {
+        const edge = switch (constraint.scope) {
+            .edge => |value| value,
+            else => continue,
+        };
+        if (!std.meta.eql(edge, fixture.root)) continue;
+        found = true;
+        try std.testing.expect(termIsEquality(&derived, constraint.predicate, fixture.joined, fixture.selector, .{ .kind = .boolean }));
+    }
+    try std.testing.expect(found);
 }
