@@ -19,9 +19,9 @@ source is at hand, so that the original can serve as the reference. A frontend i
 writes a `lifter_ir_v1` handoff: a lifting or analysis tool supplies the frontend for the artefact
 it targets, and the contract is what that frontend has to satisfy.
 
-The backend is about 148,000 lines of Zig across 159 files, with over 850 unit tests. The source
-frontend, the IR library and codec, and the conformance suite take about 55,000 lines across 169
-files under `luau/`. The suite holds 49 fixture files, 29 conformance scripts, 9 audits and 7
+The backend is about 153,000 lines of Zig across 159 files, with over 850 unit tests. The source
+frontend, the IR library and codec, and the conformance suite take about 64,000 lines across 181
+files under `luau/`. The suite holds 60 fixture files, 29 conformance scripts, 10 audits and 7
 oracles; it compiles the emitted programs with the official Luau compiler and runs its oracles under
 Lune, a standalone Luau runtime.
 
