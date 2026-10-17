@@ -443,6 +443,21 @@ const StructuralPredecessor = struct {
     kind: ir.CfgEdgeKind,
 };
 
+/// T6-CONSUMED-BRANCH-REPLAY: the condition that decides the branch arms of block `source`. A live
+/// branch gives its own condition; a branch that an authenticated selection consumed into a jump gives
+/// the witnessed one (`edge_path.witnessedBranchCondition`, the switch proof_digest.zig
+/// `appendEdgeSourceWitness` uses for a branch arm's source). Null for any other terminator and for a
+/// jump without one authenticated witness. The arm fact replay and the predecessor walk both read an
+/// arm's truth here, so a fact derived before the selection still replays after it.
+fn armCondition(program: *const ir.Program, source: ir.BlockId) ?ir.ValueId {
+    if (source.index() >= program.blocks.len) return null;
+    return switch (program.blocks[source.index()].terminator) {
+        .branch => |branch| branch.condition,
+        .jump => edge_path.witnessedBranchCondition(program, source),
+        else => null,
+    };
+}
+
 // Fold only a straight, unambiguous predecessor chain into the downstream edge root.
 fn uniquePredecessorBranchTruth(
     program: *const ir.Program,
@@ -467,19 +482,24 @@ fn uniquePredecessorBranchTruth(
         }
 
         const block = program.blocks[predecessor.source.index()];
-        switch (block.terminator) {
-            .branch => |branch| {
-                if (branch.condition.index() >= program.values.len) return null;
-                const condition = program.values[branch.condition.index()];
-                if (condition.id != branch.condition or condition.function != source.function) return null;
-                if (branch.condition == value_id) return switch (predecessor.kind) {
-                    .branch_then => true,
-                    .branch_else => false,
-                    .jump => null,
-                };
-            },
-            .jump => {},
+        // A branch that an authenticated selection consumed into a jump is entered through the
+        // historical arm `structuralRootEdge` reads from its witness, and decides the value on that arm
+        // as the live branch did; a plain jump, or a jump entered through its jump edge, passes the
+        // walk on.
+        const arm_condition: ?ir.ValueId = switch (block.terminator) {
+            .branch => armCondition(program, predecessor.source),
+            .jump => if (predecessor.kind == .jump) null else armCondition(program, predecessor.source),
             else => return null,
+        };
+        if (arm_condition) |condition_id| {
+            if (condition_id.index() >= program.values.len) return null;
+            const condition = program.values[condition_id.index()];
+            if (condition.id != condition_id or condition.function != source.function) return null;
+            if (condition_id == value_id) return switch (predecessor.kind) {
+                .branch_then => true,
+                .branch_else => false,
+                .jump => null,
+            };
         }
 
         if (visited_len == visited.len) return null;
@@ -626,13 +646,13 @@ fn replaysBranchConstraint(program: *const ir.Program, constraint: ir.Constraint
         else => return false,
     };
     if (edge_path.constraintEdgeValue(program, constraint) == null or root.source.index() >= program.blocks.len) return false;
-    const branch = switch (program.blocks[root.source.index()].terminator) {
-        .branch => |value| value,
-        else => return false,
-    };
+    // An arm truth fact replays against the condition that decides its arm (`armCondition`): after an
+    // authenticated selection, the witnessed branch's, which the edge scope (validate_proofs.zig
+    // validConstraintEdgeScope) and the argument facts' replay (edge_path.rootEdgeValue) already read.
+    const condition = armCondition(program, root.source) orelse return false;
     return switch (root.kind) {
-        .branch_then => termIsValue(program, constraint.predicate, branch.condition, .{ .kind = .boolean }),
-        .branch_else => termIsNotValue(program, constraint.predicate, branch.condition),
+        .branch_then => termIsValue(program, constraint.predicate, condition, .{ .kind = .boolean }),
+        .branch_else => termIsNotValue(program, constraint.predicate, condition),
         .jump => false,
     };
 }
