@@ -763,25 +763,21 @@ pub fn build(b: *std.Build) void {
         "luau/fixtures/per_iteration_capture_branch_source.luau",
         "source-frontend-per-iteration-capture-branch",
     );
-    const per_execution_cell_dispatcher_refusal = addEmitRefusalConformance(
+    const per_execution_cell_dispatcher_refusal = addDispatcherRuntimeConformance(
         b,
         exe,
         z3_enabled,
         z3_bin,
+        "source-frontend-per-iteration-capture-branch",
         source_frontend_cell_branch_conformance.resolved_ir,
-        "source-frontend-per-iteration-capture-branch.dispatcher.luau",
-        "dispatcher",
-        "stage=per_execution_cell error=UnsupportedOperation",
     );
-    const per_execution_cell_inherited_flat_refusal = addEmitRefusalConformance(
+    const per_execution_cell_inherited_flat_refusal = addAutomaticRuntimeConformance(
         b,
         exe,
         z3_enabled,
         z3_bin,
+        "per-execution-cell-inherited-flat",
         b.path("luau/fixtures/per_execution_cell_inherited_flat.lifter-ir.json"),
-        "per-execution-cell-inherited-flat.automatic.luau",
-        "automatic",
-        "stage=per_execution_cell error=UnsupportedOperation",
     );
     const numeric_operand_flat_grouping = addNumericOperandGroupingConformance(
         b,
@@ -2181,6 +2177,42 @@ fn addDispatcherRuntimeConformance(
     runtime_dispatcher.expectExitCode(0);
     runtime_dispatcher.step.dependOn(&compile_dispatcher.step);
     return &runtime_dispatcher.step;
+}
+
+// The inherited-flat automatic arm — a fixture's resolved IR emitted under the automatic
+// strategy (which inherits force_dispatcher and renders flat), compiled at -O0 and executed by the runtime
+// oracle case of the same name. A sibling of addDispatcherRuntimeConformance that passes `automatic`.
+fn addAutomaticRuntimeConformance(
+    b: *std.Build,
+    exe: *std.Build.Step.Compile,
+    z3_enabled: bool,
+    z3_bin: []const u8,
+    fixture_name: []const u8,
+    resolved_ir: std.Build.LazyPath,
+) *std.Build.Step {
+    const emit_automatic = b.addRunArtifact(exe);
+    if (z3_enabled) emit_automatic.addPathDir(b.pathFromRoot(z3_bin));
+    emit_automatic.addArg("emit-readable-luau-strategy");
+    emit_automatic.addFileArg(resolved_ir);
+    const automatic_luau = emit_automatic.addOutputFileArg(b.fmt("{s}.automatic.luau", .{fixture_name}));
+    emit_automatic.addArgs(&.{ "standard-luau", "automatic" });
+    emit_automatic.expectExitCode(0);
+
+    const compile_automatic = b.addSystemCommand(&.{ luauCompileExe(b), "--null", "-O0" });
+    compile_automatic.addFileArg(automatic_luau);
+    compile_automatic.expectExitCode(0);
+
+    const runtime_automatic = b.addSystemCommand(&.{ luneExe(b), "run" });
+    runtime_automatic.addFileArg(b.path("luau/runtime_oracle.luau"));
+    runtime_automatic.addFileInput(b.path("luau/source_runtime_oracle.luau"));
+    runtime_automatic.addFileInput(b.path("luau/pack_multi_latch_runtime_oracle.luau"));
+    runtime_automatic.addFileInput(b.path("luau/pack_return_storage_runtime_oracle.luau"));
+    runtime_automatic.addFileInput(b.path("luau/iteration_exit_transfer_runtime_oracle.luau"));
+    runtime_automatic.addArg(fixture_name);
+    runtime_automatic.addFileArg(automatic_luau);
+    runtime_automatic.expectExitCode(0);
+    runtime_automatic.step.dependOn(&compile_automatic.step);
+    return &runtime_automatic.step;
 }
 
 // An emission that must be refused with a typed line, in the dispatcher-budget refusal form

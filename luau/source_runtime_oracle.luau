@@ -351,6 +351,27 @@ function SourceRuntimeOracle.run(caseName: string, source: string, exported: any
 		check(10, 3, { 303, 3003, 3, 224, 202, 303, 3, 3, 3 })
 		check(2.5, 7, { 303, 3336, 3, 224, 202, 303, 10.5, 13.5, 10.5 })
 		check(3, 3, { 303, 3336, 3, 202, 202, 303, 12, 15, 12 })
+
+	elseif caseName == "per-execution-cell-inherited-flat" then
+		local selectors = { -1, 0, 1, 2, 3, 5, 1.5 }
+		local budgets = { 0, 1, 2, 3, 4, 6 }
+		local expected = {
+			{ 0, 10, 50, 140, 300, 910 },
+			{ 0, 11, 53, 146, 310, 931 },
+			{ 0, 12, 56, 152, 320, 952 },
+			{ 0, 13, 59, 158, 330, 973 },
+			{ 0, 14, 62, 164, 340, 994 },
+			{ 0, 16, 68, 176, 360, 1036 },
+			{ 0, 12.5, 57.5, 155, 325, 962.5 },
+		}
+		for selectorIndex, selector in selectors do
+			for budgetIndex, budget in budgets do
+				assert(
+					exported(selector, budget) == expected[selectorIndex][budgetIndex],
+					"a boxed per-execution cell changed a nested-function result"
+				)
+			end
+		end
 	elseif caseName == "source-frontend-typed-block" then
 		assert(exported(7) == 7, "source frontend changed typed block runtime behavior")
 	elseif caseName == "source-frontend-numeric-for" then

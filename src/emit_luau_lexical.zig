@@ -11,6 +11,25 @@ pub const ValueBinding = struct {
     source: ir.ValueId,
 };
 
+// A per-creation snapshot of a boxed per-execution cell: the creating leaf emits
+// `local <captured> = <source holder>` so the child captures the box reference of this execution.
+pub const SnapshotBinding = struct {
+    captured: ir.PlaceId,
+    source: ir.PlaceId,
+};
+
+fn sourceIsBoxedCell(source: ir.PlaceId, parent_place_aliases: []const PlaceAlias, stable_values: anytype) bool {
+    const resolved = place_render.resolve(source, parent_place_aliases) orelse return false;
+    return switch (resolved) {
+        .boxed_cell => true,
+        // The owning function's terminal self-alias is present in the emitter's aliases (so `.boxed_cell`
+        // above covers it and grandchildren), but not in a validator's `&.{}` aliases; there a direct boxed
+        // source is recognised through the scope plan when the stable-values provider exposes `isBoxedPlace`.
+        .place => |place_id| if (@hasDecl(@TypeOf(stable_values), "isBoxedPlace")) stable_values.isBoxedPlace(place_id) else false,
+        .external_binding => false,
+    };
+}
+
 pub const EntryValueBinding = struct {
     captured: ir.ValueId,
     source: ir.ExternalBindingId,
@@ -73,6 +92,7 @@ pub const ClosurePlan = struct {
     allocator: std.mem.Allocator,
     value_bindings: []ValueBinding,
     place_aliases: []PlaceAlias,
+    snapshot_bindings: []SnapshotBinding,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -94,6 +114,7 @@ pub const ClosurePlan = struct {
     ) (std.mem.Allocator.Error || error{InvalidClosureBinding})!ClosurePlan {
         var value_count: usize = 0;
         var alias_count: usize = parent_place_aliases.len;
+        var snapshot_count: usize = 0;
         for (target.captures, closure.bindings) |capture_id, binding| switch (program.captures[capture_id.index()].kind) {
             .immutable_value => {
                 const source = switch (binding) {
@@ -103,7 +124,10 @@ pub const ClosurePlan = struct {
                 if (canAliasImmutableSource(program, source, stable_values)) alias_count += 1 else value_count += 1;
             },
             .shared_place => switch (binding) {
-                .place => alias_count += 1,
+                .place => |place_id| {
+                    alias_count += 1;
+                    if (sourceIsBoxedCell(place_id, parent_place_aliases, stable_values)) snapshot_count += 1;
+                },
                 .value => return error.InvalidClosureBinding,
             },
         };
@@ -113,9 +137,12 @@ pub const ClosurePlan = struct {
         const place_aliases = try allocator.alloc(PlaceAlias, alias_count);
         errdefer allocator.free(place_aliases);
         @memcpy(place_aliases[0..parent_place_aliases.len], parent_place_aliases);
+        const snapshot_bindings = try allocator.alloc(SnapshotBinding, snapshot_count);
+        errdefer allocator.free(snapshot_bindings);
 
         var next_value: usize = 0;
         var next_alias = parent_place_aliases.len;
+        var next_snapshot: usize = 0;
         for (target.captures, closure.bindings) |capture_id, binding| {
             switch (program.captures[capture_id.index()].kind) {
                 .immutable_value => |captured| {
@@ -136,8 +163,15 @@ pub const ClosurePlan = struct {
                         .place => |place_id| place_id,
                         .value => return error.InvalidClosureBinding,
                     };
-                    place_aliases[next_alias] = .{ .place = .{ .captured = captured, .source = source } };
-                    next_alias += 1;
+                    if (sourceIsBoxedCell(source, parent_place_aliases, stable_values)) {
+                        place_aliases[next_alias] = .{ .boxed_place = .{ .captured = captured, .holder = captured } };
+                        next_alias += 1;
+                        snapshot_bindings[next_snapshot] = .{ .captured = captured, .source = source };
+                        next_snapshot += 1;
+                    } else {
+                        place_aliases[next_alias] = .{ .place = .{ .captured = captured, .source = source } };
+                        next_alias += 1;
+                    }
                 },
             }
         }
@@ -146,17 +180,22 @@ pub const ClosurePlan = struct {
             .allocator = allocator,
             .value_bindings = value_bindings,
             .place_aliases = place_aliases,
+            .snapshot_bindings = snapshot_bindings,
         };
     }
 
     pub fn deinit(self: *ClosurePlan) void {
         self.allocator.free(self.value_bindings);
         self.allocator.free(self.place_aliases);
+        self.allocator.free(self.snapshot_bindings);
     }
 };
 
 const NoStableValues = struct {
     pub fn contains(_: NoStableValues, _: ir.ValueId) bool {
+        return false;
+    }
+    pub fn isBoxedPlace(_: NoStableValues, _: ir.PlaceId) bool {
         return false;
     }
 };
@@ -200,7 +239,6 @@ pub fn emitWrite(
     place_aliases: []const PlaceAlias,
 ) !void {
     try output.appendSlice(allocator, indent);
-    _ = instruction;
     const resolved = place_render.resolve(operation.place, place_aliases) orelse return error.UnsupportedOperation;
     switch (resolved) {
         .place => {
@@ -220,7 +258,33 @@ pub fn emitWrite(
             try render.valueUseScalar(output, allocator, program, value_plan, operation.value);
             try output.appendSlice(allocator, ")\n");
         },
+        .boxed_cell => {
+            // A boxed per-execution cell: the allocating origin write makes a fresh box
+            // `<holder> = { value }`; every other write stores through the slot `<holder>[1] = value`.
+            if (declare_place) return error.UnsupportedOperation;
+            if (placeWriteIsBoxAllocation(program, operation.place, instruction)) {
+                try place_render.emitBoxHolderName(output, allocator, value_plan.names, program, operation.place, place_aliases);
+                try output.appendSlice(allocator, " = { ");
+                try render.valueUseScalar(output, allocator, program, value_plan, operation.value);
+                try output.appendSlice(allocator, " }\n");
+            } else {
+                try emitPlaceName(output, allocator, value_plan.names, program, operation.place, place_aliases);
+                try output.appendSlice(allocator, " = ");
+                try render.valueUseScalar(output, allocator, program, value_plan, operation.value);
+                try output.append(allocator, '\n');
+            }
+        },
     }
+}
+
+// The place_write at a boxed cell's origin instruction is the allocation (`<holder> = { value }`);
+// any other write of the same place stores through the box slot.
+pub fn placeWriteIsBoxAllocation(program: *const ir.Program, place_id: ir.PlaceId, instruction: ir.Instruction) bool {
+    if (place_id.index() >= program.places.len) return false;
+    return switch (program.places[place_id.index()].origin) {
+        .instruction => |allocation| allocation == instruction.id,
+        else => false,
+    };
 }
 
 pub fn emitPlaceName(
@@ -256,6 +320,9 @@ test "immutable lexical aliases require a stable emitted binding" {
 
         pub fn contains(self: @This(), value_id: ir.ValueId) bool {
             return self.id == value_id;
+        }
+        pub fn isBoxedPlace(_: @This(), _: ir.PlaceId) bool {
+            return false;
         }
     };
     var block_parameter_plan = try ClosurePlan.initWithStableValues(

@@ -176,6 +176,20 @@ pub const Plan = struct {
             if (!made_progress) unreachable;
         }
         plan.storage_name = try uniqueName(allocator, &used, "__lifter_place_storage");
+        // A boxed per-execution cell is captured by snapshot — the child reads its own
+        // `local <cell> = <holder>` through `[1]`. Name each shared_place capture's captured place (capture
+        // origin, otherwise unnamed) so the snapshot binding and the terminal boxed-place alias resolve it.
+        // Assigned last, so no earlier name moves; a non-boxed shared_place capture keeps the plain `.place`
+        // alias and never reads this name, so no existing output changes.
+        for (program.captures) |capture_item| switch (capture_item.kind) {
+            .shared_place => |captured| {
+                if (captured.index() >= plan.places.len or plan.places[captured.index()].len != 0) continue;
+                const hint = try std.fmt.allocPrint(allocator, "cell_{d}", .{captured.index()});
+                defer allocator.free(hint);
+                plan.places[captured.index()] = try uniqueName(allocator, &used, hint);
+            },
+            .immutable_value => {},
+        };
         return plan;
     }
 

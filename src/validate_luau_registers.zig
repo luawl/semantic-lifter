@@ -25,6 +25,10 @@ const StableCaptureValues = struct {
     pub fn contains(self: StableCaptureValues, value_id: ir.ValueId) bool {
         return self.scopes.valueHasStableLexicalBinding(value_id);
     }
+
+    pub fn isBoxedPlace(self: StableCaptureValues, place_id: ir.PlaceId) bool {
+        return self.scopes.arbitraryPlaceNeedsPerExecutionCell(place_id);
+    }
 };
 
 const Pressure = struct {
@@ -178,6 +182,16 @@ fn validatePrepared(
             );
             effective_locals = @max(effective_locals, flat_locals);
             effective_total = @max(effective_total, saturatingAdd(flat_locals, pressure.total -| pressure.locals));
+            // A boxed per-execution cell snapshots its holder with one transient `do`-block local
+            // per boxed capture at each closure creation; sequential creations reuse the registers, so the peak is
+            // the most boxed cells a single `make_closure` captures. The comprehensive flat `@max` above masks the
+            // scoped pressure, so add the peak to the flat frame in lockstep with the emission (like the
+            // `luau_numeric`/`generic_for_next` additions). The root holder count is unchanged.
+            const peak_boxed_snapshots = peakBoxedSnapshots(program, &emission, &scopes, function);
+            if (peak_boxed_snapshots != 0) {
+                effective_locals = @max(effective_locals, saturatingAdd(flat_locals, peak_boxed_snapshots));
+                effective_total = @max(effective_total, saturatingAdd(flat_locals, saturatingAdd(peak_boxed_snapshots, pressure.total -| pressure.locals)));
+            }
             // A `luau_numeric` transition renders a one-shot native `for` as its coercion guard. The guard's loop
             // variable is one more local and is FORNPREP's index register, so the limit, step and index frame of 3
             // includes that local rather than adding to it.
@@ -245,6 +259,38 @@ fn validatePrepared(
 }
 
 /// The function-scope registers a certified layout holds before any scoped
+/// The most boxed per-execution cells a single `make_closure` in this function captures.
+/// Each such capture snapshots its holder with one transient `do`-block local at the creation site; the
+/// snapshots of one creation are live together, while sequential creations reuse the registers. The holder
+/// itself stays a root-list place (counted by `arbitraryDeclarationCount`), so only the snapshots are added.
+fn peakBoxedSnapshots(
+    program: *const ir.Program,
+    emission: *const emission_planning.Plan,
+    scopes: *const emission_scope.Plan,
+    function: ir.Function,
+) usize {
+    var peak: usize = 0;
+    for (function.blocks) |block_id| {
+        if (block_id.index() >= program.blocks.len) continue;
+        for (program.blocks[block_id.index()].instructions) |instruction_id| {
+            if (instruction_id.index() >= program.instructions.len or emission.dead.contains(instruction_id)) continue;
+            const closure = switch (program.instructions[instruction_id.index()].operation) {
+                .make_closure => |value| value,
+                else => continue,
+            };
+            var count: usize = 0;
+            for (closure.bindings) |binding| switch (binding) {
+                .place => |place_id| {
+                    if (scopes.arbitraryPlaceNeedsPerExecutionCell(place_id)) count += 1;
+                },
+                .value => {},
+            };
+            peak = @max(peak, count);
+        }
+    }
+    return peak;
+}
+
 /// binding: the parameters (the entry chunk's bindings for the entry
 /// function), the owned-escape depth, the storage tables and, on a structured
 /// root, the escape flags `emitFunctionBody` declares at function scope: one
