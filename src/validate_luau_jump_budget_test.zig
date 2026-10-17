@@ -165,3 +165,16 @@ test "identical branch edges do not create a jump-distance obligation" {
     defer report.deinit();
     try expectClean(&report);
 }
+
+test "the forced dispatcher budgets the flat root's whole-body back jump" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const call_count = luau_runtime.max_jump_emission_units / call_units + 1;
+    // branched=true gives more than one block, so the .dispatcher strategy lays the function out flat
+    // (initArbitrary builds an all-.block root emitted as `while true do` plus a balanced dispatch over the blocks).
+    const program = try callProgram(arena.allocator(), call_count, true, false);
+    try std.testing.expect((try unitCount(std.testing.allocator, &program)) > luau_runtime.max_jump_emission_units);
+    var report = try validation.validateForTargetWithStrategy(std.testing.allocator, &program, .readable_luau, .standard_luau, .dispatcher);
+    defer report.deinit();
+    try std.testing.expect(report.contains(.unsupported_readable_jump_distance));
+}
