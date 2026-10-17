@@ -74,6 +74,9 @@ fn regionHasEncodedJump(
     emission: *const emission_planning.Plan,
     region: *const structure.Region,
 ) bool {
+    // A flat (arbitrary-CFG) root is emitted inside `while true do` plus a dispatch tree, whose whole-body back
+    // jump the structured loop layout budgets at the `.loop` arm below; budget it here too.
+    if (region.arbitrary_cfg) return true;
     for (region.nodes) |node| switch (node) {
         .block => {},
         .branch => |branch| {
