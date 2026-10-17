@@ -73,6 +73,9 @@ lune run frontends/disassembly/lift_compiler_disassembly.luau <handoff.json> <pr
 
 `function_index` selects the compiled function in the listing; the caller declares its signature,
 `parameter_count` (default 2) and `is_variadic` (default `false`), which the text listing does not encode.
+A caller may also declare the listing's level, `optimization_level: 0` for a `-O0` listing such as the
+one-liner's (the only value the option takes); with that declaration a table record template
+(`DUPTABLE`) is lowered to a literal constructor, and without it the template stays a typed refusal.
 
 Then validate, resolve and emit:
 
