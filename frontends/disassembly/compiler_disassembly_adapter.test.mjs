@@ -845,9 +845,9 @@ test('constant-operand AND/OR stay refused at the pinned level', () => {
       && /unsupported opcode ORK at disassembly line 3/.test(error.message));
 });
 
-test('a -O0 record template stays refused with its remark and its stores', () => {
-  // By design, DUPTABLE stays refused even where the -O0 listing shows its remark and its key stores; the reason is
-  // recorded at the adapter's refusal.
+test('without a declared level a record template stays refused', () => {
+  // For a listing whose level is not declared, DUPTABLE stays refused even
+  // where the -O0 listing shows its remark and its key stores; the reason is recorded at the adapter's refusal.
   assert.throws(() => parseDisassembly(tableRecordFields),
     (error) => refusedAs('table_template_opaque')(error) && error.opcode === 'DUPTABLE' && error.line_number === 11);
 });
@@ -1543,4 +1543,90 @@ test('closure trees with an uninstantiated function are refused', () => {
 test('a by-reference capture inside a numeric for loop is refused', () => {
   assert.throws(() => parseDisassembly(closureLoopReference, { function_index: 1, parameter_count: 2, nested: one(0) }),
     refusedAs('captured_register_reused_after_close'));
+});
+
+// Record templates: at a caller-declared -O0 (`optimization_level: 0`) a DUPTABLE record
+// template and its N record stores lower to a literal constructor window whose members carry their LOADK'd keys, so the
+// bridge builds one make_table_literal with constant identifier keys, which the backend prints as a record that Luau
+// recompiles to a DUPTABLE of the same template. Without the declaration the template stays refused (the pin above).
+// duptableControlflow is the verbatim Function 0 of the -O0 -g0 listing of the author-owned program
+// duptable_controlflow, CRLF removed.
+const duptableControlflow = `Function 0 (??):
+K0: 'positive'
+K1: 'scaled'
+K2: {...}
+K3: 0
+REMARK allocation: table template 2
+DUPTABLE R2 2
+LOADK R3 K0 ['positive']
+LOADK R5 K3 [0]
+JUMPIFLT R5 R0 L0
+LOADB R4 0 +1
+L0: LOADB R4 1
+L1: SETTABLE R4 R2 R3
+LOADK R3 K1 ['scaled']
+SETTABLE R1 R2 R3
+GETTABLEKS R3 R2 K0 ['positive']
+GETTABLEKS R4 R2 K1 ['scaled']
+RETURN R3 2
+`;
+const declaredO0 = { optimization_level: 0 };
+const refusedWithMessage = (code, message) => (error) => refusedAs(code)(error) && message.test(error.message);
+const replaceExactlyOnce = (text, from, to) => {
+  assert.equal(text.split(from).length - 1, 1, `not exactly once: ${from}`);
+  return text.replace(from, () => to);
+};
+const pickFields = (instruction, fields) => Object.fromEntries(fields.map((field) => [field, instruction[field]]));
+
+test('a record template at a declared -O0 lowers to a literal window with record keys', () => {
+  const handoff = parseDisassembly(tableRecordFields, declaredO0);
+  assert.deepEqual(Object.keys(handoff), ['schema_version', 'listing_sha256', 'function_index', 'parameter_count', 'is_variadic',
+    'registers', 'instructions', 'signature_origin', 'scope']);
+  const { instructions } = handoff;
+  assert.deepEqual(pickFields(instructions[0], ['op', 'kind', 'template_size', 'writes', 'constructor']),
+    { op: 'DUPTABLE', kind: 'new_table', template_size: 2, writes: [2], constructor: { create: 0, mode: 'literal' } });
+  assert.deepEqual(pickFields(instructions[3], ['op', 'kind', 'table', 'value', 'key_constant', 'reads', 'constructor']),
+    { op: 'SETTABLE', kind: 'table_set', table: 2, value: 4, key_constant: { string: 'count' }, reads: [4], constructor: { create: 0, mode: 'literal' } });
+  assert.deepEqual(pickFields(instructions[5], ['op', 'value', 'key_constant', 'reads', 'complete']),
+    { op: 'SETTABLE', value: 0, key_constant: { string: 'total' }, reads: [0], complete: true });
+  assert.equal(Object.hasOwn(instructions[3], 'key'), false);
+  assert.equal(Object.hasOwn(instructions[5], 'key'), false);
+  assert.deepEqual(instructions.flatMap((instruction, index) => (Object.hasOwn(instruction, 'constructor') ? [index] : [])), [0, 3, 5]);
+});
+
+test('record templates outside the -O0 record shape are typed refusals', () => {
+  assert.throws(() => parseDisassembly(tableRecordFields, { optimization_level: 1 }),
+    refusedWithMessage('invalid_options', /^optimization_level must be 0 or omitted$/));
+  assert.throws(() => parseDisassembly(replaceExactlyOnce(tableRecordFields, 'REMARK allocation: table template 2\n', ''), declaredO0),
+    refusedWithMessage('table_template_opaque', /no table template remark/));
+  assert.throws(() => parseDisassembly(replaceExactlyOnce(tableRecordFields, "K0: 'count'", "K0: 'end'"), declaredO0),
+    refusedWithMessage('non_identifier_name', /DUPTABLE member key is not a record name at disassembly line 14/));
+  assert.throws(() => parseDisassembly(replaceExactlyOnce(tableRecordFields, "SETTABLE R4 R2 R3\nLOADK R3 K1",
+    "SETTABLE R4 R2 R3\nGETTABLEKS R5 R2 K0 ['count']\nLOADK R3 K1"), declaredO0),
+  refusedWithMessage('constructor_window_unsupported', /template of 2 fields has 1 stores/));
+  assert.throws(() => parseDisassembly(replaceExactlyOnce(tableRecordFields, "LOADK R3 K1 ['total']\nSETTABLE R0 R2 R3",
+    "SETTABLEKS R0 R2 K1 ['total']"), declaredO0),
+  refusedWithMessage('constructor_window_unsupported', /DUPTABLE member is not a record field store at disassembly line 15/));
+  assert.throws(() => parseDisassembly(replaceExactlyOnce(tableRecordFields, 'table template 2', 'table template 3'), declaredO0),
+    refusedWithMessage('constructor_window_unsupported', /template of 3 fields has 2 stores/));
+});
+
+test('a record template window may hold control flow that stays inside it', () => {
+  const { instructions } = parseDisassembly(duptableControlflow, declaredO0);
+  const members = instructions.flatMap((instruction, index) => (Object.hasOwn(instruction, 'constructor') ? [index] : []));
+  assert.deepEqual(members.map((index) => instructions[index].op), ['DUPTABLE', 'SETTABLE', 'SETTABLE']);
+  assert.deepEqual(members.slice(1).map((index) => instructions[index].key_constant), [{ string: 'positive' }, { string: 'scaled' }]);
+  assert.equal(instructions[members[2]].complete, true);
+});
+
+test('control flow that enters, leaves or bypasses a record template window is refused', () => {
+  assert.throws(() => parseDisassembly(replaceExactlyOnce(duptableControlflow, "GETTABLEKS R4 R2 K1 ['scaled']\n",
+    "GETTABLEKS R4 R2 K1 ['scaled']\nJUMPIF R3 L0\n"), declaredO0),
+  refusedWithMessage('constructor_window_unsupported', /transfer enters a DUPTABLE window/));
+  assert.throws(() => parseDisassembly(replaceExactlyOnce(replaceExactlyOnce(duptableControlflow, 'JUMPIFLT R5 R0 L0', 'JUMPIFLT R5 R0 L2'),
+    "LOADK R3 K1 ['scaled']", "L2: LOADK R3 K1 ['scaled']"), declaredO0),
+  refusedWithMessage('constructor_window_unsupported', /transfer leaves the DUPTABLE window or passes a member/));
+  assert.throws(() => parseDisassembly(replaceExactlyOnce(duptableControlflow, "L1: SETTABLE R4 R2 R3\nLOADK R3 K1 ['scaled']\nSETTABLE R1 R2 R3",
+    "L1: SETTABLE R4 R2 R3\nJUMPIF R1 L2\nLOADK R3 K1 ['scaled']\nL2: SETTABLE R1 R2 R3"), declaredO0),
+  refusedWithMessage('constructor_window_unsupported', /transfer passes the key load of a DUPTABLE member/));
 });

@@ -3,6 +3,8 @@ import { createHash } from 'node:crypto';
 // Supported input: the text listing of `luau-compile --text --dump-constants -O0 -g0` from
 // Luau 0.720, the pinned compiler. Other optimization levels, binary bytecode and original source ASTs are not
 // inputs. Everything this adapter cannot represent faithfully is refused with a typed DisassemblyRefusal.
+// A caller may declare that level (`optimization_level: 0`); only then is a DUPTABLE record template lifted, from its
+// `REMARK allocation: table template N` line and its N record stores.
 // Iteration, at that -O0 -g0 level only: FORNPREP/FORGPREP become `iteration_prepare` and
 // FORNLOOP/FORGLOOP `iteration_loop` records that share one `loop` region (iteration, base, prepare, latch, exit,
 // variables). A loop shape outside that region form is refused as iteration_pair_mismatch, iteration_state_written,
@@ -163,7 +165,7 @@ function closureSites(records) {
 // One function body: the selected function or a declared nested function. `upvalues` lists the classes ('value' |
 // 'place') of the function's upvalues, as its creating closure record decided them; `childIds` maps the k of each
 // `NEWCLOSURE R<a> P<k>` line of the body to the caller-declared index of the function it creates.
-function parseFunction(records, { parameter_count, is_variadic, upvalues, childIds }) {
+function parseFunction(records, { parameter_count, is_variadic, upvalues, childIds, optimization_level = null }) {
   const constants = new Map();
   const labels = new Map();
   const instructions = [];
@@ -476,12 +478,27 @@ function parseFunction(records, { parameter_count, is_variadic, upvalues, childI
       }
     } else if (op === 'DUPTABLE') {
       // DUPTABLE: the template constant prints as `{...}`, so its keys are not in the listing.
-      // It stays refused by design: a lifted record constructor with register
-      // or bracketed keys recompiles to NEWTABLE, whose `next` order differs from the template's when a field holds nil
-      // (Luau 0.720, 400 generated key sets: 174 with the first value nil, 169 with every odd value nil, 67 with the middle
-      // value nil), and at -O1 the template carries constant values the listing does not show while the listing cannot
-      // prove its level.
-      refuseAt(site, 'table_template_opaque', 'DUPTABLE template keys are not in the listing');
+      // Without a caller-declared -O0 (`optimization_level: 0`) it stays refused: at -O1 the template carries constant
+      // values the listing does not show, and the listing cannot prove its level. At a declared -O0 (the caller's
+      // declaration lifts the refusal for declared -O0 listings only) the compiler stores every
+      // template key right after the DUPTABLE, one `LOADK R<k> K<'key'>` + value + `SETTABLE R<v> R<t> R<k>` per record
+      // field in source order, and the `REMARK allocation: table template N` line right before it names N. The window
+      // (below) must be exactly those N stores; their keys become key_constant, so the bridge emits make_table_literal
+      // with constant identifier keys, which the backend prints as record syntax and the compiler turns back into a
+      // DUPTABLE of the same template. The stores only overwrite values of a template that already holds all N keys, so
+      // the node layout, and with it the `next` order, depends on the key sequence alone, nil values included. The 174,
+      // 169 and 67 of 400 key sets of the earlier reason measured a lowering with register or bracketed keys, which
+      // recompiles to a hinted NEWTABLE; the record-key lowering differs from the original in none of them.
+      if (optimization_level !== 0) refuseAt(site, 'table_template_opaque', 'DUPTABLE template keys are not in the listing');
+      let remark = null;
+      for (let back = position - 1; back >= 0 && records[back].line.startsWith('REMARK '); back -= 1) {
+        remark ??= /^REMARK allocation: table template ([1-9]\d*)$/.exec(records[back].line);
+      }
+      if (!remark) refuseAt(site, 'table_template_opaque', 'DUPTABLE has no table template remark');
+      if (!/^\d+$/.test(args[1]) || constants.get(Number(args[1])) !== '{...}') refuseAt(site, 'operand_form', 'DUPTABLE template constant is absent');
+      instruction.kind = 'new_table';
+      instruction.template_size = Number(remark[1]);
+      instruction.writes = [register(args[0], site)];
     } else if (op === 'GETUPVAL') {
       // `GETUPVAL R<a> <u>`: R<a> = upvalue u (a value capture's value, or a read of a place capture).
       instruction.kind = 'upvalue_get';
@@ -636,22 +653,77 @@ function parseFunction(records, { parameter_count, is_variadic, upvalues, childI
   // which at -O0 is source order.
   const storeRegisters = (store) => (store.kind === 'set_list' ? store.values
     : [...(store.key === undefined ? [] : [store.key]), store.value]);
+  // A DUPTABLE window holds exactly N members, each a -O0 record store: SETTABLE whose key
+  // register was last written inside the window by LOADK of a string that the backend prints as a record key (an identifier
+  // and not a reserved word, src/luau_syntax.zig:3-7 and :74-79), the last member included.
+  const RESERVED = new Set(['and', 'break', 'do', 'else', 'elseif', 'end', 'false', 'for', 'function', 'if', 'in', 'local',
+    'nil', 'not', 'or', 'repeat', 'return', 'then', 'true', 'until', 'while']);
+  const recordStores = (create, template, members) => {
+    if (members.length !== template) {
+      refuseAt(instructions[create], 'constructor_window_unsupported', `DUPTABLE template of ${template} fields has ${members.length} stores in its window`);
+    }
+    for (const index of members) {
+      const member = instructions[index];
+      let writer = null;
+      for (let at = index - 1; at > create && writer === null; at -= 1) {
+        if (instructions[at].writes.includes(member.key) || (instructions[at].clobbers_from ?? Infinity) <= member.key) writer = instructions[at];
+      }
+      if (!(member.op === 'SETTABLE' && writer?.op === 'LOADK' && typeof writer.value.string === 'string')) {
+        refuseAt(member, 'constructor_window_unsupported', 'DUPTABLE member is not a record field store');
+      }
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(writer.value.string) || RESERVED.has(writer.value.string)) {
+        refuseAt(member, 'non_identifier_name', 'DUPTABLE member key is not a record name');
+      }
+    }
+    // The DUPTABLE window is closed. (a) Every transfer inside goes forward and lands at or before the next member,
+    // so each member lies on every path from the create. (b) Nothing outside (create, last] jumps into it. (c) Nothing
+    // jumps past a member's key load into the stretch up to that member.
+    const last = members[members.length - 1];
+    for (let index = create + 1; index < last; index += 1) {
+      const bound = members.find((member) => member > index);
+      if (!instructions[index].successors.every((target) => target > index && target <= bound)) {
+        refuseAt(instructions[index], 'constructor_window_unsupported', 'transfer leaves the DUPTABLE window or passes a member');
+      }
+    }
+    for (const [index, other] of instructions.entries()) {
+      if (index >= create && index <= last) continue;
+      if (other.successors.some((target) => target > create && target <= last)) {
+        refuseAt(other, 'constructor_window_unsupported', 'transfer enters a DUPTABLE window');
+      }
+    }
+    for (const index of members) {
+      const { key } = instructions[index];
+      let load = index - 1;
+      while (!(instructions[load].writes.includes(key) || (instructions[load].clobbers_from ?? Infinity) <= key)) load -= 1;
+      for (let at = create + 1; at < load; at += 1) {
+        if (instructions[at].successors.some((target) => target > load && target <= index)) {
+          refuseAt(instructions[at], 'constructor_window_unsupported', 'transfer passes the key load of a DUPTABLE member');
+        }
+      }
+    }
+  };
   for (const [create, table] of instructions.entries()) {
     if (table.kind !== 'new_table') continue;
     const [t] = table.writes;
     const members = [];
+    const template = table.template_size; // DUPTABLE windows only
     for (let index = create + 1; index < instructions.length; index += 1) {
       const instruction = instructions[index];
       const transfers = ['jump', 'branch', 'return', 'iteration_prepare', 'iteration_loop'].includes(instruction.kind)
         || instruction.successors[0] !== index + 1;
-      if (labelled.has(index) || transfers) break;
+      // A template window may hold labels and forward transfers (checked by recordStores); a return or an
+      // iteration instruction still ends it.
+      if (template === undefined ? (labelled.has(index) || transfers)
+        : ['return', 'iteration_prepare', 'iteration_loop'].includes(instruction.kind)) break;
       const store = (instruction.kind === 'set_list' || instruction.kind === 'table_set') && instruction.table === t;
       const touched = store ? storeRegisters(instruction)
         : [...instruction.reads, ...instruction.writes, ...(instruction.references ?? [])];
       if (touched.includes(t) || (instruction.clobbers_from ?? Infinity) <= t) break;
       if (store) members.push(index);
+      if (template !== undefined && members.length === template) break; // exactly its N stores
     }
-    if (!members.some((index) => instructions[index].kind === 'set_list')) continue;
+    if (template !== undefined) recordStores(create, template, members);
+    else if (!members.some((index) => instructions[index].kind === 'set_list')) continue;
     const last = members[members.length - 1];
     // List items continue from 1 (`[1]`, then the previous start plus the previous count); an open tail is last.
     let next = 1;
@@ -833,7 +905,8 @@ function nestedDeclarations(nested) {
 
 // The compiler owns bytecode decoding. This adapter accepts its pinned text
 // format, not arbitrary binary bytecode or original source ASTs.
-export function parseDisassembly(text, { function_index = 0, parameter_count = 2, is_variadic = false, nested = {} } = {}) {
+export function parseDisassembly(text, { function_index = 0, parameter_count = 2, is_variadic = false, nested = {},
+  optimization_level = null } = {}) {
   if (!(Number.isInteger(function_index) && function_index >= 0)) {
     refuse('invalid_options', 'function_index must be a non-negative integer');
   }
@@ -841,6 +914,9 @@ export function parseDisassembly(text, { function_index = 0, parameter_count = 2
     refuse('invalid_options', 'parameter_count must be an integer from 0 to 254');
   }
   if (typeof is_variadic !== 'boolean') refuse('invalid_options', 'is_variadic must be a boolean');
+  // The compiler level that produced the listing, declared by the caller as
+  // parameter_count is; the listing cannot prove it.
+  if (!(optimization_level === null || optimization_level === 0)) refuse('invalid_options', 'optimization_level must be 0 or omitted');
   const declared = nestedDeclarations(nested);
   const functions = new Map();
   let current = null;
@@ -919,7 +995,7 @@ export function parseDisassembly(text, { function_index = 0, parameter_count = 2
       }
     }
   }
-  const selected = parseFunction(records, { parameter_count, is_variadic, upvalues: [], childIds: childIds(function_index) });
+  const selected = parseFunction(records, { parameter_count, is_variadic, upvalues: [], childIds: childIds(function_index), optimization_level });
   const result = {
     schema_version: 'compiler_disassembly_handoff_v2',
     listing_sha256: createHash('sha256').update(text).digest('hex'),
@@ -937,6 +1013,7 @@ export function parseDisassembly(text, { function_index = 0, parameter_count = 2
       const upvalues = closure.captures.map((capture) => capture.class);
       const body = parseFunction(functions.get(entry.index), {
         parameter_count: entry.parameter_count, is_variadic: entry.is_variadic, upvalues, childIds: childIds(entry.index),
+        optimization_level,
       });
       // The compiler captures exactly the upvalues a function references, in first-reference order.
       if (body.usedUpvalues.size !== upvalues.length) {
