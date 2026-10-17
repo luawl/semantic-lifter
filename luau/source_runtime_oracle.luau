@@ -324,6 +324,33 @@ function SourceRuntimeOracle.run(caseName: string, source: string, exported: any
 		check(3, 3, { 4, 12, 9, 4, 2, 0, 4, 4 })
 		check(10, 3, { 3, 3, 3, 3, 2, 0, 3, 1 })
 		check(2.5, 7, { 4, 10.5, 9, 4, 2, 0, 4, 3.5 })
+
+	elseif caseName == "source-frontend-always-break-transfer-iteration" then
+		local forLines = 0
+		for line in string.gmatch(source, "[^\n]+") do
+			if string.match(line, "^%s*for .+ do%s*$") ~= nil then
+				forLines += 1
+			end
+		end
+		assert(forLines == 8, "a nested-transfer always-break body lost its native for loop")
+		assert(string.find(source, "continue", 1, true) == nil, "a nested-transfer always-break body emitted a continue")
+		local function check(initial: any, limit: any, expected: { any })
+			local results = table.pack(exported(initial, limit))
+			assert(results.n == 9, "nested-transfer always-break bodies changed the result count")
+			for index = 1, 9 do
+				assert(results[index] == expected[index], "nested-transfer always-break bodies changed a result")
+			end
+		end
+		check(1, 3, { 333, 3033, 33, 224, 202, 323, 6, 6, 6 })
+		check(1.5, 3, { 336, 3036, 36, 224, 202, 325, 7.5, 10.5, 7.5 })
+		check(2, 3, { 336, 3036, 36, 224, 202, 325, 9, 12, 9 })
+		check(3, 7, { 303, 3336, 3, 224, 202, 303, 12, 15, 12 })
+		check(4, 10, { 303, 3003, 3, 224, 202, 303, 15, 18, 15 })
+		check(6, 7, { 303, 3003, 3, 224, 202, 303, -1, -1, -1 })
+		check(3, 1, { 303, 3003, 3, 224, 202, 303, 3, 3, 3 })
+		check(10, 3, { 303, 3003, 3, 224, 202, 303, 3, 3, 3 })
+		check(2.5, 7, { 303, 3336, 3, 224, 202, 303, 10.5, 13.5, 10.5 })
+		check(3, 3, { 303, 3336, 3, 202, 202, 303, 12, 15, 12 })
 	elseif caseName == "source-frontend-typed-block" then
 		assert(exported(7) == 7, "source frontend changed typed block runtime behavior")
 	elseif caseName == "source-frontend-numeric-for" then
