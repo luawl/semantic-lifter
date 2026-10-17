@@ -198,10 +198,11 @@ pub fn matchAcyclicBranch(
         // Forms A and B: until it reaches the loop's exit block, the body stays in its region (no back edge to the
         // header; no `break`, `continue` or escape of an enclosing construct, which would bind to the native `for`).
         if (!try bodyStaysInRegion(allocator, &analysis, shape.body_region, shape.body_edge.target, shape.exit_edge.target)) return null;
-        // A nested branch that joins or escapes to the loop's exit is
-        // written as an escape flag and a `break`, which would bind to the native `for`; the acyclic writer declares
-        // and propagates no such flag, so the body stays refused.
-        if (bodyHasNestedTransfer(program, shape.body_region, shape.exit_edge.target)) return null;
+        // A nested escape to the loop's exit block is written by the body region's own
+        // `repeat ... until true` wrapper, which declares and consumes its flag inside the `for`. What a native `for`
+        // cannot carry is a `continue` (or an enclosing loop's `break`), which would bind to it, so only a body whose
+        // nested transfer the writer would write that way stays refused.
+        if (try bodyHasUnwrittenTransfer(allocator, program, shape.body_region, shape.exit_edge.target)) return null;
     } else if (try analysis.canReach(shape.body_edge.target, header.id)) return null;
 
     const identity = try allocator.alloc(ir.ValueId, program.values.len);
@@ -436,8 +437,9 @@ fn exitArmIsStop(plan: structure.Branch, shape: AcyclicShape, region: *const str
 }
 
 /// Every block the body reaches before the loop's exit block lies in the body region. The
-/// header is never in that region, so a back edge fails the walk; a `.terminal` boundary's block is not in it either,
-/// so a body that may also return stays refused.
+/// header is never in that region, so a back edge fails the walk. A function-terminating block
+/// the region writes inline (`regionHoldsTerminalBlock`: a `.terminal` boundary's block, a `.loop_terminal`'s terminal
+/// block) counts as inside; it has no successor, so the walk gains no path, and a body that may also return is admitted.
 fn bodyStaysInRegion(
     allocator: std.mem.Allocator,
     analysis: *const cfg.Analysis,
@@ -456,7 +458,7 @@ fn bodyStaysInRegion(
         if (block_id.index() >= visited.len) return false;
         if (visited[block_id.index()]) continue;
         visited[block_id.index()] = true;
-        if (!regionContainsBlock(region, block_id)) return false;
+        if (!regionContainsBlock(region, block_id) and !regionHoldsTerminalBlock(region, block_id)) return false;
         for (0..analysis.successorCount(block_id)) |successor_index| {
             try pending.append(allocator, analysis.successorAt(block_id, successor_index) orelse return false);
         }
@@ -464,69 +466,146 @@ fn bodyStaysInRegion(
     return true;
 }
 
+/// A function-terminating block the region writes inline: the boundary block of a `.terminal`
+/// loop boundary (emitOwnedTerminalArm) or the terminal block of a `.loop_terminal` node, at any depth.
+fn regionHoldsTerminalBlock(region: *const structure.Region, target: ir.BlockId) bool {
+    for (region.nodes) |node| {
+        const held = switch (node) {
+            .block, .loop_control => false,
+            .loop_terminal => |control| control.terminal_block == target,
+            .branch => |branch| regionHoldsTerminalBlock(branch.then_region, target) or
+                regionHoldsTerminalBlock(branch.else_region, target),
+            .loop => |loop| regionHoldsTerminalBlock(loop.body_region, target),
+            .latch_loop => |loop| regionHoldsTerminalBlock(loop.body_region, target),
+            .infinite_loop => |loop| regionHoldsTerminalBlock(loop.body_region, target),
+            .loop_boundary => |control| regionHoldsTerminalBlock(control.body_region, target) or switch (control.boundary) {
+                .terminal => |terminal| terminal.block == target,
+                else => false,
+            },
+        };
+        if (held) return true;
+    }
+    return false;
+}
+
+/// Inside an enclosed body a nested escape (to the loop's exit block X or to an inner join) is
+/// written by the escaping region's own `repeat ... until true` wrapper and re-raised after each wrapper up to the
+/// region whose stop is the target (emitRegionWithPredeclaredBlock, emitRegionEscapePropagation); for X that region is
+/// the body region, so its flag is declared and consumed inside the `for`. What the writer cannot carry inside a
+/// native `for` is a `continue`.
+fn bodyHasUnwrittenTransfer(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    body: *const structure.Region,
+    exit: ir.BlockId,
+) std.mem.Allocator.Error!bool {
+    // Without a loop exit the writer sets an escape flag but writes no `break` after it (emitRegionWithPredeclaredBlock,
+    // emitRegionBodyWithPredeclaredBlock): the nested-transfer rule stays (form A at an `if`-arm tail or in a side-exit region).
+    if (body.loop_exit == null) return bodyHasNestedTransfer(program, body, exit);
+    // The writer's precondition: nothing has to be propagated past the `for` (implied by bodyStaysInRegion).
+    const free_targets = try structure.regionFreeTargetsAlloc(allocator, body);
+    defer allocator.free(free_targets);
+    if (free_targets.len != 0) return true;
+    return regionWritesContinue(program, body, exit);
+}
+
+/// Whether the region writer would write, in this region or below it, a `continue` (or an
+/// enclosing loop's `break`), which inside a native `for` would bind to the `for`. The edge-override test of the nested-transfer walk is
+/// not repeated: an override replaces the effective edge and writes no transfer (emit_luau_branch_stmt.zig; known
+/// by code reading, not modelled here).
+fn regionWritesContinue(program: *const ir.Program, region: *const structure.Region, exit: ir.BlockId) bool {
+    if (region.continue_projection != null) return true; // a `continue` statement or flag
+    if (region.stop) |stop| {
+        // Consumed as `if <flag> then continue end` after the region's wrapper (emitRegionEscapePropagation): a
+        // loop-boundary body that also breaks from a nested branch, or a nested break whose exit edges are forwarded to the
+        // enclosing loop header.
+        if (region.continue_target != null and region.continue_target.? == stop and
+            structure.regionHasNestedEscapeTo(region, stop)) return true;
+    }
+    for (region.nodes) |node| switch (node) {
+        .block, .loop_terminal => {}, // a .loop_terminal falls through to the region stop (emitLoopTerminalControl)
+        .loop_control => return true, // writes the enclosing loop's exit as a `break` (confinement excludes it already)
+        .branch => |branch| if (regionWritesContinue(program, branch.then_region, exit) or
+            regionWritesContinue(program, branch.else_region, exit)) return true,
+        .loop, .latch_loop, .infinite_loop => if (walk.node(program, node, exit)) return true, // the strict nested-transfer walk
+        .loop_boundary => |control| {
+            // Only a `.terminal` boundary whose body stops at this region's stop (`.parent_stop`, no `continue`:
+            // transparent_stop.zig, emitLoopBoundaryBodyImpl).
+            if (control.boundary != .terminal) return true;
+            const stop = region.stop orelse return true;
+            if (control.body_region.stop == null or control.body_region.stop.? != stop) return true;
+            if (regionWritesContinue(program, control.body_region, exit)) return true;
+        },
+    };
+    return false;
+}
+
 /// A branch nested below the body region that joins or escapes to the
-/// loop's exit block is written as an escape flag and a `break`, which would bind to the native `for`; the acyclic
-/// writer declares and propagates no such flag, so such a body stays refused. A nested region counts when it carries
-/// an escape or continue projection, or holds a `.branch` whose join is the exit block or whose branch edge (or its
-/// edge override) targets it. The body region's own top-level branches count only through their arm regions: a
-/// top-level branch joining at the exit block is the body's ordinary shape.
+/// loop's exit block is written as an escape flag. `bodyHasUnwrittenTransfer` keeps this rule
+/// for a body without an inherited `loop_exit`, where the writer sets that flag but writes no `break` after it. A
+/// nested region counts when it carries an escape or continue projection, or holds a `.branch` whose join is the exit
+/// block or whose branch edge (or its edge override) targets it. The body region's own top-level branches count only
+/// through their arm regions: a top-level branch joining at the exit block is the body's ordinary shape.
 fn bodyHasNestedTransfer(program: *const ir.Program, region: *const structure.Region, exit: ir.BlockId) bool {
     if (structure.regionHasNestedEscapeTo(region, exit)) return true;
-    const walk = struct {
-        /// The regions one node holds, each checked as a nested region.
-        fn node(source: *const ir.Program, value: structure.Node, target: ir.BlockId) bool {
-            return switch (value) {
-                .block, .loop_control, .loop_terminal => false,
-                .branch => |branch| nested(source, branch.then_region, target) or nested(source, branch.else_region, target),
-                .loop => |loop| nested(source, loop.body_region, target),
-                .latch_loop => |loop| nested(source, loop.body_region, target),
-                .infinite_loop => |loop| infinite: {
-                    if (nested(source, loop.body_region, target)) break :infinite true;
-                    const side_exit = loop.shared_side_exit orelse break :infinite false;
-                    for (side_exit.entries) |entry| {
-                        if (nested(source, entry.region, target)) break :infinite true;
-                    }
-                    break :infinite false;
-                },
-                .loop_boundary => |control| nested(source, control.body_region, target) or switch (control.boundary) {
-                    .side_exit => |side| nested(source, side.region, target),
-                    .side_escape => |side| nested(source, side.region, target),
-                    else => false,
-                },
-            };
-        }
-
-        fn nested(source: *const ir.Program, nested_region: *const structure.Region, target: ir.BlockId) bool {
-            if (nested_region.escape_projection != null or nested_region.continue_projection != null) return true;
-            for (nested_region.nodes) |value| {
-                switch (value) {
-                    .branch => |branch| {
-                        if (branch.join != null and branch.join.? == target) return true;
-                        if (branch.then_edge_override) |override| {
-                            if (override.edge().target == target) return true;
-                        }
-                        if (branch.else_edge_override) |override| {
-                            if (override.edge().target == target) return true;
-                        }
-                        if (branch.block.index() < source.blocks.len) {
-                            switch (source.blocks[branch.block.index()].terminator) {
-                                .branch => |edges| if (edges.then_edge.target == target or edges.else_edge.target == target) return true,
-                                else => {},
-                            }
-                        }
-                    },
-                    else => {},
-                }
-                if (node(source, value, target)) return true;
-            }
-            return false;
-        }
-    };
     for (region.nodes) |value| {
         if (walk.node(program, value, exit)) return true;
     }
     return false;
 }
+
+/// The nested-transfer walk of `bodyHasNestedTransfer`, hoisted to file scope so that
+/// `regionWritesContinue` keeps it for nested real loops.
+const walk = struct {
+    /// The regions one node holds, each checked as a nested region.
+    fn node(source: *const ir.Program, value: structure.Node, target: ir.BlockId) bool {
+        return switch (value) {
+            .block, .loop_control, .loop_terminal => false,
+            .branch => |branch| nested(source, branch.then_region, target) or nested(source, branch.else_region, target),
+            .loop => |loop| nested(source, loop.body_region, target),
+            .latch_loop => |loop| nested(source, loop.body_region, target),
+            .infinite_loop => |loop| infinite: {
+                if (nested(source, loop.body_region, target)) break :infinite true;
+                const side_exit = loop.shared_side_exit orelse break :infinite false;
+                for (side_exit.entries) |entry| {
+                    if (nested(source, entry.region, target)) break :infinite true;
+                }
+                break :infinite false;
+            },
+            .loop_boundary => |control| nested(source, control.body_region, target) or switch (control.boundary) {
+                .side_exit => |side| nested(source, side.region, target),
+                .side_escape => |side| nested(source, side.region, target),
+                else => false,
+            },
+        };
+    }
+
+    fn nested(source: *const ir.Program, nested_region: *const structure.Region, target: ir.BlockId) bool {
+        if (nested_region.escape_projection != null or nested_region.continue_projection != null) return true;
+        for (nested_region.nodes) |value| {
+            switch (value) {
+                .branch => |branch| {
+                    if (branch.join != null and branch.join.? == target) return true;
+                    if (branch.then_edge_override) |override| {
+                        if (override.edge().target == target) return true;
+                    }
+                    if (branch.else_edge_override) |override| {
+                        if (override.edge().target == target) return true;
+                    }
+                    if (branch.block.index() < source.blocks.len) {
+                        switch (source.blocks[branch.block.index()].terminator) {
+                            .branch => |edges| if (edges.then_edge.target == target or edges.else_edge.target == target) return true,
+                            else => {},
+                        }
+                    }
+                },
+                else => {},
+            }
+            if (node(source, value, target)) return true;
+        }
+        return false;
+    }
+};
 
 /// Which entry edges into an acyclic header count as edges that continue the iteration.
 /// `matchAcyclicBranch` keeps the reachability test; `matchAcyclicLoopBoundary` takes the dominance test.
@@ -2437,6 +2516,727 @@ test "join-less acyclic iteration whose exit arm is not empty stays refused when
     const branch = found orelse return error.TestUnexpectedResult;
     try std.testing.expect((try matchAcyclicBranch(std.testing.allocator, &program, branch)) == null);
 
+    var report = diagnostics.Report.init(std.testing.allocator);
+    defer report.deinit();
+    try validateFunction(std.testing.allocator, &report, &program, &analysis, &plan);
+    var reported = false;
+    for (report.diagnostics.items) |diagnostic| {
+        if (diagnostic.code == .unsupported_readable_iteration_protocol and diagnostic.entity_index != null and
+            diagnostic.entity_index.? == i_next.index()) reported = true;
+    }
+    try std.testing.expect(reported);
+}
+
+test "acyclic iteration in a loop body is recognized when its body breaks from a nested branch" {
+    // A numeric loop inside a `while` body whose body leaves the loop from a nested
+    // branch as well as at its end (`if a then if b then break end <code> end <code> break`). The nested `break` to the
+    // loop's exit block X is written by the body region's own `repeat ... until true` wrapper, which declares and
+    // consumes its flag inside the `for`, so nothing has to be carried past the native loop.
+    const f = ir.FunctionId.fromIndex(0);
+    const b_entry = ir.BlockId.fromIndex(0);
+    const b_while = ir.BlockId.fromIndex(1);
+    const b_pre = ir.BlockId.fromIndex(2);
+    const b_header = ir.BlockId.fromIndex(3);
+    const b_body = ir.BlockId.fromIndex(4);
+    const b_nested = ir.BlockId.fromIndex(5);
+    const b_inner = ir.BlockId.fromIndex(6);
+    const b_tail = ir.BlockId.fromIndex(7);
+    const b_exit = ir.BlockId.fromIndex(8);
+    const b_done = ir.BlockId.fromIndex(9);
+    const i_control = ir.InstructionId.fromIndex(0);
+    const i_limit = ir.InstructionId.fromIndex(1);
+    const i_step = ir.InstructionId.fromIndex(2);
+    const i_true = ir.InstructionId.fromIndex(3);
+    const i_next = ir.InstructionId.fromIndex(4);
+    const i_inner = ir.InstructionId.fromIndex(5);
+    const i_tail = ir.InstructionId.fromIndex(6);
+    const v_flag = ir.ValueId.fromIndex(0);
+    const v_a = ir.ValueId.fromIndex(1);
+    const v_b = ir.ValueId.fromIndex(2);
+    const v_control = ir.ValueId.fromIndex(3);
+    const v_limit = ir.ValueId.fromIndex(4);
+    const v_step = ir.ValueId.fromIndex(5);
+    const v_true = ir.ValueId.fromIndex(6);
+    const v_header_control = ir.ValueId.fromIndex(7);
+    const v_header_limit = ir.ValueId.fromIndex(8);
+    const v_header_step = ir.ValueId.fromIndex(9);
+    const v_header_initial = ir.ValueId.fromIndex(10);
+    const v_has = ir.ValueId.fromIndex(11);
+    const v_normalized_limit = ir.ValueId.fromIndex(12);
+    const v_normalized_step = ir.ValueId.fromIndex(13);
+    const v_index = ir.ValueId.fromIndex(14);
+    const v_body_index = ir.ValueId.fromIndex(15);
+    const v_inner = ir.ValueId.fromIndex(16);
+    const v_tail = ir.ValueId.fromIndex(17);
+
+    const values = [_]ir.Value{
+        .{ .id = v_flag, .function = f, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = v_a, .function = f, .type = .boolean, .origin = .{ .parameter = 1 } },
+        .{ .id = v_b, .function = f, .type = .boolean, .origin = .{ .parameter = 2 } },
+        .{ .id = v_control, .function = f, .type = .number, .origin = .{ .instruction_result = .{ .instruction = i_control, .index = 0 } } },
+        .{ .id = v_limit, .function = f, .type = .number, .origin = .{ .instruction_result = .{ .instruction = i_limit, .index = 0 } } },
+        .{ .id = v_step, .function = f, .type = .number, .origin = .{ .instruction_result = .{ .instruction = i_step, .index = 0 } } },
+        .{ .id = v_true, .function = f, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = i_true, .index = 0 } } },
+        .{ .id = v_header_control, .function = f, .origin = .{ .block_parameter = .{ .block = b_header, .index = 0 } } },
+        .{ .id = v_header_limit, .function = f, .origin = .{ .block_parameter = .{ .block = b_header, .index = 1 } } },
+        .{ .id = v_header_step, .function = f, .origin = .{ .block_parameter = .{ .block = b_header, .index = 2 } } },
+        .{ .id = v_header_initial, .function = f, .type = .boolean, .origin = .{ .block_parameter = .{ .block = b_header, .index = 3 } } },
+        .{ .id = v_has, .function = f, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = i_next, .index = 0 } } },
+        .{ .id = v_normalized_limit, .function = f, .type = .number, .origin = .{ .instruction_result = .{ .instruction = i_next, .index = 1 } } },
+        .{ .id = v_normalized_step, .function = f, .type = .number, .origin = .{ .instruction_result = .{ .instruction = i_next, .index = 2 } } },
+        .{ .id = v_index, .function = f, .type = .number, .origin = .{ .instruction_result = .{ .instruction = i_next, .index = 3 } } },
+        .{ .id = v_body_index, .function = f, .type = .number, .origin = .{ .block_parameter = .{ .block = b_body, .index = 0 } } },
+        .{ .id = v_inner, .function = f, .type = .number, .origin = .{ .instruction_result = .{ .instruction = i_inner, .index = 0 } } },
+        .{ .id = v_tail, .function = f, .type = .number, .origin = .{ .instruction_result = .{ .instruction = i_tail, .index = 0 } } },
+    };
+
+    const instructions = [_]ir.Instruction{
+        .{ .id = i_control, .block = b_pre, .operation = .{ .constant = .{ .integer = "1" } }, .results = &.{v_control}, .effects = .pure },
+        .{ .id = i_limit, .block = b_pre, .operation = .{ .constant = .{ .integer = "3" } }, .results = &.{v_limit}, .effects = .pure },
+        .{ .id = i_step, .block = b_pre, .operation = .{ .constant = .{ .integer = "1" } }, .results = &.{v_step}, .effects = .pure },
+        .{ .id = i_true, .block = b_pre, .operation = .{ .constant = .{ .boolean = true } }, .results = &.{v_true}, .effects = .pure },
+        .{
+            .id = i_next,
+            .block = b_header,
+            .operation = .{ .numeric_for_next = .{
+                .control = v_header_control,
+                .limit = v_header_limit,
+                .step = v_header_step,
+                .initial = v_header_initial,
+            } },
+            .results = &.{ v_has, v_normalized_limit, v_normalized_step, v_index },
+            .effects = .numeric_for_next,
+        },
+        .{ .id = i_inner, .block = b_inner, .operation = .{ .constant = .{ .integer = "0" } }, .results = &.{v_inner}, .effects = .pure },
+        .{ .id = i_tail, .block = b_tail, .operation = .{ .constant = .{ .integer = "0" } }, .results = &.{v_tail}, .effects = .pure },
+    };
+
+    const blocks = [_]ir.Block{
+        .{ .id = b_entry, .function = f, .terminator = .{ .jump = .{ .target = b_while } } },
+        .{
+            .id = b_while,
+            .function = f,
+            .terminator = .{ .branch = .{
+                .condition = v_flag,
+                .then_edge = .{ .target = b_pre },
+                .else_edge = .{ .target = b_done },
+            } },
+        },
+        .{
+            .id = b_pre,
+            .function = f,
+            .instructions = &.{ i_control, i_limit, i_step, i_true },
+            .terminator = .{ .jump = .{ .target = b_header, .arguments = &.{ v_control, v_limit, v_step, v_true } } },
+        },
+        .{
+            .id = b_header,
+            .function = f,
+            .parameters = &.{ v_header_control, v_header_limit, v_header_step, v_header_initial },
+            .instructions = &.{i_next},
+            .terminator = .{ .branch = .{
+                .condition = v_has,
+                .then_edge = .{ .target = b_body, .arguments = &.{v_index} },
+                .else_edge = .{ .target = b_exit },
+            } },
+        },
+        .{
+            .id = b_body,
+            .function = f,
+            .parameters = &.{v_body_index},
+            .terminator = .{ .branch = .{
+                .condition = v_a,
+                .then_edge = .{ .target = b_nested },
+                .else_edge = .{ .target = b_tail },
+            } },
+        },
+        .{
+            .id = b_nested,
+            .function = f,
+            .terminator = .{ .branch = .{
+                .condition = v_b,
+                .then_edge = .{ .target = b_exit },
+                .else_edge = .{ .target = b_inner },
+            } },
+        },
+        .{ .id = b_inner, .function = f, .instructions = &.{i_inner}, .terminator = .{ .jump = .{ .target = b_tail } } },
+        .{ .id = b_tail, .function = f, .instructions = &.{i_tail}, .terminator = .{ .jump = .{ .target = b_exit } } },
+        .{ .id = b_exit, .function = f, .terminator = .{ .jump = .{ .target = b_while } } },
+        .{ .id = b_done, .function = f, .terminator = .{ .return_values = &.{} } },
+    };
+
+    const functions = [_]ir.Function{.{
+        .id = f,
+        .parameters = &.{ v_flag, v_a, v_b },
+        .blocks = &.{ b_entry, b_while, b_pre, b_header, b_body, b_nested, b_inner, b_tail, b_exit, b_done },
+        .entry_block = b_entry,
+    }};
+
+    const program: ir.Program = .{
+        .program_id = "acyclic-iteration-nested-break-in-loop-test",
+        .entry_function = f,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+    };
+
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, functions[0]);
+    defer analysis.deinit();
+    var plan = try structure.Plan.init(std.testing.allocator, &analysis);
+    defer plan.deinit();
+    // (a) The planner's decision: the `while` loop's body holds the header as a branch joining at its exit block.
+    const loop = firstLoop(&plan) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(b_while, loop.header);
+    var found: ?structure.Branch = null;
+    for (loop.body_region.nodes) |node| switch (node) {
+        .branch => |value| {
+            if (value.block == b_header) found = value;
+        },
+        else => {},
+    };
+    const branch = found orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(?ir.BlockId, b_exit), branch.join);
+
+    // (b) The acyclic matcher takes the join form: the then edge is the body, the else edge leaves to the join.
+    const acyclic = (try matchAcyclicBranch(std.testing.allocator, &program, branch)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(b_body, acyclic.body_edge.target);
+    try std.testing.expectEqual(b_exit, acyclic.exit_edge.target);
+    try std.testing.expect(acyclic.exit_region == null);
+
+    // (c) Readable admission recognizes the transition.
+    var report = diagnostics.Report.init(std.testing.allocator);
+    defer report.deinit();
+    try validateFunction(std.testing.allocator, &report, &program, &analysis, &plan);
+    try std.testing.expect(report.isClean());
+}
+
+test "acyclic iteration in a loop body is recognized when its body may return" {
+    // A numeric loop inside a `while` body whose body returns on one path and breaks on
+    // the other (`if a then return end <code> break`). The planner places the body block at a `.terminal` loop
+    // boundary; the region writes that boundary's return block inline, and it has no successor, so until the loop's
+    // exit block the body still stays in its region.
+    const f = ir.FunctionId.fromIndex(0);
+    const b_entry = ir.BlockId.fromIndex(0);
+    const b_while = ir.BlockId.fromIndex(1);
+    const b_pre = ir.BlockId.fromIndex(2);
+    const b_header = ir.BlockId.fromIndex(3);
+    const b_body = ir.BlockId.fromIndex(4);
+    const b_return = ir.BlockId.fromIndex(5);
+    const b_tail = ir.BlockId.fromIndex(6);
+    const b_exit = ir.BlockId.fromIndex(7);
+    const b_done = ir.BlockId.fromIndex(8);
+    const i_control = ir.InstructionId.fromIndex(0);
+    const i_limit = ir.InstructionId.fromIndex(1);
+    const i_step = ir.InstructionId.fromIndex(2);
+    const i_true = ir.InstructionId.fromIndex(3);
+    const i_next = ir.InstructionId.fromIndex(4);
+    const i_return = ir.InstructionId.fromIndex(5);
+    const i_tail = ir.InstructionId.fromIndex(6);
+    const v_flag = ir.ValueId.fromIndex(0);
+    const v_a = ir.ValueId.fromIndex(1);
+    const v_control = ir.ValueId.fromIndex(2);
+    const v_limit = ir.ValueId.fromIndex(3);
+    const v_step = ir.ValueId.fromIndex(4);
+    const v_true = ir.ValueId.fromIndex(5);
+    const v_header_control = ir.ValueId.fromIndex(6);
+    const v_header_limit = ir.ValueId.fromIndex(7);
+    const v_header_step = ir.ValueId.fromIndex(8);
+    const v_header_initial = ir.ValueId.fromIndex(9);
+    const v_has = ir.ValueId.fromIndex(10);
+    const v_normalized_limit = ir.ValueId.fromIndex(11);
+    const v_normalized_step = ir.ValueId.fromIndex(12);
+    const v_index = ir.ValueId.fromIndex(13);
+    const v_body_index = ir.ValueId.fromIndex(14);
+    const v_return = ir.ValueId.fromIndex(15);
+    const v_tail = ir.ValueId.fromIndex(16);
+
+    const values = [_]ir.Value{
+        .{ .id = v_flag, .function = f, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = v_a, .function = f, .type = .boolean, .origin = .{ .parameter = 1 } },
+        .{ .id = v_control, .function = f, .type = .number, .origin = .{ .instruction_result = .{ .instruction = i_control, .index = 0 } } },
+        .{ .id = v_limit, .function = f, .type = .number, .origin = .{ .instruction_result = .{ .instruction = i_limit, .index = 0 } } },
+        .{ .id = v_step, .function = f, .type = .number, .origin = .{ .instruction_result = .{ .instruction = i_step, .index = 0 } } },
+        .{ .id = v_true, .function = f, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = i_true, .index = 0 } } },
+        .{ .id = v_header_control, .function = f, .origin = .{ .block_parameter = .{ .block = b_header, .index = 0 } } },
+        .{ .id = v_header_limit, .function = f, .origin = .{ .block_parameter = .{ .block = b_header, .index = 1 } } },
+        .{ .id = v_header_step, .function = f, .origin = .{ .block_parameter = .{ .block = b_header, .index = 2 } } },
+        .{ .id = v_header_initial, .function = f, .type = .boolean, .origin = .{ .block_parameter = .{ .block = b_header, .index = 3 } } },
+        .{ .id = v_has, .function = f, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = i_next, .index = 0 } } },
+        .{ .id = v_normalized_limit, .function = f, .type = .number, .origin = .{ .instruction_result = .{ .instruction = i_next, .index = 1 } } },
+        .{ .id = v_normalized_step, .function = f, .type = .number, .origin = .{ .instruction_result = .{ .instruction = i_next, .index = 2 } } },
+        .{ .id = v_index, .function = f, .type = .number, .origin = .{ .instruction_result = .{ .instruction = i_next, .index = 3 } } },
+        .{ .id = v_body_index, .function = f, .type = .number, .origin = .{ .block_parameter = .{ .block = b_body, .index = 0 } } },
+        .{ .id = v_return, .function = f, .type = .number, .origin = .{ .instruction_result = .{ .instruction = i_return, .index = 0 } } },
+        .{ .id = v_tail, .function = f, .type = .number, .origin = .{ .instruction_result = .{ .instruction = i_tail, .index = 0 } } },
+    };
+
+    const instructions = [_]ir.Instruction{
+        .{ .id = i_control, .block = b_pre, .operation = .{ .constant = .{ .integer = "1" } }, .results = &.{v_control}, .effects = .pure },
+        .{ .id = i_limit, .block = b_pre, .operation = .{ .constant = .{ .integer = "3" } }, .results = &.{v_limit}, .effects = .pure },
+        .{ .id = i_step, .block = b_pre, .operation = .{ .constant = .{ .integer = "1" } }, .results = &.{v_step}, .effects = .pure },
+        .{ .id = i_true, .block = b_pre, .operation = .{ .constant = .{ .boolean = true } }, .results = &.{v_true}, .effects = .pure },
+        .{
+            .id = i_next,
+            .block = b_header,
+            .operation = .{ .numeric_for_next = .{
+                .control = v_header_control,
+                .limit = v_header_limit,
+                .step = v_header_step,
+                .initial = v_header_initial,
+            } },
+            .results = &.{ v_has, v_normalized_limit, v_normalized_step, v_index },
+            .effects = .numeric_for_next,
+        },
+        .{ .id = i_return, .block = b_return, .operation = .{ .constant = .{ .integer = "0" } }, .results = &.{v_return}, .effects = .pure },
+        .{ .id = i_tail, .block = b_tail, .operation = .{ .constant = .{ .integer = "0" } }, .results = &.{v_tail}, .effects = .pure },
+    };
+
+    const blocks = [_]ir.Block{
+        .{ .id = b_entry, .function = f, .terminator = .{ .jump = .{ .target = b_while } } },
+        .{
+            .id = b_while,
+            .function = f,
+            .terminator = .{ .branch = .{
+                .condition = v_flag,
+                .then_edge = .{ .target = b_pre },
+                .else_edge = .{ .target = b_done },
+            } },
+        },
+        .{
+            .id = b_pre,
+            .function = f,
+            .instructions = &.{ i_control, i_limit, i_step, i_true },
+            .terminator = .{ .jump = .{ .target = b_header, .arguments = &.{ v_control, v_limit, v_step, v_true } } },
+        },
+        .{
+            .id = b_header,
+            .function = f,
+            .parameters = &.{ v_header_control, v_header_limit, v_header_step, v_header_initial },
+            .instructions = &.{i_next},
+            .terminator = .{ .branch = .{
+                .condition = v_has,
+                .then_edge = .{ .target = b_body, .arguments = &.{v_index} },
+                .else_edge = .{ .target = b_exit },
+            } },
+        },
+        .{
+            .id = b_body,
+            .function = f,
+            .parameters = &.{v_body_index},
+            .terminator = .{ .branch = .{
+                .condition = v_a,
+                .then_edge = .{ .target = b_return },
+                .else_edge = .{ .target = b_tail },
+            } },
+        },
+        .{ .id = b_return, .function = f, .instructions = &.{i_return}, .terminator = .{ .return_values = &.{} } },
+        .{ .id = b_tail, .function = f, .instructions = &.{i_tail}, .terminator = .{ .jump = .{ .target = b_exit } } },
+        .{ .id = b_exit, .function = f, .terminator = .{ .jump = .{ .target = b_while } } },
+        .{ .id = b_done, .function = f, .terminator = .{ .return_values = &.{} } },
+    };
+
+    const functions = [_]ir.Function{.{
+        .id = f,
+        .parameters = &.{ v_flag, v_a },
+        .blocks = &.{ b_entry, b_while, b_pre, b_header, b_body, b_return, b_tail, b_exit, b_done },
+        .entry_block = b_entry,
+    }};
+
+    const program: ir.Program = .{
+        .program_id = "acyclic-iteration-return-or-break-in-loop-test",
+        .entry_function = f,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+    };
+
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, functions[0]);
+    defer analysis.deinit();
+    var plan = try structure.Plan.init(std.testing.allocator, &analysis);
+    defer plan.deinit();
+    // (a) The planner's decision: the `while` loop's body holds the header as a branch joining at its exit block, and
+    // the body arm holds the body block as a loop boundary whose boundary is the returning block.
+    const loop = firstLoop(&plan) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(b_while, loop.header);
+    var found: ?structure.Branch = null;
+    for (loop.body_region.nodes) |node| switch (node) {
+        .branch => |value| {
+            if (value.block == b_header) found = value;
+        },
+        else => {},
+    };
+    const branch = found orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(?ir.BlockId, b_exit), branch.join);
+    var boundary: ?structure.LoopBoundaryControl = null;
+    for (branch.then_region.nodes) |node| switch (node) {
+        .loop_boundary => |value| {
+            if (value.block == b_body) boundary = value;
+        },
+        else => {},
+    };
+    const control = boundary orelse return error.TestUnexpectedResult;
+    switch (control.boundary) {
+        .terminal => |terminal| try std.testing.expectEqual(b_return, terminal.block),
+        else => return error.TestUnexpectedResult,
+    }
+
+    // (b) The acyclic matcher takes the join form: the then edge is the body, the else edge leaves to the join.
+    const acyclic = (try matchAcyclicBranch(std.testing.allocator, &program, branch)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(b_body, acyclic.body_edge.target);
+    try std.testing.expectEqual(b_exit, acyclic.exit_edge.target);
+    try std.testing.expect(acyclic.exit_region == null);
+
+    // (c) Readable admission recognizes the transition.
+    var report = diagnostics.Report.init(std.testing.allocator);
+    defer report.deinit();
+    try validateFunction(std.testing.allocator, &report, &program, &analysis, &plan);
+    try std.testing.expect(report.isClean());
+}
+
+test "acyclic iteration in a loop body stays refused when a loop-boundary body owns an escape to its own continue target" {
+    // The previous test's program whose non-returning path also breaks from a nested
+    // branch (`if a then return end if b then if c then break end <code> end <code> break`). The loop boundary's body
+    // region stops at the loop's exit block, which is also its continue target, and owns an escape to it: its wrapper
+    // is consumed by a `continue`, which would bind to the native `for`. The transition stays reported, whatever node
+    // the planner makes of the header.
+    const f = ir.FunctionId.fromIndex(0);
+    const b_entry = ir.BlockId.fromIndex(0);
+    const b_while = ir.BlockId.fromIndex(1);
+    const b_pre = ir.BlockId.fromIndex(2);
+    const b_header = ir.BlockId.fromIndex(3);
+    const b_body = ir.BlockId.fromIndex(4);
+    const b_return = ir.BlockId.fromIndex(5);
+    const b_outer = ir.BlockId.fromIndex(6);
+    const b_nested = ir.BlockId.fromIndex(7);
+    const b_inner = ir.BlockId.fromIndex(8);
+    const b_tail = ir.BlockId.fromIndex(9);
+    const b_exit = ir.BlockId.fromIndex(10);
+    const b_done = ir.BlockId.fromIndex(11);
+    const i_control = ir.InstructionId.fromIndex(0);
+    const i_limit = ir.InstructionId.fromIndex(1);
+    const i_step = ir.InstructionId.fromIndex(2);
+    const i_true = ir.InstructionId.fromIndex(3);
+    const i_next = ir.InstructionId.fromIndex(4);
+    const i_return = ir.InstructionId.fromIndex(5);
+    const i_inner = ir.InstructionId.fromIndex(6);
+    const i_tail = ir.InstructionId.fromIndex(7);
+    const v_flag = ir.ValueId.fromIndex(0);
+    const v_a = ir.ValueId.fromIndex(1);
+    const v_b = ir.ValueId.fromIndex(2);
+    const v_c = ir.ValueId.fromIndex(3);
+    const v_control = ir.ValueId.fromIndex(4);
+    const v_limit = ir.ValueId.fromIndex(5);
+    const v_step = ir.ValueId.fromIndex(6);
+    const v_true = ir.ValueId.fromIndex(7);
+    const v_header_control = ir.ValueId.fromIndex(8);
+    const v_header_limit = ir.ValueId.fromIndex(9);
+    const v_header_step = ir.ValueId.fromIndex(10);
+    const v_header_initial = ir.ValueId.fromIndex(11);
+    const v_has = ir.ValueId.fromIndex(12);
+    const v_normalized_limit = ir.ValueId.fromIndex(13);
+    const v_normalized_step = ir.ValueId.fromIndex(14);
+    const v_index = ir.ValueId.fromIndex(15);
+    const v_body_index = ir.ValueId.fromIndex(16);
+    const v_return = ir.ValueId.fromIndex(17);
+    const v_inner = ir.ValueId.fromIndex(18);
+    const v_tail = ir.ValueId.fromIndex(19);
+
+    const values = [_]ir.Value{
+        .{ .id = v_flag, .function = f, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = v_a, .function = f, .type = .boolean, .origin = .{ .parameter = 1 } },
+        .{ .id = v_b, .function = f, .type = .boolean, .origin = .{ .parameter = 2 } },
+        .{ .id = v_c, .function = f, .type = .boolean, .origin = .{ .parameter = 3 } },
+        .{ .id = v_control, .function = f, .type = .number, .origin = .{ .instruction_result = .{ .instruction = i_control, .index = 0 } } },
+        .{ .id = v_limit, .function = f, .type = .number, .origin = .{ .instruction_result = .{ .instruction = i_limit, .index = 0 } } },
+        .{ .id = v_step, .function = f, .type = .number, .origin = .{ .instruction_result = .{ .instruction = i_step, .index = 0 } } },
+        .{ .id = v_true, .function = f, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = i_true, .index = 0 } } },
+        .{ .id = v_header_control, .function = f, .origin = .{ .block_parameter = .{ .block = b_header, .index = 0 } } },
+        .{ .id = v_header_limit, .function = f, .origin = .{ .block_parameter = .{ .block = b_header, .index = 1 } } },
+        .{ .id = v_header_step, .function = f, .origin = .{ .block_parameter = .{ .block = b_header, .index = 2 } } },
+        .{ .id = v_header_initial, .function = f, .type = .boolean, .origin = .{ .block_parameter = .{ .block = b_header, .index = 3 } } },
+        .{ .id = v_has, .function = f, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = i_next, .index = 0 } } },
+        .{ .id = v_normalized_limit, .function = f, .type = .number, .origin = .{ .instruction_result = .{ .instruction = i_next, .index = 1 } } },
+        .{ .id = v_normalized_step, .function = f, .type = .number, .origin = .{ .instruction_result = .{ .instruction = i_next, .index = 2 } } },
+        .{ .id = v_index, .function = f, .type = .number, .origin = .{ .instruction_result = .{ .instruction = i_next, .index = 3 } } },
+        .{ .id = v_body_index, .function = f, .type = .number, .origin = .{ .block_parameter = .{ .block = b_body, .index = 0 } } },
+        .{ .id = v_return, .function = f, .type = .number, .origin = .{ .instruction_result = .{ .instruction = i_return, .index = 0 } } },
+        .{ .id = v_inner, .function = f, .type = .number, .origin = .{ .instruction_result = .{ .instruction = i_inner, .index = 0 } } },
+        .{ .id = v_tail, .function = f, .type = .number, .origin = .{ .instruction_result = .{ .instruction = i_tail, .index = 0 } } },
+    };
+
+    const instructions = [_]ir.Instruction{
+        .{ .id = i_control, .block = b_pre, .operation = .{ .constant = .{ .integer = "1" } }, .results = &.{v_control}, .effects = .pure },
+        .{ .id = i_limit, .block = b_pre, .operation = .{ .constant = .{ .integer = "3" } }, .results = &.{v_limit}, .effects = .pure },
+        .{ .id = i_step, .block = b_pre, .operation = .{ .constant = .{ .integer = "1" } }, .results = &.{v_step}, .effects = .pure },
+        .{ .id = i_true, .block = b_pre, .operation = .{ .constant = .{ .boolean = true } }, .results = &.{v_true}, .effects = .pure },
+        .{
+            .id = i_next,
+            .block = b_header,
+            .operation = .{ .numeric_for_next = .{
+                .control = v_header_control,
+                .limit = v_header_limit,
+                .step = v_header_step,
+                .initial = v_header_initial,
+            } },
+            .results = &.{ v_has, v_normalized_limit, v_normalized_step, v_index },
+            .effects = .numeric_for_next,
+        },
+        .{ .id = i_return, .block = b_return, .operation = .{ .constant = .{ .integer = "0" } }, .results = &.{v_return}, .effects = .pure },
+        .{ .id = i_inner, .block = b_inner, .operation = .{ .constant = .{ .integer = "0" } }, .results = &.{v_inner}, .effects = .pure },
+        .{ .id = i_tail, .block = b_tail, .operation = .{ .constant = .{ .integer = "0" } }, .results = &.{v_tail}, .effects = .pure },
+    };
+
+    const blocks = [_]ir.Block{
+        .{ .id = b_entry, .function = f, .terminator = .{ .jump = .{ .target = b_while } } },
+        .{
+            .id = b_while,
+            .function = f,
+            .terminator = .{ .branch = .{
+                .condition = v_flag,
+                .then_edge = .{ .target = b_pre },
+                .else_edge = .{ .target = b_done },
+            } },
+        },
+        .{
+            .id = b_pre,
+            .function = f,
+            .instructions = &.{ i_control, i_limit, i_step, i_true },
+            .terminator = .{ .jump = .{ .target = b_header, .arguments = &.{ v_control, v_limit, v_step, v_true } } },
+        },
+        .{
+            .id = b_header,
+            .function = f,
+            .parameters = &.{ v_header_control, v_header_limit, v_header_step, v_header_initial },
+            .instructions = &.{i_next},
+            .terminator = .{ .branch = .{
+                .condition = v_has,
+                .then_edge = .{ .target = b_body, .arguments = &.{v_index} },
+                .else_edge = .{ .target = b_exit },
+            } },
+        },
+        .{
+            .id = b_body,
+            .function = f,
+            .parameters = &.{v_body_index},
+            .terminator = .{ .branch = .{
+                .condition = v_a,
+                .then_edge = .{ .target = b_return },
+                .else_edge = .{ .target = b_outer },
+            } },
+        },
+        .{ .id = b_return, .function = f, .instructions = &.{i_return}, .terminator = .{ .return_values = &.{} } },
+        .{
+            .id = b_outer,
+            .function = f,
+            .terminator = .{ .branch = .{
+                .condition = v_b,
+                .then_edge = .{ .target = b_nested },
+                .else_edge = .{ .target = b_tail },
+            } },
+        },
+        .{
+            .id = b_nested,
+            .function = f,
+            .terminator = .{ .branch = .{
+                .condition = v_c,
+                .then_edge = .{ .target = b_exit },
+                .else_edge = .{ .target = b_inner },
+            } },
+        },
+        .{ .id = b_inner, .function = f, .instructions = &.{i_inner}, .terminator = .{ .jump = .{ .target = b_tail } } },
+        .{ .id = b_tail, .function = f, .instructions = &.{i_tail}, .terminator = .{ .jump = .{ .target = b_exit } } },
+        .{ .id = b_exit, .function = f, .terminator = .{ .jump = .{ .target = b_while } } },
+        .{ .id = b_done, .function = f, .terminator = .{ .return_values = &.{} } },
+    };
+
+    const functions = [_]ir.Function{.{
+        .id = f,
+        .parameters = &.{ v_flag, v_a, v_b, v_c },
+        .blocks = &.{ b_entry, b_while, b_pre, b_header, b_body, b_return, b_outer, b_nested, b_inner, b_tail, b_exit, b_done },
+        .entry_block = b_entry,
+    }};
+
+    const program: ir.Program = .{
+        .program_id = "acyclic-iteration-boundary-escape-to-continue-target-test",
+        .entry_function = f,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+    };
+
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, functions[0]);
+    defer analysis.deinit();
+    var plan = try structure.Plan.init(std.testing.allocator, &analysis);
+    defer plan.deinit();
+    var report = diagnostics.Report.init(std.testing.allocator);
+    defer report.deinit();
+    try validateFunction(std.testing.allocator, &report, &program, &analysis, &plan);
+    var reported = false;
+    for (report.diagnostics.items) |diagnostic| {
+        if (diagnostic.code == .unsupported_readable_iteration_protocol and diagnostic.entity_index != null and
+            diagnostic.entity_index.? == i_next.index()) reported = true;
+    }
+    try std.testing.expect(reported);
+}
+
+test "acyclic iteration in a loop body stays refused when the loop's exit is the enclosing loop header and its body owns an escape to it" {
+    // On the conformance path: the nested-break program with the loop's exit edge, the
+    // nested `break` and the body's last edge going straight to the `while` header, as `resolve-ir` forwards them. The
+    // body region then stops at its own continue target and owns an escape to it, which is consumed by a `continue`
+    // that would bind to the native `for`. The transition stays reported, whatever node the planner makes of the
+    // header.
+    const f = ir.FunctionId.fromIndex(0);
+    const b_entry = ir.BlockId.fromIndex(0);
+    const b_while = ir.BlockId.fromIndex(1);
+    const b_pre = ir.BlockId.fromIndex(2);
+    const b_header = ir.BlockId.fromIndex(3);
+    const b_body = ir.BlockId.fromIndex(4);
+    const b_nested = ir.BlockId.fromIndex(5);
+    const b_inner = ir.BlockId.fromIndex(6);
+    const b_tail = ir.BlockId.fromIndex(7);
+    const b_done = ir.BlockId.fromIndex(8);
+    const i_control = ir.InstructionId.fromIndex(0);
+    const i_limit = ir.InstructionId.fromIndex(1);
+    const i_step = ir.InstructionId.fromIndex(2);
+    const i_true = ir.InstructionId.fromIndex(3);
+    const i_next = ir.InstructionId.fromIndex(4);
+    const i_inner = ir.InstructionId.fromIndex(5);
+    const i_tail = ir.InstructionId.fromIndex(6);
+    const v_flag = ir.ValueId.fromIndex(0);
+    const v_a = ir.ValueId.fromIndex(1);
+    const v_b = ir.ValueId.fromIndex(2);
+    const v_control = ir.ValueId.fromIndex(3);
+    const v_limit = ir.ValueId.fromIndex(4);
+    const v_step = ir.ValueId.fromIndex(5);
+    const v_true = ir.ValueId.fromIndex(6);
+    const v_header_control = ir.ValueId.fromIndex(7);
+    const v_header_limit = ir.ValueId.fromIndex(8);
+    const v_header_step = ir.ValueId.fromIndex(9);
+    const v_header_initial = ir.ValueId.fromIndex(10);
+    const v_has = ir.ValueId.fromIndex(11);
+    const v_normalized_limit = ir.ValueId.fromIndex(12);
+    const v_normalized_step = ir.ValueId.fromIndex(13);
+    const v_index = ir.ValueId.fromIndex(14);
+    const v_body_index = ir.ValueId.fromIndex(15);
+    const v_inner = ir.ValueId.fromIndex(16);
+    const v_tail = ir.ValueId.fromIndex(17);
+
+    const values = [_]ir.Value{
+        .{ .id = v_flag, .function = f, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = v_a, .function = f, .type = .boolean, .origin = .{ .parameter = 1 } },
+        .{ .id = v_b, .function = f, .type = .boolean, .origin = .{ .parameter = 2 } },
+        .{ .id = v_control, .function = f, .type = .number, .origin = .{ .instruction_result = .{ .instruction = i_control, .index = 0 } } },
+        .{ .id = v_limit, .function = f, .type = .number, .origin = .{ .instruction_result = .{ .instruction = i_limit, .index = 0 } } },
+        .{ .id = v_step, .function = f, .type = .number, .origin = .{ .instruction_result = .{ .instruction = i_step, .index = 0 } } },
+        .{ .id = v_true, .function = f, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = i_true, .index = 0 } } },
+        .{ .id = v_header_control, .function = f, .origin = .{ .block_parameter = .{ .block = b_header, .index = 0 } } },
+        .{ .id = v_header_limit, .function = f, .origin = .{ .block_parameter = .{ .block = b_header, .index = 1 } } },
+        .{ .id = v_header_step, .function = f, .origin = .{ .block_parameter = .{ .block = b_header, .index = 2 } } },
+        .{ .id = v_header_initial, .function = f, .type = .boolean, .origin = .{ .block_parameter = .{ .block = b_header, .index = 3 } } },
+        .{ .id = v_has, .function = f, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = i_next, .index = 0 } } },
+        .{ .id = v_normalized_limit, .function = f, .type = .number, .origin = .{ .instruction_result = .{ .instruction = i_next, .index = 1 } } },
+        .{ .id = v_normalized_step, .function = f, .type = .number, .origin = .{ .instruction_result = .{ .instruction = i_next, .index = 2 } } },
+        .{ .id = v_index, .function = f, .type = .number, .origin = .{ .instruction_result = .{ .instruction = i_next, .index = 3 } } },
+        .{ .id = v_body_index, .function = f, .type = .number, .origin = .{ .block_parameter = .{ .block = b_body, .index = 0 } } },
+        .{ .id = v_inner, .function = f, .type = .number, .origin = .{ .instruction_result = .{ .instruction = i_inner, .index = 0 } } },
+        .{ .id = v_tail, .function = f, .type = .number, .origin = .{ .instruction_result = .{ .instruction = i_tail, .index = 0 } } },
+    };
+
+    const instructions = [_]ir.Instruction{
+        .{ .id = i_control, .block = b_pre, .operation = .{ .constant = .{ .integer = "1" } }, .results = &.{v_control}, .effects = .pure },
+        .{ .id = i_limit, .block = b_pre, .operation = .{ .constant = .{ .integer = "3" } }, .results = &.{v_limit}, .effects = .pure },
+        .{ .id = i_step, .block = b_pre, .operation = .{ .constant = .{ .integer = "1" } }, .results = &.{v_step}, .effects = .pure },
+        .{ .id = i_true, .block = b_pre, .operation = .{ .constant = .{ .boolean = true } }, .results = &.{v_true}, .effects = .pure },
+        .{
+            .id = i_next,
+            .block = b_header,
+            .operation = .{ .numeric_for_next = .{
+                .control = v_header_control,
+                .limit = v_header_limit,
+                .step = v_header_step,
+                .initial = v_header_initial,
+            } },
+            .results = &.{ v_has, v_normalized_limit, v_normalized_step, v_index },
+            .effects = .numeric_for_next,
+        },
+        .{ .id = i_inner, .block = b_inner, .operation = .{ .constant = .{ .integer = "0" } }, .results = &.{v_inner}, .effects = .pure },
+        .{ .id = i_tail, .block = b_tail, .operation = .{ .constant = .{ .integer = "0" } }, .results = &.{v_tail}, .effects = .pure },
+    };
+
+    const blocks = [_]ir.Block{
+        .{ .id = b_entry, .function = f, .terminator = .{ .jump = .{ .target = b_while } } },
+        .{
+            .id = b_while,
+            .function = f,
+            .terminator = .{ .branch = .{
+                .condition = v_flag,
+                .then_edge = .{ .target = b_pre },
+                .else_edge = .{ .target = b_done },
+            } },
+        },
+        .{
+            .id = b_pre,
+            .function = f,
+            .instructions = &.{ i_control, i_limit, i_step, i_true },
+            .terminator = .{ .jump = .{ .target = b_header, .arguments = &.{ v_control, v_limit, v_step, v_true } } },
+        },
+        .{
+            .id = b_header,
+            .function = f,
+            .parameters = &.{ v_header_control, v_header_limit, v_header_step, v_header_initial },
+            .instructions = &.{i_next},
+            .terminator = .{ .branch = .{
+                .condition = v_has,
+                .then_edge = .{ .target = b_body, .arguments = &.{v_index} },
+                .else_edge = .{ .target = b_while },
+            } },
+        },
+        .{
+            .id = b_body,
+            .function = f,
+            .parameters = &.{v_body_index},
+            .terminator = .{ .branch = .{
+                .condition = v_a,
+                .then_edge = .{ .target = b_nested },
+                .else_edge = .{ .target = b_tail },
+            } },
+        },
+        .{
+            .id = b_nested,
+            .function = f,
+            .terminator = .{ .branch = .{
+                .condition = v_b,
+                .then_edge = .{ .target = b_while },
+                .else_edge = .{ .target = b_inner },
+            } },
+        },
+        .{ .id = b_inner, .function = f, .instructions = &.{i_inner}, .terminator = .{ .jump = .{ .target = b_tail } } },
+        .{ .id = b_tail, .function = f, .instructions = &.{i_tail}, .terminator = .{ .jump = .{ .target = b_while } } },
+        .{ .id = b_done, .function = f, .terminator = .{ .return_values = &.{} } },
+    };
+
+    const functions = [_]ir.Function{.{
+        .id = f,
+        .parameters = &.{ v_flag, v_a, v_b },
+        .blocks = &.{ b_entry, b_while, b_pre, b_header, b_body, b_nested, b_inner, b_tail, b_done },
+        .entry_block = b_entry,
+    }};
+
+    const program: ir.Program = .{
+        .program_id = "acyclic-iteration-escape-to-enclosing-header-test",
+        .entry_function = f,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+    };
+
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, functions[0]);
+    defer analysis.deinit();
+    var plan = try structure.Plan.init(std.testing.allocator, &analysis);
+    defer plan.deinit();
     var report = diagnostics.Report.init(std.testing.allocator);
     defer report.deinit();
     try validateFunction(std.testing.allocator, &report, &program, &analysis, &plan);
