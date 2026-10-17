@@ -2651,3 +2651,131 @@ test "edge facts read the planner lists at the point of use on edges without der
         try fixture.expectAdmitted(&resolved);
     }
 }
+
+// A branch consumed after its arm truth facts exist. The arm-fact deferral keeps the
+// entry's arm facts out of the program until a base claim had its round, but two routes consume the branch with
+// the facts already there: (a) a frontend block claim whose query assumes an explicit-only fact (no base scope,
+// so nothing is deferred; the claim, proved in round 0, consumes the branch); (b) an input that already carries
+// the entry's arm facts (a resolved output re-fed) together with a base fact that decides the condition. The arm
+// facts stay true of the witnessed historical arms, which the edge scope and the argument facts' replay already
+// read through the authenticated witness.
+const consumed_arm_fixture = struct {
+    const base = own_condition_arm_fixture;
+    const value_term = ir.SolverTermId.fromIndex(0);
+    const not_term = ir.SolverTermId.fromIndex(1);
+    const terms = [_]ir.SolverTerm{
+        .{ .id = value_term, .sort = .{ .kind = .boolean }, .operation = .{ .value = base.condition } },
+        .{ .id = not_term, .sort = .{ .kind = .boolean }, .operation = .{ .logical_not = value_term } },
+    };
+    const then_root: ir.CfgEdgeRef = .{ .source = base.entry_id, .kind = .branch_then, .target = base.join_id };
+    const else_root: ir.CfgEdgeRef = .{ .source = base.entry_id, .kind = .branch_else, .target = base.join_id };
+    const arm_locator = "backend:cfg-branch-arm-truth:v1";
+
+    // Route (a): `condition` as an explicit-only fact (the default scope) and an unproven claim on the entry.
+    const explicit_fact = [_]ir.Constraint{.{ .id = ir.ConstraintId.fromIndex(0), .predicate = value_term, .evidence = &.{base.proof} }};
+    const entry_query = [_]ir.SolverQuery{.{
+        .id = ir.QueryId.fromIndex(0),
+        .kind = .prove_true,
+        .assumptions = &.{ir.ConstraintId.fromIndex(0)},
+        .goal = value_term,
+    }};
+    const entry_claim = [_]ir.Claim{.{
+        .id = ir.ClaimId.fromIndex(0),
+        .subject = .{ .block = base.entry_id },
+        .predicate = value_term,
+        .status = .unproven,
+        .evidence = &.{base.proof},
+        .query = ir.QueryId.fromIndex(0),
+    }};
+
+    // Route (b): the entry's two arm facts in the resolver's layout, and a block-scoped fact deciding `condition`.
+    const arm_evidence = ir.EvidenceId.fromIndex(1);
+    const seeded_evidence = base.evidence ++ [_]ir.Evidence{.{ .id = arm_evidence, .kind = .structural_derivation, .locator = arm_locator }};
+    const seeded_facts = [_]ir.Constraint{
+        .{ .id = ir.ConstraintId.fromIndex(0), .predicate = value_term, .evidence = &.{arm_evidence}, .scope = .{ .edge = then_root } },
+        .{ .id = ir.ConstraintId.fromIndex(1), .predicate = not_term, .evidence = &.{arm_evidence}, .scope = .{ .edge = else_root } },
+        .{ .id = ir.ConstraintId.fromIndex(2), .predicate = value_term, .evidence = &.{base.proof}, .scope = .{ .block = base.entry_id } },
+    };
+    const deciding_fact = [_]ir.Constraint{
+        .{ .id = ir.ConstraintId.fromIndex(0), .predicate = value_term, .evidence = &.{base.proof}, .scope = .{ .block = base.entry_id } },
+    };
+
+    fn expectConsumedAndClean(resolved: *const ResolvedProgram) !void {
+        try std.testing.expect(resolved.program.blocks[base.entry_id.index()].terminator == .jump);
+        try std.testing.expect(@import("edge_path.zig").witnessedBranchCondition(&resolved.program, base.entry_id) != null);
+        var report = try @import("validate.zig").validate(std.testing.allocator, &resolved.program, .core);
+        defer report.deinit();
+        try std.testing.expect(!report.contains(.invalid_structural_derivation));
+        try std.testing.expect(report.isClean());
+    }
+};
+
+test "a branch a frontend block claim consumes keeps its arm truth facts replayable" {
+    const fixture = consumed_arm_fixture;
+    var program = fixture.base.program;
+    program.solver_terms = &fixture.terms;
+    program.constraints = &fixture.explicit_fact;
+    program.queries = &fixture.entry_query;
+    program.claims = &fixture.entry_claim;
+    var resolved = try resolveAlloc(std.testing.allocator, &program, solver_backend.internalFacts());
+    defer resolved.deinit();
+    try fixture.expectConsumedAndClean(&resolved);
+}
+
+test "arm truth facts already in the input stay replayable when a base fact consumes their branch" {
+    const fixture = consumed_arm_fixture;
+    var program = fixture.base.program;
+    program.solver_terms = &fixture.terms;
+    program.constraints = &fixture.seeded_facts;
+    program.evidence = &fixture.seeded_evidence;
+    var resolved = try resolveAlloc(std.testing.allocator, &program, solver_backend.internalFacts());
+    defer resolved.deinit();
+    try fixture.expectConsumedAndClean(&resolved);
+}
+
+test "arm truth facts on a consumed branch replay against its witness, and only correct ones" {
+    const fixture = consumed_arm_fixture;
+    var program = fixture.base.program;
+    program.solver_terms = &fixture.terms;
+    program.constraints = &fixture.deciding_fact;
+    var resolved = try resolveAlloc(std.testing.allocator, &program, solver_backend.internalFacts());
+    defer resolved.deinit();
+    // The base fact consumes the entry in round 0, before any arm fact of the entry exists (the deferral).
+    try std.testing.expect(resolved.program.blocks[fixture.base.entry_id.index()].terminator == .jump);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    // The join's own arm facts carry the arm-truth evidence record; the appended facts reuse it.
+    const arm_evidence = for (resolved.program.evidence) |record| {
+        if (record.kind == .structural_derivation and std.mem.eql(u8, record.locator, fixture.arm_locator)) break record.id;
+    } else return error.TestUnexpectedResult;
+    const first = resolved.program.constraints.len;
+    const arm_facts = [_]ir.Constraint{
+        .{ .id = ir.ConstraintId.fromIndex(first), .predicate = fixture.value_term, .evidence = &.{arm_evidence}, .scope = .{ .edge = fixture.then_root } },
+        .{ .id = ir.ConstraintId.fromIndex(first + 1), .predicate = fixture.not_term, .evidence = &.{arm_evidence}, .scope = .{ .edge = fixture.else_root } },
+    };
+    var consumed = resolved.program;
+    consumed.constraints = try std.mem.concat(allocator, ir.Constraint, &.{ resolved.program.constraints, &arm_facts });
+    var report = try @import("validate.zig").validate(std.testing.allocator, &consumed, .core);
+    defer report.deinit();
+    try std.testing.expect(!report.contains(.invalid_structural_derivation));
+    try std.testing.expect(report.isClean());
+
+    // Swapped predicates are false on their arms and stay refused.
+    var swapped_facts = arm_facts;
+    swapped_facts[0].predicate = fixture.not_term;
+    swapped_facts[1].predicate = fixture.value_term;
+    var swapped = resolved.program;
+    swapped.constraints = try std.mem.concat(allocator, ir.Constraint, &.{ resolved.program.constraints, &swapped_facts });
+    var swapped_report = try @import("validate.zig").validate(std.testing.allocator, &swapped, .core);
+    defer swapped_report.deinit();
+    try std.testing.expect(swapped_report.contains(.invalid_structural_derivation));
+
+    // Without the authenticated witness there is no historical branch to replay against.
+    var unwitnessed = consumed;
+    unwitnessed.obligations = &.{};
+    var unwitnessed_report = try @import("validate.zig").validate(std.testing.allocator, &unwitnessed, .core);
+    defer unwitnessed_report.deinit();
+    try std.testing.expect(unwitnessed_report.contains(.invalid_structural_derivation));
+}
