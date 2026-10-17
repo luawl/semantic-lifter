@@ -53,6 +53,10 @@ const StableCaptureValues = struct {
     pub fn contains(self: StableCaptureValues, value_id: ir.ValueId) bool {
         return self.scopes.valueHasStableLexicalBinding(value_id);
     }
+
+    pub fn isBoxedPlace(self: StableCaptureValues, place_id: ir.PlaceId) bool {
+        return self.scopes.arbitraryPlaceNeedsPerExecutionCell(place_id);
+    }
 };
 
 const ClosureDestination = union(enum) {
@@ -412,7 +416,9 @@ fn emitFunctionBody(
     }
     if (plan.root.arbitrary_cfg) {
         try emitArbitraryCfgDeclarations(output, allocator, program, emission_plan, &scopes, function, indent);
-        emitArbitraryCfgBody(output, allocator, program, emission_plan, &scopes, plan.root, indent, place_aliases) catch |err| {
+        const body_aliases = try arbitraryBodyPlaceAliases(allocator, program, &scopes, function, place_aliases);
+        defer allocator.free(body_aliases);
+        emitArbitraryCfgBody(output, allocator, program, emission_plan, &scopes, plan.root, indent, body_aliases) catch |err| {
             std.debug.print("emit function={} stage=arbitrary_cfg error={s}\n", .{ function.id.index(), @errorName(err) });
             return err;
         };
@@ -455,13 +461,43 @@ fn emitFunctionBody(
                 &emission_plan.closure_stores,
             );
             try emitArbitraryCfgDeclarations(output, allocator, program, emission_plan, &scopes, function, indent);
-            try emitArbitraryCfgBody(output, allocator, program, emission_plan, &scopes, plan.root, indent, place_aliases);
+            const body_aliases = try arbitraryBodyPlaceAliases(allocator, program, &scopes, function, place_aliases);
+            defer allocator.free(body_aliases);
+            try emitArbitraryCfgBody(output, allocator, program, emission_plan, &scopes, plan.root, indent, body_aliases);
             trimTrailingEmptyReturn(output, indent);
             return;
         }
         return err;
     };
     trimTrailingEmptyReturn(output, indent);
+}
+
+// The flat (dispatcher) layout renders every non-allocation use of a boxed per-execution cell through its
+// holder's `[1]` slot (T7-BOXED-CELL). A terminal self-alias per boxed place makes `place_render.resolve`
+// report `.boxed_cell`, the same path a captured boxed cell is reached through in a child. Returns a freshly
+// allocated list the caller frees: the parent aliases followed by one self-alias per boxed place.
+fn arbitraryBodyPlaceAliases(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    scopes: *const emission_scope.Plan,
+    function: ir.Function,
+    place_aliases: []const PlaceAlias,
+) std.mem.Allocator.Error![]PlaceAlias {
+    var boxed_count: usize = 0;
+    for (function.local_places) |place_id| {
+        if (place_id.index() >= program.places.len) continue;
+        if (scopes.arbitraryPlaceNeedsPerExecutionCell(place_id)) boxed_count += 1;
+    }
+    const aliases = try allocator.alloc(PlaceAlias, place_aliases.len + boxed_count);
+    @memcpy(aliases[0..place_aliases.len], place_aliases);
+    var next = place_aliases.len;
+    for (function.local_places) |place_id| {
+        if (place_id.index() >= program.places.len) continue;
+        if (!scopes.arbitraryPlaceNeedsPerExecutionCell(place_id)) continue;
+        aliases[next] = .{ .boxed_place = .{ .captured = place_id, .holder = place_id } };
+        next += 1;
+    }
+    return aliases;
 }
 
 // A reducible region is preferred for readable output.  When the CFG remains
@@ -624,13 +660,8 @@ fn emitArbitraryCfgDeclarations(
             .local, .instruction => {},
             .capture => continue,
         }
-        if (scopes.arbitraryPlaceNeedsPerExecutionCell(place_id)) {
-            std.debug.print("emit arbitrary place={} allocation={} stage=per_execution_cell error=UnsupportedOperation\n", .{
-                place_id.index(),
-                place.origin.instruction.index(),
-            });
-            return error.UnsupportedOperation;
-        }
+        // A boxed per-execution cell (T7-BOXED-CELL) keeps its holder in the root `local` list, declared
+        // once per activation; the allocating origin write reassigns it to a fresh box per execution.
         // Declared at its allocation, inside the allocating block's leaf.
         if (scopes.arbitraryLeafDeclaresPlace(place_id)) continue;
         const name = emission_plan.names.place(place_id) orelse return error.UnsupportedOperation;
@@ -4735,7 +4766,7 @@ fn emitPlaceWriteInstruction(
         return error.UnsupportedOperation;
     };
 
-    if (!declare_place and resolved_target == .place) {
+    if (!declare_place and (resolved_target == .place or resolved_target == .boxed_cell)) {
         if (compound_update.matchPlace(program, &emission_plan.dead, &emission_plan.place_writes, &emission_plan.place_reads, producer, instruction)) |update| {
             try output.appendSlice(allocator, indent);
             try lexical.emitPlaceName(output, allocator, &emission_plan.names, program, operation.place, place_aliases);
@@ -4749,6 +4780,7 @@ fn emitPlaceWriteInstruction(
     }
 
     try output.appendSlice(allocator, indent);
+    var box_close = false;
     const closes_external = switch (resolved_target) {
         .place => blk: {
             if (declare_place and !emission_plan.names.placeUsesStorage(resolved_target.place)) {
@@ -4764,6 +4796,20 @@ fn emitPlaceWriteInstruction(
             try place_render.emitExternalBindingName(output, allocator, &emission_plan.names, binding_id);
             try output.appendSlice(allocator, ", 1, ");
             break :blk true;
+        },
+        .boxed_cell => blk: {
+            // A boxed per-execution cell (T7-BOXED-CELL): the allocating origin write makes a fresh box
+            // `<holder> = { value }`; any other write stores the produced value through `<holder>[1]`.
+            if (declare_place) return error.UnsupportedOperation;
+            if (lexical.placeWriteIsBoxAllocation(program, operation.place, instruction)) {
+                try place_render.emitBoxHolderName(output, allocator, &emission_plan.names, program, operation.place, place_aliases);
+                try output.appendSlice(allocator, " = { ");
+                box_close = true;
+            } else {
+                try lexical.emitPlaceName(output, allocator, &emission_plan.names, program, operation.place, place_aliases);
+                try output.appendSlice(allocator, " = ");
+            }
+            break :blk false;
         },
     };
     switch (emission_plan.packs.role(producer.id)) {
@@ -4798,6 +4844,7 @@ fn emitPlaceWriteInstruction(
         },
         else => return error.UnsupportedOperation,
     }
+    if (box_close) try output.appendSlice(allocator, " }");
     if (closes_external) try output.append(allocator, ')');
     try output.append(allocator, '\n');
 }
@@ -5082,7 +5129,7 @@ fn emitRepeatedTableGetCounterIncrement(
     const resolved = place_render.resolve(counter, place_aliases) orelse return error.UnsupportedOperation;
     try output.appendSlice(allocator, indent);
     switch (resolved) {
-        .place => {
+        .place, .boxed_cell => {
             try lexical.emitPlaceName(output, allocator, &emission_plan.names, program, counter, place_aliases);
             try output.appendSlice(allocator, " = ");
             try lexical.emitPlaceName(output, allocator, &emission_plan.names, program, counter, place_aliases);
@@ -5175,12 +5222,19 @@ fn emitScopedClosureDestinationDeclaration(
         .place => |place| {
             if (!place.declare) return;
             const resolved = place_render.resolve(place.id, parent_place_aliases) orelse return error.UnsupportedOperation;
-            if (resolved != .place) return error.UnsupportedOperation;
-            if (emission_plan.names.placeUsesStorage(resolved.place)) return;
-            try output.appendSlice(allocator, indent);
-            try output.appendSlice(allocator, "local ");
-            try lexical.emitPlaceName(output, allocator, &emission_plan.names, program, place.id, parent_place_aliases);
-            try output.append(allocator, '\n');
+            switch (resolved) {
+                // A boxed closure-store destination writes `<holder>[1] = function…`; the box slot needs no
+                // `local` and the holder is already declared in the root list (O5, T7-BOXED-CELL).
+                .boxed_cell => return,
+                .external_binding => return error.UnsupportedOperation,
+                .place => |direct| {
+                    if (emission_plan.names.placeUsesStorage(direct)) return;
+                    try output.appendSlice(allocator, indent);
+                    try output.appendSlice(allocator, "local ");
+                    try lexical.emitPlaceName(output, allocator, &emission_plan.names, program, place.id, parent_place_aliases);
+                    try output.append(allocator, '\n');
+                },
+            }
         },
         .table, .environment => {},
     }
@@ -5218,7 +5272,7 @@ fn emitClosure(
     };
     defer closure_plan.deinit();
 
-    const scopes_snapshots = closure_plan.value_bindings.len != 0;
+    const scopes_snapshots = closure_plan.value_bindings.len != 0 or closure_plan.snapshot_bindings.len != 0;
     var closure_indent = indent;
     var scoped_indent: ?[]u8 = null;
     defer if (scoped_indent) |value| allocator.free(value);
@@ -5257,6 +5311,22 @@ fn emitClosure(
         };
         try output.append(allocator, '\n');
     }
+    // Per-creation snapshot of each captured boxed per-execution cell: `local <cell> = <holder>` so the child
+    // captures this execution's box reference, read through `<cell>[1]` in its body (T7-BOXED-CELL).
+    for (closure_plan.snapshot_bindings) |snapshot| {
+        try output.appendSlice(allocator, closure_indent);
+        try output.appendSlice(allocator, "local ");
+        try place_render.emitDirectName(output, allocator, &emission_plan.names, snapshot.captured);
+        try output.appendSlice(allocator, " = ");
+        place_render.emitBoxHolderName(output, allocator, &emission_plan.names, program, snapshot.source, parent_place_aliases) catch |err| {
+            std.debug.print(
+                "emit closure={} target={} stage=box_snapshot source={} captured={} error={s}\n",
+                .{ closure.function.index(), target.id.index(), snapshot.source.index(), snapshot.captured.index(), @errorName(err) },
+            );
+            return err;
+        };
+        try output.append(allocator, '\n');
+    }
 
     try output.appendSlice(allocator, closure_indent);
     var closes_external = false;
@@ -5283,6 +5353,17 @@ fn emitClosure(
                         std.debug.print(
                             "emit closure={} target={} stage=destination_name place={} resolved={} aliases={} error={s}\n",
                             .{ closure.function.index(), target.id.index(), place.id.index(), resolved.place.index(), parent_place_aliases.len, @errorName(err) },
+                        );
+                        return err;
+                    };
+                },
+                .boxed_cell => {
+                    // A closure stored into a boxed per-execution cell: `<holder>[1] = function…` (O5,
+                    // T7-BOXED-CELL). The holder is a declared root place, so the slot needs no `local`.
+                    lexical.emitPlaceName(output, allocator, &emission_plan.names, program, place.id, parent_place_aliases) catch |err| {
+                        std.debug.print(
+                            "emit closure={} target={} stage=destination_name place={} aliases={} error={s}\n",
+                            .{ closure.function.index(), target.id.index(), place.id.index(), parent_place_aliases.len, @errorName(err) },
                         );
                         return err;
                     };

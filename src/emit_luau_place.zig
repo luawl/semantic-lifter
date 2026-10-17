@@ -18,15 +18,25 @@ pub const ExternalPlaceAlias = struct {
     binding: ir.ExternalBindingId,
 };
 
+// A captured boxed per-execution cell: the child reads its own snapshot of the holder through `[1]`
+// (T7-BOXED-CELL). The alias is terminal like `external_place`; `holder` is the snapshot place the
+// child reads (a parent place for the owning function's self-alias, or the child's captured place).
+pub const BoxedPlaceAlias = struct {
+    captured: ir.PlaceId,
+    holder: ir.PlaceId,
+};
+
 pub const Alias = union(enum) {
     place: PlaceAlias,
     value: ValueAlias,
     external_place: ExternalPlaceAlias,
+    boxed_place: BoxedPlaceAlias,
 };
 
 pub const ResolvedPlace = union(enum) {
     place: ir.PlaceId,
     external_binding: ir.ExternalBindingId,
+    boxed_cell: ir.PlaceId,
 };
 
 pub fn emitName(
@@ -38,13 +48,19 @@ pub fn emitName(
     aliases: []const Alias,
 ) !void {
     const resolved = resolve(place_id, aliases) orelse return error.UnsupportedOperation;
-    const direct = switch (resolved) {
-        .place => |value| value,
+    switch (resolved) {
+        .place => |direct| {
+            if (direct.index() >= program.places.len) return error.UnsupportedOperation;
+            if (program.places[direct.index()].origin == .capture) return error.UnsupportedOperation;
+            try emitResolvedName(output, allocator, names, direct);
+        },
         .external_binding => return error.UnsupportedOperation,
-    };
-    if (direct.index() >= program.places.len) return error.UnsupportedOperation;
-    if (program.places[direct.index()].origin == .capture) return error.UnsupportedOperation;
-    try emitResolvedName(output, allocator, names, direct);
+        .boxed_cell => |holder| {
+            if (holder.index() >= program.places.len) return error.UnsupportedOperation;
+            try emitResolvedName(output, allocator, names, holder);
+            try output.appendSlice(allocator, "[1]");
+        },
+    }
 }
 
 pub fn emitRead(
@@ -57,7 +73,7 @@ pub fn emitRead(
 ) !void {
     const resolved = resolve(place_id, aliases) orelse return error.UnsupportedOperation;
     switch (resolved) {
-        .place => try emitName(output, allocator, names, program, place_id, aliases),
+        .place, .boxed_cell => try emitName(output, allocator, names, program, place_id, aliases),
         .external_binding => |binding_id| {
             try output.appendSlice(allocator, names.runtimeCapability(.rawget) orelse return error.UnsupportedOperation);
             try output.append(allocator, '(');
@@ -88,6 +104,30 @@ pub fn emitExternalBindingName(output: *std.ArrayList(u8), allocator: std.mem.Al
     try output.appendSlice(allocator, names.externalBinding(binding_id) orelse return error.UnsupportedOperation);
 }
 
+// Renders a boxed per-execution cell's holder without the `[1]` slot (T7-BOXED-CELL): the allocation
+// left-hand side `<holder> = { value }` and the per-creation snapshot source `local cell = <holder>`.
+pub fn emitBoxHolderName(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    names: *const name_plan.Plan,
+    program: *const ir.Program,
+    place_id: ir.PlaceId,
+    aliases: []const Alias,
+) !void {
+    const resolved = resolve(place_id, aliases) orelse return error.UnsupportedOperation;
+    const holder = switch (resolved) {
+        .place => |direct| blk: {
+            if (direct.index() >= program.places.len) return error.UnsupportedOperation;
+            if (program.places[direct.index()].origin == .capture) return error.UnsupportedOperation;
+            break :blk direct;
+        },
+        .boxed_cell => |holder_id| holder_id,
+        .external_binding => return error.UnsupportedOperation,
+    };
+    if (holder.index() >= program.places.len) return error.UnsupportedOperation;
+    try emitResolvedName(output, allocator, names, holder);
+}
+
 pub fn resolve(place_id: ir.PlaceId, aliases: []const Alias) ?ResolvedPlace {
     var current = place_id;
     var remaining = aliases.len + 1;
@@ -106,6 +146,9 @@ pub fn resolve(place_id: ir.PlaceId, aliases: []const Alias) ?ResolvedPlace {
                 .external_place => |external_alias| if (external_alias.captured == current) {
                     return .{ .external_binding = external_alias.binding };
                 },
+                .boxed_place => |boxed_alias| if (boxed_alias.captured == current) {
+                    return .{ .boxed_cell = boxed_alias.holder };
+                },
                 .value => {},
             }
         }
@@ -123,7 +166,7 @@ pub fn resolveValue(value_id: ir.ValueId, aliases: []const Alias) ?ir.ValueId {
         while (index != 0) {
             index -= 1;
             switch (aliases[index]) {
-                .place, .external_place => {},
+                .place, .external_place, .boxed_place => {},
                 .value => |value_alias| if (value_alias.captured == current) {
                     current = value_alias.source;
                     found = true;

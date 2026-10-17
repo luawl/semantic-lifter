@@ -24,6 +24,10 @@ const StableCaptureValues = struct {
     pub fn contains(self: StableCaptureValues, value_id: ir.ValueId) bool {
         return self.scopes.valueHasStableLexicalBinding(value_id);
     }
+
+    pub fn isBoxedPlace(self: StableCaptureValues, place_id: ir.PlaceId) bool {
+        return self.scopes.arbitraryPlaceNeedsPerExecutionCell(place_id);
+    }
 };
 
 const Summary = struct {
@@ -553,7 +557,8 @@ const Recorder = struct {
                 .target = closure.function,
                 .ambient_depth = saturatingAdd(
                     saturatingAdd(depth, segment_depth),
-                    @intFromBool(closure_plan.value_bindings.len != 0),
+                    // The value-binding or boxed-snapshot `do … end` wrapper adds one nesting level (T7-BOXED-CELL).
+                    @intFromBool(closure_plan.value_bindings.len != 0 or closure_plan.snapshot_bindings.len != 0),
                 ),
             });
         }

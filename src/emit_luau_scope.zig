@@ -831,9 +831,11 @@ pub const Plan = struct {
     ///
     /// Also marks (`arbitrary_per_execution_cell_places`) each place that a
     /// nested function reads, that is used in several blocks, and whose
-    /// allocating block lies on a CFG cycle: it has no declaration site that is
-    /// both executed once per execution of the allocation and visible from
-    /// every use, so the flat emitter refuses it. On no cycle the root
+    /// allocating block lies on a CFG cycle: it has no single Luau `local` that
+    /// is both executed once per execution of the allocation and visible from
+    /// every use, so the flat emitter boxes it (T7-BOXED-CELL) — a holder in the
+    /// root list, a fresh box per execution of the allocation, and a per-creation
+    /// snapshot each closure reads through `[1]`. On no cycle the root
     /// declaration is one cell per activation, which is one per execution.
     fn findArbitraryLeafPlaces(self: *Plan) std.mem.Allocator.Error!void {
         for (self.function.local_places) |place_id| {
