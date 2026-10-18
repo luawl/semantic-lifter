@@ -18,6 +18,10 @@ pub fn regionHasLoopBoundaryContinueNotTo(region: *const structure.Region, stop:
     return structure.regionHasLoopBoundaryContinueNotTo(region, stop);
 }
 
+pub fn regionHasUnflaggedLoopExitBreak(program: *const ir.Program, region: *const structure.Region) bool {
+    return structure.regionHasUnflaggedLoopExitBreak(program, region);
+}
+
 pub fn loopBoundaryExitTargetsAlloc(
     allocator: std.mem.Allocator,
     region: *const structure.Region,

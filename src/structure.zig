@@ -463,6 +463,29 @@ pub fn regionHasLoopBoundaryContinueNotTo(region: *const Region, stop: ir.BlockI
     return false;
 }
 
+/// Reports a loop exit below `region` that the writer ends with an unflagged
+/// lexical `break`: a `.loop_boundary` side exit whose side region does not
+/// always end the function, a `.loop_boundary` shared exit, or a
+/// `.loop_control` exit (written through `emitLoopExit`).
+///
+/// When a region is written inside a `repeat ... until true` transfer wrapper,
+/// such a `break` binds to that `repeat`, whatever the wrapper's stop (the loop
+/// header or the latch block): leaving the wrapper reaches its stop and the
+/// loop runs another pass instead of leaving. No escape flag is set for these
+/// exits and the loop-boundary census counts only `.exit`, so nothing carries
+/// the exit out of the wrapper; keep it separate so the emitter can refuse and
+/// fall back to the flat layout. The walk descends into branch arms,
+/// loop-boundary body and side regions, and infinite-loop shared side-exit
+/// regions; it does not enter `.loop`, `.latch_loop` or `.infinite_loop`
+/// bodies, where a nested loop rebinds `break`. It compares no stop, so it
+/// walks null-stop arms too.
+pub fn regionHasUnflaggedLoopExitBreak(program: *const ir.Program, region: *const Region) bool {
+    for (region.nodes) |node| {
+        if (nodeHasUnflaggedLoopExitBreak(program, node)) return true;
+    }
+    return false;
+}
+
 /// Returns the distinct loop-boundary exit targets in a structured region.
 /// These targets need function-scope signal locals so nested wrappers can
 /// communicate with the loop that owns each exit.
@@ -499,6 +522,124 @@ test "loop-boundary exit targets are tracked separately from free targets" {
     const free_targets = try regionFreeTargetsAlloc(allocator, &region);
     defer allocator.free(free_targets);
     try std.testing.expectEqual(@as(usize, 0), free_targets.len);
+}
+
+test "loop exits written as an unflagged break are reported whatever the region's stop" {
+    // A side exit whose side region does not end the function, a shared exit and a loop control's exit are each
+    // written with an unflagged `break`, which binds to a `repeat ... until true` transfer wrapper whatever the
+    // wrapper's stop. Only the side regions' last blocks are read: the jump and return pair
+    // pins the termination copy to the emitter's regionAlwaysFunctionTerminates.
+    const function_id = ir.FunctionId.fromIndex(0);
+    const header = ir.BlockId.fromIndex(0);
+    const decision = ir.BlockId.fromIndex(1);
+    const control = ir.BlockId.fromIndex(2);
+    const latch = ir.BlockId.fromIndex(3);
+    const side_jump = ir.BlockId.fromIndex(4);
+    const side_return = ir.BlockId.fromIndex(5);
+    const exit = ir.BlockId.fromIndex(6);
+    const blocks = [_]ir.Block{
+        .{ .id = header, .function = function_id, .terminator = .{ .jump = .{ .target = decision } } },
+        .{ .id = decision, .function = function_id, .terminator = .{ .branch = .{
+            .condition = ir.ValueId.fromIndex(0),
+            .then_edge = .{ .target = control },
+            .else_edge = .{ .target = side_jump },
+        } } },
+        .{ .id = control, .function = function_id, .terminator = .{ .branch = .{
+            .condition = ir.ValueId.fromIndex(1),
+            .then_edge = .{ .target = latch },
+            .else_edge = .{ .target = exit },
+        } } },
+        .{ .id = latch, .function = function_id, .terminator = .{ .jump = .{ .target = header } } },
+        .{ .id = side_jump, .function = function_id, .terminator = .{ .jump = .{ .target = exit } } },
+        .{ .id = side_return, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = exit, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .parameters = &.{ ir.ValueId.fromIndex(0), ir.ValueId.fromIndex(1) },
+        .blocks = &.{ header, decision, control, latch, side_jump, side_return, exit },
+        .entry_block = header,
+    }};
+    const program: ir.Program = .{
+        .program_id = "unflagged-loop-exit-break",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &.{},
+    };
+    var body_region = Region{ .nodes = &.{}, .stop = latch, .loop_exit = exit, .continue_target = header };
+    var side_jump_nodes = [_]Node{.{ .block = side_jump }};
+    var side_jump_region = Region{ .nodes = &side_jump_nodes, .stop = exit, .loop_exit = null };
+    var side_return_nodes = [_]Node{.{ .block = side_return }};
+    var side_return_region = Region{ .nodes = &side_return_nodes, .stop = exit, .loop_exit = null };
+
+    // A side exit whose side region ends in a jump is reported under a header stop and a latch stop alike; the
+    // same node whose side region returns is not.
+    var side_exit_nodes = [_]Node{.{ .loop_boundary = .{
+        .block = decision,
+        .body_edge = .{ .target = control },
+        .body_region = &body_region,
+        .boundary = .{ .side_exit = .{ .entry_edge = .{ .target = side_jump }, .region = &side_jump_region } },
+        .body_on_true = true,
+    } }};
+    const header_stop = Region{ .nodes = &side_exit_nodes, .stop = header, .loop_exit = exit, .continue_target = header };
+    try std.testing.expect(regionHasUnflaggedLoopExitBreak(&program, &header_stop));
+    const latch_stop = Region{ .nodes = &side_exit_nodes, .stop = latch, .loop_exit = exit, .continue_target = header };
+    try std.testing.expect(regionHasUnflaggedLoopExitBreak(&program, &latch_stop));
+    var returning_nodes = [_]Node{.{ .loop_boundary = .{
+        .block = decision,
+        .body_edge = .{ .target = control },
+        .body_region = &body_region,
+        .boundary = .{ .side_exit = .{ .entry_edge = .{ .target = side_return }, .region = &side_return_region } },
+        .body_on_true = true,
+    } }};
+    const returning = Region{ .nodes = &returning_nodes, .stop = header, .loop_exit = exit, .continue_target = header };
+    try std.testing.expect(!regionHasUnflaggedLoopExitBreak(&program, &returning));
+
+    // A nested loop rebinds `break`, so the side exit inside a `.loop` body is not reported; a null-stop branch
+    // arm is walked like any other region.
+    var loop_body = Region{ .nodes = &side_exit_nodes, .stop = header, .loop_exit = exit, .continue_target = header };
+    var loop_nodes = [_]Node{.{ .loop = .{
+        .header = header,
+        .body_region = &loop_body,
+        .body_edge = .{ .target = decision },
+        .exit_edge = .{ .target = exit },
+        .continue_on_true = true,
+    } }};
+    const nested = Region{ .nodes = &loop_nodes, .stop = null, .loop_exit = null };
+    try std.testing.expect(!regionHasUnflaggedLoopExitBreak(&program, &nested));
+    var arm_region = Region{ .nodes = &side_exit_nodes, .stop = null, .loop_exit = exit, .continue_target = header };
+    var empty_arm = Region{ .nodes = &.{}, .stop = null, .loop_exit = exit, .continue_target = header };
+    var branch_nodes = [_]Node{.{ .branch = .{
+        .block = header,
+        .then_region = &arm_region,
+        .else_region = &empty_arm,
+        .join = null,
+    } }};
+    const null_stop_arm = Region{ .nodes = &branch_nodes, .stop = header, .loop_exit = exit, .continue_target = header };
+    try std.testing.expect(regionHasUnflaggedLoopExitBreak(&program, &null_stop_arm));
+
+    // A shared exit and a loop control's exit always end with the bare `break`; the loop control sits in a region
+    // whose stop is the latch block.
+    const shared = loop_exit_shape.SharedPaths{ .exit = exit, .blocks = &.{}, .route_indices = &.{}, .entries = &.{} };
+    var shared_nodes = [_]Node{.{ .loop_boundary = .{
+        .block = decision,
+        .body_edge = .{ .target = control },
+        .body_region = &body_region,
+        .boundary = .{ .shared_exit = .{ .owner = &shared, .index = 0 } },
+        .body_on_true = true,
+    } }};
+    const shared_holder = Region{ .nodes = &shared_nodes, .stop = header, .loop_exit = exit, .continue_target = header };
+    try std.testing.expect(regionHasUnflaggedLoopExitBreak(&program, &shared_holder));
+    var control_nodes = [_]Node{.{ .loop_control = .{
+        .block = control,
+        .continue_edge = .{ .target = latch },
+        .exit_edge = .{ .target = exit },
+        .continue_on_true = true,
+    } }};
+    const control_holder = Region{ .nodes = &control_nodes, .stop = latch, .loop_exit = exit, .continue_target = header };
+    try std.testing.expect(regionHasUnflaggedLoopExitBreak(&program, &control_holder));
 }
 
 pub const Plan = struct {
@@ -16532,6 +16673,59 @@ fn sharedSideExitHasLoopBoundaryContinueNotTo(side_exit: SharedSideExit) bool {
         if (nestedRegionHasLoopBoundaryContinueNotTo(entry.region)) return true;
     }
     return false;
+}
+
+fn nodeHasUnflaggedLoopExitBreak(program: *const ir.Program, node: Node) bool {
+    return switch (node) {
+        .block, .loop_terminal => false,
+        .loop_control => true,
+        .branch => |branch| regionHasUnflaggedLoopExitBreak(program, branch.then_region) or
+            regionHasUnflaggedLoopExitBreak(program, branch.else_region),
+        .loop, .latch_loop => false,
+        .infinite_loop => |loop| loop.shared_side_exit != null and
+            sharedSideExitHasUnflaggedLoopExitBreak(program, loop.shared_side_exit.?),
+        .loop_boundary => |control| blk: {
+            if (regionHasUnflaggedLoopExitBreak(program, control.body_region)) break :blk true;
+            break :blk switch (control.boundary) {
+                .side_exit => |side| !regionAlwaysFunctionTerminates(program, side.region) or
+                    regionHasUnflaggedLoopExitBreak(program, side.region),
+                .side_escape => |side| regionHasUnflaggedLoopExitBreak(program, side.region),
+                .shared_exit => true,
+                .exit, .escape, .terminal => false,
+            };
+        },
+    };
+}
+
+fn sharedSideExitHasUnflaggedLoopExitBreak(program: *const ir.Program, side_exit: SharedSideExit) bool {
+    for (side_exit.entries) |entry| {
+        if (regionHasUnflaggedLoopExitBreak(program, entry.region)) return true;
+    }
+    return false;
+}
+
+/// The emitter's termination test (`regionAlwaysFunctionTerminates` in
+/// src/emit_luau.zig): the side-exit arm writes no `break` after a side region
+/// it reports. A lockstep copy, like the one in
+/// src/validate_luau_syntax_depth.zig; the three must change together.
+fn regionAlwaysFunctionTerminates(program: *const ir.Program, region: *const Region) bool {
+    if (region.terminal_projection != null) return true;
+    if (region.escape_projection != null) return false;
+    if (region.nodes.len == 0) return false;
+    return nodeAlwaysFunctionTerminates(program, region.nodes[region.nodes.len - 1]);
+}
+
+fn nodeAlwaysFunctionTerminates(program: *const ir.Program, node: Node) bool {
+    return switch (node) {
+        .block => |block_id| switch (program.blocks[block_id.index()].terminator) {
+            .return_values, .return_pack, .return_expanded, .throw_error, .unreachable_block => true,
+            else => false,
+        },
+        .branch => |branch| branch.join == null and
+            regionAlwaysFunctionTerminates(program, branch.then_region) and
+            regionAlwaysFunctionTerminates(program, branch.else_region),
+        else => false,
+    };
 }
 
 fn collectLoopBoundaryExitTargets(

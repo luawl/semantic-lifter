@@ -943,6 +943,10 @@ fn emitRegionWithPredeclaredBlock(
     // A loop boundary's body arm written as a lexical `continue` would bind to this `repeat`; leaving the wrapper
     // reaches `target`, not the loop header. Refuse: emitFunctionBody re-emits the function flat.
     if (structured_escape.regionHasLoopBoundaryContinueNotTo(region, target)) return error.UnsupportedControlFlow;
+    // A loop exit written as an unflagged `break` (a side exit that does not end the function, a shared exit or a
+    // loop control's exit) would bind to this `repeat`; leaving the wrapper reaches `target`, not the loop exit.
+    // Refuse: emitFunctionBody re-emits the function flat instead.
+    if (structured_escape.regionHasUnflaggedLoopExitBreak(program, region)) return error.UnsupportedControlFlow;
     const body_indent = try allocDeeperIndent(allocator, region_indent);
     defer allocator.free(body_indent);
 
