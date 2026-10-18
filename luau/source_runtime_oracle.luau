@@ -372,6 +372,36 @@ function SourceRuntimeOracle.run(caseName: string, source: string, exported: any
 				)
 			end
 		end
+
+	elseif
+		caseName == "source-frontend-generic-initializer-scope"
+		or caseName == "source-frontend-generic-initializer-scope-direct-locals"
+	then
+		local function check(limit: number, expectedText: string, expectedScore: number)
+			local text, score = exported(limit)
+			assert(text == expectedText and score == expectedScore, "a fused generic-for initializer lost its operand's declaration")
+		end
+		check(0, "", 0)
+		check(3, "3,7,10", 1)
+		check(8, "1,2,3,5,6,7,9,10", 7)
+	elseif
+		caseName == "source-frontend-generic-initializer-scope-storage"
+		or caseName == "source-frontend-generic-initializer-scope-storage-direct-locals"
+	then
+		local storage = string.find(source, "__lifter_value_storage", 1, true) ~= nil
+		if caseName == "source-frontend-generic-initializer-scope-storage" then
+			assert(storage, "the standard-luau storage arm lost its value storage")
+		else
+			assert(not storage, "the direct-locals arm took value storage")
+		end
+		local function check(limit: number, expectedText: string, expectedScore: number)
+			local text, score = exported(limit)
+			assert(text == expectedText and score == expectedScore, "a fused generic-for initializer lost its operand's declaration")
+		end
+		check(0, "", 0)
+		check(3, "3,7,10", 1)
+		check(8, "1,2,3,5,6,7,9,10", 6)
+		check(12, "0,1,2,3,4,5,6,7,7,8,9,10", 15)
 	elseif caseName == "source-frontend-typed-block" then
 		assert(exported(7) == 7, "source frontend changed typed block runtime behavior")
 	elseif caseName == "source-frontend-numeric-for" then

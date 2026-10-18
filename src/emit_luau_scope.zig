@@ -730,6 +730,10 @@ pub const Plan = struct {
                     for (initial_arguments[0..@min(initial_arguments.len, 3)]) |value_id| {
                         self.addRenderedValueUse(value_id, scope);
                     }
+                    switch (acyclic.protocol) {
+                        .generic => |generic| self.addGenericInitializerProducerUses(generic.initial_arguments, scope),
+                        .numeric => {},
+                    }
                 }
                 try self.collectNativeIterationInitializerUses(branch.then_region);
                 try self.collectNativeIterationInitializerUses(branch.else_region);
@@ -743,6 +747,10 @@ pub const Plan = struct {
                     };
                     for (initial_arguments[0..@min(initial_arguments.len, 3)]) |value_id| {
                         self.addRenderedValueUse(value_id, scope);
+                    }
+                    switch (match) {
+                        .generic => |generic| self.addGenericInitializerProducerUses(generic.initial_arguments, scope),
+                        .numeric => {},
                     }
                 }
                 try self.collectNativeIterationInitializerUses(loop.body_region);
@@ -764,6 +772,10 @@ pub const Plan = struct {
                     for (initial_arguments[0..@min(initial_arguments.len, 3)]) |value_id| {
                         self.addRenderedValueUse(value_id, scope);
                     }
+                    switch (acyclic.protocol) {
+                        .generic => |generic| self.addGenericInitializerProducerUses(generic.initial_arguments, scope),
+                        .numeric => {},
+                    }
                 }
                 try self.collectNativeIterationInitializerUses(control.body_region);
                 switch (control.boundary) {
@@ -773,6 +785,23 @@ pub const Plan = struct {
                 }
             },
         };
+    }
+
+    /// A fused generic initializer's producer is rendered on the native `for`
+    /// line (`render.plannedInvocation` in `emitGenericForOpen`), so its callee
+    /// or receiver, arguments and argument pack are read at the loop header,
+    /// not in the preheader where activation suppresses it. Charge them at the
+    /// header scope too, or a `do` group or segment that closes before the loop
+    /// hides their declarations from the `for` line.
+    fn addGenericInitializerProducerUses(self: *Plan, initial_arguments: []const ir.ValueId, scope: ScopeId) void {
+        if (initial_arguments.len < 3) return;
+        const fusion = self.genericInitializerFusion(initial_arguments[0..3]) orelse return;
+        if (fusion.producer.index() >= self.program.instructions.len) return;
+        runtime_uses.visitOperationUses(self.program.instructions[fusion.producer.index()].operation, UseVisitor{
+            .plan = self,
+            .scope = scope,
+            .remaining = self.renderedUseDepth(),
+        });
     }
 
     fn hoistFunctionPlacesOutOfLoops(self: *Plan) void {

@@ -3034,3 +3034,239 @@ test "acyclic iteration in a loop boundary inside a while loop emits one native 
     try std.testing.expect(!body_branches);
     try std.testing.expect(std.mem.indexOf(u8, source, "while ") != null);
 }
+
+test "direct-locals declares a fused generic-for producer's operand before the preheader's closed do" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const proof = ir.EvidenceId.fromIndex(0);
+    const function_id = ir.FunctionId.fromIndex(0);
+    const b_entry = ir.BlockId.fromIndex(0);
+    const b_header = ir.BlockId.fromIndex(1);
+    const b_body = ir.BlockId.fromIndex(2);
+    const b_exit = ir.BlockId.fromIndex(3);
+    const p_pack = ir.ValuePackId.fromIndex(0);
+
+    const observable_count: usize = 32;
+    // Entry block instructions: 32 ambient reads, then make_table, keep read, keep
+    // call, ipairs read, ipairs call, adjust_pack, true, false (40 total); the
+    // generic_for_next lives in the header, so 41 instructions in all.
+    const instruction_count: usize = observable_count + 9;
+    // 32 observable results + 8 entry values + 4 header parameters + 5
+    // generic_for_next results + 2 body parameters = 51 values.
+    const value_count: usize = observable_count + 19;
+
+    const i_make = ir.InstructionId.fromIndex(32);
+    const i_keep_get = ir.InstructionId.fromIndex(33);
+    const i_keep_call = ir.InstructionId.fromIndex(34);
+    const i_ipairs_get = ir.InstructionId.fromIndex(35);
+    const i_ipairs_call = ir.InstructionId.fromIndex(36);
+    const i_adjust = ir.InstructionId.fromIndex(37);
+    const i_true = ir.InstructionId.fromIndex(38);
+    const i_false = ir.InstructionId.fromIndex(39);
+    const i_gfn = ir.InstructionId.fromIndex(40);
+
+    const v_list = ir.ValueId.fromIndex(32);
+    const v_keep = ir.ValueId.fromIndex(33);
+    const v_ipairs = ir.ValueId.fromIndex(34);
+    const v_adj0 = ir.ValueId.fromIndex(35);
+    const v_adj1 = ir.ValueId.fromIndex(36);
+    const v_adj2 = ir.ValueId.fromIndex(37);
+    const v_true = ir.ValueId.fromIndex(38);
+    const v_false = ir.ValueId.fromIndex(39);
+    const hp0 = ir.ValueId.fromIndex(40);
+    const hp1 = ir.ValueId.fromIndex(41);
+    const hp2 = ir.ValueId.fromIndex(42);
+    const hp3 = ir.ValueId.fromIndex(43);
+    const r0 = ir.ValueId.fromIndex(44);
+    const r1 = ir.ValueId.fromIndex(45);
+    const r2 = ir.ValueId.fromIndex(46);
+    const r3 = ir.ValueId.fromIndex(47);
+    const r4 = ir.ValueId.fromIndex(48);
+    const bp0 = ir.ValueId.fromIndex(49);
+    const bp1 = ir.ValueId.fromIndex(50);
+
+    const values = try arena.alloc(ir.Value, value_count);
+    const instructions = try arena.alloc(ir.Instruction, instruction_count);
+    const instruction_ids = try arena.alloc(ir.InstructionId, instruction_count);
+
+    for (0..observable_count) |index| {
+        const instruction_id = ir.InstructionId.fromIndex(index);
+        const value_id = ir.ValueId.fromIndex(index);
+        instruction_ids[index] = instruction_id;
+        values[index] = .{
+            .id = value_id,
+            .function = function_id,
+            .origin = .{ .instruction_result = .{ .instruction = instruction_id, .index = 0 } },
+        };
+        instructions[index] = .{
+            .id = instruction_id,
+            .block = b_entry,
+            .operation = .{ .environment_get = .{ .target = .{ .ambient = {} }, .name = "observable" } },
+            .results = try arena.dupe(ir.ValueId, &.{value_id}),
+            .effects = .semantic_environment_read,
+            .evidence = &.{proof},
+        };
+    }
+
+    values[32] = .{ .id = v_list, .function = function_id, .name_hint = "list", .origin = .{ .instruction_result = .{ .instruction = i_make, .index = 0 } } };
+    values[33] = .{ .id = v_keep, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = i_keep_get, .index = 0 } } };
+    values[34] = .{ .id = v_ipairs, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = i_ipairs_get, .index = 0 } } };
+    values[35] = .{ .id = v_adj0, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = i_adjust, .index = 0 } } };
+    values[36] = .{ .id = v_adj1, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = i_adjust, .index = 1 } } };
+    values[37] = .{ .id = v_adj2, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = i_adjust, .index = 2 } } };
+    values[38] = .{ .id = v_true, .function = function_id, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = i_true, .index = 0 } } };
+    values[39] = .{ .id = v_false, .function = function_id, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = i_false, .index = 0 } } };
+    values[40] = .{ .id = hp0, .function = function_id, .origin = .{ .block_parameter = .{ .block = b_header, .index = 0 } } };
+    values[41] = .{ .id = hp1, .function = function_id, .origin = .{ .block_parameter = .{ .block = b_header, .index = 1 } } };
+    values[42] = .{ .id = hp2, .function = function_id, .origin = .{ .block_parameter = .{ .block = b_header, .index = 2 } } };
+    values[43] = .{ .id = hp3, .function = function_id, .type = .boolean, .origin = .{ .block_parameter = .{ .block = b_header, .index = 3 } } };
+    values[44] = .{ .id = r0, .function = function_id, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = i_gfn, .index = 0 } } };
+    values[45] = .{ .id = r1, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = i_gfn, .index = 1 } } };
+    values[46] = .{ .id = r2, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = i_gfn, .index = 2 } } };
+    values[47] = .{ .id = r3, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = i_gfn, .index = 3 } } };
+    values[48] = .{ .id = r4, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = i_gfn, .index = 4 } } };
+    values[49] = .{ .id = bp0, .function = function_id, .name_hint = "key", .origin = .{ .block_parameter = .{ .block = b_body, .index = 0 } } };
+    values[50] = .{ .id = bp1, .function = function_id, .name_hint = "value", .origin = .{ .block_parameter = .{ .block = b_body, .index = 1 } } };
+
+    instruction_ids[32] = i_make;
+    instructions[32] = .{ .id = i_make, .block = b_entry, .operation = .{ .make_table = {} }, .results = try arena.dupe(ir.ValueId, &.{v_list}), .effects = .table_constructor, .evidence = &.{proof} };
+    instruction_ids[33] = i_keep_get;
+    instructions[33] = .{ .id = i_keep_get, .block = b_entry, .operation = .{ .environment_get = .{ .target = .{ .ambient = {} }, .name = "keep" } }, .results = try arena.dupe(ir.ValueId, &.{v_keep}), .effects = .semantic_environment_read, .evidence = &.{proof} };
+    instruction_ids[34] = i_keep_call;
+    instructions[34] = .{ .id = i_keep_call, .block = b_entry, .operation = .{ .call = .{ .callee = v_keep, .arguments = try arena.dupe(ir.ValueId, &.{v_list}), .result_arity = .{ .fixed = 0 } } }, .results = &.{}, .effects = .dynamic_call, .evidence = &.{proof} };
+    instruction_ids[35] = i_ipairs_get;
+    instructions[35] = .{ .id = i_ipairs_get, .block = b_entry, .operation = .{ .environment_get = .{ .target = .{ .ambient = {} }, .name = "ipairs" } }, .results = try arena.dupe(ir.ValueId, &.{v_ipairs}), .effects = .semantic_environment_read, .evidence = &.{proof} };
+    instruction_ids[36] = i_ipairs_call;
+    instructions[36] = .{ .id = i_ipairs_call, .block = b_entry, .operation = .{ .call = .{ .callee = v_ipairs, .arguments = try arena.dupe(ir.ValueId, &.{v_list}), .result_arity = .{ .variadic = {} } } }, .results = &.{}, .pack_result = p_pack, .effects = .dynamic_call, .evidence = &.{proof} };
+    instruction_ids[37] = i_adjust;
+    instructions[37] = .{ .id = i_adjust, .block = b_entry, .operation = .{ .adjust_pack = p_pack }, .results = try arena.dupe(ir.ValueId, &.{ v_adj0, v_adj1, v_adj2 }), .effects = .pure, .evidence = &.{proof} };
+    instruction_ids[38] = i_true;
+    instructions[38] = .{ .id = i_true, .block = b_entry, .operation = .{ .constant = .{ .boolean = true } }, .results = try arena.dupe(ir.ValueId, &.{v_true}), .effects = .pure, .evidence = &.{proof} };
+    instruction_ids[39] = i_false;
+    instructions[39] = .{ .id = i_false, .block = b_entry, .operation = .{ .constant = .{ .boolean = false } }, .results = try arena.dupe(ir.ValueId, &.{v_false}), .effects = .pure, .evidence = &.{proof} };
+    instruction_ids[40] = i_gfn;
+    instructions[40] = .{ .id = i_gfn, .block = b_header, .operation = .{ .generic_for_next = .{ .iterator = hp0, .state = hp1, .control = hp2, .initial = hp3, .variable_count = 2 } }, .results = try arena.dupe(ir.ValueId, &.{ r0, r1, r2, r3, r4 }), .effects = ir.EffectSummary.generic_for_next, .evidence = &.{proof} };
+
+    const blocks = [_]ir.Block{
+        .{
+            .id = b_entry,
+            .function = function_id,
+            .instructions = instruction_ids[0..40],
+            .terminator = .{ .jump = .{ .target = b_header, .arguments = try arena.dupe(ir.ValueId, &.{ v_adj0, v_adj1, v_adj2, v_true }) } },
+            .evidence = &.{proof},
+        },
+        .{
+            .id = b_header,
+            .function = function_id,
+            .parameters = try arena.dupe(ir.ValueId, &.{ hp0, hp1, hp2, hp3 }),
+            .instructions = instruction_ids[40..41],
+            .terminator = .{ .branch = .{
+                .condition = r0,
+                .then_edge = .{ .target = b_body, .arguments = try arena.dupe(ir.ValueId, &.{ r3, r4 }) },
+                .else_edge = .{ .target = b_exit },
+            } },
+            .evidence = &.{proof},
+        },
+        .{
+            .id = b_body,
+            .function = function_id,
+            .parameters = try arena.dupe(ir.ValueId, &.{ bp0, bp1 }),
+            .terminator = .{ .jump = .{ .target = b_header, .arguments = try arena.dupe(ir.ValueId, &.{ r1, r2, r3, v_false }) } },
+            .evidence = &.{proof},
+        },
+        .{
+            .id = b_exit,
+            .function = function_id,
+            .terminator = .{ .return_values = &.{} },
+            .evidence = &.{proof},
+        },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .blocks = &.{ b_entry, b_header, b_body, b_exit },
+        .entry_block = b_entry,
+        .evidence = &.{proof},
+    }};
+    const value_packs = [_]ir.ValuePack{.{
+        .id = p_pack,
+        .function = function_id,
+        .origin = .{ .instruction_result = i_ipairs_call },
+        .evidence = &.{proof},
+    }};
+    const evidence = [_]ir.Evidence{.{ .id = proof, .kind = .dynamic_fixture, .locator = "fixture:generic-initializer-scope" }};
+    const program: ir.Program = .{
+        .program_id = "generic-initializer-scope-unit",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = instructions,
+        .values = values,
+        .value_packs = &value_packs,
+        .evidence = &evidence,
+    };
+
+    const source = try lifter.emit_luau.emitAdmittedAllocForTarget(allocator, &program, .direct_locals_luau);
+    defer allocator.free(source);
+
+    // (G1) the structured layout, not the dispatcher.
+    try std.testing.expect(std.mem.indexOf(u8, source, "__lifter_pc") == null);
+
+    // (G2) the fused producer is written onto the `for` line; read the table name X.
+    var table_name: []const u8 = "";
+    var for_line_index: ?usize = null;
+    {
+        var lines = std.mem.splitScalar(u8, source, '\n');
+        var index: usize = 0;
+        while (lines.next()) |line| : (index += 1) {
+            const trimmed = std.mem.trim(u8, line, " \t");
+            if (std.mem.startsWith(u8, trimmed, "for ") and std.mem.endsWith(u8, trimmed, " do") and
+                std.mem.indexOf(u8, trimmed, " in ipairs(") != null)
+            {
+                const open = std.mem.indexOf(u8, trimmed, "ipairs(").? + "ipairs(".len;
+                const close = open + std.mem.indexOfScalar(u8, trimmed[open..], ')').?;
+                table_name = trimmed[open..close];
+                for_line_index = index;
+                break;
+            }
+        }
+    }
+    try std.testing.expect(for_line_index != null);
+    try std.testing.expect(table_name.len != 0);
+
+    // (G3) at least one line whose trimmed text is exactly `do` precedes the `for` line.
+    var first_do_index: ?usize = null;
+    {
+        var lines = std.mem.splitScalar(u8, source, '\n');
+        var index: usize = 0;
+        while (lines.next()) |line| : (index += 1) {
+            if (std.mem.eql(u8, std.mem.trim(u8, line, " \t"), "do")) {
+                first_do_index = index;
+                break;
+            }
+        }
+    }
+    try std.testing.expect(first_do_index != null);
+    try std.testing.expect(first_do_index.? < for_line_index.?);
+
+    // (D) a `local` line before the first such `do` line declares X.
+    var declares_table = false;
+    {
+        var lines = std.mem.splitScalar(u8, source, '\n');
+        var index: usize = 0;
+        while (lines.next()) |line| : (index += 1) {
+            if (index >= first_do_index.?) break;
+            const trimmed = std.mem.trim(u8, line, " \t");
+            if (!std.mem.startsWith(u8, trimmed, "local ")) continue;
+            const rest = trimmed["local ".len..];
+            const names = if (std.mem.indexOf(u8, rest, " = ")) |eq| rest[0..eq] else rest;
+            var parts = std.mem.splitScalar(u8, names, ',');
+            while (parts.next()) |part| {
+                if (std.mem.eql(u8, std.mem.trim(u8, part, " \t"), table_name)) declares_table = true;
+            }
+        }
+    }
+    try std.testing.expect(declares_table);
+}

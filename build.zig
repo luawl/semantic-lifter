@@ -855,6 +855,40 @@ pub fn build(b: *std.Build) void {
         "luau/fixtures/always_break_transfer_iteration_source.luau",
         "source-frontend-always-break-transfer-iteration",
     );
+    const source_frontend_generic_initializer_scope_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/generic_initializer_scope_source.luau",
+        "source-frontend-generic-initializer-scope",
+    );
+    const source_frontend_generic_initializer_scope_direct_locals_conformance = addLuauSourceConformanceForTarget(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/generic_initializer_scope_source.luau",
+        "source-frontend-generic-initializer-scope-direct-locals",
+        "direct-locals-luau",
+    );
+    const source_frontend_generic_initializer_scope_storage_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/generic_initializer_scope_storage_source.luau",
+        "source-frontend-generic-initializer-scope-storage",
+    );
+    const source_frontend_generic_initializer_scope_storage_direct_locals_conformance = addLuauSourceConformanceForTarget(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/generic_initializer_scope_storage_source.luau",
+        "source-frontend-generic-initializer-scope-storage-direct-locals",
+        "direct-locals-luau",
+    );
     const source_frontend_table_pack_conformance = addLuauSourceConformance(
         b,
         exe,
@@ -1222,6 +1256,10 @@ pub fn build(b: *std.Build) void {
     source_frontend_always_return_iteration_in_loop_conformance.addTo(conformance_step);
     source_frontend_always_break_iteration_conformance.addTo(conformance_step);
     source_frontend_always_break_transfer_iteration_conformance.addTo(conformance_step);
+    source_frontend_generic_initializer_scope_conformance.addTo(conformance_step);
+    source_frontend_generic_initializer_scope_direct_locals_conformance.addTo(conformance_step);
+    source_frontend_generic_initializer_scope_storage_conformance.addTo(conformance_step);
+    source_frontend_generic_initializer_scope_storage_direct_locals_conformance.addTo(conformance_step);
     source_frontend_table_pack_conformance.addTo(conformance_step);
     source_frontend_function_statement_conformance.addTo(conformance_step);
     source_frontend_interpolation_conformance.addTo(conformance_step);
@@ -2450,6 +2488,65 @@ fn addSerializedConformanceWithEngine(
         .validate = &validate_command.step,
         .compile = &emit_command.step,
         .runtime = &runtime_command.step,
+        .input_ir = fixture_json,
+        .resolved_ir = resolved_json,
+        .generated_luau = emitted_luau,
+    };
+}
+
+// A source conformance arm emitted for a named target. addSerializedConformanceWithEngine emits
+// standard-luau only, whose value storage (more than 120 candidate values) hides a scope-plan defect in a large
+// function; this sibling runs the same lift, resolve-ir, validate, checked emit, runtime, source compile, lexical and
+// source runtime steps for the target it is given (direct-locals-luau).
+fn addLuauSourceConformanceForTarget(
+    b: *std.Build,
+    exe: *std.Build.Step.Compile,
+    z3_enabled: bool,
+    z3_bin: []const u8,
+    source_path: []const u8,
+    fixture_name: []const u8,
+    target_name: []const u8,
+) FixtureConformance {
+    const fixture_json = addLuauSourceIr(b, source_path, null, fixture_name);
+    const engine_name = if (z3_enabled) "z3" else "internal";
+
+    const resolve_command = b.addRunArtifact(exe);
+    if (z3_enabled) resolve_command.addPathDir(b.pathFromRoot(z3_bin));
+    resolve_command.addArg("resolve-ir");
+    resolve_command.addFileArg(fixture_json);
+    const resolved_json = resolve_command.addOutputFileArg(b.fmt("{s}.resolved.lifter-ir.json", .{fixture_name}));
+    resolve_command.addArg(engine_name);
+
+    const validate_command = b.addRunArtifact(exe);
+    if (z3_enabled) validate_command.addPathDir(b.pathFromRoot(z3_bin));
+    validate_command.addArg("validate");
+    validate_command.addFileArg(resolved_json);
+    validate_command.addArg("readable-luau");
+
+    const emit_command = b.addRunArtifact(exe);
+    if (z3_enabled) emit_command.addPathDir(b.pathFromRoot(z3_bin));
+    emit_command.addArg("emit-luau-solved");
+    emit_command.addFileArg(resolved_json);
+    const emitted_luau = emit_command.addOutputFileArg(b.fmt("{s}.generated.luau", .{fixture_name}));
+    emit_command.addArg(engine_name);
+    emit_command.addArg(target_name);
+    emit_command.addFileArg(.{ .cwd_relative = luauCompileExe(b) });
+
+    const runtime_command = b.addSystemCommand(&.{ luneExe(b), "run" });
+    runtime_command.addFileArg(b.path("luau/runtime_oracle.luau"));
+    runtime_command.addFileInput(b.path("luau/source_runtime_oracle.luau"));
+    runtime_command.addFileInput(b.path("luau/pack_multi_latch_runtime_oracle.luau"));
+    runtime_command.addFileInput(b.path("luau/pack_return_storage_runtime_oracle.luau"));
+    runtime_command.addFileInput(b.path("luau/iteration_exit_transfer_runtime_oracle.luau"));
+    runtime_command.addArg(fixture_name);
+    runtime_command.addFileArg(emitted_luau);
+
+    return .{
+        .validate = &validate_command.step,
+        .compile = &emit_command.step,
+        .runtime = &runtime_command.step,
+        .source_compile = addSourceCompileConformance(b, source_path),
+        .source_runtime = addSourceRuntimeConformance(b, source_path, fixture_name, emitted_luau),
         .input_ir = fixture_json,
         .resolved_ir = resolved_json,
         .generated_luau = emitted_luau,
