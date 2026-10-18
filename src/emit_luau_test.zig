@@ -3270,3 +3270,162 @@ test "direct-locals declares a fused generic-for producer's operand before the p
     }
     try std.testing.expect(declares_table);
 }
+
+test "a fused generic-for producer keeps its place before a later effect in its block" {
+    const allocator = std.testing.allocator;
+
+    const proof = ir.EvidenceId.fromIndex(0);
+    const function_id = ir.FunctionId.fromIndex(0);
+    const b_entry = ir.BlockId.fromIndex(0);
+    const b_header = ir.BlockId.fromIndex(1);
+    const b_body = ir.BlockId.fromIndex(2);
+    const b_exit = ir.BlockId.fromIndex(3);
+    const p_pack = ir.ValuePackId.fromIndex(0);
+
+    const i_producer = ir.InstructionId.fromIndex(0);
+    const i_adjust = ir.InstructionId.fromIndex(1);
+    const i_effect = ir.InstructionId.fromIndex(2);
+    const i_true = ir.InstructionId.fromIndex(3);
+    const i_false = ir.InstructionId.fromIndex(4);
+    const i_gfn = ir.InstructionId.fromIndex(5);
+
+    const f = ir.ValueId.fromIndex(0);
+    const g = ir.ValueId.fromIndex(1);
+    const t = ir.ValueId.fromIndex(2);
+    const v_adj0 = ir.ValueId.fromIndex(3);
+    const v_adj1 = ir.ValueId.fromIndex(4);
+    const v_adj2 = ir.ValueId.fromIndex(5);
+    const v_true = ir.ValueId.fromIndex(6);
+    const v_false = ir.ValueId.fromIndex(7);
+    const hp0 = ir.ValueId.fromIndex(8);
+    const hp1 = ir.ValueId.fromIndex(9);
+    const hp2 = ir.ValueId.fromIndex(10);
+    const hp3 = ir.ValueId.fromIndex(11);
+    const r0 = ir.ValueId.fromIndex(12);
+    const r1 = ir.ValueId.fromIndex(13);
+    const r2 = ir.ValueId.fromIndex(14);
+    const r3 = ir.ValueId.fromIndex(15);
+    const r4 = ir.ValueId.fromIndex(16);
+    const bp0 = ir.ValueId.fromIndex(17);
+    const bp1 = ir.ValueId.fromIndex(18);
+
+    const values = [_]ir.Value{
+        .{ .id = f, .function = function_id, .type = .dynamic, .name_hint = "f", .origin = .{ .parameter = 0 } },
+        .{ .id = g, .function = function_id, .type = .dynamic, .name_hint = "g", .origin = .{ .parameter = 1 } },
+        .{ .id = t, .function = function_id, .type = .dynamic, .name_hint = "t", .origin = .{ .parameter = 2 } },
+        .{ .id = v_adj0, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = i_adjust, .index = 0 } } },
+        .{ .id = v_adj1, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = i_adjust, .index = 1 } } },
+        .{ .id = v_adj2, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = i_adjust, .index = 2 } } },
+        .{ .id = v_true, .function = function_id, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = i_true, .index = 0 } } },
+        .{ .id = v_false, .function = function_id, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = i_false, .index = 0 } } },
+        .{ .id = hp0, .function = function_id, .origin = .{ .block_parameter = .{ .block = b_header, .index = 0 } } },
+        .{ .id = hp1, .function = function_id, .origin = .{ .block_parameter = .{ .block = b_header, .index = 1 } } },
+        .{ .id = hp2, .function = function_id, .origin = .{ .block_parameter = .{ .block = b_header, .index = 2 } } },
+        .{ .id = hp3, .function = function_id, .type = .boolean, .origin = .{ .block_parameter = .{ .block = b_header, .index = 3 } } },
+        .{ .id = r0, .function = function_id, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = i_gfn, .index = 0 } } },
+        .{ .id = r1, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = i_gfn, .index = 1 } } },
+        .{ .id = r2, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = i_gfn, .index = 2 } } },
+        .{ .id = r3, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = i_gfn, .index = 3 } } },
+        .{ .id = r4, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = i_gfn, .index = 4 } } },
+        .{ .id = bp0, .function = function_id, .name_hint = "key", .origin = .{ .block_parameter = .{ .block = b_body, .index = 0 } } },
+        .{ .id = bp1, .function = function_id, .name_hint = "value", .origin = .{ .block_parameter = .{ .block = b_body, .index = 1 } } },
+    };
+
+    const instructions = [_]ir.Instruction{
+        .{ .id = i_producer, .block = b_entry, .operation = .{ .call = .{ .callee = f, .arguments = &.{t}, .result_arity = .{ .variadic = {} } } }, .results = &.{}, .pack_result = p_pack, .effects = .dynamic_call, .evidence = &.{proof} },
+        .{ .id = i_adjust, .block = b_entry, .operation = .{ .adjust_pack = p_pack }, .results = &.{ v_adj0, v_adj1, v_adj2 }, .effects = .pure, .evidence = &.{proof} },
+        .{ .id = i_effect, .block = b_entry, .operation = .{ .call = .{ .callee = g, .arguments = &.{}, .result_arity = .{ .fixed = 0 } } }, .results = &.{}, .effects = .dynamic_call, .evidence = &.{proof} },
+        .{ .id = i_true, .block = b_entry, .operation = .{ .constant = .{ .boolean = true } }, .results = &.{v_true}, .effects = .pure, .evidence = &.{proof} },
+        .{ .id = i_false, .block = b_entry, .operation = .{ .constant = .{ .boolean = false } }, .results = &.{v_false}, .effects = .pure, .evidence = &.{proof} },
+        .{ .id = i_gfn, .block = b_header, .operation = .{ .generic_for_next = .{ .iterator = hp0, .state = hp1, .control = hp2, .initial = hp3, .variable_count = 2 } }, .results = &.{ r0, r1, r2, r3, r4 }, .effects = ir.EffectSummary.generic_for_next, .evidence = &.{proof} },
+    };
+
+    const blocks = [_]ir.Block{
+        .{
+            .id = b_entry,
+            .function = function_id,
+            .instructions = &.{ i_producer, i_adjust, i_effect, i_true, i_false },
+            .terminator = .{ .jump = .{ .target = b_header, .arguments = &.{ v_adj0, v_adj1, v_adj2, v_true } } },
+            .evidence = &.{proof},
+        },
+        .{
+            .id = b_header,
+            .function = function_id,
+            .parameters = &.{ hp0, hp1, hp2, hp3 },
+            .instructions = &.{i_gfn},
+            .terminator = .{ .branch = .{
+                .condition = r0,
+                .then_edge = .{ .target = b_body, .arguments = &.{ r3, r4 } },
+                .else_edge = .{ .target = b_exit },
+            } },
+            .evidence = &.{proof},
+        },
+        .{
+            .id = b_body,
+            .function = function_id,
+            .parameters = &.{ bp0, bp1 },
+            .terminator = .{ .jump = .{ .target = b_header, .arguments = &.{ r1, r2, r3, v_false } } },
+            .evidence = &.{proof},
+        },
+        .{
+            .id = b_exit,
+            .function = function_id,
+            .terminator = .{ .return_values = &.{} },
+            .evidence = &.{proof},
+        },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .parameters = &.{ f, g, t },
+        .blocks = &.{ b_entry, b_header, b_body, b_exit },
+        .entry_block = b_entry,
+        .evidence = &.{proof},
+    }};
+    const value_packs = [_]ir.ValuePack{.{
+        .id = p_pack,
+        .function = function_id,
+        .origin = .{ .instruction_result = i_producer },
+        .evidence = &.{proof},
+    }};
+    const evidence = [_]ir.Evidence{.{ .id = proof, .kind = .dynamic_fixture, .locator = "fixture:generic-initializer-order" }};
+    const program: ir.Program = .{
+        .program_id = "generic-initializer-order-unit",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+        .value_packs = &value_packs,
+        .evidence = &evidence,
+    };
+
+    const source = try lifter.emit_luau.emitAdmittedAllocForTarget(allocator, &program, .standard_luau);
+    defer allocator.free(source);
+
+    // (G1) the structured layout, not the dispatcher.
+    try std.testing.expect(std.mem.indexOf(u8, source, "__lifter_pc") == null);
+
+    // (G2) the producer call and the later effect are both present, and the loop is native.
+    const producer_at = std.mem.indexOf(u8, source, "f(t)");
+    const effect_at = std.mem.indexOf(u8, source, "g()");
+    try std.testing.expect(producer_at != null);
+    try std.testing.expect(effect_at != null);
+    var native_for = false;
+    {
+        var lines = std.mem.splitScalar(u8, source, '\n');
+        while (lines.next()) |line| {
+            const trimmed = std.mem.trim(u8, line, " \t");
+            if (std.mem.startsWith(u8, trimmed, "for ") and std.mem.endsWith(u8, trimmed, " do")) {
+                native_for = true;
+                break;
+            }
+        }
+    }
+    try std.testing.expect(native_for);
+
+    // (D1) the fused producer keeps its place before the later effect in its block.
+    try std.testing.expect(producer_at.? < effect_at.?);
+
+    // (D2) the producer is written exactly once, never both in place and on the `for` line.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "f(t)"));
+}

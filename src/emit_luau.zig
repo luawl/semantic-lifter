@@ -2516,7 +2516,7 @@ fn emitGenericForOpen(
     try output.appendSlice(allocator, " in ");
     const initializer_count = genericInitializerCount(program, emission_plan, generic.initial_arguments[0..3]);
     const initializer_fusion = if (initializer_count == 3)
-        scopes.genericInitializerFusion(generic.initial_arguments[0..3])
+        scopes.genericInitializerFusion(generic.initial_arguments[0..3], generic.transition.block)
     else
         null;
     if (initializer_fusion) |fusion| {

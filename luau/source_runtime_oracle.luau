@@ -402,6 +402,28 @@ function SourceRuntimeOracle.run(caseName: string, source: string, exported: any
 		check(3, "3,7,10", 1)
 		check(8, "1,2,3,5,6,7,9,10", 6)
 		check(12, "0,1,2,3,4,5,6,7,7,8,9,10", 15)
+
+	elseif
+		caseName == "source-frontend-generic-initializer-order"
+		or caseName == "source-frontend-generic-initializer-order-direct-locals"
+	then
+		if caseName == "source-frontend-generic-initializer-order-direct-locals" then
+			assert(
+				string.find(source, " in source(order) do", 1, true) ~= nil,
+				"the order-preserving header call lost its fused generic-for initializer"
+			)
+		end
+		local function check(mode: string, limit: number, expected: string)
+			assert(exported(mode, limit) == expected, "a fused generic-for initializer moved its producer past a later effect")
+		end
+		check("between", 3, "source,between,1=3,2=2,3=1")
+		check("guarded", 5, "source,between,1=5,2=2,3=1")
+		check("guarded", 3, "source,1=3,2=2,3=1")
+		check("reassigned", 3, "1=3,2=2,3=1,1")
+		check("outer", 3, "source,1:1=3,1:2=2,1:3=1,2:1=3,2:2=2,2:3=1")
+		check("break", 3, "source,between,3@1")
+		check("boundary", 3, "source,between|3@1")
+		check("header", 3, "between,source,1=3,2=2,3=1")
 	elseif caseName == "source-frontend-typed-block" then
 		assert(exported(7) == 7, "source frontend changed typed block runtime behavior")
 	elseif caseName == "source-frontend-numeric-for" then

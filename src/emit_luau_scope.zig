@@ -10,6 +10,7 @@ const place_read_fusion = @import("place_read_fusion.zig");
 const value_fusion = @import("value_fusion.zig");
 const closure_store_fusion = @import("closure_store_fusion.zig");
 const runtime_uses = @import("runtime_uses.zig");
+const invocation_projection_witness = @import("invocation_projection_witness.zig");
 
 pub const ScopeId = u32;
 pub const invalid_scope = std.math.maxInt(ScopeId);
@@ -731,7 +732,7 @@ pub const Plan = struct {
                         self.addRenderedValueUse(value_id, scope);
                     }
                     switch (acyclic.protocol) {
-                        .generic => |generic| self.addGenericInitializerProducerUses(generic.initial_arguments, scope),
+                        .generic => |generic| self.addGenericInitializerProducerUses(generic.initial_arguments, branch.block, scope),
                         .numeric => {},
                     }
                 }
@@ -749,7 +750,7 @@ pub const Plan = struct {
                         self.addRenderedValueUse(value_id, scope);
                     }
                     switch (match) {
-                        .generic => |generic| self.addGenericInitializerProducerUses(generic.initial_arguments, scope),
+                        .generic => |generic| self.addGenericInitializerProducerUses(generic.initial_arguments, loop.header, scope),
                         .numeric => {},
                     }
                 }
@@ -773,7 +774,7 @@ pub const Plan = struct {
                         self.addRenderedValueUse(value_id, scope);
                     }
                     switch (acyclic.protocol) {
-                        .generic => |generic| self.addGenericInitializerProducerUses(generic.initial_arguments, scope),
+                        .generic => |generic| self.addGenericInitializerProducerUses(generic.initial_arguments, control.block, scope),
                         .numeric => {},
                     }
                 }
@@ -793,9 +794,9 @@ pub const Plan = struct {
     /// not in the preheader where activation suppresses it. Charge them at the
     /// header scope too, or a `do` group or segment that closes before the loop
     /// hides their declarations from the `for` line.
-    fn addGenericInitializerProducerUses(self: *Plan, initial_arguments: []const ir.ValueId, scope: ScopeId) void {
+    fn addGenericInitializerProducerUses(self: *Plan, initial_arguments: []const ir.ValueId, header: ir.BlockId, scope: ScopeId) void {
         if (initial_arguments.len < 3) return;
-        const fusion = self.genericInitializerFusion(initial_arguments[0..3]) orelse return;
+        const fusion = self.genericInitializerFusion(initial_arguments[0..3], header) orelse return;
         if (fusion.producer.index() >= self.program.instructions.len) return;
         runtime_uses.visitOperationUses(self.program.instructions[fusion.producer.index()].operation, UseVisitor{
             .plan = self,
@@ -1062,7 +1063,7 @@ pub const Plan = struct {
             break :blk instruction;
         } else null;
         const generic_initializer = if (initial_arguments) |arguments|
-            self.genericInitializerFusion(arguments)
+            self.genericInitializerFusion(arguments, header_id)
         else
             null;
         const header_parameters = self.program.blocks[header_id.index()].parameters;
@@ -1115,7 +1116,7 @@ pub const Plan = struct {
         return true;
     }
 
-    pub fn genericInitializerFusion(self: *const Plan, initial_arguments: []const ir.ValueId) ?GenericInitializerFusion {
+    pub fn genericInitializerFusion(self: *const Plan, initial_arguments: []const ir.ValueId, header: ir.BlockId) ?GenericInitializerFusion {
         if (initial_arguments.len != 3) return null;
         var adjustment_id: ?ir.InstructionId = null;
         for (initial_arguments, 0..) |value_id, index| {
@@ -1152,7 +1153,42 @@ pub const Plan = struct {
             .fused_invocation_producer, .materialized_invocation_producer => |consumer| if (consumer != adjustment) return null,
             else => return null,
         }
+        if (!self.initializerKeepsEvaluationOrder(producer, adjustment, header)) return null;
         return .{ .adjustment = adjustment, .producer = producer };
+    }
+
+    /// The fused producer is evaluated on the `for` line, so it may move there only
+    /// when its block enters the loop header by a jump and every later instruction
+    /// of that block but the adjustment is one an open invocation may move past
+    /// (`invocation_projection_witness.invocationGapIsMovable`). A producer whose
+    /// block jumps to the header runs once per loop entry, and a gap that is not
+    /// movable keeps the producer and its adjustment in place, so the loop reads
+    /// the three initial arguments in evaluation order.
+    fn initializerKeepsEvaluationOrder(
+        self: *const Plan,
+        producer_id: ir.InstructionId,
+        adjustment_id: ir.InstructionId,
+        header: ir.BlockId,
+    ) bool {
+        const producer = self.program.instructions[producer_id.index()];
+        if (producer.block.index() >= self.program.blocks.len) return false;
+        const block = self.program.blocks[producer.block.index()];
+        const entry = switch (block.terminator) {
+            .jump => |edge| edge,
+            else => return false,
+        };
+        if (entry.target != header) return false;
+        var after_producer = false;
+        for (block.instructions) |instruction_id| {
+            if (instruction_id == producer_id) {
+                after_producer = true;
+                continue;
+            }
+            if (!after_producer or instruction_id == adjustment_id) continue;
+            if (instruction_id.index() >= self.program.instructions.len) return false;
+            if (!invocation_projection_witness.invocationGapIsMovable(self.program, self.program.instructions[instruction_id.index()])) return false;
+        }
+        return after_producer;
     }
 
     fn suppressGenericIteratorStores(self: *Plan, values: []const ir.ValueId, body_parameters: []const ir.ValueId) void {
