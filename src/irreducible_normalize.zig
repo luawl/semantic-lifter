@@ -1342,6 +1342,127 @@ fn shortCircuitElseCloneEdge(
     return .{ .source = inner, .kind = .branch_else, .target = previous };
 }
 
+/// The outgoing edges of a block whose
+/// terminator is a `jump` (one edge) or a `branch` (then and else).  Null for a
+/// `return`, `throw` or `unreachable` block, which never flows to the join.
+const CompoundOrArmEdges = struct {
+    edges: [2]ir.Edge,
+    count: usize,
+
+    fn slice(self: *const CompoundOrArmEdges) []const ir.Edge {
+        return self.edges[0..self.count];
+    }
+};
+
+fn compoundOrArmOutgoingEdges(terminator: ir.Terminator) ?CompoundOrArmEdges {
+    return switch (terminator) {
+        .jump => |edge| .{ .edges = .{ edge, undefined }, .count = 1 },
+        .branch => |branch| .{ .edges = .{ branch.then_edge, branch.else_edge }, .count = 2 },
+        .return_values, .return_pack, .return_expanded, .throw_error, .unreachable_block => null,
+    };
+}
+
+/// The generalization of the one-block
+/// short-circuit `or` block to a multi-block compound `or` arm.  For an
+/// `already_owned` collision at the statement join `join` whose owner context
+/// stop is the `or`-arm entry `entry`: `entry` has exactly two predecessors,
+/// both `branch` blocks reaching `entry` on their else edge without arguments
+/// (`branchReachesElseWithoutArguments`), one dominating the other, and the
+/// inner (dominated) branch's then edge targets `join`.  R is the blocks reached
+/// from `entry` without entering `join`, each dominated by `entry` (reflexive,
+/// so `entry` qualifies), each ending in a `jump` or `branch`, every edge
+/// leaving R targeting `join` without arguments.  R is ordered by a Kahn pass
+/// over its internal edges (a dominator before every block it dominates, `entry`
+/// first); a region that does not fully order holds a cycle and is refused.
+/// Returns the ordered closure R and the inner branch's else edge to `entry`.
+/// The one-block shape is the case R = {entry}.
+const CompoundOrArm = struct {
+    closure: []ir.BlockId,
+    clone_edge: ir.CfgEdgeRef,
+};
+
+fn compoundShortCircuitOrArmAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    join: ir.BlockId,
+    entry: ir.BlockId,
+) std.mem.Allocator.Error!?CompoundOrArm {
+    if (entry.index() >= program.blocks.len) return null;
+    if (analysis.predecessorCount(entry) != 2) return null;
+    const first_predecessor = analysis.predecessorAt(entry, 0) orelse return null;
+    const second_predecessor = analysis.predecessorAt(entry, 1) orelse return null;
+    if (!branchReachesElseWithoutArguments(program, first_predecessor, entry)) return null;
+    if (!branchReachesElseWithoutArguments(program, second_predecessor, entry)) return null;
+    const inner = if (analysis.dominates(first_predecessor, second_predecessor))
+        second_predecessor
+    else if (analysis.dominates(second_predecessor, first_predecessor))
+        first_predecessor
+    else
+        return null;
+    switch (program.blocks[inner.index()].terminator) {
+        .branch => |branch| if (branch.then_edge.target != join) return null,
+        else => return null,
+    }
+
+    var region: std.ArrayList(ir.BlockId) = .empty;
+    defer region.deinit(allocator);
+    const in_region = try allocator.alloc(bool, program.blocks.len);
+    defer allocator.free(in_region);
+    @memset(in_region, false);
+    try region.append(allocator, entry);
+    in_region[entry.index()] = true;
+    var cursor: usize = 0;
+    while (cursor < region.items.len) : (cursor += 1) {
+        const block_id = region.items[cursor];
+        const outgoing = compoundOrArmOutgoingEdges(program.blocks[block_id.index()].terminator) orelse return null;
+        for (outgoing.slice()) |edge| {
+            if (edge.target == join) {
+                if (edge.arguments.len != 0) return null;
+                continue;
+            }
+            if (edge.target.index() >= program.blocks.len) return null;
+            if (!analysis.dominates(entry, edge.target)) return null;
+            if (!in_region[edge.target.index()]) {
+                in_region[edge.target.index()] = true;
+                try region.append(allocator, edge.target);
+            }
+        }
+    }
+
+    const indegree = try allocator.alloc(usize, program.blocks.len);
+    defer allocator.free(indegree);
+    @memset(indegree, 0);
+    for (region.items) |block_id| {
+        const outgoing = compoundOrArmOutgoingEdges(program.blocks[block_id.index()].terminator).?;
+        for (outgoing.slice()) |edge| {
+            if (edge.target == join) continue;
+            indegree[edge.target.index()] += 1;
+        }
+    }
+    var ordered: std.ArrayList(ir.BlockId) = .empty;
+    defer ordered.deinit(allocator);
+    for (region.items) |block_id| {
+        if (indegree[block_id.index()] == 0) try ordered.append(allocator, block_id);
+    }
+    var head: usize = 0;
+    while (head < ordered.items.len) : (head += 1) {
+        const block_id = ordered.items[head];
+        const outgoing = compoundOrArmOutgoingEdges(program.blocks[block_id.index()].terminator).?;
+        for (outgoing.slice()) |edge| {
+            if (edge.target == join) continue;
+            indegree[edge.target.index()] -= 1;
+            if (indegree[edge.target.index()] == 0) try ordered.append(allocator, edge.target);
+        }
+    }
+    if (ordered.items.len != region.items.len) return null;
+
+    return .{
+        .closure = try ordered.toOwnedSlice(allocator),
+        .clone_edge = .{ .source = inner, .kind = .branch_else, .target = entry },
+    };
+}
+
 /// A `branch` whose else edge targets `block` with no arguments and
 /// whose then edge leaves it.
 fn branchReachesElseWithoutArguments(
@@ -1398,6 +1519,48 @@ fn shortCircuitElseSplitAlloc(
         .branch = clone_edge.source,
         .entry = clone_edge.target,
         .join = clone_edge.target,
+        .incoming = owned_incoming,
+        .closure = closure,
+    };
+}
+
+/// The split of a compound short-circuit `or`
+/// arm, generalizing `shortCircuitElseSplitAlloc` from the one-block case.  The
+/// closure is the ordered arm R, the incoming edge is the inner branch's else
+/// edge, the branch is the inner branch, and the entry and join are the arm
+/// entry (as the one-block split sets join = entry).  Admitted by
+/// `structural_overlap.prepareClosureWithReplayContext` unseeded, exactly as
+/// the one-block split.  Null (freeing the closure) when the preparation refuses the region, so
+/// the feedback phase keeps its continuation-cloning path.
+fn compoundShortCircuitSplitAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    function_index: usize,
+    arm: CompoundOrArm,
+    replay_context: *structural_overlap.ReplayProjectionContext,
+) std.mem.Allocator.Error!?structural_overlap.Split {
+    const closure = arm.closure;
+    errdefer allocator.free(closure);
+    const incoming = [_]ir.CfgEdgeRef{arm.clone_edge};
+    if (!structural_overlap.prepareClosureWithReplayContext(
+        allocator,
+        program,
+        analysis,
+        closure,
+        &incoming,
+        replay_context,
+    )) {
+        allocator.free(closure);
+        return null;
+    }
+    const owned_incoming = try allocator.dupe(ir.CfgEdgeRef, &incoming);
+    return .{
+        .allocator = allocator,
+        .function_index = function_index,
+        .branch = arm.clone_edge.source,
+        .entry = arm.clone_edge.target,
+        .join = arm.clone_edge.target,
         .incoming = owned_incoming,
         .closure = closure,
     };
@@ -2022,6 +2185,39 @@ fn normalizeImpl(
                                                 selected_context = null;
                                                 collision_seed = null;
                                                 seeded_fallback = true;
+                                            }
+                                        }
+                                    }
+                                    if (selected == null) {
+                                        if (obstruction.owner_context) |owner| {
+                                            if (owner.stop) |arm_entry| {
+                                                if (try compoundShortCircuitOrArmAlloc(
+                                                    feedback_allocator,
+                                                    &result.program,
+                                                    &graph,
+                                                    obstruction.block,
+                                                    arm_entry,
+                                                )) |arm| {
+                                                    if (try compoundShortCircuitSplitAlloc(
+                                                        feedback_allocator,
+                                                        &result.program,
+                                                        &graph,
+                                                        function_index,
+                                                        arm,
+                                                        replay_context,
+                                                    )) |candidate| {
+                                                        traceNormalize("feedback_compound_or_arm_split function={} entry={} inner={} closure={}\n", .{
+                                                            function_index,
+                                                            arm_entry.index(),
+                                                            candidate.branch.index(),
+                                                            candidate.closure.len,
+                                                        });
+                                                        selected = candidate;
+                                                        selected_context = null;
+                                                        collision_seed = null;
+                                                        seeded_fallback = true;
+                                                    }
+                                                }
                                             }
                                         }
                                     }

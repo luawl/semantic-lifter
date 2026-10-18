@@ -970,9 +970,7 @@ fn emitRegionWithPredeclaredBlock(
     );
     try output.appendSlice(allocator, region_indent);
     try output.appendSlice(allocator, "until true\n");
-    if (region.loop_exit != null) {
-        try emitRegionEscapePropagation(output, allocator, program, emission_plan, region, region_indent);
-    }
+    try emitRegionEscapePropagation(output, allocator, program, emission_plan, region, region_indent);
 }
 
 fn emitRegionBodyWithPredeclaredBlock(
@@ -1160,9 +1158,7 @@ fn emitRegionBodyWithPredeclaredBlock(
                                         place_aliases,
                                     );
                                     try emitEscapeFlagSet(output, allocator, program, emission_plan, projection.target, indent);
-                                    if (region.loop_exit != null) {
-                                        try emitBreakStatement(output, allocator, indent);
-                                    }
+                                    try emitBreakStatement(output, allocator, indent);
                                     continue;
                                 }
                             }
@@ -1516,9 +1512,7 @@ fn emitRegionBodyWithPredeclaredBlock(
             region.nodes[region.nodes.len - 1] != .block;
         if (needs_trailing_projection) {
             try emitEscapeFlagSet(output, allocator, program, emission_plan, projection.target, allocated_group_indent orelse region_indent);
-            if (region.loop_exit != null) {
-                try emitBreakStatement(output, allocator, allocated_group_indent orelse region_indent);
-            }
+            try emitBreakStatement(output, allocator, allocated_group_indent orelse region_indent);
         }
     }
     if (active_group != emission_scope.invalid_scope and wraps_groups) {
