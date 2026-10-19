@@ -51,7 +51,9 @@ pub const Plan = struct {
             const instruction = program.instructions[instruction_id.index()];
             if (!canEliminate(program, packs, eliminated, uses.values, uses.packs, instruction)) continue;
             eliminated[instruction_id.index()] = true;
-            try uses.removeOperation(program, aliases, instruction.operation, &worklist);
+            // `uses` holds reachable uses only (`runtime_uses.Counts.initScoped` above): an unreachable
+            // instruction's operand uses were never counted, so eliminating it must not subtract them.
+            if (scope.instruction(instruction_id)) try uses.removeOperation(program, aliases, instruction.operation, &worklist);
         }
 
         const inline_depths = try allocator.alloc(usize, program.instructions.len);
@@ -404,4 +406,62 @@ test "unreachable predecessors do not suppress jump parameter aliases" {
     var plan = try Plan.init(std.testing.allocator, &program, &packs);
     defer plan.deinit();
     try std.testing.expectEqual(source_id, plan.resolveValue(target_parameter_id));
+}
+
+test "unreachable consumers keep a live producer's use count" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry_id = ir.BlockId.fromIndex(0);
+    const dead_id = ir.BlockId.fromIndex(1);
+    const parameter_id = ir.ValueId.fromIndex(0);
+    const once_id = ir.ValueId.fromIndex(1);
+    const twice_id = ir.ValueId.fromIndex(2);
+    const dead_once_id = ir.ValueId.fromIndex(3);
+    const dead_twice_id = ir.ValueId.fromIndex(4);
+    const once_instruction = ir.InstructionId.fromIndex(0);
+    const twice_instruction = ir.InstructionId.fromIndex(1);
+    const dead_once_instruction = ir.InstructionId.fromIndex(2);
+    const dead_twice_instruction = ir.InstructionId.fromIndex(3);
+    const values = [_]ir.Value{
+        .{ .id = parameter_id, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = once_id, .function = function_id, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = once_instruction, .index = 0 } } },
+        .{ .id = twice_id, .function = function_id, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = twice_instruction, .index = 0 } } },
+        .{ .id = dead_once_id, .function = function_id, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = dead_once_instruction, .index = 0 } } },
+        .{ .id = dead_twice_id, .function = function_id, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = dead_twice_instruction, .index = 0 } } },
+    };
+    const instructions = [_]ir.Instruction{
+        .{ .id = once_instruction, .block = entry_id, .operation = .{ .unary = .{ .operator = .logical_not, .operand = parameter_id } }, .results = &.{once_id}, .effects = .pure },
+        .{ .id = twice_instruction, .block = entry_id, .operation = .{ .unary = .{ .operator = .logical_not, .operand = parameter_id } }, .results = &.{twice_id}, .effects = .pure },
+        // Block 1 is reached by no edge (a branch arm a proved_branch rewrite threaded past).
+        .{ .id = dead_once_instruction, .block = dead_id, .operation = .{ .unary = .{ .operator = .logical_not, .operand = once_id } }, .results = &.{dead_once_id}, .effects = .pure },
+        .{ .id = dead_twice_instruction, .block = dead_id, .operation = .{ .unary = .{ .operator = .logical_not, .operand = twice_id } }, .results = &.{dead_twice_id}, .effects = .pure },
+    };
+    const blocks = [_]ir.Block{
+        .{ .id = entry_id, .function = function_id, .instructions = &.{ once_instruction, twice_instruction }, .terminator = .{ .return_values = &.{ once_id, twice_id, twice_id } } },
+        .{ .id = dead_id, .function = function_id, .instructions = &.{ dead_once_instruction, dead_twice_instruction }, .terminator = .{ .return_values = &.{ dead_once_id, dead_twice_id } } },
+    };
+    const function: ir.Function = .{
+        .id = function_id,
+        .parameters = &.{parameter_id},
+        .entry_block = entry_id,
+        .blocks = &.{ entry_id, dead_id },
+    };
+    const program: ir.Program = .{
+        .program_id = "unreachable-consumer-use-count",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+    };
+
+    var packs = try pack_plan.Plan.init(std.testing.allocator, &program);
+    defer packs.deinit();
+    var plan = try Plan.init(std.testing.allocator, &program, &packs);
+    defer plan.deinit();
+    // One live use: the producer is kept or inlined, never dropped. The unreachable
+    // `not once` is not a counted use, so eliminating it must not take the count to 0.
+    try std.testing.expect(!plan.contains(once_instruction) or plan.isInlined(once_instruction));
+    // Two live uses: the producer stays a statement. The unreachable `not twice` must
+    // not take the count to 1, which would inline the producer at both uses.
+    try std.testing.expect(!plan.contains(twice_instruction));
 }

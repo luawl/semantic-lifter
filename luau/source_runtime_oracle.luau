@@ -437,6 +437,21 @@ function SourceRuntimeOracle.run(caseName: string, source: string, exported: any
 		check("break", 3, "source,between,3@1")
 		check("boundary", 3, "source,between|3@1")
 		check("header", 3, "between,source,1=3,2=2,3=1")
+
+	elseif
+		caseName == "source-frontend-proved-branch-unreachable-consumer"
+		or caseName == "source-frontend-proved-branch-unreachable-consumer-direct-locals"
+	then
+		local numbers, strings = exported(10)
+		assert(
+			numbers == "6,7,8,9,10" and strings == "1,2,3,4,10",
+			"a local that an unreachable consumer of a proved branch also reads lost its declaration"
+		)
+		local fewNumbers, fewStrings = exported(3)
+		assert(
+			fewNumbers == "" and fewStrings == "1,2,3",
+			"a local that an unreachable consumer of a proved branch also reads lost its declaration"
+		)
 	elseif caseName == "source-frontend-typed-block" then
 		assert(exported(7) == 7, "source frontend changed typed block runtime behavior")
 	elseif caseName == "source-frontend-numeric-for" then
