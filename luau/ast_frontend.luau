@@ -401,6 +401,30 @@ expressionLowerer = AstExpressions.new({
 	resolve_local = function(context: FunctionContext, node: Record, localNode: Record): ValueRef
 		return materializeBinding(context, node, resolveLocalBinding(context, localNode), nil)
 	end,
+	-- The left operand of a binary operator that names, through groups and type assertions, a place
+	-- of the current function is read at the operator, after the right operand ran (Luau's register
+	-- operand); a value binding emits nothing and a captured place is read in order, as an upvalue.
+	defer_register_local = function(context: FunctionContext, node: Record): (() -> ValueRef)?
+		local operand = node
+		while nodeTag(operand) == "AstExprGroup" or nodeTag(operand) == "AstExprTypeAssertion" do
+			operand = expectRecord(operand.expr, "malformed_group", "operand wrapper is missing its expression")
+		end
+		if nodeTag(operand) ~= "AstExprLocal" then
+			return nil
+		end
+		local localNode = expectRecord(operand["local"], "malformed_local_expression", "local expression has no declaration identity")
+		local binding = resolveLocalBinding(context, localNode)
+		if binding.kind ~= "place" or binding.place == nil then
+			return nil
+		end
+		local placeRecord = context.frontend.builder.program.places[(binding.place :: number) + 1]
+		if placeRecord == nil or placeRecord.origin.capture ~= nil then
+			return nil
+		end
+		return function(): ValueRef
+			return materializeBinding(context, operand, binding, nil)
+		end
+	end,
 	resolve_intrinsic_alias = function(context: FunctionContext, localNode: Record): any?
 		local binding = resolveLocalBinding(context, localNode)
 		if binding.kind == "value" and binding.value ~= nil then

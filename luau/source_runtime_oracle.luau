@@ -222,6 +222,19 @@ function SourceRuntimeOracle.run(caseName: string, source: string, exported: any
 		assert(environmentValue == 14 and storedEnvironmentValue == 14, "source frontend changed function-environment compound mutation")
 		assert(environmentEffects == "rvwr", "source frontend changed function-environment callback order")
 		assert(environmentMatches == true, "source frontend changed function-environment identity after mutation")
+	elseif caseName == "source-frontend-binary-operand-read-order" or caseName == "source-frontend-binary-operand-read-order-direct-locals" then
+		local sum, grouped, equal, ordered, steps, loopFirst, loopSecond, parameter, metamethod, first, second, joined, snapshot =
+			exported(10, 4)
+		assert(sum == 104, "source frontend read a register local arithmetic operand before the right operand ran")
+		assert(grouped == 500, "source frontend read a grouped register local operand before the right operand ran")
+		assert(equal == true and ordered == false, "source frontend read a register local comparison operand before the right operand ran")
+		assert(steps == 1, "source frontend read a loop-condition register local before the right operand ran")
+		assert(loopFirst == 100 and loopSecond == 100, "source frontend read a per-iteration register local before the right operand ran")
+		assert(parameter == 100, "source frontend read a register parameter operand before the right operand ran")
+		assert(metamethod == 104, "source frontend read a register local before a metamethod in the right operand ran")
+		assert(first == 10 and second == 4, "source frontend changed Luau's in-order copy of generic call arguments")
+		assert(joined == "104", "source frontend changed Luau's in-order copy of concatenation operands")
+		assert(snapshot == 14, "source frontend changed Luau's upvalue snapshot in a child function")
 	elseif caseName == "source-frontend-if-expression" then
 		assert(
 			string.find(source, 'consume(if condition() then arm("t") else arm("f"))', 1, true) ~= nil,

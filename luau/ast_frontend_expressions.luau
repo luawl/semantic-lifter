@@ -30,6 +30,7 @@ type Host = {
 	lower_target_recovery_origin: (any, Record, Record) -> any,
 	mark_target_recovery_resolution_used: (any, Record) -> (),
 	resolve_local: (any, Record, Record) -> any,
+	defer_register_local: (any, Record) -> (() -> any)?,
 	resolve_intrinsic_alias: (any, Record) -> any?,
 	lower_function: (any, Record, string?) -> any,
 	lower_short_circuit: (any, Record, string?) -> any,
@@ -842,15 +843,27 @@ function ExpressionLowerer:lower(context: any, node: Record, nameHint: string?):
 		if node.op == "And" or node.op == "Or" then
 			return host.lower_short_circuit(context, node, nameHint)
 		end
-		local leftOutcome = self:lower(context, host.expect_record(node.left, "malformed_binary", "binary expression is missing its left operand"), nil)
-		if leftOutcome.kind == "terminated" then
-			return leftOutcome
+		-- Luau reads a register local named by the left operand of an arithmetic or comparison
+		-- operator at the operator instruction, after the right operand ran; a concatenation copies
+		-- its operands in order (SOURCE-FRONTEND-READ-ORDER).
+		local leftNode = host.expect_record(node.left, "malformed_binary", "binary expression is missing its left operand")
+		local deferredLeft = if node.op ~= "Concat" then host.defer_register_local(context, leftNode) else nil
+		local left = nil
+		if deferredLeft == nil then
+			local leftOutcome = self:lower(context, leftNode, nil)
+			if leftOutcome.kind == "terminated" then
+				return leftOutcome
+			end
+			left = leftOutcome.value
 		end
 		local rightOutcome = self:lower(context, host.expect_record(node.right, "malformed_binary", "binary expression is missing its right operand"), nil)
 		if rightOutcome.kind == "terminated" then
 			return rightOutcome
 		end
-		return Outcome.value(self:lowerBinaryValues(context, node, node.op, leftOutcome.value, rightOutcome.value, nameHint))
+		if deferredLeft ~= nil then
+			left = deferredLeft()
+		end
+		return Outcome.value(self:lowerBinaryValues(context, node, node.op, left, rightOutcome.value, nameHint))
 	elseif tag == "AstExprUnary" then
 		local operator = AstExpressionScalar.unaryOperator(node.op)
 		if operator == nil then
