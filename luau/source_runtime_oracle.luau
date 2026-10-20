@@ -546,6 +546,13 @@ function SourceRuntimeOracle.run(caseName: string, source: string, exported: any
 		assert(tripled == 9, "source frontend changed nested function target evaluation")
 		assert(originalOffset == 4, "source frontend changed the pre-reassignment function snapshot")
 		assert(mutableOffset == 5, "source frontend changed the reassigned local function")
+	elseif
+		caseName == "source-frontend-closure-store-environment"
+		or caseName == "source-frontend-closure-store-environment-direct-locals"
+	then
+		local assigned, defined = exported()
+		assert(assigned == "p:old", "closure store created a closure after code that replaced the environment")
+		assert(defined == "f:old", "closure store created a function statement's closure after its target prefix")
 	elseif caseName == "source-frontend-interpolation" then
 		local rendered, calls = exported(7)
 		assert(string.byte(rendered, 1) == 0xff and string.byte(rendered, 2) == 0xfe, "source frontend changed string byte transport")

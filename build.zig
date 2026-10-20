@@ -956,6 +956,23 @@ pub fn build(b: *std.Build) void {
         "luau/fixtures/function_statement_source.luau",
         "source-frontend-function-statement",
     );
+    const source_frontend_closure_store_environment_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/closure_store_environment_source.luau",
+        "source-frontend-closure-store-environment",
+    );
+    const source_frontend_closure_store_environment_direct_locals_conformance = addLuauSourceConformanceForTarget(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/closure_store_environment_source.luau",
+        "source-frontend-closure-store-environment-direct-locals",
+        "direct-locals-luau",
+    );
     const source_frontend_interpolation_conformance = addLuauSourceConformance(
         b,
         exe,
@@ -1319,6 +1336,8 @@ pub fn build(b: *std.Build) void {
     source_frontend_proved_branch_unreachable_consumer_direct_locals_conformance.addTo(conformance_step);
     source_frontend_table_pack_conformance.addTo(conformance_step);
     source_frontend_function_statement_conformance.addTo(conformance_step);
+    source_frontend_closure_store_environment_conformance.addTo(conformance_step);
+    source_frontend_closure_store_environment_direct_locals_conformance.addTo(conformance_step);
     source_frontend_interpolation_conformance.addTo(conformance_step);
     source_frontend_intrinsic_invocation_conformance.addTo(conformance_step);
     source_frontend_coroutine_wrap_conformance.addTo(conformance_step);

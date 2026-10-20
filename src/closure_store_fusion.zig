@@ -73,11 +73,31 @@ fn closureResult(program: *const ir.Program, dead: *const dead_code.Plan, instru
 }
 
 fn canCrossGap(producer: ir.Instruction, gap: ir.Instruction) bool {
+    // A closure is created with the running function's current environment, which code run by the
+    // gap (setfenv from a callee or a metamethod) can replace. No closure crosses a call, whatever its
+    // effects or certificate (summaryMayBeNarrowed), so this test comes before the exact-pure one.
+    if (summaryMayBeNarrowed(gap.operation)) return false;
+    if (pack_plan.isExactPure(gap.effects)) return true;
     const capture_free = switch (producer.operation) {
         .make_closure => |closure| closure.bindings.len == 0,
         else => false,
     };
-    return capture_free or pack_plan.isExactPure(gap.effects);
+    // A capture-free closure may cross a gap that touches memory, never one that may run code: apart
+    // from a call, an exact summary without these two flags runs no code (namecalls, protected calls,
+    // coroutine resumes and yields, generic-for steps and interpolation must keep both, and a semantic
+    // access or operator drops them only when it is proved or known to dispatch no metamethod).
+    return capture_free and gap.effects.precision == .exact and
+        !gap.effects.may_yield and !gap.effects.invokes_unknown_code;
+}
+
+/// A proved `effect_summary` claim may narrow a call's summary below `dynamic_call`, even to exact-pure
+/// (`validate_effects.validateCall`), and no effect flag records replacing a function environment: a
+/// callee that only runs `setfenv` is an exact memory write. No closure therefore crosses a call.
+fn summaryMayBeNarrowed(operation: ir.Operation) bool {
+    return switch (operation) {
+        .call, .call_repeated_table_get => true,
+        else => false,
+    };
 }
 
 fn consumerStoresValue(instruction: ir.Instruction, result_id: ir.ValueId) bool {

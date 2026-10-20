@@ -3429,3 +3429,118 @@ test "a fused generic-for producer keeps its place before a later effect in its 
     // (D2) the producer is written exactly once, never both in place and on the `for` line.
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "f(t)"));
 }
+
+test "a capture-free closure store stays before a gap that may run code" {
+    const proof = ir.EvidenceId.fromIndex(0);
+    const function_id = ir.FunctionId.fromIndex(0);
+    const child_id = ir.FunctionId.fromIndex(1);
+    const block_id = ir.BlockId.fromIndex(0);
+    const child_block_id = ir.BlockId.fromIndex(1);
+    const closure_instruction = ir.InstructionId.fromIndex(0);
+    const gap_instruction = ir.InstructionId.fromIndex(1);
+    const key_instruction = ir.InstructionId.fromIndex(2);
+    const store_instruction = ir.InstructionId.fromIndex(3);
+    const holder = ir.ValueId.fromIndex(0);
+    const callee = ir.ValueId.fromIndex(1);
+    const closure = ir.ValueId.fromIndex(2);
+    const key = ir.ValueId.fromIndex(3);
+    const slot_value = ir.ValueId.fromIndex(4);
+    const slot = ir.PlaceId.fromIndex(0);
+    // The call program uses values 0-3; value 4 is the quiet gap's unused result.
+    const values = [_]ir.Value{
+        .{ .id = holder, .function = function_id, .type = .{ .kind = .table }, .name_hint = "holder", .origin = .{ .parameter = 0 } },
+        .{ .id = callee, .function = function_id, .type = .function, .name_hint = "callee", .origin = .{ .parameter = 1 } },
+        .{ .id = closure, .function = function_id, .type = .function, .origin = .{ .instruction_result = .{ .instruction = closure_instruction, .index = 0 } } },
+        .{ .id = key, .function = function_id, .type = .string, .origin = .{ .instruction_result = .{ .instruction = key_instruction, .index = 0 } } },
+        .{ .id = slot_value, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = gap_instruction, .index = 0 } } },
+    };
+    const places = [_]ir.Place{.{ .id = slot, .function = function_id, .name_hint = "slot", .origin = .{ .local = 0 }, .evidence = &.{proof} }};
+    const quiet_instructions = [_]ir.Instruction{
+        .{ .id = closure_instruction, .block = block_id, .operation = .{ .make_closure = .{ .function = child_id, .bindings = &.{} } }, .results = &.{closure}, .effects = .pure, .evidence = &.{proof} },
+        .{ .id = gap_instruction, .block = block_id, .operation = .{ .place_read = slot }, .results = &.{slot_value}, .effects = .place_read, .evidence = &.{proof} },
+        .{ .id = key_instruction, .block = block_id, .operation = .{ .constant = .{ .string = "get" } }, .results = &.{key}, .effects = .pure, .evidence = &.{proof} },
+        .{ .id = store_instruction, .block = block_id, .operation = .{ .table_set = .{ .table = holder, .key = key, .value = closure, .mode = .semantic } }, .results = &.{}, .effects = .semantic_table_write, .evidence = &.{proof} },
+    };
+    const call_instructions = [_]ir.Instruction{
+        .{ .id = closure_instruction, .block = block_id, .operation = .{ .make_closure = .{ .function = child_id, .bindings = &.{} } }, .results = &.{closure}, .effects = .pure, .evidence = &.{proof} },
+        .{ .id = gap_instruction, .block = block_id, .operation = .{ .call = .{ .callee = callee, .arguments = &.{}, .result_arity = .{ .fixed = 0 } } }, .results = &.{}, .effects = .dynamic_call, .evidence = &.{proof} },
+        .{ .id = key_instruction, .block = block_id, .operation = .{ .constant = .{ .string = "get" } }, .results = &.{key}, .effects = .pure, .evidence = &.{proof} },
+        .{ .id = store_instruction, .block = block_id, .operation = .{ .table_set = .{ .table = holder, .key = key, .value = closure, .mode = .semantic } }, .results = &.{}, .effects = .semantic_table_write, .evidence = &.{proof} },
+    };
+    const blocks = [_]ir.Block{
+        .{ .id = block_id, .function = function_id, .name_hint = "entry", .instructions = &.{ closure_instruction, gap_instruction, key_instruction, store_instruction }, .terminator = .{ .return_values = &.{} }, .evidence = &.{proof} },
+        .{ .id = child_block_id, .function = child_id, .name_hint = "entry", .terminator = .{ .return_values = &.{} }, .evidence = &.{proof} },
+    };
+    const quiet_functions = [_]ir.Function{
+        .{ .id = function_id, .name_hint = "chunk", .parameters = &.{ holder, callee }, .local_places = &.{slot}, .blocks = &.{block_id}, .entry_block = block_id, .evidence = &.{proof} },
+        .{ .id = child_id, .name_hint = "child", .lexical_parent = function_id, .blocks = &.{child_block_id}, .entry_block = child_block_id, .evidence = &.{proof} },
+    };
+    const call_functions = [_]ir.Function{
+        .{ .id = function_id, .name_hint = "chunk", .parameters = &.{ holder, callee }, .blocks = &.{block_id}, .entry_block = block_id, .evidence = &.{proof} },
+        .{ .id = child_id, .name_hint = "child", .lexical_parent = function_id, .blocks = &.{child_block_id}, .entry_block = child_block_id, .evidence = &.{proof} },
+    };
+    const evidence = [_]ir.Evidence{.{ .id = proof, .kind = .dynamic_fixture, .locator = "fixture:closure-store-gap" }};
+    const quiet_program: ir.Program = .{
+        .program_id = "closure-store-quiet-gap",
+        .entry_function = function_id,
+        .functions = &quiet_functions,
+        .blocks = &blocks,
+        .instructions = &quiet_instructions,
+        .values = &values,
+        .places = &places,
+        .evidence = &evidence,
+    };
+    const call_program: ir.Program = .{
+        .program_id = "closure-store-call-gap",
+        .entry_function = function_id,
+        .functions = &call_functions,
+        .blocks = &blocks,
+        .instructions = &call_instructions,
+        .values = values[0..4],
+        .evidence = &evidence,
+    };
+
+    // A gap that cannot run code (an exact read of a local place) leaves the closure fused into its store.
+    const quiet = try emitAlloc(std.testing.allocator, &quiet_program);
+    defer std.testing.allocator.free(quiet);
+    try std.testing.expect(std.mem.indexOf(u8, quiet, "holder.get = function()") != null);
+    // A call may replace the running function's environment (setfenv), and a closure takes the
+    // environment current at its creation, so the closure is created before the call.
+    const source = try emitAlloc(std.testing.allocator, &call_program);
+    defer std.testing.allocator.free(source);
+    try std.testing.expect(std.mem.indexOf(u8, source, "function()").? < std.mem.indexOf(u8, source, "callee()").?);
+    // A call whose summary a proved effect_summary claim narrows to an exact memory write (a callee
+    // that only runs setfenv) is still a call, whatever the claim certifies: the closure is created
+    // before it too.
+    const term_id = ir.SolverTermId.fromIndex(0);
+    const query_id = ir.QueryId.fromIndex(0);
+    const certificate_id = ir.CertificateId.fromIndex(0);
+    const claim_id = ir.ClaimId.fromIndex(0);
+    const narrowed: ir.EffectSummary = .{ .precision = .exact, .reads_memory = true, .writes_memory = true, .may_throw = true };
+    const certified_instructions = [_]ir.Instruction{
+        .{ .id = closure_instruction, .block = block_id, .operation = .{ .make_closure = .{ .function = child_id, .bindings = &.{} } }, .results = &.{closure}, .effects = .pure, .evidence = &.{proof} },
+        .{ .id = gap_instruction, .block = block_id, .operation = .{ .call = .{ .callee = callee, .arguments = &.{}, .result_arity = .{ .fixed = 0 } } }, .results = &.{}, .effects = narrowed, .evidence = &.{proof}, .claims = &.{claim_id} },
+        .{ .id = key_instruction, .block = block_id, .operation = .{ .constant = .{ .string = "get" } }, .results = &.{key}, .effects = .pure, .evidence = &.{proof} },
+        .{ .id = store_instruction, .block = block_id, .operation = .{ .table_set = .{ .table = holder, .key = key, .value = closure, .mode = .semantic } }, .results = &.{}, .effects = .semantic_table_write, .evidence = &.{proof} },
+    };
+    const terms = [_]ir.SolverTerm{.{ .id = term_id, .sort = .{ .kind = .boolean }, .operation = .{ .semantic_atom = .{ .instruction_effects = gap_instruction } } }};
+    const queries = [_]ir.SolverQuery{.{ .id = query_id, .kind = .prove_true, .goal = term_id }};
+    const certificates = [_]ir.SolverCertificate{.{ .id = certificate_id, .query = query_id, .engine = .imported, .resolution = .proved, .evidence = &.{proof}, .certificate_digest = "fixture:instruction-effects" }};
+    const claims = [_]ir.Claim{.{ .id = claim_id, .subject = .{ .instruction = gap_instruction }, .predicate = term_id, .purpose = .{ .effect_summary = narrowed }, .status = .proved, .required_for_emission = true, .evidence = &.{proof}, .query = query_id, .certificate = certificate_id }};
+    const certified_program: ir.Program = .{
+        .program_id = "closure-store-certified-call-gap",
+        .entry_function = function_id,
+        .functions = &call_functions,
+        .blocks = &blocks,
+        .instructions = &certified_instructions,
+        .values = values[0..4],
+        .evidence = &evidence,
+        .solver_terms = &terms,
+        .queries = &queries,
+        .certificates = &certificates,
+        .claims = &claims,
+    };
+    const certified = try emitAlloc(std.testing.allocator, &certified_program);
+    defer std.testing.allocator.free(certified);
+    try std.testing.expect(std.mem.indexOf(u8, certified, "function()").? < std.mem.indexOf(u8, certified, "callee()").?);
+}
