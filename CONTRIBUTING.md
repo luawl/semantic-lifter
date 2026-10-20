@@ -17,4 +17,4 @@ The repository stores every file byte for byte: `.gitattributes` sets `* -text`,
 
 ## Licence
 
-The project is licensed under the PolyForm Strict License 1.0.0 (`LICENSE`): noncommercial use only, and no distribution of changed or new works based on it. Contributions are accepted only together with the contributor's grant to the project of the rights needed to include them under this licence.
+The project is licensed under the PolyForm Strict License 1.0.0 (`LICENSE`), which grants a copyright licence "for any permitted purpose, other than distributing the software or making changes or new works based on the software"; noncommercial purposes are permitted purposes. Contributions are accepted only together with the contributor's grant to the project of the rights needed to include them under this licence.

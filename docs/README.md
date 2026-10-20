@@ -24,7 +24,7 @@ The full walkthrough is in [How Semantic-Lifter works](design.md).
 - **Compile-gated output**: `standard-luau` or `direct-locals-luau`, published only after `luau-compile` accepts it.
 - **Source frontend**: declarations, plain and compound assignment, `if`, `while`, `repeat`, both `for` forms, `break`, `continue`, open returns, closures, varargs, tables, method calls, string interpolation, `and`/`or` and `if` expressions.
 - **Compiler-disassembly frontend**: lifts a selected function from a `luau-compile --text` listing; the caller declares its signature.
-- **Tests**: over 850 unit tests and over 550 conformance steps; 60 fixture files, 29 conformance scripts, 10 audits, 7 oracles; emitted programs are compiled and run.
+- **Tests**: over 850 unit tests and over 600 conformance steps; 66 fixture files, 29 conformance scripts, 10 audits, 7 oracles; emitted programs are compiled and run.
 
 ## Quick start
 

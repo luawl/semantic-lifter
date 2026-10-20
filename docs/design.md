@@ -19,9 +19,9 @@ source is at hand, so that the original can serve as the reference. A frontend i
 writes a `lifter_ir_v1` handoff: a lifting or analysis tool supplies the frontend for the artefact
 it targets, and the contract is what that frontend has to satisfy.
 
-The backend is about 153,000 lines of Zig across 159 files, with over 850 unit tests. The source
-frontend, the IR library and codec, and the conformance suite take about 64,000 lines across 181
-files under `luau/`. The suite holds 60 fixture files, 29 conformance scripts, 10 audits and 7
+The backend is about 155,000 lines of Zig across 159 files, with over 850 unit tests. The source
+frontend, the IR library and codec, and the conformance suite take about 64,000 lines across 187
+files under `luau/`. The suite holds 66 fixture files, 29 conformance scripts, 10 audits and 7
 oracles; it compiles the emitted programs with the official Luau compiler and runs its oracles under
 Lune, a standalone Luau runtime.
 
@@ -179,7 +179,8 @@ method calls, string interpolation, `and`/`or` and `if` expressions. An unsuppor
 refused with a typed diagnostic, never lifted silently. Before the handoff, the frontend admits the
 parser's syntax tree in a bounded preflight, checks every runtime local's canonical identity, owning
 function and lexical visibility, and lowers expressions and result packs in Luau's evaluation
-order. Numeric and generic `for` loops keep their hidden state for the backend to validate and
+order. It models that order at the compiler's default optimisation level: a register local is read
+where the compiled code reads it, after an effectful later operand. Numeric and generic `for` loops keep their hidden state for the backend to validate and
 re-emit, and a table constructor whose keys can fail is lowered to explicit ordered writes. Once the
 whole program is known, place domains are finalised: closure bindings make each captured-place
 alias class explicit, and a class is refined only when all of its writes agree on one domain.

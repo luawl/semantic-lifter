@@ -89,3 +89,7 @@ This repository implements the forthcoming preprint *Checked, Not Trusted: Typed
   note   = {Preprint. Code: https://github.com/luawl/semantic-lifter},
 }
 ```
+
+## License
+
+Semantic-Lifter is a proof of concept published for study. It is licensed under the [PolyForm Strict License 1.0.0](LICENSE). The licence grants a copyright licence "for any permitted purpose, other than distributing the software or making changes or new works based on the software"; noncommercial purposes are permitted purposes, and the required notice must be kept. Commercial use of any kind is not permitted. Changes reach the repository only through the contribution guide, together with a grant of the rights needed to include them.
