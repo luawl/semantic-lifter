@@ -1158,7 +1158,7 @@ pub fn plannedPackValues(
         else => return error.UnsupportedOperation,
     };
     if (values.len == 0) return error.UnsupportedOperation;
-    try valueUseList(output, allocator, program, plan, values, true);
+    try valueUseList(output, allocator, program, plan, values, false);
 }
 
 test "Luau string literal emission preserves arbitrary bytes" {

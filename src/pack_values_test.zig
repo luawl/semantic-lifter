@@ -641,3 +641,63 @@ test "cross-block closed packs materialize operands and reject producer reentry"
     defer std.testing.allocator.free(return_source);
     try std.testing.expect(std.mem.indexOf(u8, return_source, "return snapshotted_probe") != null);
 }
+
+test "fused last pack_values operand truncates to the modeled arity" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const block_id = ir.BlockId.fromIndex(0);
+    const call_id = ir.InstructionId.fromIndex(0);
+    const pack_instruction = ir.InstructionId.fromIndex(1);
+    const callee = ir.ValueId.fromIndex(0);
+    const result = ir.ValueId.fromIndex(1);
+    const pack_id = ir.ValuePackId.fromIndex(0);
+    const proof = ir.EvidenceId.fromIndex(0);
+
+    const values = [_]ir.Value{
+        .{ .id = callee, .function = function_id, .type = .function, .name_hint = "f", .origin = .{ .parameter = 0 } },
+        .{ .id = result, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = call_id, .index = 0 } } },
+    };
+    const prefix = [_]ir.ValueType{.dynamic};
+    const packs = [_]ir.ValuePack{.{
+        .id = pack_id,
+        .function = function_id,
+        .origin = .{ .instruction_result = pack_instruction },
+        .shape = .{ .prefix = &prefix, .tail = .closed },
+        .evidence = &.{proof},
+    }};
+    const instructions = [_]ir.Instruction{
+        .{ .id = call_id, .block = block_id, .operation = .{ .call = .{ .callee = callee, .arguments = &.{}, .result_arity = .{ .fixed = 1 } } }, .results = &.{result}, .effects = .dynamic_call, .evidence = &.{proof} },
+        .{ .id = pack_instruction, .block = block_id, .operation = .{ .pack_values = &.{result} }, .results = &.{}, .pack_result = pack_id, .effects = .pure, .evidence = &.{proof} },
+    };
+    const blocks = [_]ir.Block{.{
+        .id = block_id,
+        .function = function_id,
+        .instructions = &.{ call_id, pack_instruction },
+        .terminator = .{ .return_pack = pack_id },
+        .evidence = &.{proof},
+    }};
+    const functions = [_]ir.Function{.{ .id = function_id, .parameters = &.{callee}, .blocks = &.{block_id}, .entry_block = block_id, .evidence = &.{proof} }};
+    const evidence = [_]ir.Evidence{.{ .id = proof, .kind = .dynamic_fixture, .locator = "fixture:fused-pack-tail-return" }};
+    const program: ir.Program = .{
+        .program_id = "fused-pack-tail-return",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+        .value_packs = &packs,
+        .evidence = &evidence,
+    };
+
+    try expectClean(&program, .readable_luau);
+    var plan = try pack_plan.Plan.init(std.testing.allocator, &program);
+    defer plan.deinit();
+    try std.testing.expectEqual(
+        pack_plan.TerminatorRole{ .fused_pack_values_return = pack_instruction },
+        plan.terminatorRole(block_id),
+    );
+
+    const source = try emitter.emitStandardLuauAlloc(std.testing.allocator, &program);
+    defer std.testing.allocator.free(source);
+    try std.testing.expect(std.mem.indexOf(u8, source, "return (f())") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "return f()") == null);
+}
