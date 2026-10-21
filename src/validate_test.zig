@@ -1232,7 +1232,6 @@ test "unreachable valid blocks can be omitted from readable emission" {
 
     var readable_report = try validation.validate(std.testing.allocator, &program, .readable_luau);
     defer readable_report.deinit();
-    try std.testing.expect(!readable_report.contains(.unreachable_readable_block));
     try std.testing.expect(readable_report.isClean());
 }
 

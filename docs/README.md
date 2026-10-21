@@ -17,7 +17,7 @@ The full walkthrough is in [How Semantic-Lifter works](design.md).
 
 ## Features
 
-- **Typed evidence contract**: 7 evidence kinds, 12 obligation kinds, 241 typed diagnostics, 2 admission profiles (`core`, `readable-luau`).
+- **Typed evidence contract**: 7 evidence kinds, 12 obligation kinds, 237 typed diagnostics, 2 admission profiles (`core`, `readable-luau`).
 - **Checked resolution**: only proved facts change the program, as replayable CFG rewrites; internal engine, optional [Z3 backend](usage.md#requirements).
 - **Restructuring**: `if`, `while`, `break`, `continue`, native numeric and generic `for`; guarded node splitting, within a growth budget, for irreducible control.
 - **Compiler-limit admission**: 200 live locals, 255 registers, 200 upvalues per nested function, jump budget, syntax depth, child prototypes.

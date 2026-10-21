@@ -188,7 +188,7 @@ alias class explicit, and a class is refined only when all of its writes agree o
 **Backend.**
 
 - **Validation.** The checked pipeline validates every handoff under the typed evidence contract: 7 evidence kinds, 12
-  obligation kinds, 241 typed diagnostics and 2 admission profiles. The validators cover types,
+  obligation kinds, 237 typed diagnostics and 2 admission profiles. The validators cover types,
   ownership, closures, operations, declared effects, packs, the dominance of every use, and the
   consistency of claims, obligations, certificates and CFG rewrites; an open obligation blocks the
   profile it names.
