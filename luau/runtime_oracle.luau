@@ -6,6 +6,7 @@ local SourceRuntimeOracle = require("./source_runtime_oracle")
 local PackMultiLatchRuntimeOracle = require("./pack_multi_latch_runtime_oracle")
 local PackReturnStorageRuntimeOracle = require("./pack_return_storage_runtime_oracle")
 local IterationExitTransferRuntimeOracle = require("./iteration_exit_transfer_runtime_oracle")
+local IterationBreakExitTransferRuntimeOracle = require("./iteration_break_exit_transfer_runtime_oracle")
 
 local caseName = process.args[1]
 local sourcePath = process.args[2]
@@ -354,6 +355,12 @@ elseif caseName == "pack-return-storage" then
 	exported = PackReturnStorageRuntimeOracle.run(chunk, source)
 elseif caseName == "iteration-exit-transfer" then
 	exported = IterationExitTransferRuntimeOracle.run(chunk, source)
+elseif caseName == "iteration-break-exit-transfer" then
+	exported = IterationBreakExitTransferRuntimeOracle.run(chunk, source, caseName)
+elseif caseName == "iteration-escape-join-exit" then
+	exported = IterationBreakExitTransferRuntimeOracle.run(chunk, source, caseName)
+elseif caseName == "iteration-dominating-break-exit" then
+	exported = IterationBreakExitTransferRuntimeOracle.run(chunk, source, caseName)
 else
 	exported, secondaryExport, tertiaryExport, quaternaryExport = chunk()
 end
@@ -644,6 +651,12 @@ elseif caseName == "pack-return-storage" then
 	assert(type(exported) == "function", "return-only pack storage runtime oracle did not retain its results")
 elseif caseName == "iteration-exit-transfer" then
 	assert(type(exported) == "function", "iteration exit-transfer runtime oracle did not retain its worker")
+elseif caseName == "iteration-break-exit-transfer" then
+	assert(type(exported) == "function", "iteration break exit-transfer runtime oracle did not retain its worker")
+elseif caseName == "iteration-escape-join-exit" then
+	assert(type(exported) == "function", "iteration escape-to-join runtime oracle did not retain its worker")
+elseif caseName == "iteration-dominating-break-exit" then
+	assert(type(exported) == "function", "iteration dominating-exit runtime oracle did not retain its worker")
 elseif caseName == "pack-materialized-adjustment" then
 	assert(type(secondaryExport) == "table", "pack materialization audit was not retained")
 	local narrowResults = secondaryExport.narrowResults

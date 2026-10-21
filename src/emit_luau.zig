@@ -31,6 +31,7 @@ pub const EmitError = error{
 const PlaceAlias = lexical.PlaceAlias;
 
 const EmissionPlan = emission_planning.Plan;
+const NativeIterationCompletion = emission_planning.NativeIterationCompletion;
 
 const ContainerGroupWrapper = struct {
     output_start: usize,
@@ -1447,6 +1448,7 @@ fn emitRegionBodyWithPredeclaredBlock(
                     output,
                     allocator,
                     program,
+                    emission_plan,
                     projection.target_edge,
                     region.continue_projection.?.target,
                     indent,
@@ -1458,6 +1460,7 @@ fn emitRegionBodyWithPredeclaredBlock(
                 (node.* == .branch or node.* == .latch_loop or node.* == .infinite_loop))
             {
                 if (region.continue_target != null and projection.target == region.continue_target.?) {
+                    try emitNativeIterationCompletionSetForTarget(output, allocator, emission_plan, projection.target, indent);
                     try emitContinueStatement(output, allocator, indent);
                 } else {
                     try emitEscapeFlagSet(output, allocator, program, emission_plan, projection.target, indent);
@@ -2242,6 +2245,14 @@ fn emitNumericForLoop(
     const results = numeric.transition.results;
     if (results.len != 4) return error.UnsupportedControlFlow;
 
+    const completion_flag: ?[]const u8 = if (!break_after_body) blk: {
+        const edge = exit_edge orelse break :blk null;
+        if (!loopExitTransferWritesParameters(program, emission_plan, scopes, edge)) break :blk null;
+        const header = body_region.stop orelse return error.UnsupportedControlFlow;
+        break :blk try nativeIterationCompletionFlagNameAlloc(allocator, program, emission_plan, header);
+    } else null;
+    defer if (completion_flag) |flag| allocator.free(flag);
+
     if (break_after_body and exit_edge != null) {
         try emitEdgeParametersUnlessConsumed(
             output,
@@ -2257,31 +2268,48 @@ fn emitNumericForLoop(
         );
     }
 
+    if (completion_flag) |flag| try emitNativeIterationCompletionDeclaration(output, allocator, flag, indent);
+
     try emitNumericForOpen(output, allocator, program, emission_plan, numeric, indent, place_aliases);
 
     const loop_indent = try allocDeeperIndent(allocator, indent);
     defer allocator.free(loop_indent);
+
+    const completion_state = emission_plan.state;
+    const previous_completion = completion_state.native_iteration_completion;
+    var completion_context: NativeIterationCompletion = undefined;
+    if (completion_flag) |flag| {
+        completion_context = .{
+            .header = body_region.stop.?,
+            .flag_name = flag,
+            .parent = previous_completion,
+        };
+        completion_state.native_iteration_completion = &completion_context;
+        try emitNativeIterationCompletionAssignment(output, allocator, flag, false, loop_indent);
+    }
+    defer {
+        if (completion_flag != null) completion_state.native_iteration_completion = previous_completion;
+    }
+
     try emitRegion(output, allocator, program, emission_plan, scopes, body_region, loop_indent, place_aliases);
+    if (completion_flag) |flag| try emitNativeIterationCompletionAssignment(output, allocator, flag, true, loop_indent);
     if (break_after_body and !regionAlwaysFunctionTerminates(program, body_region)) {
         try emitBreakStatement(output, allocator, loop_indent);
     }
 
     try output.appendSlice(allocator, indent);
     try output.appendSlice(allocator, "end\n");
-    if (!break_after_body and exit_edge != null) {
-        try emitEdgeParametersUnlessConsumed(
-            output,
-            allocator,
-            program,
-            emission_plan,
-            scopes,
-            program.blocks[exit_edge.?.target.index()],
-            exit_edge.?.arguments,
-            indent,
-            false,
-            place_aliases,
-        );
-    }
+    if (completion_flag) |flag| try emitGuardedNativeIterationExitCopy(
+        output,
+        allocator,
+        program,
+        emission_plan,
+        scopes,
+        exit_edge.?,
+        flag,
+        indent,
+        place_aliases,
+    );
 }
 
 /// The `for <index> = <start>, <limit>, <step> do` line of a native numeric loop.
@@ -2396,6 +2424,20 @@ fn emitSemanticNormalizedNumericLoop(
     try output.appendSlice(allocator, "if not ");
     try render.valueName(output, allocator, &emission_plan.names, results[0]);
     try output.appendSlice(allocator, " then\n");
+    if (!break_after_body and exit_edge != null) {
+        try emitEdgeParametersUnlessConsumed(
+            output,
+            allocator,
+            program,
+            emission_plan,
+            scopes,
+            program.blocks[exit_edge.?.target.index()],
+            exit_edge.?.arguments,
+            branch_indent,
+            false,
+            place_aliases,
+        );
+    }
     try emitBreakStatement(output, allocator, branch_indent);
     try output.appendSlice(allocator, loop_indent);
     try output.appendSlice(allocator, "end\n");
@@ -2413,20 +2455,6 @@ fn emitSemanticNormalizedNumericLoop(
 
     try output.appendSlice(allocator, indent);
     try output.appendSlice(allocator, "end\n");
-    if (!break_after_body and exit_edge != null) {
-        try emitEdgeParametersUnlessConsumed(
-            output,
-            allocator,
-            program,
-            emission_plan,
-            scopes,
-            program.blocks[exit_edge.?.target.index()],
-            exit_edge.?.arguments,
-            indent,
-            false,
-            place_aliases,
-        );
-    }
 }
 
 fn emitGenericForLoop(
@@ -2448,6 +2476,14 @@ fn emitGenericForLoop(
     const results = generic.transition.results;
     if (results.len < 4 or results.len != @as(usize, generic.operation.variable_count) + 3) return error.UnsupportedControlFlow;
 
+    const completion_flag: ?[]const u8 = if (!break_after_body) blk: {
+        const edge = exit_edge orelse break :blk null;
+        if (!loopExitTransferWritesParameters(program, emission_plan, scopes, edge)) break :blk null;
+        const header = body_region.stop orelse return error.UnsupportedControlFlow;
+        break :blk try nativeIterationCompletionFlagNameAlloc(allocator, program, emission_plan, header);
+    } else null;
+    defer if (completion_flag) |flag| allocator.free(flag);
+
     if (break_after_body and exit_edge != null) {
         try emitEdgeParametersUnlessConsumed(
             output,
@@ -2463,31 +2499,144 @@ fn emitGenericForLoop(
         );
     }
 
+    if (completion_flag) |flag| try emitNativeIterationCompletionDeclaration(output, allocator, flag, indent);
+
     try emitGenericForOpen(output, allocator, program, emission_plan, scopes, generic, indent, place_aliases);
 
     const loop_indent = try allocDeeperIndent(allocator, indent);
     defer allocator.free(loop_indent);
+
+    const completion_state = emission_plan.state;
+    const previous_completion = completion_state.native_iteration_completion;
+    var completion_context: NativeIterationCompletion = undefined;
+    if (completion_flag) |flag| {
+        completion_context = .{
+            .header = body_region.stop.?,
+            .flag_name = flag,
+            .parent = previous_completion,
+        };
+        completion_state.native_iteration_completion = &completion_context;
+        try emitNativeIterationCompletionAssignment(output, allocator, flag, false, loop_indent);
+    }
+    defer {
+        if (completion_flag != null) completion_state.native_iteration_completion = previous_completion;
+    }
+
     try emitRegion(output, allocator, program, emission_plan, scopes, body_region, loop_indent, place_aliases);
+    if (completion_flag) |flag| try emitNativeIterationCompletionAssignment(output, allocator, flag, true, loop_indent);
     if (break_after_body and !regionAlwaysFunctionTerminates(program, body_region)) {
         try emitBreakStatement(output, allocator, loop_indent);
     }
 
     try output.appendSlice(allocator, indent);
     try output.appendSlice(allocator, "end\n");
-    if (!break_after_body and exit_edge != null) {
-        try emitEdgeParametersUnlessConsumed(
-            output,
-            allocator,
-            program,
-            emission_plan,
-            scopes,
-            program.blocks[exit_edge.?.target.index()],
-            exit_edge.?.arguments,
-            indent,
-            false,
-            place_aliases,
-        );
+    if (completion_flag) |flag| try emitGuardedNativeIterationExitCopy(
+        output,
+        allocator,
+        program,
+        emission_plan,
+        scopes,
+        exit_edge.?,
+        flag,
+        indent,
+        place_aliases,
+    );
+}
+
+fn loopExitTransferWritesParameters(
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    scopes: *const emission_scope.Plan,
+    edge: ir.Edge,
+) bool {
+    if (edge.target.index() >= program.blocks.len or scopes.nativeIterationConsumesParameters(edge.target)) return false;
+    const target = program.blocks[edge.target.index()];
+    for (target.parameters) |parameter| {
+        if (!emission_plan.dead.isValueAlias(parameter)) return true;
     }
+    return false;
+}
+
+fn nativeIterationCompletionFlagNameAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    header: ir.BlockId,
+) std.mem.Allocator.Error![]const u8 {
+    const base = try std.fmt.allocPrint(allocator, "__lifter_native_iteration_complete_{d}", .{header.index()});
+    defer allocator.free(base);
+    return emission_plan.names.internalNameAlloc(allocator, program, base);
+}
+
+fn emitNativeIterationCompletionDeclaration(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    flag_name: []const u8,
+    indent: []const u8,
+) std.mem.Allocator.Error!void {
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "local ");
+    try output.appendSlice(allocator, flag_name);
+    try output.appendSlice(allocator, " = true\n");
+}
+
+fn emitNativeIterationCompletionAssignment(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    flag_name: []const u8,
+    complete: bool,
+    indent: []const u8,
+) std.mem.Allocator.Error!void {
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, flag_name);
+    try output.appendSlice(allocator, if (complete) " = true\n" else " = false\n");
+}
+
+fn emitNativeIterationCompletionSetForTarget(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    emission_plan: *const EmissionPlan,
+    target: ir.BlockId,
+    indent: []const u8,
+) std.mem.Allocator.Error!void {
+    var active = emission_plan.state.native_iteration_completion;
+    while (active) |completion| : (active = completion.parent) {
+        if (completion.header != target) continue;
+        return emitNativeIterationCompletionAssignment(output, allocator, completion.flag_name, true, indent);
+    }
+}
+
+fn emitGuardedNativeIterationExitCopy(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    scopes: *const emission_scope.Plan,
+    edge: ir.Edge,
+    flag_name: []const u8,
+    indent: []const u8,
+    place_aliases: []const PlaceAlias,
+) (EmitError || std.mem.Allocator.Error)!void {
+    const copy_indent = try allocDeeperIndent(allocator, indent);
+    defer allocator.free(copy_indent);
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "if ");
+    try output.appendSlice(allocator, flag_name);
+    try output.appendSlice(allocator, " then\n");
+    try emitEdgeParametersUnlessConsumed(
+        output,
+        allocator,
+        program,
+        emission_plan,
+        scopes,
+        program.blocks[edge.target.index()],
+        edge.arguments,
+        copy_indent,
+        false,
+        place_aliases,
+    );
+    try output.appendSlice(allocator, indent);
+    try output.appendSlice(allocator, "end\n");
 }
 
 /// The `for <bindings> in <initializers> do` line of a native generic loop, with its initializer fusion.
@@ -2923,6 +3072,7 @@ fn emitEscapePropagation(
         try output.appendSlice(allocator, " then\n");
         try output.appendSlice(allocator, break_indent);
         if (escapePropagationIsLoopContinue(target, loop_header)) {
+            try emitNativeIterationCompletionSetForTarget(output, allocator, emission_plan, target, break_indent);
             try output.appendSlice(allocator, "continue\n");
         } else {
             try output.appendSlice(allocator, "break\n");
@@ -2948,6 +3098,7 @@ fn emitEscapeContinueIfSet(
     try output.appendSlice(allocator, "if ");
     try output.appendSlice(allocator, flag);
     try output.appendSlice(allocator, " then\n");
+    try emitNativeIterationCompletionSetForTarget(output, allocator, emission_plan, target, body_indent);
     try emitContinueStatement(output, allocator, body_indent);
     try output.appendSlice(allocator, indent);
     try output.appendSlice(allocator, "end\n");
@@ -3145,6 +3296,7 @@ fn emitProjectedContinue(
         false,
         place_aliases,
     );
+    try emitNativeIterationCompletionSetForTarget(output, allocator, emission_plan, target, indent);
     try emitContinueStatement(output, allocator, indent);
 }
 
@@ -3152,11 +3304,13 @@ fn emitProjectedContinueAfterTransferredEdge(
     output: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
     program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
     edge: ir.Edge,
     target: ir.BlockId,
     indent: []const u8,
 ) (EmitError || std.mem.Allocator.Error)!void {
     _ = try loop_continue_projection.validateEntry(program, target, edge);
+    try emitNativeIterationCompletionSetForTarget(output, allocator, emission_plan, target, indent);
     try emitContinueStatement(output, allocator, indent);
 }
 
@@ -3270,7 +3424,7 @@ fn emitLoopBoundaryControl(
     try render.valueUseScalar(output, allocator, program, valuePlan(emission_plan, place_aliases), branch.condition);
     try output.appendSlice(allocator, " then\n");
     if (control.body_on_true) {
-        try emitLoopBoundaryBody(output, allocator, program, emission_plan, scopes, control, body_exit, arm_indent, place_aliases);
+        try emitLoopBoundaryBody(output, allocator, program, emission_plan, scopes, control, body_exit, region.continue_target, arm_indent, place_aliases);
     } else {
         try emitLoopBoundaryArm(output, allocator, program, emission_plan, scopes, control.boundary, arm_indent, place_aliases);
     }
@@ -3279,7 +3433,7 @@ fn emitLoopBoundaryControl(
     if (control.body_on_true) {
         try emitLoopBoundaryArm(output, allocator, program, emission_plan, scopes, control.boundary, arm_indent, place_aliases);
     } else {
-        try emitLoopBoundaryBody(output, allocator, program, emission_plan, scopes, control, body_exit, arm_indent, place_aliases);
+        try emitLoopBoundaryBody(output, allocator, program, emission_plan, scopes, control, body_exit, region.continue_target, arm_indent, place_aliases);
     }
     try output.appendSlice(allocator, indent);
     try output.appendSlice(allocator, "end\n");
@@ -3353,7 +3507,7 @@ fn emitLoopBoundaryNativeIteration(
         else => return error.UnsupportedControlFlow,
     }
     if (body_exit == .parent_stop and branchArmIsStructurallyEmpty(program, control.body_edge, control.body_region, null)) return;
-    try emitLoopBoundaryBody(output, allocator, program, emission_plan, scopes, control, body_exit, indent, place_aliases);
+    try emitLoopBoundaryBody(output, allocator, program, emission_plan, scopes, control, body_exit, region.continue_target, indent, place_aliases);
 }
 
 fn emitLoopBoundaryBodyImpl(
@@ -3364,6 +3518,7 @@ fn emitLoopBoundaryBodyImpl(
     scopes: *const emission_scope.Plan,
     control: structure.LoopBoundaryControl,
     body_exit: transparent_stop.LoopBoundaryBodyExit,
+    continue_target: ?ir.BlockId,
     indent: []const u8,
     place_aliases: []const PlaceAlias,
 ) !void {
@@ -3374,12 +3529,20 @@ fn emitLoopBoundaryBodyImpl(
         if (transfer.nonlocal) {
             try emitEscapeFlagSet(output, allocator, program, emission_plan, transfer.target, indent);
         } else {
+            try emitNativeIterationCompletionSetForTarget(output, allocator, emission_plan, transfer.target, indent);
             try emitContinueStatement(output, allocator, indent);
         }
         return;
     }
     try emitRegion(output, allocator, program, emission_plan, scopes, control.body_region, indent, place_aliases);
     if (body_exit == .continue_target and control.body_region.continue_projection == null) {
+        try emitNativeIterationCompletionSetForTarget(
+            output,
+            allocator,
+            emission_plan,
+            continue_target orelse return error.UnsupportedControlFlow,
+            indent,
+        );
         try emitContinueStatement(output, allocator, indent);
     }
 }
@@ -3412,6 +3575,7 @@ fn emitLoopBoundaryBody(
     scopes: *const emission_scope.Plan,
     control: structure.LoopBoundaryControl,
     body_exit: transparent_stop.LoopBoundaryBodyExit,
+    continue_target: ?ir.BlockId,
     indent: []const u8,
     place_aliases: []const PlaceAlias,
 ) !void {
@@ -3423,6 +3587,7 @@ fn emitLoopBoundaryBody(
         scopes,
         control,
         body_exit,
+        continue_target,
         indent,
         place_aliases,
     );

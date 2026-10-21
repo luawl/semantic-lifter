@@ -13,8 +13,19 @@ const render = @import("emit_luau_expr.zig");
 const name_plan = @import("name_plan.zig");
 const stage_trace = @import("stage_trace.zig");
 
+pub const NativeIterationCompletion = struct {
+    header: ir.BlockId,
+    flag_name: []const u8,
+    parent: ?*NativeIterationCompletion = null,
+};
+
+pub const EmitState = struct {
+    native_iteration_completion: ?*NativeIterationCompletion = null,
+};
+
 pub const Plan = struct {
     force_dispatcher: bool = false,
+    state: *EmitState,
     runtime: luau_runtime.Plan,
     names: name_plan.Plan,
     packs: pack_plan.Plan,
@@ -64,7 +75,11 @@ pub const Plan = struct {
         }
         var names = try name_plan.Plan.initWithRuntime(allocator, program, &scope, runtime);
         errdefer names.deinit();
+        const state = try allocator.create(EmitState);
+        errdefer allocator.destroy(state);
+        state.* = .{};
         return .{
+            .state = state,
             .runtime = runtime,
             .names = names,
             .packs = packs,
@@ -77,6 +92,7 @@ pub const Plan = struct {
     }
 
     pub fn deinit(self: *Plan) void {
+        self.names.allocator.destroy(self.state);
         self.fused_values.deinit();
         self.closure_stores.deinit();
         self.place_reads.deinit();
