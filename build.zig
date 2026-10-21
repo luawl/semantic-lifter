@@ -983,6 +983,23 @@ pub fn build(b: *std.Build) void {
         "source-frontend-proved-branch-unreachable-consumer-direct-locals",
         "direct-locals-luau",
     );
+    const source_frontend_generic_initializer_read_after_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/generic_initializer_read_after_source.luau",
+        "source-frontend-generic-initializer-read-after",
+    );
+    const source_frontend_generic_initializer_read_after_direct_locals_conformance = addLuauSourceConformanceForTarget(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/generic_initializer_read_after_source.luau",
+        "source-frontend-generic-initializer-read-after-direct-locals",
+        "direct-locals-luau",
+    );
     const source_frontend_table_pack_conformance = addLuauSourceConformance(
         b,
         exe,
@@ -1344,6 +1361,8 @@ pub fn build(b: *std.Build) void {
     source_frontend_binary_operand_read_order_direct_locals_conformance.addTo(conformance_step);
     source_frontend_proved_branch_unreachable_consumer_conformance.addTo(conformance_step);
     source_frontend_proved_branch_unreachable_consumer_direct_locals_conformance.addTo(conformance_step);
+    source_frontend_generic_initializer_read_after_conformance.addTo(conformance_step);
+    source_frontend_generic_initializer_read_after_direct_locals_conformance.addTo(conformance_step);
     source_frontend_table_pack_conformance.addTo(conformance_step);
     source_frontend_function_statement_conformance.addTo(conformance_step);
     source_frontend_closure_store_environment_conformance.addTo(conformance_step);

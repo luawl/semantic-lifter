@@ -452,6 +452,27 @@ function SourceRuntimeOracle.run(caseName: string, source: string, exported: any
 			fewNumbers == "" and fewStrings == "1,2,3",
 			"a local that an unreachable consumer of a proved branch also reads lost its declaration"
 		)
+
+	elseif
+		caseName == "source-frontend-generic-initializer-read-after"
+		or caseName == "source-frontend-generic-initializer-read-after-direct-locals"
+	then
+		local function check(mode: string, limit: number, expected: string)
+			assert(exported(mode, limit) == expected, "a generic-for initializer result read outside its loop header lost its declaration")
+		end
+		check("after", 3, "source,1=3,2=2,3=1,after=0/function/true")
+		check("body", 3, "source,1#3,2#3,3#3")
+		check("break", 3, "source,3@1,after=0/function")
+		check("boundary", 5, "source,1:0/function,source,2:0/function")
+		check("boundary", 3, "source|3@1")
+		check("unread", 3, "source,1=3,2=2,3=1")
+		check("header", 3, "source,1=3,2=2,3=1")
+		if caseName == "source-frontend-generic-initializer-read-after-direct-locals" then
+			assert(
+				select(2, string.gsub(source, " in source%(order%) do", "")) == 2,
+				"a generic-for initializer read only by its header lost its fusion, or one read outside it kept it"
+			)
+		end
 	elseif caseName == "source-frontend-typed-block" then
 		assert(exported(7) == 7, "source frontend changed typed block runtime behavior")
 	elseif caseName == "source-frontend-numeric-for" then

@@ -1154,6 +1154,7 @@ pub const Plan = struct {
             else => return null,
         }
         if (!self.initializerKeepsEvaluationOrder(producer, adjustment, header)) return null;
+        if (!self.initializerResultsReadOnlyAtHeader(producer, adjustment, header)) return null;
         return .{ .adjustment = adjustment, .producer = producer };
     }
 
@@ -1189,6 +1190,47 @@ pub const Plan = struct {
             if (!invocation_projection_witness.invocationGapIsMovable(self.program, self.program.instructions[instruction_id.index()])) return false;
         }
         return after_producer;
+    }
+
+    /// A fused producer is written on the `for` line and its three results lose their
+    /// declarations, so the fusion stands only when nothing outside the loop header
+    /// uses those results. The header block is the header's own use (its transition
+    /// reads the header parameters, which the acyclic sites alias to the results), and
+    /// so are the first three arguments of the entry jump. A result used anywhere else
+    /// in the function, after the loop or in its body, keeps the producer and its
+    /// adjustment in place, so the loop reads the three initial arguments
+    /// and a read after the loop sees the call's result.
+    fn initializerResultsReadOnlyAtHeader(
+        self: *const Plan,
+        producer_id: ir.InstructionId,
+        adjustment_id: ir.InstructionId,
+        header: ir.BlockId,
+    ) bool {
+        const entry_block = self.program.instructions[producer_id.index()].block;
+        for (self.program.instructions[adjustment_id.index()].results) |result_id| {
+            const result = self.dead.resolveValue(result_id);
+            for (self.function.blocks) |block_id| {
+                if (block_id == header) continue;
+                if (block_id.index() >= self.program.blocks.len) return false;
+                const block = self.program.blocks[block_id.index()];
+                for (block.instructions) |instruction_id| {
+                    if (instruction_id == adjustment_id) continue;
+                    if (instruction_id.index() >= self.program.instructions.len) return false;
+                    if (self.dead.contains(instruction_id) and !self.dead.isInlined(instruction_id)) continue;
+                    if (self.dead.operationUsesValue(self.program.instructions[instruction_id.index()].operation, result)) return false;
+                }
+                if (block_id == entry_block) {
+                    const entry = switch (block.terminator) {
+                        .jump => |edge| edge,
+                        else => return false,
+                    };
+                    for (entry.arguments, 0..) |argument, index| {
+                        if (index >= 3 and self.dead.resolveValue(argument) == result) return false;
+                    }
+                } else if (self.dead.terminatorUsesValue(block.terminator, result)) return false;
+            }
+        }
+        return true;
     }
 
     fn suppressGenericIteratorStores(self: *Plan, values: []const ir.ValueId, body_parameters: []const ir.ValueId) void {

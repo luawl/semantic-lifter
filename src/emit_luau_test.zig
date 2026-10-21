@@ -3544,3 +3544,163 @@ test "a capture-free closure store stays before a gap that may run code" {
     defer std.testing.allocator.free(certified);
     try std.testing.expect(std.mem.indexOf(u8, certified, "function()").? < std.mem.indexOf(u8, certified, "callee()").?);
 }
+
+test "a generic-for initializer result read after the loop keeps its triple in place" {
+    const allocator = std.testing.allocator;
+
+    const proof = ir.EvidenceId.fromIndex(0);
+    const function_id = ir.FunctionId.fromIndex(0);
+    const b_entry = ir.BlockId.fromIndex(0);
+    const b_header = ir.BlockId.fromIndex(1);
+    const b_body = ir.BlockId.fromIndex(2);
+    const b_exit = ir.BlockId.fromIndex(3);
+    const p_pack = ir.ValuePackId.fromIndex(0);
+
+    const i_producer = ir.InstructionId.fromIndex(0);
+    const i_adjust = ir.InstructionId.fromIndex(1);
+    const i_true = ir.InstructionId.fromIndex(2);
+    const i_false = ir.InstructionId.fromIndex(3);
+    const i_gfn = ir.InstructionId.fromIndex(4);
+
+    const f = ir.ValueId.fromIndex(0);
+    const t = ir.ValueId.fromIndex(1);
+    const v_step = ir.ValueId.fromIndex(2);
+    const v_state = ir.ValueId.fromIndex(3);
+    const v_start = ir.ValueId.fromIndex(4);
+    const v_true = ir.ValueId.fromIndex(5);
+    const v_false = ir.ValueId.fromIndex(6);
+    const hp0 = ir.ValueId.fromIndex(7);
+    const hp1 = ir.ValueId.fromIndex(8);
+    const hp2 = ir.ValueId.fromIndex(9);
+    const hp3 = ir.ValueId.fromIndex(10);
+    const r0 = ir.ValueId.fromIndex(11);
+    const r1 = ir.ValueId.fromIndex(12);
+    const r2 = ir.ValueId.fromIndex(13);
+    const r3 = ir.ValueId.fromIndex(14);
+    const r4 = ir.ValueId.fromIndex(15);
+    const bp0 = ir.ValueId.fromIndex(16);
+    const bp1 = ir.ValueId.fromIndex(17);
+
+    const values = [_]ir.Value{
+        .{ .id = f, .function = function_id, .type = .dynamic, .name_hint = "f", .origin = .{ .parameter = 0 } },
+        .{ .id = t, .function = function_id, .type = .dynamic, .name_hint = "t", .origin = .{ .parameter = 1 } },
+        .{ .id = v_step, .function = function_id, .name_hint = "step", .origin = .{ .instruction_result = .{ .instruction = i_adjust, .index = 0 } } },
+        .{ .id = v_state, .function = function_id, .name_hint = "state", .origin = .{ .instruction_result = .{ .instruction = i_adjust, .index = 1 } } },
+        .{ .id = v_start, .function = function_id, .name_hint = "start", .origin = .{ .instruction_result = .{ .instruction = i_adjust, .index = 2 } } },
+        .{ .id = v_true, .function = function_id, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = i_true, .index = 0 } } },
+        .{ .id = v_false, .function = function_id, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = i_false, .index = 0 } } },
+        .{ .id = hp0, .function = function_id, .origin = .{ .block_parameter = .{ .block = b_header, .index = 0 } } },
+        .{ .id = hp1, .function = function_id, .origin = .{ .block_parameter = .{ .block = b_header, .index = 1 } } },
+        .{ .id = hp2, .function = function_id, .origin = .{ .block_parameter = .{ .block = b_header, .index = 2 } } },
+        .{ .id = hp3, .function = function_id, .type = .boolean, .origin = .{ .block_parameter = .{ .block = b_header, .index = 3 } } },
+        .{ .id = r0, .function = function_id, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = i_gfn, .index = 0 } } },
+        .{ .id = r1, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = i_gfn, .index = 1 } } },
+        .{ .id = r2, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = i_gfn, .index = 2 } } },
+        .{ .id = r3, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = i_gfn, .index = 3 } } },
+        .{ .id = r4, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = i_gfn, .index = 4 } } },
+        .{ .id = bp0, .function = function_id, .name_hint = "key", .origin = .{ .block_parameter = .{ .block = b_body, .index = 0 } } },
+        .{ .id = bp1, .function = function_id, .name_hint = "value", .origin = .{ .block_parameter = .{ .block = b_body, .index = 1 } } },
+    };
+
+    const instructions = [_]ir.Instruction{
+        .{ .id = i_producer, .block = b_entry, .operation = .{ .call = .{ .callee = f, .arguments = &.{t}, .result_arity = .{ .variadic = {} } } }, .results = &.{}, .pack_result = p_pack, .effects = .dynamic_call, .evidence = &.{proof} },
+        .{ .id = i_adjust, .block = b_entry, .operation = .{ .adjust_pack = p_pack }, .results = &.{ v_step, v_state, v_start }, .effects = .pure, .evidence = &.{proof} },
+        .{ .id = i_true, .block = b_entry, .operation = .{ .constant = .{ .boolean = true } }, .results = &.{v_true}, .effects = .pure, .evidence = &.{proof} },
+        .{ .id = i_false, .block = b_entry, .operation = .{ .constant = .{ .boolean = false } }, .results = &.{v_false}, .effects = .pure, .evidence = &.{proof} },
+        .{ .id = i_gfn, .block = b_header, .operation = .{ .generic_for_next = .{ .iterator = hp0, .state = hp1, .control = hp2, .initial = hp3, .variable_count = 2 } }, .results = &.{ r0, r1, r2, r3, r4 }, .effects = ir.EffectSummary.generic_for_next, .evidence = &.{proof} },
+    };
+
+    const blocks = [_]ir.Block{
+        .{
+            .id = b_entry,
+            .function = function_id,
+            .instructions = &.{ i_producer, i_adjust, i_true, i_false },
+            .terminator = .{ .jump = .{ .target = b_header, .arguments = &.{ v_step, v_state, v_start, v_true } } },
+            .evidence = &.{proof},
+        },
+        .{
+            .id = b_header,
+            .function = function_id,
+            .parameters = &.{ hp0, hp1, hp2, hp3 },
+            .instructions = &.{i_gfn},
+            .terminator = .{ .branch = .{
+                .condition = r0,
+                .then_edge = .{ .target = b_body, .arguments = &.{ r3, r4 } },
+                .else_edge = .{ .target = b_exit },
+            } },
+            .evidence = &.{proof},
+        },
+        .{
+            .id = b_body,
+            .function = function_id,
+            .parameters = &.{ bp0, bp1 },
+            .terminator = .{ .jump = .{ .target = b_header, .arguments = &.{ r1, r2, r3, v_false } } },
+            .evidence = &.{proof},
+        },
+        .{
+            .id = b_exit,
+            .function = function_id,
+            .terminator = .{ .return_values = &.{v_start} },
+            .evidence = &.{proof},
+        },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .parameters = &.{ f, t },
+        .blocks = &.{ b_entry, b_header, b_body, b_exit },
+        .entry_block = b_entry,
+        .evidence = &.{proof},
+    }};
+    const value_packs = [_]ir.ValuePack{.{
+        .id = p_pack,
+        .function = function_id,
+        .origin = .{ .instruction_result = i_producer },
+        .evidence = &.{proof},
+    }};
+    const evidence = [_]ir.Evidence{.{ .id = proof, .kind = .dynamic_fixture, .locator = "fixture:generic-initializer-read-after" }};
+    const program: ir.Program = .{
+        .program_id = "generic-initializer-read-after-unit",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+        .value_packs = &value_packs,
+        .evidence = &evidence,
+    };
+
+    const source = try lifter.emit_luau.emitAdmittedAllocForTarget(allocator, &program, .standard_luau);
+    defer allocator.free(source);
+
+    // (G1) the structured layout, not the dispatcher.
+    try std.testing.expect(std.mem.indexOf(u8, source, "__lifter_pc") == null);
+
+    // (G2) the producer call and the read after the loop are present, and the loop is native.
+    try std.testing.expect(std.mem.indexOf(u8, source, "f(t)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "return start") != null);
+    var for_at: ?usize = null;
+    var fused_for = false;
+    {
+        var offset: usize = 0;
+        var lines = std.mem.splitScalar(u8, source, '\n');
+        while (lines.next()) |line| : (offset += line.len + 1) {
+            const trimmed = std.mem.trim(u8, line, " \t");
+            if (std.mem.startsWith(u8, trimmed, "for ") and std.mem.endsWith(u8, trimmed, " do")) {
+                if (for_at == null) for_at = offset;
+                if (std.mem.indexOf(u8, trimmed, "f(t)") != null) fused_for = true;
+            }
+        }
+    }
+    try std.testing.expect(for_at != null);
+
+    // (D1) a producer whose result is read after the loop is not written on the `for` line.
+    try std.testing.expect(!fused_for);
+
+    // (D2) the triple is written in place, before the loop.
+    const triple_at = std.mem.indexOf(u8, source, "local step, state, start = f(t)");
+    try std.testing.expect(triple_at != null);
+    try std.testing.expect(triple_at.? < for_at.?);
+
+    // (D3) the producer is written exactly once.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "f(t)"));
+}
