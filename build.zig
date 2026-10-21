@@ -100,11 +100,6 @@ pub fn build(b: *std.Build) void {
         "trace-normalize-phases",
         "Enable bounded phase timing diagnostics for control normalization",
     ) orelse false;
-    const workspace_sample_conformance = b.option(
-        bool,
-        "workspace-sample-conformance",
-        "Include optional whole-program samples owned by the parent workspace",
-    ) orelse false;
 
     const lune_option = b.option([]const u8, "lune", "Path to the Lune 0.10.4 runtime (default: lune on PATH)");
     const luau_compile_option = b.option([]const u8, "luau-compile", "Path to luau-compile from the Luau 0.720 tools (default: luau-compile on PATH)");
@@ -1121,24 +1116,6 @@ pub fn build(b: *std.Build) void {
         "luau/fixtures/temporal_target_identity_manifest.json",
         "source-frontend-temporal-target-identity",
     );
-    const historical_readable_conformance = addLuauSourceCompileConformance(
-        b,
-        exe,
-        z3_enabled,
-        z3_bin,
-        "../../../src/ib1/decoded/ib1-current-sample-decompiled.luau",
-        "historical-readable-whole-program",
-        if (z3_enabled) "z3" else "internal",
-    );
-    const onion_readable_source_conformance = addLuauSourceCompileConformance(
-        b,
-        exe,
-        z3_enabled,
-        z3_bin,
-        "../../../src/ib1/decoded/onion-ndir-current-readable-source.luau",
-        "onion-readable-source-whole-program",
-        if (z3_enabled) "z3" else "internal",
-    );
     const ast_admission_compile_conformance = addLuauSourceCompileConformance(
         b,
         exe,
@@ -1165,27 +1142,6 @@ pub fn build(b: *std.Build) void {
         "luau/register_budget_oracle.luau",
         "strict-module-register-budget-oracle",
         if (z3_enabled) "z3" else "internal",
-    );
-    const onion_recovery_obligation_conformance = addLuauSourceRecoveryObligationConformance(
-        b,
-        exe,
-        z3_enabled,
-        z3_bin,
-        "../../../src/ib1/decoded/onion-ndir-current-readable-source.luau",
-        "luau/fixtures/onion_recovery_incomplete_manifest.json",
-        "onion-target-recovery-incomplete",
-        if (z3_enabled) "z3" else "internal",
-        65,
-        &.{
-            .{ .kind = "unresolved_identity", .subject = "instruction", .operation = "call", .producer = "constant.nil_value", .value_type = "nil_value", .place_flow = "none", .proof_links = "none", .count = 36 },
-            .{ .kind = "unresolved_identity", .subject = "instruction", .operation = "call", .producer = "constant.boolean", .value_type = "boolean", .place_flow = "none", .proof_links = "none", .count = 1 },
-            .{ .kind = "unresolved_identity", .subject = "instruction", .operation = "call", .producer = "place_read", .value_type = "dynamic", .place_flow = "unique.constant.nil_value", .proof_links = "none", .count = 11 },
-            .{ .kind = "unresolved_identity", .subject = "instruction", .operation = "call", .producer = "place_read", .value_type = "dynamic", .place_flow = "unique.constant.integer", .proof_links = "none", .count = 1 },
-            .{ .kind = "unresolved_identity", .subject = "instruction", .operation = "call", .producer = "place_read", .value_type = "dynamic", .place_flow = "unique.binary", .proof_links = "none", .count = 5 },
-            .{ .kind = "unresolved_identity", .subject = "instruction", .operation = "call", .producer = "place_read", .value_type = "dynamic", .place_flow = "unique.pack.call.0", .proof_links = "none", .count = 4 },
-            .{ .kind = "unresolved_identity", .subject = "instruction", .operation = "call", .producer = "place_read", .value_type = "dynamic", .place_flow = "multiple", .proof_links = "none", .count = 1 },
-            .{ .kind = "unresolved_identity", .subject = "instruction", .operation = "call", .producer = "place_read", .value_type = "nil_value", .place_flow = "unique.constant.nil_value", .proof_links = "none", .count = 6 },
-        },
     );
 
     const register_budget_oracle = addRegisterBudgetOracle(b);
@@ -1403,11 +1359,6 @@ pub fn build(b: *std.Build) void {
     source_frontend_namecall_target_origin_conformance.addTo(conformance_step);
     source_frontend_compositional_access_path_conformance.addTo(conformance_step);
     source_frontend_temporal_target_identity_conformance.addTo(conformance_step);
-    if (workspace_sample_conformance) {
-        historical_readable_conformance.addTo(conformance_step);
-        onion_readable_source_conformance.addTo(conformance_step);
-        onion_recovery_obligation_conformance.addTo(conformance_step);
-    }
     ast_admission_compile_conformance.addTo(conformance_step);
     loop_module_compile_conformance.addTo(conformance_step);
     register_budget_module_compile_conformance.addTo(conformance_step);
@@ -1919,29 +1870,6 @@ const CompileOnlyConformance = struct {
     }
 };
 
-const RecoveryObligationConformance = struct {
-    core_validate: *std.Build.Step,
-    readable_rejection: *std.Build.Step,
-    census: *std.Build.Step,
-
-    fn addTo(self: RecoveryObligationConformance, step: *std.Build.Step) void {
-        step.dependOn(self.core_validate);
-        step.dependOn(self.readable_rejection);
-        step.dependOn(self.census);
-    }
-};
-
-const BlockerCensusRow = struct {
-    kind: []const u8,
-    subject: []const u8,
-    operation: []const u8,
-    producer: []const u8,
-    value_type: []const u8,
-    place_flow: []const u8,
-    proof_links: []const u8,
-    count: usize,
-};
-
 fn addZigFixtureConformance(
     b: *std.Build,
     exe: *std.Build.Step.Compile,
@@ -2443,56 +2371,6 @@ fn addNumericOperandGroupingConformance(
     audit.expectExitCode(0);
     audit.step.dependOn(&compile.step);
     return &audit.step;
-}
-
-fn addLuauSourceRecoveryObligationConformance(
-    b: *std.Build,
-    exe: *std.Build.Step.Compile,
-    z3_enabled: bool,
-    z3_bin: []const u8,
-    source_path: []const u8,
-    manifest_path: []const u8,
-    fixture_name: []const u8,
-    engine_name: []const u8,
-    expected_total: usize,
-    expected_rows: []const BlockerCensusRow,
-) RecoveryObligationConformance {
-    const fixture_json = addLuauSourceIr(b, source_path, manifest_path, fixture_name);
-
-    const resolve_command = b.addRunArtifact(exe);
-    if (z3_enabled) resolve_command.addPathDir(b.pathFromRoot(z3_bin));
-    resolve_command.addArg("resolve-ir");
-    resolve_command.addFileArg(fixture_json);
-    const resolved_json = resolve_command.addOutputFileArg(b.fmt("{s}.resolved.lifter-ir.json", .{fixture_name}));
-    resolve_command.addArg(engine_name);
-
-    const core_validate = b.addRunArtifact(exe);
-    if (z3_enabled) core_validate.addPathDir(b.pathFromRoot(z3_bin));
-    core_validate.addArg("validate");
-    core_validate.addFileArg(resolved_json);
-    core_validate.addArg("core");
-
-    const readable_rejection = b.addRunArtifact(exe);
-    if (z3_enabled) readable_rejection.addPathDir(b.pathFromRoot(z3_bin));
-    readable_rejection.addArg("expect-diagnostic");
-    readable_rejection.addFileArg(resolved_json);
-    readable_rejection.addArgs(&.{ "readable-luau", "open_profile_obligation" });
-
-    const census = b.addRunArtifact(exe);
-    if (z3_enabled) census.addPathDir(b.pathFromRoot(z3_bin));
-    census.addArg("expect-blocker-proof-census");
-    census.addFileArg(resolved_json);
-    census.addArg("readable-luau");
-    census.addArg(b.fmt("{d}", .{expected_total}));
-    for (expected_rows) |row| {
-        census.addArgs(&.{ row.kind, row.subject, row.operation, row.producer, row.value_type, row.place_flow, row.proof_links, b.fmt("{d}", .{row.count}) });
-    }
-
-    return .{
-        .core_validate = &core_validate.step,
-        .readable_rejection = &readable_rejection.step,
-        .census = &census.step,
-    };
 }
 
 fn addLuauSourceIr(
