@@ -232,7 +232,8 @@ fn integerNumberRelation(integer: []const u8, number: f64) DynamicRelation {
     if (!std.math.isFinite(number)) return .distinct;
     const parsed = exactLuauInteger(integer) orelse return .unresolved;
     const float_limit: f64 = @floatFromInt(@as(i64, 1 << 53));
-    if (number < -float_limit or number > float_limit) return .unresolved;
+    // The parsed integer lies within 2^53, so a finite number beyond 2^53 cannot equal it.
+    if (number < -float_limit or number > float_limit) return .distinct;
     if (@trunc(number) != number) return .distinct;
     return if (@as(f64, @floatFromInt(parsed)) == number) .equivalent else .distinct;
 }

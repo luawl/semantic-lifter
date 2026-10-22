@@ -1181,6 +1181,12 @@ function SourceRuntimeOracle.run(caseName: string, source: string, exported: any
 			end
 		end
 		assert(mismatches == 0, `a loop with two continues changed its behaviour: rows={rows} mismatches={mismatches} first: {first}`)
+	elseif caseName == "source-frontend-double-rounding-comparison" then
+		local equalArm, notEqualArm = exported()
+		assert(equalArm == "else-arm", "equality with a double chain rounded beyond 2^53 followed exact integer arithmetic")
+		assert(notEqualArm == "then-arm", "inequality with a double chain rounded beyond 2^53 followed exact integer arithmetic")
+	elseif caseName == "source-frontend-double-rounding-comparison-in-range" then
+		assert(exported() == "else-arm", "equality with a double chain rounded to 2^53 followed exact integer arithmetic")
 	else
 		return false
 	end

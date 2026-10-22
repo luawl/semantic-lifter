@@ -393,7 +393,7 @@ test "Z3 orchestration persists no unresolved exact numeric model" {
     values[fixture.v_unreachable.index()].type = .dynamic;
     var instructions = fixture.instructions;
     instructions[fixture.i_matched.index()].operation = .{ .constant = .{ .integer = "9007199254740993" } };
-    instructions[fixture.i_unreachable.index()].operation = .{ .constant = .{ .number = 9007199254740994.0 } };
+    instructions[fixture.i_unreachable.index()].operation = .{ .constant = .{ .special_number = .nan } };
     const terms = [_]ir.SolverTerm{
         .{ .id = ir.SolverTermId.fromIndex(0), .sort = .{ .kind = .dynamic_value }, .operation = .{ .value = fixture.v_matched } },
         .{ .id = ir.SolverTermId.fromIndex(1), .sort = .{ .kind = .dynamic_value }, .operation = .{ .value = fixture.v_unreachable } },

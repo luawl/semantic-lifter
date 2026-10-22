@@ -1367,6 +1367,22 @@ pub fn build(b: *std.Build) void {
         "luau/fixtures/coroutine_wrap_source.luau",
         "source-frontend-coroutine-wrap",
     );
+    const source_frontend_double_rounding_comparison_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/double_rounding_comparison_source.luau",
+        "source-frontend-double-rounding-comparison",
+    );
+    const source_frontend_double_rounding_comparison_in_range_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/double_rounding_comparison_in_range_source.luau",
+        "source-frontend-double-rounding-comparison-in-range",
+    );
     const source_frontend_target_resolution_conformance = addLuauSourceManifestProofConformance(
         b,
         exe,
@@ -1714,6 +1730,8 @@ pub fn build(b: *std.Build) void {
     source_frontend_interpolation_conformance.addTo(conformance_step);
     source_frontend_intrinsic_invocation_conformance.addTo(conformance_step);
     source_frontend_coroutine_wrap_conformance.addTo(conformance_step);
+    source_frontend_double_rounding_comparison_conformance.addTo(conformance_step);
+    source_frontend_double_rounding_comparison_in_range_conformance.addTo(conformance_step);
     source_frontend_target_resolution_conformance.addTo(conformance_step);
     source_frontend_opaque_result_target_conformance.addTo(conformance_step);
     source_frontend_nonintrinsic_target_origin_conformance.addTo(conformance_step);

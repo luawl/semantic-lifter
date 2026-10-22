@@ -476,7 +476,7 @@ test "dynamic model coherence enforces scalar domains and numeric representabili
         .{ .id = ir.InstructionId.fromIndex(3), .block = ir.BlockId.fromIndex(0), .operation = .{ .constant = .{ .boolean = true } }, .results = &.{exact_true}, .effects = .pure },
         .{ .id = ir.InstructionId.fromIndex(4), .block = ir.BlockId.fromIndex(0), .operation = .{ .constant = .{ .boolean = false } }, .results = &.{exact_false}, .effects = .pure },
         .{ .id = ir.InstructionId.fromIndex(5), .block = ir.BlockId.fromIndex(0), .operation = .{ .constant = .{ .integer = "9007199254740993" } }, .results = &.{large_integer}, .effects = .pure },
-        .{ .id = ir.InstructionId.fromIndex(6), .block = ir.BlockId.fromIndex(0), .operation = .{ .constant = .{ .number = 9007199254740994.0 } }, .results = &.{large_number}, .effects = .pure },
+        .{ .id = ir.InstructionId.fromIndex(6), .block = ir.BlockId.fromIndex(0), .operation = .{ .constant = .{ .special_number = .nan } }, .results = &.{large_number}, .effects = .pure },
         .{ .id = ir.InstructionId.fromIndex(7), .block = ir.BlockId.fromIndex(0), .operation = .{ .constant = .{ .integer = "7" } }, .results = &.{integer_seven}, .effects = .pure },
         .{ .id = ir.InstructionId.fromIndex(8), .block = ir.BlockId.fromIndex(0), .operation = .{ .constant = .{ .number = 7.0 } }, .results = &.{number_seven}, .effects = .pure },
     };
@@ -615,7 +615,7 @@ test "artifact validation rejects unrepresentable exact dynamic numerics" {
     try std.testing.expect(separated_report.contains(.invalid_solver_model_value));
 
     instructions[fixture.i_matched.index()].operation = .{ .constant = .{ .integer = "9007199254740993" } };
-    instructions[fixture.i_unreachable.index()].operation = .{ .constant = .{ .number = 9007199254740994.0 } };
+    instructions[fixture.i_unreachable.index()].operation = .{ .constant = .{ .special_number = .nan } };
     var unresolved_report = try validation.validate(std.testing.allocator, &program, .core);
     defer unresolved_report.deinit();
     try std.testing.expect(unresolved_report.contains(.invalid_solver_model_value));

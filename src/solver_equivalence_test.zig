@@ -104,6 +104,105 @@ test "dynamic scalar descriptors distinguish exact and unresolved relations" {
     try std.testing.expectEqual(DynamicRelation.unresolved, dynamicDescriptorRelation(not_a_number, not_a_number));
 }
 
+test "integer text within 2^53 and a finite number beyond 2^53 are distinct" {
+    const integer_two53: DynamicDescriptor = .{ .category = .number, .exact_number = .{ .integer = "9007199254740992" } };
+    const integer_negative_two53: DynamicDescriptor = .{ .category = .number, .exact_number = .{ .integer = "-9007199254740992" } };
+    const integer_below_two53: DynamicDescriptor = .{ .category = .number, .exact_number = .{ .integer = "9007199254740991" } };
+    const integer_zero: DynamicDescriptor = .{ .category = .number, .exact_number = .{ .integer = "0" } };
+    const integer_three: DynamicDescriptor = .{ .category = .number, .exact_number = .{ .integer = "3" } };
+    const number_above_two53: DynamicDescriptor = .{ .category = .number, .exact_number = .{ .number = 9007199254740994.0 } };
+    const number_below_negative_two53: DynamicDescriptor = .{ .category = .number, .exact_number = .{ .number = -9007199254740994.0 } };
+    const number_1e20: DynamicDescriptor = .{ .category = .number, .exact_number = .{ .number = 1e20 } };
+    const number_largest: DynamicDescriptor = .{ .category = .number, .exact_number = .{ .number = std.math.floatMax(f64) } };
+    const number_negative_largest: DynamicDescriptor = .{ .category = .number, .exact_number = .{ .number = -std.math.floatMax(f64) } };
+    try std.testing.expectEqual(DynamicRelation.distinct, dynamicDescriptorRelation(integer_two53, number_above_two53));
+    try std.testing.expectEqual(DynamicRelation.distinct, dynamicDescriptorRelation(number_above_two53, integer_two53));
+    try std.testing.expectEqual(DynamicRelation.distinct, dynamicDescriptorRelation(integer_negative_two53, number_below_negative_two53));
+    try std.testing.expectEqual(DynamicRelation.distinct, dynamicDescriptorRelation(number_below_negative_two53, integer_negative_two53));
+    try std.testing.expectEqual(DynamicRelation.distinct, dynamicDescriptorRelation(integer_below_two53, number_above_two53));
+    try std.testing.expectEqual(DynamicRelation.distinct, dynamicDescriptorRelation(number_above_two53, integer_below_two53));
+    try std.testing.expectEqual(DynamicRelation.distinct, dynamicDescriptorRelation(integer_zero, number_1e20));
+    try std.testing.expectEqual(DynamicRelation.distinct, dynamicDescriptorRelation(number_1e20, integer_zero));
+    try std.testing.expectEqual(DynamicRelation.distinct, dynamicDescriptorRelation(integer_three, number_largest));
+    try std.testing.expectEqual(DynamicRelation.distinct, dynamicDescriptorRelation(number_largest, integer_three));
+    try std.testing.expectEqual(DynamicRelation.distinct, dynamicDescriptorRelation(integer_three, number_negative_largest));
+    try std.testing.expectEqual(DynamicRelation.distinct, dynamicDescriptorRelation(number_negative_largest, integer_three));
+
+    const integer_wide: DynamicDescriptor = .{ .category = .number, .exact_number = .{ .integer = "9007199254740993" } };
+    const integer_noncanonical: DynamicDescriptor = .{ .category = .number, .exact_number = .{ .integer = "03" } };
+    const number_two53: DynamicDescriptor = .{ .category = .number, .exact_number = .{ .number = 9007199254740992.0 } };
+    const number_infinity: DynamicDescriptor = .{ .category = .number, .exact_number = .{ .number = std.math.inf(f64) } };
+    const number_nan: DynamicDescriptor = .{ .category = .number, .exact_number = .{ .number = std.math.nan(f64) } };
+    try std.testing.expectEqual(DynamicRelation.equivalent, dynamicDescriptorRelation(integer_two53, number_two53));
+    try std.testing.expectEqual(DynamicRelation.equivalent, dynamicDescriptorRelation(number_two53, integer_two53));
+    try std.testing.expectEqual(DynamicRelation.distinct, dynamicDescriptorRelation(integer_three, number_infinity));
+    try std.testing.expectEqual(DynamicRelation.distinct, dynamicDescriptorRelation(number_infinity, integer_three));
+    try std.testing.expectEqual(DynamicRelation.unresolved, dynamicDescriptorRelation(integer_three, number_nan));
+    try std.testing.expectEqual(DynamicRelation.unresolved, dynamicDescriptorRelation(number_nan, integer_three));
+    try std.testing.expectEqual(DynamicRelation.unresolved, dynamicDescriptorRelation(integer_wide, number_above_two53));
+    try std.testing.expectEqual(DynamicRelation.unresolved, dynamicDescriptorRelation(number_above_two53, integer_wide));
+    try std.testing.expectEqual(DynamicRelation.unresolved, dynamicDescriptorRelation(integer_noncanonical, number_1e20));
+    try std.testing.expectEqual(DynamicRelation.unresolved, dynamicDescriptorRelation(number_1e20, integer_noncanonical));
+}
+
+test "a number chain rounded beyond 2^53 is not compared by its exact integer value" {
+    const evaluator = @import("solver_evaluator.zig");
+    const almost = ir.ValueId.fromIndex(0);
+    const three = ir.ValueId.fromIndex(1);
+    const raised = ir.ValueId.fromIndex(2);
+    const tripled = ir.ValueId.fromIndex(3);
+    const offset = ir.ValueId.fromIndex(4);
+    const first_difference = ir.ValueId.fromIndex(5);
+    const second_difference = ir.ValueId.fromIndex(6);
+    const thirteen = ir.ValueId.fromIndex(7);
+    const rounded = ir.ValueId.fromIndex(8);
+    const compared = ir.ValueId.fromIndex(9);
+    const same = ir.ValueId.fromIndex(10);
+    const differs = ir.ValueId.fromIndex(11);
+    const values = [_]ir.Value{
+        .{ .id = almost, .function = ir.FunctionId.fromIndex(0), .type = .integer, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(0), .index = 0 } } },
+        .{ .id = three, .function = ir.FunctionId.fromIndex(0), .type = .integer, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(1), .index = 0 } } },
+        .{ .id = raised, .function = ir.FunctionId.fromIndex(0), .type = .number, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(2), .index = 0 } } },
+        .{ .id = tripled, .function = ir.FunctionId.fromIndex(0), .type = .number, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(3), .index = 0 } } },
+        .{ .id = offset, .function = ir.FunctionId.fromIndex(0), .type = .integer, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(4), .index = 0 } } },
+        .{ .id = first_difference, .function = ir.FunctionId.fromIndex(0), .type = .number, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(5), .index = 0 } } },
+        .{ .id = second_difference, .function = ir.FunctionId.fromIndex(0), .type = .number, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(6), .index = 0 } } },
+        .{ .id = thirteen, .function = ir.FunctionId.fromIndex(0), .type = .integer, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(7), .index = 0 } } },
+        .{ .id = rounded, .function = ir.FunctionId.fromIndex(0), .type = .number, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(8), .index = 0 } } },
+        .{ .id = compared, .function = ir.FunctionId.fromIndex(0), .type = .integer, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(9), .index = 0 } } },
+        .{ .id = same, .function = ir.FunctionId.fromIndex(0), .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(10), .index = 0 } } },
+        .{ .id = differs, .function = ir.FunctionId.fromIndex(0), .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(11), .index = 0 } } },
+    };
+    const instructions = [_]ir.Instruction{
+        .{ .id = ir.InstructionId.fromIndex(0), .block = ir.BlockId.fromIndex(0), .operation = .{ .constant = .{ .integer = "9007199254740991" } }, .results = &.{almost}, .effects = .pure },
+        .{ .id = ir.InstructionId.fromIndex(1), .block = ir.BlockId.fromIndex(0), .operation = .{ .constant = .{ .integer = "3" } }, .results = &.{three}, .effects = .pure },
+        .{ .id = ir.InstructionId.fromIndex(2), .block = ir.BlockId.fromIndex(0), .operation = .{ .binary = .{ .operator = .add, .left = almost, .right = three } }, .results = &.{raised}, .effects = .pure },
+        .{ .id = ir.InstructionId.fromIndex(3), .block = ir.BlockId.fromIndex(0), .operation = .{ .binary = .{ .operator = .multiply, .left = raised, .right = three } }, .results = &.{tripled}, .effects = .pure },
+        .{ .id = ir.InstructionId.fromIndex(4), .block = ir.BlockId.fromIndex(0), .operation = .{ .constant = .{ .integer = "9007199254740989" } }, .results = &.{offset}, .effects = .pure },
+        .{ .id = ir.InstructionId.fromIndex(5), .block = ir.BlockId.fromIndex(0), .operation = .{ .binary = .{ .operator = .subtract, .left = tripled, .right = offset } }, .results = &.{first_difference}, .effects = .pure },
+        .{ .id = ir.InstructionId.fromIndex(6), .block = ir.BlockId.fromIndex(0), .operation = .{ .binary = .{ .operator = .subtract, .left = first_difference, .right = offset } }, .results = &.{second_difference}, .effects = .pure },
+        .{ .id = ir.InstructionId.fromIndex(7), .block = ir.BlockId.fromIndex(0), .operation = .{ .constant = .{ .integer = "13" } }, .results = &.{thirteen}, .effects = .pure },
+        .{ .id = ir.InstructionId.fromIndex(8), .block = ir.BlockId.fromIndex(0), .operation = .{ .binary = .{ .operator = .subtract, .left = second_difference, .right = thirteen } }, .results = &.{rounded}, .effects = .pure },
+        .{ .id = ir.InstructionId.fromIndex(9), .block = ir.BlockId.fromIndex(0), .operation = .{ .constant = .{ .integer = "9007199254740991" } }, .results = &.{compared}, .effects = .pure },
+        .{ .id = ir.InstructionId.fromIndex(10), .block = ir.BlockId.fromIndex(0), .operation = .{ .binary = .{ .operator = .equal, .left = rounded, .right = compared } }, .results = &.{same}, .effects = .pure },
+        .{ .id = ir.InstructionId.fromIndex(11), .block = ir.BlockId.fromIndex(0), .operation = .{ .binary = .{ .operator = .not_equal, .left = rounded, .right = compared } }, .results = &.{differs}, .effects = .pure },
+    };
+    const program: ir.Program = .{
+        .program_id = "number-chain-rounded-beyond-2p53",
+        .entry_function = ir.FunctionId.fromIndex(0),
+        .functions = &.{},
+        .blocks = &.{},
+        .instructions = &instructions,
+        .values = &values,
+    };
+
+    // As Luau doubles the chain ends at 9007199254740996; as exact integers it ends at 9007199254740991.
+    const same_result = evaluator.evaluateValue(&program, same);
+    try std.testing.expect(!(same_result == .boolean and same_result.boolean));
+    const differs_result = evaluator.evaluateValue(&program, differs);
+    try std.testing.expect(!(differs_result == .boolean and !differs_result.boolean));
+}
+
 test "exact primitive Boolean logic preserves truthiness and decisive unknown identities" {
     const exact_false: DynamicDescriptor = .{ .category = .boolean, .exact_boolean = false };
     const exact_true: DynamicDescriptor = .{ .category = .boolean, .exact_boolean = true };
