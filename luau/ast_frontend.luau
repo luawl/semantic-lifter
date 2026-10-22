@@ -109,6 +109,7 @@ type FrontendState = {
 	target_recovery: AstTargetRecovery.State,
 	mutable_locals: { [string]: boolean },
 	reassigned_locals: { [string]: boolean },
+	closure_bound_by_function: { [number]: { [string]: boolean } },
 }
 
 local FrontendDiagnostic = {}
@@ -433,6 +434,17 @@ expressionLowerer = AstExpressions.new({
 		return function(): ValueRef
 			return materializeBinding(context, operand, binding, nil)
 		end
+	end,
+	place_closure_bound = function(context: FunctionContext, node: Record): boolean
+		local operand = node
+		while nodeTag(operand) == "AstExprGroup" or nodeTag(operand) == "AstExprTypeAssertion" do
+			operand = expectRecord(operand.expr, "malformed_group", "operand wrapper is missing its expression")
+		end
+		if nodeTag(operand) ~= "AstExprLocal" or type(operand["local"]) ~= "table" then
+			return false
+		end
+		local places = context.frontend.closure_bound_by_function[context.id]
+		return places ~= nil and places[localKey(operand["local"])] == true
 	end,
 	resolve_intrinsic_alias = function(context: FunctionContext, localNode: Record): any?
 		local binding = resolveLocalBinding(context, localNode)
@@ -881,6 +893,42 @@ local function runtimeLocalNames(node: any, into: { [string]: boolean })
 	end
 end
 
+-- The keys of the current function's locals that a nested closure captures as an upvalue: a walk over
+-- the function body that, at every nested function expression, collects every local read inside it (at
+-- any depth), so a closure created later in a loop body is included. A method receiver that names such a
+-- place is read at the call, where the register holds the closure's write, not at its source position.
+local function collectClosureBoundPlaces(node: any, into: { [string]: boolean })
+	if type(node) ~= "table" then
+		return
+	end
+	local tag = node.type
+	if type(tag) == "string" then
+		if tag == "AstExprFunction" then
+			runtimeLocalNames(node, into)
+			return
+		end
+		if
+			string.sub(tag, 1, 7) == "AstType"
+			or tag == "AstLocal"
+			or tag == "AstGenericType"
+			or tag == "AstGenericTypePack"
+			or tag == "AstStatTypeAlias"
+			or tag == "AstStatTypeFunction"
+		then
+			return
+		end
+	end
+	for _, child in node do
+		collectClosureBoundPlaces(child, into)
+	end
+end
+
+local function closureBoundPlaces(body: any): { [string]: boolean }
+	local into: { [string]: boolean } = {}
+	collectClosureBoundPlaces(body, into)
+	return into
+end
+
 local function operandLocalKey(node: any): string?
 	local operand = node
 	while type(operand) == "table" and (operand.type == "AstExprGroup" or operand.type == "AstExprTypeAssertion") do
@@ -1189,6 +1237,7 @@ lowerFunctionExpression = function(parent: FunctionContext, node: Record, nameHi
 	if isVariadic then
 		context.vararg_pack = state.builder:addVarargPack(functionId, evidenceFor(state, node))
 	end
+	state.closure_bound_by_function[functionId] = closureBoundPlaces(expectRecord(node.body, "malformed_function", "function is missing its body"))
 	lowerStatementBlock(context, expectRecord(node.body, "malformed_function", "function is missing its body"), true)
 	state.builder:finalizeFunction(functionId)
 	return scalarResult(
@@ -1298,6 +1347,7 @@ local function liftUnchecked(document: Record, options: Options): Record
 		target_recovery = targetRecovery,
 		mutable_locals = mutableLocals,
 		reassigned_locals = reassignedLocals,
+		closure_bound_by_function = {},
 	}
 	local chunk = builder:reserveFunction({
 		name_hint = "chunk",
@@ -1318,6 +1368,7 @@ local function liftUnchecked(document: Record, options: Options): Record
 		loop_stack = {},
 		terminated = false,
 	}
+	state.closure_bound_by_function[chunk] = closureBoundPlaces(root)
 	lowerStatementBlock(context, root, true)
 	targetRecoveryLowerer:assertComplete(state.target_recovery, root)
 	if programObligations ~= nil then

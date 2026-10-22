@@ -31,6 +31,7 @@ type Host = {
 	mark_target_recovery_resolution_used: (any, Record) -> (),
 	resolve_local: (any, Record, Record) -> any,
 	defer_register_local: (any, Record) -> (() -> any)?,
+	place_closure_bound: (any, Record) -> boolean,
 	resolve_intrinsic_alias: (any, Record) -> any?,
 	lower_function: (any, Record, string?) -> any,
 	lower_short_circuit: (any, Record, string?) -> any,
@@ -593,6 +594,7 @@ function ExpressionLowerer:lowerCall(context: any, node: Record, resultCount: nu
 
 	local callee: any? = nil
 	local namecallReceiver: any? = nil
+	local readReceiver: (() -> any)? = nil
 	local namecallMethod: string? = nil
 	local staticMethodName = callMethodName(host, node)
 	if intrinsicKind == nil and staticMethodName ~= nil then
@@ -607,15 +609,15 @@ function ExpressionLowerer:lowerCall(context: any, node: Record, resultCount: nu
 		if recoveredResolution ~= nil and recoveredResolution.preserve_source_target ~= true then
 			namecallReceiver = host.lower_target_recovery_origin(context, node, recoveredResolution)
 		else
-			local receiverOutcome = self:lower(
-				context,
-				host.expect_record(functionNode.expr, "malformed_method_call", "method call is missing its receiver"),
-				"receiver"
-			)
-			if receiverOutcome.kind == "terminated" then
-				return receiverOutcome
+			local receiverNode = host.expect_record(functionNode.expr, "malformed_method_call", "method call is missing its receiver")
+			readReceiver = if host.place_closure_bound(context, receiverNode) then host.defer_register_local(context, receiverNode) else nil
+			if readReceiver == nil then
+				local receiverOutcome = self:lower(context, receiverNode, "receiver")
+				if receiverOutcome.kind == "terminated" then
+					return receiverOutcome
+				end
+				namecallReceiver = receiverOutcome.value
 			end
-			namecallReceiver = receiverOutcome.value
 		end
 		namecallMethod = if recoveredResolution ~= nil then recoveredResolution.namecall_method else staticMethodName
 	elseif intrinsicKind == nil then
@@ -660,6 +662,10 @@ function ExpressionLowerer:lowerCall(context: any, node: Record, resultCount: nu
 			return argumentOutcome
 		end
 		argumentPack = argumentOutcome.pack
+	end
+
+	if readReceiver ~= nil then
+		namecallReceiver = readReceiver()
 	end
 
 	if intrinsicKind ~= nil and intrinsicEvidence ~= nil then

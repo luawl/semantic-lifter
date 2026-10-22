@@ -294,6 +294,14 @@ function SourceRuntimeOracle.run(caseName: string, source: string, exported: any
 		assert(snapshot == "1/nil", "source frontend changed Luau's upvalue snapshot of a table constructor key in a child function")
 		assert(earlierItem == "1/2", "source frontend changed Luau's key read after an earlier item's call")
 		assert(listItem == "old/new", "source frontend changed Luau's in-order copy of a table constructor list item")
+	elseif caseName == "source-frontend-method-receiver-read-order" or caseName == "source-frontend-method-receiver-read-order-direct-locals" then
+		local grouped, leading, wrapped, statement, repeated, loopFirst, loopSecond, fieldReceiver, snapshot = exported(2)
+		assert(grouped == "new" and leading == "new" and wrapped == "new", "source frontend read a register local method receiver before the arguments ran")
+		assert(statement == "0/1", "source frontend read a register local method receiver before a statement call's arguments ran")
+		assert(repeated == "xyzxyz", "source frontend read a register local string receiver before the arguments ran")
+		assert(loopFirst == "new1" and loopSecond == "new2", "source frontend read a per-iteration register local receiver before the arguments ran")
+		assert(fieldReceiver == "old", "source frontend changed Luau's in-order field-read method receiver")
+		assert(snapshot == "old", "source frontend changed Luau's upvalue snapshot of a method receiver in a child function")
 	elseif caseName == "source-frontend-if-expression" then
 		assert(
 			string.find(source, 'consume(if condition() then arm("t") else arm("f"))', 1, true) ~= nil,
