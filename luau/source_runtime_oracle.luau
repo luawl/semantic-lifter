@@ -235,6 +235,42 @@ function SourceRuntimeOracle.run(caseName: string, source: string, exported: any
 		assert(first == 10 and second == 4, "source frontend changed Luau's in-order copy of generic call arguments")
 		assert(joined == "104", "source frontend changed Luau's in-order copy of concatenation operands")
 		assert(snapshot == 14, "source frontend changed Luau's upvalue snapshot in a child function")
+	elseif caseName == "source-frontend-index-base-read-order" or caseName == "source-frontend-index-base-read-order-direct-locals" then
+		local plain, arithmetic, grouped, metamethod, loopFirst, loopSecond, parameter, snapshot, constantKey, fieldTable =
+			exported(3, 4)
+		assert(plain == 100 and arithmetic == 200, "source frontend read a register local index table before the key ran")
+		assert(grouped == 100, "source frontend read a grouped register local index table before the key ran")
+		assert(metamethod == 100, "source frontend read a register local index table before a metamethod in the key ran")
+		assert(loopFirst == 100 and loopSecond == 200, "source frontend read a per-iteration register local index table before the key ran")
+		assert(parameter == 7, "source frontend read a register parameter index table before the key ran")
+		assert(snapshot == 3, "source frontend changed Luau's upvalue snapshot of an index table in a child function")
+		assert(constantKey == 4 and fieldTable == 3, "source frontend changed Luau's in-order index with a constant key or a field-read table")
+	elseif caseName == "source-frontend-assignment-target-read-order" or caseName == "source-frontend-assignment-target-read-order-direct-locals" then
+		local byName, byNumber, multiple, byKey, tableAndKey, ownTableWrite, ownKeyWrite, snapshot, fieldTable = exported("v")
+		assert(byName == "nil/v" and byNumber == "nil/v", "source frontend read a register local assignment table before the value ran")
+		assert(multiple == "nil/v,v!", "source frontend read a register local assignment table before a multiple assignment's values ran")
+		assert(byKey == "nil/v", "source frontend read a register local assignment key before the value ran")
+		assert(tableAndKey == "nil/nil,nil/v", "source frontend read a register local assignment table and key before the value ran")
+		assert(ownTableWrite == "v/nil" and ownKeyWrite == "v/nil", "source frontend read an assignment table or key after the statement wrote it")
+		assert(snapshot == "v/nil", "source frontend changed Luau's upvalue snapshot of an assignment table in a child function")
+		assert(fieldTable == "v/nil", "source frontend changed Luau's in-order field-read assignment table")
+	elseif caseName == "source-frontend-compound-table-target-read-order" or caseName == "source-frontend-compound-table-target-read-order-direct-locals" then
+		local byName, byNumber, byKey, concat, metamethod, snapshot, plain = exported(1, 2)
+		assert(byName == "1/3" and byNumber == "1/3", "source frontend stored a compound table target through a table read taken before the right-hand side ran")
+		assert(byKey == "1/3", "source frontend stored a compound table target through a key read taken before the right-hand side ran")
+		assert(concat == "p/pq", "source frontend stored a compound concatenation target through a table read taken before the right-hand side ran")
+		assert(metamethod == "nil/3", "source frontend stored a compound table target through a table read taken before its current-value metamethod ran")
+		assert(snapshot == "3/50", "source frontend changed Luau's single upvalue read of a compound table target in a child function")
+		assert(plain == 3, "source frontend changed a compound table assignment")
+	elseif caseName == "source-frontend-multiple-assignment-value-read-order" or caseName == "source-frontend-multiple-assignment-value-read-order-direct-locals" then
+		local fieldLocal, twoFields, keyed, parameter, localTarget, snapshot, single, ownWrite = exported("old")
+		assert(fieldLocal == "new/5" and twoFields == "new/5", "source frontend read a register local multiple-assignment table value before a later value ran")
+		assert(keyed == "new/5", "source frontend read a register local multiple-assignment value of a keyed target before a later value ran")
+		assert(parameter == "new/5", "source frontend read a register parameter multiple-assignment table value before a later value ran")
+		assert(localTarget == "old/5", "source frontend changed Luau's in-order copy of a local target's value")
+		assert(snapshot == "old/5", "source frontend changed Luau's upvalue snapshot of a multiple-assignment value in a child function")
+		assert(single == "old", "source frontend changed a single table assignment")
+		assert(ownWrite == "new/old", "source frontend read a table target's value after the statement wrote its own local")
 	elseif caseName == "source-frontend-if-expression" then
 		assert(
 			string.find(source, 'consume(if condition() then arm("t") else arm("f"))', 1, true) ~= nil,

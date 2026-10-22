@@ -330,7 +330,7 @@ local lowerFunctionExpression: (FunctionContext, Record, string?) -> ValueRef
 local lowerStatement: (FunctionContext, Record) -> ()
 local lowerStatementBlock: (FunctionContext, Record, boolean) -> ()
 local bindDeclaredLocal: (FunctionContext, Record, Record, ValueRef) -> ()
-local lowerValueList: (FunctionContext, { any }, number, { string }, Record, string) -> any
+local lowerValueList: (FunctionContext, { any }, number, { string }, Record, string, { Record }?) -> any
 local expressionLowerer: any
 
 local iterationLowerer = AstIteration.new({
@@ -504,9 +504,10 @@ lowerValueList = function(
 	targetCount: number,
 	nameHints: { string },
 	ownerNode: Record,
-	malformedCode: string
-): { ValueRef }
-	local results: { ValueRef } = {}
+	malformedCode: string,
+	targets: { Record }?
+): { any }
+	local results: { any } = {}
 	local scalarCount = #expressionNodes
 	local openExpression: Record? = nil
 	if scalarCount > 0 then
@@ -519,16 +520,30 @@ lowerValueList = function(
 	end
 
 	for index = 1, scalarCount do
-		local valueOutcome = lowerExpression(
-			context,
-			expectRecord(expressionNodes[index], malformedCode, "value-list member is not an AST node"),
-			if index <= targetCount then nameHints[index] else nil
-		)
-		if valueOutcome.kind == "terminated" then
-			return valueOutcome
+		local valueNode = expectRecord(expressionNodes[index], malformedCode, "value-list member is not an AST node")
+		local deferredValue = nil
+		if targets ~= nil and index <= targetCount then
+			local target = targets[index]
+			if target ~= nil and target.kind == "table" then
+				deferredValue = expressionLowerer.host.defer_register_local(context, valueNode)
+			end
 		end
-		if #results < targetCount then
-			table.insert(results, valueOutcome.value)
+		if deferredValue ~= nil then
+			if #results < targetCount then
+				table.insert(results, deferredValue)
+			end
+		else
+			local valueOutcome = lowerExpression(
+				context,
+				valueNode,
+				if index <= targetCount then nameHints[index] else nil
+			)
+			if valueOutcome.kind == "terminated" then
+				return valueOutcome
+			end
+			if #results < targetCount then
+				table.insert(results, valueOutcome.value)
+			end
 		end
 	end
 
@@ -697,7 +712,7 @@ local function lowerLocalFunction(context: FunctionContext, node: Record)
 	)
 end
 
-local function prepareAssignmentTarget(context: FunctionContext, target: Record): Record
+local function prepareAssignmentTarget(context: FunctionContext, target: Record, deferTarget: boolean?): Record
 	local targetTag = nodeTag(target)
 	if targetTag == "AstExprLocal" then
 		local localNode = expectRecord(target["local"], "malformed_assignment", "local assignment has no declaration identity")
@@ -707,7 +722,7 @@ local function prepareAssignmentTarget(context: FunctionContext, target: Record)
 		end
 		return Outcome.value({ kind = "local", binding = binding })
 	elseif targetTag == "AstExprIndexExpr" or targetTag == "AstExprIndexName" then
-		local addressOutcome = expressionLowerer:lowerIndexAddress(context, target)
+		local addressOutcome = expressionLowerer:lowerIndexAddress(context, target, deferTarget)
 		if addressOutcome.kind == "terminated" then
 			return addressOutcome
 		end
@@ -715,6 +730,8 @@ local function prepareAssignmentTarget(context: FunctionContext, target: Record)
 			kind = "table",
 			table_value = addressOutcome.value.table_value,
 			key = addressOutcome.value.key,
+			read_table = addressOutcome.value.read_table,
+			read_key = addressOutcome.value.read_key,
 		})
 	elseif targetTag == "AstExprGlobal" then
 		if type(target.global) ~= "string" or target.global == "" then
@@ -723,6 +740,15 @@ local function prepareAssignmentTarget(context: FunctionContext, target: Record)
 		return Outcome.value({ kind = "global", name = target.global })
 	end
 	return diagnostic("unsupported_assignment_target", target, `assignment target node {targetTag} is not supported`)
+end
+
+-- A table target's register-local base or key (read_table, read_key) is read where Luau reads its
+-- register: at the store, and once more for a compound assignment's current value
+-- in the order Luau evaluates them.
+local function tableTargetOperands(target: Record): (ValueRef, ValueRef)
+	local tableValue = if target.read_table ~= nil then target.read_table() else target.table_value
+	local keyValue = if target.read_key ~= nil then target.read_key() else target.key
+	return tableValue, keyValue
 end
 
 local function writeAssignmentTarget(context: FunctionContext, node: Record, target: Record, value: ValueRef)
@@ -735,9 +761,10 @@ local function writeAssignmentTarget(context: FunctionContext, node: Record, tar
 			instructionOptions(context.frontend, node, LifterIR.Effects.placeWrite())
 		)
 	elseif target.kind == "table" then
+		local tableValue, keyValue = tableTargetOperands(target)
 		context.frontend.builder:addInstruction(
 			context.block,
-			LifterIR.Operation.tableSet(target.table_value.id, target.key.id, value.id),
+			LifterIR.Operation.tableSet(tableValue.id, keyValue.id, value.id),
 			{},
 			instructionOptions(context.frontend, node, LifterIR.Effects.semanticTableWrite())
 		)
@@ -757,10 +784,11 @@ local function readAssignmentTarget(context: FunctionContext, node: Record, targ
 	if target.kind == "local" then
 		return materializeBinding(context, node, target.binding :: Binding, nil)
 	elseif target.kind == "table" then
+		local tableValue, keyValue = tableTargetOperands(target)
 		return scalarResult(
 			context,
 			node,
-			LifterIR.Operation.tableGet(target.table_value.id, target.key.id),
+			LifterIR.Operation.tableGet(tableValue.id, keyValue.id),
 			LifterIR.Types.dynamic(),
 			"compound_current",
 			LifterIR.Effects.semanticTableRead()
@@ -805,18 +833,30 @@ local function lowerAssignment(context: FunctionContext, node: Record)
 	local names = {}
 	for index, targetValue in targetNodes do
 		local targetNode = expectRecord(targetValue, "malformed_assignment", "assignment target is not an AST node")
-		local targetOutcome = prepareAssignmentTarget(context, targetNode)
+		local targetOutcome = prepareAssignmentTarget(context, targetNode, true)
 		if targetOutcome.kind == "terminated" then
 			return
 		end
 		table.insert(targets, targetOutcome.value)
 		table.insert(names, `assigned_{index}`)
 	end
-	local valuesOutcome = lowerValueList(context, expressionNodes, #targets, names, node, "malformed_assignment")
+	local valuesOutcome = lowerValueList(context, expressionNodes, #targets, names, node, "malformed_assignment", targets)
 	if valuesOutcome.kind == "terminated" then
 		return
 	end
 	local values = valuesOutcome.value
+	-- Luau stores through a register-local base or key as it is after every value ran and before the
+	-- statement assigns any of its locals, so every deferred read comes before the first write.
+	for index, target in targets do
+		if target.kind == "table" then
+			local tableValue, keyValue = tableTargetOperands(target)
+			targets[index] = { kind = "table", table_value = tableValue, key = keyValue }
+			local deferredValue = values[index]
+			if type(deferredValue) == "function" then
+				values[index] = deferredValue()
+			end
+		end
+	end
 	for index, target in targets do
 		writeAssignmentTarget(context, node, target, values[index])
 	end
@@ -824,7 +864,7 @@ end
 
 local function lowerCompoundAssignment(context: FunctionContext, node: Record)
 	local targetNode = expectRecord(node.var, "malformed_compound_assignment", "compound assignment is missing its target")
-	local targetOutcome = prepareAssignmentTarget(context, targetNode)
+	local targetOutcome = prepareAssignmentTarget(context, targetNode, true)
 	if targetOutcome.kind == "terminated" then
 		return
 	end

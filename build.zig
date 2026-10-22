@@ -1000,6 +1000,74 @@ pub fn build(b: *std.Build) void {
         "source-frontend-generic-initializer-read-after-direct-locals",
         "direct-locals-luau",
     );
+    const source_frontend_index_base_read_order_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/index_base_read_order_source.luau",
+        "source-frontend-index-base-read-order",
+    );
+    const source_frontend_index_base_read_order_direct_locals_conformance = addLuauSourceConformanceForTarget(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/index_base_read_order_source.luau",
+        "source-frontend-index-base-read-order-direct-locals",
+        "direct-locals-luau",
+    );
+    const source_frontend_assignment_target_read_order_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/assignment_target_read_order_source.luau",
+        "source-frontend-assignment-target-read-order",
+    );
+    const source_frontend_assignment_target_read_order_direct_locals_conformance = addLuauSourceConformanceForTarget(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/assignment_target_read_order_source.luau",
+        "source-frontend-assignment-target-read-order-direct-locals",
+        "direct-locals-luau",
+    );
+    const source_frontend_compound_table_target_read_order_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/compound_table_target_read_order_source.luau",
+        "source-frontend-compound-table-target-read-order",
+    );
+    const source_frontend_compound_table_target_read_order_direct_locals_conformance = addLuauSourceConformanceForTarget(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/compound_table_target_read_order_source.luau",
+        "source-frontend-compound-table-target-read-order-direct-locals",
+        "direct-locals-luau",
+    );
+    const source_frontend_multiple_assignment_value_read_order_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/multiple_assignment_value_read_order_source.luau",
+        "source-frontend-multiple-assignment-value-read-order",
+    );
+    const source_frontend_multiple_assignment_value_read_order_direct_locals_conformance = addLuauSourceConformanceForTarget(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/multiple_assignment_value_read_order_source.luau",
+        "source-frontend-multiple-assignment-value-read-order-direct-locals",
+        "direct-locals-luau",
+    );
     const source_frontend_table_pack_conformance = addLuauSourceConformance(
         b,
         exe,
@@ -1363,6 +1431,14 @@ pub fn build(b: *std.Build) void {
     source_frontend_proved_branch_unreachable_consumer_direct_locals_conformance.addTo(conformance_step);
     source_frontend_generic_initializer_read_after_conformance.addTo(conformance_step);
     source_frontend_generic_initializer_read_after_direct_locals_conformance.addTo(conformance_step);
+    source_frontend_index_base_read_order_conformance.addTo(conformance_step);
+    source_frontend_index_base_read_order_direct_locals_conformance.addTo(conformance_step);
+    source_frontend_assignment_target_read_order_conformance.addTo(conformance_step);
+    source_frontend_assignment_target_read_order_direct_locals_conformance.addTo(conformance_step);
+    source_frontend_compound_table_target_read_order_conformance.addTo(conformance_step);
+    source_frontend_compound_table_target_read_order_direct_locals_conformance.addTo(conformance_step);
+    source_frontend_multiple_assignment_value_read_order_conformance.addTo(conformance_step);
+    source_frontend_multiple_assignment_value_read_order_direct_locals_conformance.addTo(conformance_step);
     source_frontend_table_pack_conformance.addTo(conformance_step);
     source_frontend_function_statement_conformance.addTo(conformance_step);
     source_frontend_closure_store_environment_conformance.addTo(conformance_step);

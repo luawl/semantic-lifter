@@ -109,31 +109,60 @@ function ExpressionLowerer:_constantString(context: any, node: Record, value: st
 	)
 end
 
-function ExpressionLowerer:lowerIndexAddress(context: any, node: Record): any
+-- Luau reads a register local that is the base (or, for an assignment target, the key) of an index
+-- at the indexing instruction, after the key and the assigned values ran; another base or key is
+-- computed in order. A read's base place read follows its key.
+-- With deferTarget the base and key reads are returned unread (read_table, read_key) for the caller.
+function ExpressionLowerer:lowerIndexAddress(context: any, node: Record, deferTarget: boolean?): any
 	local host: Host = self.host
 	local tag = host.node_tag(node)
 	if tag == "AstExprIndexExpr" then
-		local tableOutcome = self:lower(context, host.expect_record(node.expr, "malformed_index", "index expression is missing its table"), nil)
-		if tableOutcome.kind == "terminated" then
-			return tableOutcome
+		local tableNode = host.expect_record(node.expr, "malformed_index", "index expression is missing its table")
+		local readTable = host.defer_register_local(context, tableNode)
+		local tableValue = nil
+		if readTable == nil then
+			local tableOutcome = self:lower(context, tableNode, nil)
+			if tableOutcome.kind == "terminated" then
+				return tableOutcome
+			end
+			tableValue = tableOutcome.value
 		end
-		local keyOutcome = self:lower(context, host.expect_record(node.index, "malformed_index", "index expression is missing its key"), nil)
-		if keyOutcome.kind == "terminated" then
-			return keyOutcome
+		local keyNode = host.expect_record(node.index, "malformed_index", "index expression is missing its key")
+		local readKey = if deferTarget then host.defer_register_local(context, keyNode) else nil
+		local keyValue = nil
+		if readKey == nil then
+			local keyOutcome = self:lower(context, keyNode, nil)
+			if keyOutcome.kind == "terminated" then
+				return keyOutcome
+			end
+			keyValue = keyOutcome.value
 		end
-		return Outcome.value({ table_value = tableOutcome.value, key = keyOutcome.value })
+		if deferTarget then
+			return Outcome.value({ table_value = tableValue, key = keyValue, read_table = readTable, read_key = readKey })
+		end
+		if readTable ~= nil then
+			tableValue = readTable()
+		end
+		return Outcome.value({ table_value = tableValue, key = keyValue })
 	elseif tag == "AstExprIndexName" then
 		local index, indexProblem = AstExpressionScalar.indexName(node)
 		if indexProblem ~= nil then
 			host.diagnostic(indexProblem.code, indexProblem.node, indexProblem.detail)
 		end
-		local tableOutcome = self:lower(context, host.expect_record(node.expr, "malformed_index", "named index is missing its table"), nil)
-		if tableOutcome.kind == "terminated" then
-			return tableOutcome
+		local tableNode = host.expect_record(node.expr, "malformed_index", "named index is missing its table")
+		local readTable = if deferTarget then host.defer_register_local(context, tableNode) else nil
+		local tableValue = nil
+		if readTable == nil then
+			local tableOutcome = self:lower(context, tableNode, nil)
+			if tableOutcome.kind == "terminated" then
+				return tableOutcome
+			end
+			tableValue = tableOutcome.value
 		end
 		return Outcome.value({
-			table_value = tableOutcome.value,
+			table_value = tableValue,
 			key = self:_constantString(context, node, index :: string, "field_key"),
+			read_table = readTable,
 		})
 	end
 	return host.diagnostic("unsupported_index_address", node, `expression node {tag} is not an indexed place`)
