@@ -483,6 +483,22 @@ pub fn build(b: *std.Build) void {
         "loop-owned-exit-flag",
         luau_loop_owned_exit_flag_conformance.resolved_ir,
     );
+    const luau_iteration_header_forwarder_conformance = addLuauFixtureConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/iteration_header_forwarder_conformance.luau",
+        "iteration-header-forwarder",
+    );
+    const iteration_header_forwarder_dispatcher = addDispatcherRuntimeConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "iteration-header-forwarder",
+        luau_iteration_header_forwarder_conformance.resolved_ir,
+    );
     const luau_open_pack_projection_conformance = addLuauFixtureConformance(
         b,
         exe,
@@ -1598,6 +1614,8 @@ pub fn build(b: *std.Build) void {
     conformance_step.dependOn(&wrapped_continue_layout.step);
     luau_loop_owned_exit_flag_conformance.addTo(conformance_step);
     conformance_step.dependOn(loop_owned_exit_flag_dispatcher);
+    luau_iteration_header_forwarder_conformance.addTo(conformance_step);
+    conformance_step.dependOn(iteration_header_forwarder_dispatcher);
     luau_open_pack_projection_conformance.addTo(conformance_step);
     luau_closed_pack_discard_conformance.addTo(conformance_step);
     luau_table_conformance.addTo(conformance_step);

@@ -49,6 +49,7 @@ pub const Plan = struct {
     repeated_blocks: []bool,
     loop_header_blocks: []bool,
     native_iteration_headers: []bool,
+    native_reentry_forwarders: []bool,
     instruction_scopes: []ScopeId,
     value_scopes: []ScopeId,
     pack_scopes: []ScopeId,
@@ -101,6 +102,9 @@ pub const Plan = struct {
         const native_iteration_headers = try allocator.alloc(bool, program.blocks.len);
         errdefer allocator.free(native_iteration_headers);
         @memset(native_iteration_headers, false);
+        const native_reentry_forwarders = try allocator.alloc(bool, program.blocks.len);
+        errdefer allocator.free(native_reentry_forwarders);
+        @memset(native_reentry_forwarders, false);
         const instruction_scopes = try allocator.alloc(ScopeId, program.instructions.len);
         errdefer allocator.free(instruction_scopes);
         @memset(instruction_scopes, invalid_scope);
@@ -156,6 +160,7 @@ pub const Plan = struct {
             .repeated_blocks = repeated_blocks,
             .loop_header_blocks = loop_header_blocks,
             .native_iteration_headers = native_iteration_headers,
+            .native_reentry_forwarders = native_reentry_forwarders,
             .instruction_scopes = instruction_scopes,
             .value_scopes = value_scopes,
             .pack_scopes = pack_scopes,
@@ -224,6 +229,7 @@ pub const Plan = struct {
         self.allocator.free(self.pack_scopes);
         self.allocator.free(self.value_scopes);
         self.allocator.free(self.instruction_scopes);
+        self.allocator.free(self.native_reentry_forwarders);
         self.allocator.free(self.native_iteration_headers);
         self.allocator.free(self.loop_header_blocks);
         self.allocator.free(self.repeated_blocks);
@@ -317,6 +323,14 @@ pub const Plan = struct {
 
     pub fn nativeIterationConsumesParameters(self: *const Plan, block_id: ir.BlockId) bool {
         return block_id.index() < self.native_iteration_headers.len and self.native_iteration_headers[block_id.index()];
+    }
+
+    /// No edge into this block writes a parameter copy: a native header (its loop statement holds the state) or a
+    /// forwarding block on such a header's re-entry path (its parameters only carry the transition state there).
+    /// Whether a node is written as a native loop is asked of `nativeIterationConsumesParameters` alone.
+    pub fn edgeParametersConsumed(self: *const Plan, block_id: ir.BlockId) bool {
+        if (self.nativeIterationConsumesParameters(block_id)) return true;
+        return block_id.index() < self.native_reentry_forwarders.len and self.native_reentry_forwarders[block_id.index()];
     }
 
     pub fn instructionDeclaresResults(self: *const Plan, instruction_id: ir.InstructionId) bool {
@@ -994,6 +1008,7 @@ pub const Plan = struct {
                     };
                     if (activated) {
                         self.native_iteration_headers[loop.header.index()] = true;
+                        self.markReentryForwarders(loop, match);
                     }
                 }
                 try self.markNativeIterationDeclarations(loop.body_region);
@@ -1040,6 +1055,26 @@ pub const Plan = struct {
                 }
             },
         };
+    }
+
+    /// Marks the pure forwarding blocks on an activated cyclic native header's re-entry path, exactly the blocks the
+    /// loop's match walks (`iteration_protocol.markReentryForwarders`), and suppresses the declarations of their
+    /// parameters that are not value aliases: they only carry the transition state to the header, which the native
+    /// loop computes itself, so no edge into them writes a copy and nothing reads them. A forwarder on the entry path
+    /// carries the initializers the loop line reads and is not walked.
+    fn markReentryForwarders(self: *Plan, loop: structure.Loop, match: iteration_protocol.Match) void {
+        const transition = switch (match) {
+            .numeric => |numeric| numeric.transition,
+            .generic => |generic| generic.transition,
+        };
+        iteration_protocol.markReentryForwarders(self.program, self.analysis, loop, transition, self.native_reentry_forwarders);
+        for (self.native_reentry_forwarders, 0..) |marked, index| {
+            if (!marked) continue;
+            for (self.program.blocks[index].parameters) |parameter| {
+                if (self.dead.isValueAlias(parameter)) continue;
+                _ = self.markSuppressedControlValue(parameter, self.value_scopes[parameter.index()]);
+            }
+        }
     }
 
     fn activateNativeIteration(

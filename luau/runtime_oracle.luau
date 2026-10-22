@@ -370,6 +370,8 @@ elseif caseName == "iteration-continue-completion" then
 	exported = IterationHeaderEntryRuntimeOracle.run(chunk, source, caseName)
 elseif caseName == "iteration-boundary-body-continue" then
 	exported = IterationHeaderEntryRuntimeOracle.run(chunk, source, caseName)
+elseif caseName == "iteration-header-forwarder" then
+	exported = IterationHeaderEntryRuntimeOracle.run(chunk, source, caseName)
 elseif caseName == "wrapped-continue" then
 	exported = WrappedContinueRuntimeOracle.run(chunk, source, caseName)
 elseif caseName == "loop-owned-exit-flag" then
@@ -676,6 +678,8 @@ elseif caseName == "iteration-continue-completion" then
 	assert(type(exported) == "function", "iteration continue-completion runtime oracle did not retain its worker")
 elseif caseName == "iteration-boundary-body-continue" then
 	assert(type(exported) == "function", "iteration boundary-body continue runtime oracle did not retain its worker")
+elseif caseName == "iteration-header-forwarder" then
+	assert(type(exported) == "function", "iteration header-forwarder runtime oracle did not retain its worker")
 elseif caseName == "wrapped-continue" then
 	assert(type(exported) == "function", "wrapped-continue runtime oracle did not retain its worker")
 elseif caseName == "loop-owned-exit-flag" then

@@ -839,7 +839,50 @@ fn internalTransitionPathCount(
     edge: ir.Edge,
 ) ?usize {
     if (iteration_state.transitionStateMatches(program, transition, edge.arguments)) return 1;
-    return forwardingTransitionPathCount(program, analysis, loop, transition, source_id, edge, edge.arguments, 0);
+    return forwardingTransitionPathCount(program, analysis, loop, transition, source_id, edge, edge.arguments, 0, null);
+}
+
+/// Marks in `forwarders` (one flag per block) each pure forwarding block the match of `loop` walks on the header's
+/// re-entry path: a block of the loop body with no instructions and a jump toward the header that passes the
+/// transition state on through its parameters (`forwardingTransitionPathCount`). Call it only for a loop the match
+/// accepted, so that the walk succeeds on every internal edge into the header. A block whose edge into the header
+/// carries the transition state itself, such as a join that only feeds a branch expression, is no forwarder, and
+/// a forwarder on the entry path is no internal edge's source.
+pub fn markReentryForwarders(
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    loop: structure.Loop,
+    transition: ir.Instruction,
+    forwarders: []bool,
+) void {
+    if (loop.header.index() >= program.blocks.len) return;
+    const header = program.blocks[loop.header.index()];
+    for (program.blocks) |source| {
+        if (source.function != header.function or !analysis.isReachable(source.id)) continue;
+        if (!regionContainsBlock(loop.body_region, source.id)) continue;
+        switch (source.terminator) {
+            .jump => |edge| markForwardersOnEdge(program, analysis, loop, transition, source.id, edge, forwarders),
+            .branch => |branch| {
+                markForwardersOnEdge(program, analysis, loop, transition, source.id, branch.then_edge, forwarders);
+                markForwardersOnEdge(program, analysis, loop, transition, source.id, branch.else_edge, forwarders);
+            },
+            else => {},
+        }
+    }
+}
+
+fn markForwardersOnEdge(
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    loop: structure.Loop,
+    transition: ir.Instruction,
+    source: ir.BlockId,
+    edge: ir.Edge,
+    forwarders: []bool,
+) void {
+    if (edge.target != loop.header or edge.arguments.len != 4) return;
+    if (iteration_state.transitionStateMatches(program, transition, edge.arguments)) return;
+    _ = forwardingTransitionPathCount(program, analysis, loop, transition, source, edge, edge.arguments, 0, forwarders);
 }
 
 fn forwardingTransitionPathCount(
@@ -851,6 +894,7 @@ fn forwardingTransitionPathCount(
     expected_outgoing: ir.Edge,
     final_arguments: []const ir.ValueId,
     depth: usize,
+    forwarders: ?[]bool,
 ) ?usize {
     if (depth >= program.blocks.len or forwarding_id.index() >= program.blocks.len or final_arguments.len != 4) return null;
     const forwarding = program.blocks[forwarding_id.index()];
@@ -860,6 +904,9 @@ fn forwardingTransitionPathCount(
         else => return null,
     };
     if (!sameEdge(outgoing, expected_outgoing)) return null;
+    if (forwarders) |marks| {
+        if (forwarding_id.index() < marks.len) marks[forwarding_id.index()] = true;
+    }
 
     var count: usize = 0;
     for (program.blocks) |predecessor| {
@@ -876,6 +923,7 @@ fn forwardingTransitionPathCount(
                     candidate,
                     final_arguments,
                     depth,
+                    forwarders,
                 ) orelse return null;
                 count = std.math.add(usize, count, added) catch return null;
             },
@@ -890,6 +938,7 @@ fn forwardingTransitionPathCount(
                     branch.then_edge,
                     final_arguments,
                     depth,
+                    forwarders,
                 ) orelse return null;
                 count = std.math.add(usize, count, then_added) catch return null;
                 const else_added = forwardingPredecessorPathCount(
@@ -902,6 +951,7 @@ fn forwardingTransitionPathCount(
                     branch.else_edge,
                     final_arguments,
                     depth,
+                    forwarders,
                 ) orelse return null;
                 count = std.math.add(usize, count, else_added) catch return null;
             },
@@ -921,6 +971,7 @@ fn forwardingPredecessorPathCount(
     incoming: ir.Edge,
     final_arguments: []const ir.ValueId,
     depth: usize,
+    forwarders: ?[]bool,
 ) ?usize {
     if (incoming.target != forwarding.id) return 0;
     if (predecessor == forwarding.id or !regionContainsBlock(loop.body_region, predecessor) or
@@ -945,6 +996,7 @@ fn forwardingPredecessorPathCount(
         incoming,
         &resolved,
         depth + 1,
+        forwarders,
     );
 }
 
@@ -1664,6 +1716,85 @@ test "numeric iteration protocol composes multiple forwarding latches" {
     defer changed_plan.deinit();
     const changed_loop = firstLoop(&changed_plan) orelse return error.TestUnexpectedResult;
     try std.testing.expect((try matchLoop(std.testing.allocator, &program, changed_loop)) == null);
+}
+
+test "a numeric loop marks exactly the forwarding blocks its match walks on the re-entry path" {
+    const fixture = numeric_test_fixture;
+    const first_forwarding = ir.BlockId.fromIndex(fixture.blocks.len);
+    const second_forwarding = ir.BlockId.fromIndex(fixture.blocks.len + 1);
+    const first_control = ir.ValueId.fromIndex(fixture.values.len);
+    const first_limit = ir.ValueId.fromIndex(fixture.values.len + 1);
+    const first_step = ir.ValueId.fromIndex(fixture.values.len + 2);
+    const first_initial = ir.ValueId.fromIndex(fixture.values.len + 3);
+    const first_extra = ir.ValueId.fromIndex(fixture.values.len + 4);
+    const second_limit = ir.ValueId.fromIndex(fixture.values.len + 5);
+    const second_control = ir.ValueId.fromIndex(fixture.values.len + 6);
+    const second_step = ir.ValueId.fromIndex(fixture.values.len + 7);
+    const second_initial = ir.ValueId.fromIndex(fixture.values.len + 8);
+    const values = fixture.values ++ [_]ir.Value{
+        .{ .id = first_control, .function = fixture.f, .type = .number, .origin = .{ .block_parameter = .{ .block = first_forwarding, .index = 0 } } },
+        .{ .id = first_limit, .function = fixture.f, .type = .number, .origin = .{ .block_parameter = .{ .block = first_forwarding, .index = 1 } } },
+        .{ .id = first_step, .function = fixture.f, .type = .number, .origin = .{ .block_parameter = .{ .block = first_forwarding, .index = 2 } } },
+        .{ .id = first_initial, .function = fixture.f, .type = .boolean, .origin = .{ .block_parameter = .{ .block = first_forwarding, .index = 3 } } },
+        .{ .id = first_extra, .function = fixture.f, .type = .dynamic, .origin = .{ .block_parameter = .{ .block = first_forwarding, .index = 4 } } },
+        .{ .id = second_limit, .function = fixture.f, .type = .number, .origin = .{ .block_parameter = .{ .block = second_forwarding, .index = 0 } } },
+        .{ .id = second_control, .function = fixture.f, .type = .number, .origin = .{ .block_parameter = .{ .block = second_forwarding, .index = 1 } } },
+        .{ .id = second_step, .function = fixture.f, .type = .number, .origin = .{ .block_parameter = .{ .block = second_forwarding, .index = 2 } } },
+        .{ .id = second_initial, .function = fixture.f, .type = .boolean, .origin = .{ .block_parameter = .{ .block = second_forwarding, .index = 3 } } },
+    };
+    var blocks = fixture.blocks ++ [_]ir.Block{
+        .{
+            .id = first_forwarding,
+            .function = fixture.f,
+            .parameters = &.{ first_control, first_limit, first_step, first_initial, first_extra },
+            .terminator = .{ .jump = .{
+                .target = second_forwarding,
+                .arguments = &.{ first_limit, first_control, first_step, first_initial },
+            } },
+        },
+        .{
+            .id = second_forwarding,
+            .function = fixture.f,
+            .parameters = &.{ second_limit, second_control, second_step, second_initial },
+            .terminator = .{ .jump = .{
+                .target = fixture.b_header,
+                .arguments = &.{ second_control, second_limit, second_step, second_initial },
+            } },
+        },
+    };
+    blocks[fixture.b_body.index()].terminator = .{ .jump = .{
+        .target = first_forwarding,
+        .arguments = &.{ fixture.v_index, fixture.v_normalized_limit, fixture.v_normalized_step, fixture.v_false, fixture.v_true },
+    } };
+    var functions = fixture.functions;
+    functions[0].blocks = &.{ fixture.b_entry, fixture.b_header, fixture.b_body, first_forwarding, second_forwarding, fixture.b_exit };
+    var program = fixture.program;
+    program.functions = &functions;
+    program.blocks = &blocks;
+    program.values = &values;
+
+    // The body reaches the header through two forwarding blocks, the first with a parameter it does not pass on: the
+    // match walks both, and only those two are marked.
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, functions[0]);
+    defer analysis.deinit();
+    var plan = try structure.Plan.init(std.testing.allocator, &analysis);
+    defer plan.deinit();
+    const loop = firstLoop(&plan) orelse return error.TestUnexpectedResult;
+    const matched = (try matchLoop(std.testing.allocator, &program, loop)) orelse return error.TestUnexpectedResult;
+    var marks = [_]bool{false} ** 6;
+    markReentryForwarders(&program, &analysis, loop, matched.numeric.transition, &marks);
+    try std.testing.expectEqualSlices(bool, &.{ false, false, false, false, true, true }, &marks);
+
+    // The canonical loop's body enters the header with the transition state itself: no block is a forwarder.
+    var canonical_analysis = try cfg.Analysis.init(std.testing.allocator, &fixture.program, fixture.functions[0]);
+    defer canonical_analysis.deinit();
+    var canonical_plan = try structure.Plan.init(std.testing.allocator, &canonical_analysis);
+    defer canonical_plan.deinit();
+    const canonical_loop = firstLoop(&canonical_plan) orelse return error.TestUnexpectedResult;
+    const canonical = (try matchLoop(std.testing.allocator, &fixture.program, canonical_loop)) orelse return error.TestUnexpectedResult;
+    var canonical_marks = [_]bool{false} ** 4;
+    markReentryForwarders(&fixture.program, &canonical_analysis, canonical_loop, canonical.numeric.transition, &canonical_marks);
+    try std.testing.expectEqualSlices(bool, &.{ false, false, false, false }, &canonical_marks);
 }
 
 test "numeric iteration protocol rejects observable hidden state" {

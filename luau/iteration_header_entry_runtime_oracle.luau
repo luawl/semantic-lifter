@@ -2,13 +2,15 @@
 --!nolint DeprecatedApi
 -- Runtime oracle for native loops whose header is entered from an inner loop, a loop control, a loop-boundary
 -- arm or an earlier loop (iteration-header-entry), for the explicit continues of a native loop that guards its
--- exit copy with a completion local (iteration-continue-completion), and for the continue a wrapped
--- loop-boundary body region ends with (iteration-boundary-body-continue). Every worker runs over a grid of rows
--- against a reference written by hand: the result and the order of its callback calls must match. The first and
--- the third case run the chunk under an environment that records, per worker, every global write and every
--- read of a name the real environment does not hold (getfenv and setfenv install it), and both must stay empty.
--- In the structured text (no __lifter_pc) the native loops keep their form, every native loop guards its exit
--- copy, and every continue inside a guarded loop is preceded by the loop's completion write.
+-- exit copy with a completion local (iteration-continue-completion), for the continue a wrapped loop-boundary
+-- body region ends with (iteration-boundary-body-continue), and for native loops whose body re-enters the header
+-- through a pure forwarding block (iteration-header-forwarder). Every worker runs over a grid of rows against a
+-- reference written by hand: the result and the order of its callback calls must match. The first, third and
+-- fourth case run the chunk under an environment that records, per worker, every global write and every read of a
+-- name the real environment does not hold (getfenv and setfenv install it), and both must stay empty. In the
+-- structured text (no __lifter_pc) the native loops keep their form, every native loop guards its exit copy, and
+-- every continue inside a guarded loop is preceded by the loop's completion write; in the fourth case no
+-- forwarder parameter is named, the entry forwarder keeps its parameters, and only the outer loops are guarded.
 -- A passing case prints nothing. A failing case prints one line per worker, `<case> <worker> rows=<R>
 -- mismatches=<M>` with the environment counts where they apply and the first differing row, then the line
 -- `<case> pins …`, and fails one assertion that counts the failed workers.
@@ -106,7 +108,7 @@ end
 -- The grid of the first two cases: n 0..4, m 0..2, 32 masks for f, 4 for g and 2 for the value observe returns
 -- (3840 rows). Each shape's reference is the loop the worker's IR spells, run over index = 1..n.
 local function gridReference(shape: string, n: number, m: number, f: any, g: any, observe: any): any
-	if shape == "pre_while_boundary_entry" then
+	if shape == "pre_while_boundary_entry" or shape == "entry_forwarder" then
 		local j = 1
 		while not (m < j) do
 			if f(j) then
@@ -117,7 +119,7 @@ local function gridReference(shape: string, n: number, m: number, f: any, g: any
 		end
 	end
 	for index = 1, n do
-		if shape == "arm_inner_loop_exits_to_header" then
+		if shape == "arm_inner_loop_exits_to_header" or shape == "loop_exit_forwarder" or shape == "native_exit_forwarder" then
 			if f(index) then
 				local j = 1
 				while not (m < j) do
@@ -127,7 +129,7 @@ local function gridReference(shape: string, n: number, m: number, f: any, g: any
 			else
 				observe(index)
 			end
-		elseif shape == "inner_latch_exit" then
+		elseif shape == "inner_latch_exit" or shape == "latch_exit_forwarder" then
 			local j = 1
 			while true do
 				observe(j)
@@ -152,7 +154,7 @@ local function gridReference(shape: string, n: number, m: number, f: any, g: any
 			end
 		elseif shape == "pre_while_boundary_entry" then
 			observe(index)
-		elseif shape == "diamond_continue" or shape == "latch_diamond" then
+		elseif shape == "diamond_continue" or shape == "latch_diamond" or shape == "chain_forwarder" then
 			if not (f(index) and g(index)) then
 				observe(index)
 			end
@@ -171,6 +173,40 @@ local function gridReference(shape: string, n: number, m: number, f: any, g: any
 			if not continued then
 				observe(index)
 			end
+		elseif shape == "entry_forwarder" then
+			observe(index)
+			if not f(index) then
+				observe(index)
+			end
+		elseif shape == "boundary_exit_forwarder" then
+			local j = 1
+			while not (m < j) do
+				if f(index, j) then
+					break
+				end
+				observe(j)
+				j += 1
+			end
+		elseif shape == "escape_arm_forwarder" then
+			if f(index) then
+				local j = 1
+				local escaped = false
+				while not (m < j) do
+					if g(j) then
+						escaped = true
+						break
+					end
+					observe(j)
+					j += 1
+				end
+				if not escaped then
+					observe(index)
+				end
+			else
+				observe(index)
+			end
+		elseif shape == "branch_expression_join" then
+			observe(index)
 		else
 			error(`no reference for {shape}`)
 		end
@@ -200,7 +236,7 @@ local function checkGridWorker(recorder: Recorder?, shape: string, kind: string,
 	if recorder ~= nil then
 		recorder.active = label
 	end
-	local twoArgument = shape == "nested_while_continue"
+	local twoArgument = shape == "nested_while_continue" or shape == "boundary_exit_forwarder"
 	for n = 0, 4 do
 		for m = 0, 2 do
 			for mask = 0, 31 do
@@ -434,6 +470,23 @@ local function checkPins(source: string, numericLoops: number, genericLoops: num
 	return text, pass
 end
 
+-- The fourth case's text pins: no name of a re-entry forwarder's parameter (`forwarded_`), the entry forwarder's
+-- parameters named, the native loops kept, and only the outer numeric and generic loops guarded (an inner native
+-- loop that leaves into a forwarder writes no copy, so it needs no completion local).
+local function checkForwarderPins(source: string, numericLoops: number, genericLoops: number, guardedLoops: number): (string, boolean)
+	if string.find(source, "__lifter_pc", 1, true) ~= nil then
+		return "pins skipped (dispatcher form)", true
+	end
+	local forwarded = countMatches(source, "%f[%w_]forwarded_[%w_]*")
+	local initial = countMatches(source, "%f[%w_]initial_control%f[^%w_]")
+	local numeric = countMatches(source, "for%s+[%a_][%w_]*%s*=")
+	local generic = countMatches(source, "for%s+[%a_][%w_]*%s+in%s+")
+	local guarded = guardedContinues(source)
+	local text = `pins forwarded_names={forwarded}/0 initial_control={initial}/>=1 numeric_for={numeric}/{numericLoops} generic_for={generic}/{genericLoops} guarded_for={guarded}/{guardedLoops}`
+	local pass = forwarded == 0 and initial >= 1 and numeric == numericLoops and generic == genericLoops and guarded == guardedLoops
+	return text, pass
+end
+
 local function collectWorkers(chunk: any, count: number, caseName: string): { any }
 	local workers = table.pack(chunk())
 	assert(workers.n == count, `{caseName} fixture returned {workers.n} workers, expected {count}`)
@@ -518,6 +571,35 @@ local function runBoundaryBodyContinue(chunk: any, source: string): any
 	return workers[1]
 end
 
+local function runHeaderForwarder(chunk: any, source: string): any
+	local report: Report = { caseName = "iteration-header-forwarder", lines = {}, failed = 0, total = 0 }
+	local recorder = newRecorder()
+	setfenv(chunk, recorder.env)
+	local workers = collectWorkers(chunk, 27, report.caseName)
+	addChunkLine(report, recorder)
+	local index = 0
+	for _, shape in {
+		"latch_diamond",
+		"loop_exit_forwarder",
+		"native_exit_forwarder",
+		"entry_forwarder",
+		"boundary_exit_forwarder",
+		"escape_arm_forwarder",
+		"latch_exit_forwarder",
+		"chain_forwarder",
+		"branch_expression_join",
+	} do
+		for _, kind in { "numeric", "generic", "semantic" } do
+			index += 1
+			local line, clean = checkGridWorker(recorder, shape, kind, workers[index])
+			addLine(report, line, clean)
+		end
+	end
+	local pins, pinsPass = checkForwarderPins(source, 12, 9, 18)
+	finish(report, pins, pinsPass)
+	return workers[1]
+end
+
 function IterationHeaderEntryRuntimeOracle.run(chunk: any, source: string, caseName: string): any
 	if caseName == "iteration-header-entry" then
 		return runHeaderEntry(chunk, source)
@@ -525,6 +607,8 @@ function IterationHeaderEntryRuntimeOracle.run(chunk: any, source: string, caseN
 		return runContinueCompletion(chunk, source)
 	elseif caseName == "iteration-boundary-body-continue" then
 		return runBoundaryBodyContinue(chunk, source)
+	elseif caseName == "iteration-header-forwarder" then
+		return runHeaderForwarder(chunk, source)
 	end
 	error(`unknown conformance case {caseName}`)
 end

@@ -768,7 +768,7 @@ fn addEdgeTemporaryFrame(
     edge: ir.Edge,
     temporaries: []usize,
 ) void {
-    if (edge.target.index() >= program.blocks.len or scopes.nativeIterationConsumesParameters(edge.target)) return;
+    if (edge.target.index() >= program.blocks.len or scopes.edgeParametersConsumed(edge.target)) return;
     const frame_size = edgeAssignmentCycleCount(program, emission, edge);
     if (frame_size == 0) return;
     if (scopes.blockScope(source)) |scope| addTemporaryAtScope(temporaries, scopes, scope, frame_size);

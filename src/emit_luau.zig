@@ -2645,7 +2645,7 @@ fn loopExitTransferWritesParameters(
     scopes: *const emission_scope.Plan,
     edge: ir.Edge,
 ) bool {
-    if (edge.target.index() >= program.blocks.len or scopes.nativeIterationConsumesParameters(edge.target)) return false;
+    if (edge.target.index() >= program.blocks.len or scopes.edgeParametersConsumed(edge.target)) return false;
     const target = program.blocks[edge.target.index()];
     for (target.parameters) |parameter| {
         if (!emission_plan.dead.isValueAlias(parameter)) return true;
@@ -4053,7 +4053,7 @@ fn emitEdgeParametersUnlessConsumed(
     declare: bool,
     place_aliases: []const PlaceAlias,
 ) !void {
-    if (scopes.nativeIterationConsumesParameters(target.id)) return;
+    if (scopes.edgeParametersConsumed(target.id)) return;
     try emitEdgeParameters(output, allocator, program, emission_plan, target, arguments, indent, declare, place_aliases);
 }
 
