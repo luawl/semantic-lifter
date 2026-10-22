@@ -459,6 +459,14 @@ pub fn build(b: *std.Build) void {
         "wrapped-continue",
         luau_wrapped_continue_conformance.resolved_ir,
     );
+    const wrapped_local_continue_layout = b.addSystemCommand(&.{ luneExe(b), "run" });
+    wrapped_local_continue_layout.addFileArg(b.path("luau/structured_layout_oracle.luau"));
+    wrapped_local_continue_layout.addArg("source-frontend-wrapped-local-continue");
+    wrapped_local_continue_layout.addFileArg(source_frontend_wrapped_local_continue_conformance.generated_luau);
+    const wrapped_continue_layout = b.addSystemCommand(&.{ luneExe(b), "run" });
+    wrapped_continue_layout.addFileArg(b.path("luau/structured_layout_oracle.luau"));
+    wrapped_continue_layout.addArg("wrapped-continue");
+    wrapped_continue_layout.addFileArg(luau_wrapped_continue_conformance.generated_luau);
     const luau_open_pack_projection_conformance = addLuauFixtureConformance(
         b,
         exe,
@@ -1570,6 +1578,8 @@ pub fn build(b: *std.Build) void {
     conformance_step.dependOn(wrapped_local_continue_dispatcher);
     luau_wrapped_continue_conformance.addTo(conformance_step);
     conformance_step.dependOn(wrapped_continue_dispatcher);
+    conformance_step.dependOn(&wrapped_local_continue_layout.step);
+    conformance_step.dependOn(&wrapped_continue_layout.step);
     luau_open_pack_projection_conformance.addTo(conformance_step);
     luau_closed_pack_discard_conformance.addTo(conformance_step);
     luau_table_conformance.addTo(conformance_step);

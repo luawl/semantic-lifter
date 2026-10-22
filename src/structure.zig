@@ -93,6 +93,10 @@ pub const ContinueProjection = struct {
     target: ir.BlockId,
     edge: ?ir.Edge,
     forwarding: ?control_flow.ForwardingPath = null,
+    /// A continue to the region's own continue target carried by an escape flag instead of a lexical `continue`,
+    /// because the innermost Luau loop statement around its writer is a transfer wrapper that stops at another
+    /// block (`markFlaggedContinues`). The escape census counts it as it counts a nonlocal continue.
+    via_flag: bool = false,
 };
 
 pub const EscapeProjection = struct {
@@ -414,9 +418,171 @@ pub fn loopFreeTargetsAlloc(
 pub fn regionOwnsEscape(region: *const Region) bool {
     const target = region.stop orelse return false;
     if (region.continue_projection) |projection| {
-        if (region.continue_target == null or region.continue_target.? != projection.target) return true;
+        if (continueProjectionUsesFlag(region, projection)) return true;
     }
     return nodesEscapeTo(region.nodes, target);
+}
+
+/// Whether a region's continue projection is written as an escape flag, which every transfer wrapper on the way
+/// forwards and the loop body's wrapper consumes as a `continue`, rather than as a lexical `continue`: its target is
+/// not the region's continue target, or `markFlaggedContinues` found that a lexical `continue` would bind to a
+/// wrapper that stops at another block.
+fn continueProjectionUsesFlag(region: *const Region, projection: ContinueProjection) bool {
+    return region.continue_target == null or region.continue_target.? != projection.target or projection.via_flag;
+}
+
+/// A Luau loop statement the readable writers put around a region's text, as `markFlaggedContinues` models it: a
+/// transfer wrapper (`repeat ... until true`), whose end reaches `stop`, or a loop, whose next pass starts at `header`
+/// (`stop` is its body region's stop). `parent` is the statement around it.
+const EnclosingStatement = struct {
+    kind: enum { wrapper, loop },
+    header: ?ir.BlockId = null,
+    stop: ?ir.BlockId = null,
+    parent: ?*const EnclosingStatement = null,
+};
+
+/// Marks each continue projection to its region's own continue target whose writer would put a lexical `continue`
+/// inside a transfer wrapper (`repeat ... until true`) that stops at another block: Luau binds that `continue` to the
+/// wrapper, and leaving the wrapper reaches its stop, not the loop's next pass. A marked projection is carried by an
+/// escape flag (`ContinueProjection.via_flag`), and the escape census counts it as it counts a nonlocal continue, so
+/// the writer sets the flag and leaves its wrapper, each wrapper on the way forwards the flag, and the loop body's
+/// wrapper consumes it as a `continue`. Counting it can put a wrapper around a region that had none, which can
+/// capture another continue, so the walk repeats until it marks nothing more. Only a continue to a loop header that is
+/// also the loop body region's stop is marked, so that region captures the flag and no census outside the loop
+/// moves; any other captured continue stays lexical, and its writer refuses it.
+pub fn markFlaggedContinues(allocator: std.mem.Allocator, root: *Region) std.mem.Allocator.Error!void {
+    while (try markRegionContinues(allocator, root, null, false)) {}
+}
+
+/// The readable writer's wrapper test (`emitRegionWithPredeclaredBlock`): a region is written inside a transfer
+/// wrapper when it owns an escape to its stop or has a free target.
+fn regionIsWrapped(allocator: std.mem.Allocator, region: *const Region) std.mem.Allocator.Error!bool {
+    if (regionOwnsEscape(region)) return true;
+    if (region.stop == null) return false;
+    const targets = try regionFreeTargetsAlloc(allocator, region);
+    defer allocator.free(targets);
+    return targets.len != 0;
+}
+
+/// Marks the continues of `region`, written inside `around`, and of the regions below it; returns whether it marked
+/// one. An `else` arm the writer may fold into an `elseif` counts as written without a wrapper of its own.
+fn markRegionContinues(
+    allocator: std.mem.Allocator,
+    region: *Region,
+    around: ?*const EnclosingStatement,
+    may_fold_into_elseif: bool,
+) std.mem.Allocator.Error!bool {
+    const wrapper: EnclosingStatement = .{ .kind = .wrapper, .stop = region.stop, .parent = around };
+    const wrapped = !may_fold_into_elseif and try regionIsWrapped(allocator, region);
+    const inner: ?*const EnclosingStatement = if (wrapped) &wrapper else around;
+    // A region with nodes writes its continue after its last node, inside its own wrapper.
+    var marked = region.nodes.len != 0 and markContinueProjection(region, inner);
+    for (region.nodes) |node| {
+        if (try markNodeContinues(allocator, node, inner)) marked = true;
+    }
+    return marked;
+}
+
+fn markNodeContinues(
+    allocator: std.mem.Allocator,
+    node: Node,
+    around: ?*const EnclosingStatement,
+) std.mem.Allocator.Error!bool {
+    var marked = false;
+    switch (node) {
+        .block, .loop_control, .loop_terminal => {},
+        .branch => |branch| {
+            // An empty arm has no wrapper of its own: its continue is written in this region's `if` arm.
+            if (branch.then_region.nodes.len == 0) {
+                if (markContinueProjection(branch.then_region, around)) marked = true;
+            } else if (try markRegionContinues(allocator, branch.then_region, around, false)) {
+                marked = true;
+            }
+            if (branch.else_region.nodes.len == 0) {
+                if (markContinueProjection(branch.else_region, around)) marked = true;
+            } else if (try markRegionContinues(allocator, branch.else_region, around, elseArmMayFoldIntoElseIf(branch))) {
+                marked = true;
+            }
+        },
+        .loop => |loop| marked = try markLoopBodyContinues(allocator, loop.header, loop.body_region, around),
+        .latch_loop => |loop| marked = try markLoopBodyContinues(allocator, loop.header, loop.body_region, around),
+        .infinite_loop => |loop| {
+            marked = try markLoopBodyContinues(allocator, loop.header, loop.body_region, around);
+            // The shared side-exit regions are written after the loop's `end`.
+            if (loop.shared_side_exit) |side_exit| {
+                for (side_exit.entries) |entry| {
+                    if (try markRegionContinues(allocator, entry.region, around, false)) marked = true;
+                }
+            }
+        },
+        .loop_boundary => |control| {
+            // The body region and the side region are written in this region's text; an empty body's continue is
+            // left to its writer.
+            if (control.body_region.nodes.len != 0 and try markRegionContinues(allocator, control.body_region, around, false)) {
+                marked = true;
+            }
+            switch (control.boundary) {
+                .side_exit => |side| {
+                    if (try markRegionContinues(allocator, side.region, around, false)) marked = true;
+                },
+                .side_escape => |side| {
+                    if (try markRegionContinues(allocator, side.region, around, false)) marked = true;
+                },
+                .exit, .escape, .terminal, .shared_exit => {},
+            }
+        },
+    }
+    return marked;
+}
+
+fn markLoopBodyContinues(
+    allocator: std.mem.Allocator,
+    header: ir.BlockId,
+    body: *Region,
+    around: ?*const EnclosingStatement,
+) std.mem.Allocator.Error!bool {
+    const loop: EnclosingStatement = .{ .kind = .loop, .header = header, .stop = body.stop, .parent = around };
+    return markRegionContinues(allocator, body, &loop, false);
+}
+
+/// Marks `region`'s continue projection when it continues the innermost loop at its header, which is also the loop
+/// body region's stop, and the innermost Luau loop statement around its writer is a transfer wrapper that stops at
+/// another block. Returns whether it marked.
+fn markContinueProjection(region: *Region, around: ?*const EnclosingStatement) bool {
+    const projection = if (region.continue_projection) |*value| value else return false;
+    if (projection.via_flag) return false;
+    const target = region.continue_target orelse return false;
+    if (projection.target != target) return false;
+    const innermost = around orelse return false;
+    if (innermost.kind != .wrapper or (innermost.stop != null and innermost.stop.? == target)) return false;
+    var outer = innermost.parent;
+    while (outer) |statement| : (outer = statement.parent) {
+        if (statement.kind == .wrapper) continue;
+        if (statement.header == null or statement.header.? != target or
+            statement.stop == null or statement.stop.? != target) return false;
+        projection.via_flag = true;
+        return true;
+    }
+    return false;
+}
+
+/// Whether the readable writer may write `branch`'s else arm as an `elseif` (`emitElseIfChain`), with no wrapper of
+/// its own: the structural part of that test. The rest (no declaration, no written instruction, no expression form)
+/// depends on emission, so the arm counts as unwrapped whenever this holds, and a continue the arm's own wrapper
+/// would capture is then left lexical and refused by its writer.
+fn elseArmMayFoldIntoElseIf(branch: Branch) bool {
+    const join = branch.join orelse return false;
+    const arm = branch.else_region;
+    if (arm.continue_projection != null or arm.stop == null or arm.stop.? != join or arm.nodes.len != 1) return false;
+    const nested = switch (arm.nodes[0]) {
+        .branch => |value| value,
+        else => return false,
+    };
+    if (nested.then_edge_override != null or nested.else_edge_override != null or
+        nested.then_shared_reentry != null or nested.else_shared_reentry != null) return false;
+    if (nested.join) |nested_join| return nested_join == join;
+    return nested.then_region.stop != null and nested.then_region.stop.? == join and
+        nested.else_region.stop != null and nested.else_region.stop.? == join;
 }
 
 /// Reports an escape carried by a nested structured node to `target`.
@@ -497,6 +663,95 @@ pub fn loopBoundaryExitTargetsAlloc(
     defer targets.deinit(allocator);
     try collectLoopBoundaryExitTargets(allocator, region, &targets);
     return sortedFreeTargetsAlloc(allocator, &targets);
+}
+
+test "a continue that a wrapper stopping at another block would capture is carried by flag" {
+    const allocator = std.testing.allocator;
+    const header = ir.BlockId.fromIndex(1);
+    const join = ir.BlockId.fromIndex(2);
+    const exit = ir.BlockId.fromIndex(3);
+    const forwarder = ir.BlockId.fromIndex(4);
+    const outer_test = ir.BlockId.fromIndex(5);
+    const inner_test = ir.BlockId.fromIndex(6);
+
+    // In a loop body: if <outer> then if <inner> then <continue the loop> else <leave the loop> end end, joining at
+    // `join`. The arm that leaves the loop gives the outer arm a free target, so the outer arm is written inside a
+    // transfer wrapper that stops at the join, and a lexical continue in the inner then-arm would bind to it.
+    var continue_nodes = [_]Node{.{ .block = ir.BlockId.fromIndex(7) }};
+    var continue_arm = Region{
+        .nodes = &continue_nodes,
+        .stop = join,
+        .loop_exit = exit,
+        .continue_target = header,
+        .continue_projection = .{ .target = header, .edge = null },
+    };
+    var escape_nodes = [_]Node{.{ .block = ir.BlockId.fromIndex(8) }};
+    var escape_arm = Region{
+        .nodes = &escape_nodes,
+        .stop = join,
+        .loop_exit = exit,
+        .continue_target = header,
+        .escape_projection = .{ .target = exit, .edge = null },
+    };
+    var arm_nodes = [_]Node{.{ .branch = .{ .block = inner_test, .then_region = &continue_arm, .else_region = &escape_arm, .join = null } }};
+    var arm = Region{ .nodes = &arm_nodes, .stop = join, .loop_exit = exit, .continue_target = header };
+    var empty_arm = Region{ .nodes = &.{}, .stop = join, .loop_exit = exit, .continue_target = header };
+    var body_nodes = [_]Node{
+        .{ .branch = .{ .block = outer_test, .then_region = &arm, .else_region = &empty_arm, .join = join } },
+        .{ .block = join },
+    };
+
+    // A loop whose body stops at a block that forwards to the header: not marked, so no census outside the loop
+    // moves; the writer refuses the continue as before.
+    var forwarded_body = Region{ .nodes = &body_nodes, .stop = forwarder, .loop_exit = exit, .continue_target = header };
+    var forwarded_nodes = [_]Node{.{ .infinite_loop = .{ .header = header, .body_region = &forwarded_body, .exit = exit } }};
+    var forwarded_root = Region{ .nodes = &forwarded_nodes, .stop = null, .loop_exit = null };
+    try markFlaggedContinues(allocator, &forwarded_root);
+    try std.testing.expect(!continue_arm.continue_projection.?.via_flag);
+
+    // A latch loop whose body stops at the header: marked, and counted as a nonlocal continue is counted. The arm
+    // with the continue and the loop body each own a wrapper; the outer arm forwards the flag.
+    var body = Region{ .nodes = &body_nodes, .stop = header, .loop_exit = exit, .continue_target = header };
+    var root_nodes = [_]Node{.{ .latch_loop = .{ .header = header, .body_region = &body, .exit = exit, .latch_count = 1 } }};
+    var root = Region{ .nodes = &root_nodes, .stop = null, .loop_exit = null };
+    try std.testing.expect(!regionOwnsEscape(&continue_arm));
+    try std.testing.expect(!regionOwnsEscape(&body));
+    try markFlaggedContinues(allocator, &root);
+    try std.testing.expect(continue_arm.continue_projection.?.via_flag);
+    try std.testing.expect(regionOwnsEscape(&continue_arm));
+    try std.testing.expect(!regionOwnsEscape(&arm));
+    try std.testing.expect(regionOwnsEscape(&body));
+    try std.testing.expect(regionHasNestedEscapeTo(&body, header));
+    const arm_targets = try regionFreeTargetsAlloc(allocator, &arm);
+    defer allocator.free(arm_targets);
+    try std.testing.expectEqualSlices(ir.BlockId, &.{ header, exit }, arm_targets);
+    const body_targets = try regionFreeTargetsAlloc(allocator, &body);
+    defer allocator.free(body_targets);
+    try std.testing.expectEqualSlices(ir.BlockId, &.{exit}, body_targets);
+    const root_targets = try regionFreeTargetsAlloc(allocator, &root);
+    defer allocator.free(root_targets);
+    try std.testing.expectEqual(@as(usize, 0), root_targets.len);
+
+    // A continue that no wrapper encloses binds to its loop: not marked, and no wrapper is added.
+    var lone_nodes = [_]Node{.{ .block = ir.BlockId.fromIndex(9) }};
+    var lone_arm = Region{
+        .nodes = &lone_nodes,
+        .stop = join,
+        .loop_exit = exit,
+        .continue_target = header,
+        .continue_projection = .{ .target = header, .edge = null },
+    };
+    var lone_empty = Region{ .nodes = &.{}, .stop = join, .loop_exit = exit, .continue_target = header };
+    var lone_body_nodes = [_]Node{
+        .{ .branch = .{ .block = outer_test, .then_region = &lone_arm, .else_region = &lone_empty, .join = join } },
+        .{ .block = join },
+    };
+    var lone_body = Region{ .nodes = &lone_body_nodes, .stop = header, .loop_exit = exit, .continue_target = header };
+    var lone_root_nodes = [_]Node{.{ .latch_loop = .{ .header = header, .body_region = &lone_body, .exit = exit, .latch_count = 1 } }};
+    var lone_root = Region{ .nodes = &lone_root_nodes, .stop = null, .loop_exit = null };
+    try markFlaggedContinues(allocator, &lone_root);
+    try std.testing.expect(!lone_arm.continue_projection.?.via_flag);
+    try std.testing.expect(!regionOwnsEscape(&lone_body));
 }
 
 test "loop-boundary exit targets are tracked separately from free targets" {
@@ -677,10 +932,15 @@ pub const Plan = struct {
     /// control-state representation and still consumes the original edges.
     pub fn initWithArbitraryFallback(allocator: std.mem.Allocator, analysis: *const cfg.Analysis) BuildError!Plan {
         if (shouldUseArbitraryFallback(analysis)) return initArbitraryCfg(allocator, analysis);
-        return Plan.init(allocator, analysis) catch |err| {
+        var plan = Plan.init(allocator, analysis) catch |err| {
             if (err != error.UnsupportedShape) return err;
             return initArbitraryCfg(allocator, analysis);
         };
+        // The readable writers, and the register and syntax-depth certificates that budget their text, build this
+        // plan: a continue a wrapper would capture is carried by flag in all of them alike.
+        errdefer plan.deinit();
+        try markFlaggedContinues(allocator, plan.root);
+        return plan;
     }
 
     /// Construct the explicit dispatcher representation after a structured
@@ -934,9 +1194,7 @@ fn collectRegionEscapeEdges(
         if (projection.target == target) try appendEscapeEdges(allocator, analysis, nested_captures, last, target, edges);
     }
     if (region.continue_projection) |projection| {
-        if ((region.continue_target == null or region.continue_target.? != projection.target) and
-            projection.target == target)
-        {
+        if (continueProjectionUsesFlag(region, projection) and projection.target == target) {
             try appendEscapeEdges(allocator, analysis, nested_captures, last, target, edges);
         }
     }
@@ -16580,7 +16838,7 @@ fn regionEscapesTo(region: *const Region, target: ir.BlockId) bool {
     return (region.escape_projection != null and region.escape_projection.?.target == target) or
         (region.continue_projection != null and
             region.continue_projection.?.target == target and
-            (region.continue_target == null or region.continue_target.? != target)) or
+            continueProjectionUsesFlag(region, region.continue_projection.?)) or
         nodesEscapeTo(region.nodes, target);
 }
 
@@ -16785,7 +17043,7 @@ fn collectRegionFreeTargets(
         try addFreeTarget(allocator, targets, nested_captures, projection.target);
     }
     if (region.continue_projection) |projection| {
-        if (region.continue_target == null or region.continue_target.? != projection.target) {
+        if (continueProjectionUsesFlag(region, projection)) {
             try addFreeTarget(allocator, targets, nested_captures, projection.target);
         }
     }

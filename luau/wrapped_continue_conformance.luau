@@ -22,7 +22,15 @@
 --     while not (m < j) do if g(j) then goto J end j += 1 end observe(300) end else return i1 end end J
 --   boundary_arm_escape_continue_else: the same with else observe(400) on the observe(i1) branch
 --   boundary_arm_escape_continue_exit: the _else shape, where J leaves the loop when n < i1 to observe(500) return marker
--- The chunk returns the twelve workers in this order.
+--   native_for_boundary_body_escape_continue: for index = 1, n do if f(index) then <the inner branch of
+--     boundary_body_escape_continue on index> end J: observe(100) end return marker
+--   native_for_boundary_arm_escape_continue: the same loop around the inner branch of
+--     boundary_arm_escape_continue_else on index
+--   latch_boundary_body_escape_continue: repeat <the loop body of boundary_body_escape_continue up to J>
+--     J: observe(100) i = i1 until n < i1 return marker
+--   boundary_body_late_exit_escape_continue: boundary_body_escape_continue whose inner loop tests its exit after
+--     its escape: j = 1 loop if g(j) then goto J end if m < j then break end observe(j) j += 1 end observe(300)
+-- The chunk returns the sixteen workers in this order.
 local fs = require("@lune/fs")
 local process = require("@lune/process")
 local LifterIR = require("./lifter_ir")
@@ -421,6 +429,104 @@ local function addWorker(shape)
 		end
 		jump(L, H, { i1 })
 		returns(RET, { i1 })
+	elseif shape == "native_for_boundary_body_escape_continue" or shape == "native_for_boundary_arm_escape_continue"
+		or shape == "latch_boundary_body_escape_continue" or shape == "boundary_body_late_exit_escape_continue"
+	then
+		local c300 = constant(entry, LifterIR.Literal.number(300), number, "c300")
+		local c400 = constant(entry, LifterIR.Literal.number(400), number, "c400")
+		local entryFlag = constant(entry, LifterIR.Literal.boolean(true), boolean, "entry_flag")
+		local laterFlag = constant(entry, LifterIR.Literal.boolean(false), boolean, "later_flag")
+		-- The loop-boundary body (or, withElse, the arm) from `armTest` on `value`, leaving to J.
+		local function boundaryBody(armTest, value, J, RET, withElse, lateExit)
+			local A = block("arm")
+			local K = block("body_test")
+			local W = block("inner_header")
+			local j = builder:addBlockParameter(W, number, "j")
+			local WB = block("inner_body")
+			local WL = block("inner_latch")
+			local P = block("inner_exit")
+			local KE = if withElse then block("body_else") else nil
+			local c = call(armTest, f, { value }, "c")
+			branch(armTest, c, A, {}, J, {})
+			local d = call(A, g, { value }, "d")
+			branch(A, d, K, {}, RET, {})
+			if KE then
+				local e = call(K, observe, { value }, "e")
+				branch(K, e, W, { one }, KE, {})
+				call(KE, observe, { c400 }, "ke")
+				jump(KE, J)
+			else
+				call(K, observe, { value }, "k")
+				jump(K, W, { one })
+			end
+			if lateExit then
+				local s = call(W, g, { j }, "s")
+				branch(W, s, J, {}, WB, {})
+				local wdone = binary(WB, "less", m, j, boolean, "inner_done")
+				branch(WB, wdone, P, {}, WL, {})
+				call(WL, observe, { j }, "w")
+				local j1 = binary(WL, "add", j, one, number, "next_j")
+				jump(WL, W, { j1 })
+			else
+				local wdone = binary(W, "less", m, j, boolean, "inner_done")
+				branch(W, wdone, P, {}, WB, {})
+				local s = call(WB, g, { j }, "s")
+				branch(WB, s, J, {}, WL, {})
+				local j1 = binary(WL, "add", j, one, number, "next_j")
+				jump(WL, W, { j1 })
+			end
+			call(P, observe, { c300 }, "q")
+			jump(P, J)
+		end
+		if shape == "native_for_boundary_body_escape_continue" or shape == "native_for_boundary_arm_escape_continue" then
+			local header = block("header")
+			local body = block("body")
+			local J = block("join")
+			local RET = block("ret")
+			local XR = block("exit_return")
+			local h1 = builder:addBlockParameter(header, number, "h1")
+			local h2 = builder:addBlockParameter(header, number, "h2")
+			local h3 = builder:addBlockParameter(header, number, "h3")
+			local hInit = builder:addBlockParameter(header, boolean, "h_initial")
+			local index = builder:addBlockParameter(body, number, "index")
+			local _, t = builder:addInstruction(header, LifterIR.Operation.numericForNext(h1, h2, h3, hInit), {
+				{ type = boolean, name_hint = "has_value" },
+				{ type = number, name_hint = "next_limit" },
+				{ type = number, name_hint = "next_step" },
+				{ type = number, name_hint = "next_control" },
+			}, { effects = LifterIR.Effects.numericForNext(), evidence = evidence })
+			branch(header, t[1], body, { t[4] }, XR, {})
+			jump(entry, header, { one, n, one, entryFlag })
+			boundaryBody(body, index, J, RET, shape == "native_for_boundary_arm_escape_continue", false)
+			call(J, observe, { hundred }, "o")
+			jump(J, header, { t[4], t[2], t[3], laterFlag })
+			returns(RET, { index })
+			returns(XR, { marker })
+		else
+			local H = block("outer_header")
+			local i = builder:addBlockParameter(H, number, "i")
+			local T = block("test")
+			local J = block("join")
+			local L = block("latch")
+			local RET = block("ret")
+			local XR = block("exit_return")
+			jump(entry, H, { zero })
+			local i1 = binary(H, "add", i, one, number, "i1")
+			jump(H, T)
+			boundaryBody(T, i1, J, RET, false, shape == "boundary_body_late_exit_escape_continue")
+			call(J, observe, { hundred }, "o")
+			if shape == "latch_boundary_body_escape_continue" then
+				jump(J, L)
+				local done = binary(L, "less", n, i1, boolean, "done")
+				branch(L, done, XR, {}, H, { i1 })
+			else
+				local done = binary(J, "less", n, i1, boolean, "done")
+				branch(J, done, XR, {}, L, {})
+				jump(L, H, { i1 })
+			end
+			returns(RET, { i1 })
+			returns(XR, { marker })
+		end
 	else
 		error("unknown shape " .. tostring(shape))
 	end
@@ -443,6 +549,10 @@ for _, shape in {
 	"boundary_arm_escape_continue",
 	"boundary_arm_escape_continue_else",
 	"boundary_arm_escape_continue_exit",
+	"native_for_boundary_body_escape_continue",
+	"native_for_boundary_arm_escape_continue",
+	"latch_boundary_body_escape_continue",
+	"boundary_body_late_exit_escape_continue",
 } do
 	local worker = addWorker(shape)
 	local _, exported = builder:addInstruction(chunkBlock, LifterIR.Operation.functionRef(worker), { { type = functionValue, name_hint = "exported_worker" } }, { effects = pure, evidence = evidence })

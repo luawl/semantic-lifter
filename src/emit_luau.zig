@@ -1455,22 +1455,29 @@ fn emitRegionBodyWithPredeclaredBlock(
         }
         if (projected_continue) |projection| {
             if (node_index + 1 == region.nodes.len and node.* == .loop) {
-                try emitProjectedContinueAfterTransferredEdge(
-                    output,
-                    allocator,
-                    program,
-                    emission_plan,
-                    projection.target_edge,
-                    region.continue_projection.?.target,
-                    indent,
-                );
+                if (projection.nonlocal) {
+                    // Carried by flag: this region's own wrapper follows the inner loop, and the flag carries the
+                    // continue past every wrapper to the loop.
+                    _ = try loop_continue_projection.validateEntry(program, region.continue_projection.?.target, projection.target_edge);
+                    try emitEscapeFlagSet(output, allocator, program, emission_plan, region.continue_projection.?.target, indent);
+                } else {
+                    try emitProjectedContinueAfterTransferredEdge(
+                        output,
+                        allocator,
+                        program,
+                        emission_plan,
+                        projection.target_edge,
+                        region.continue_projection.?.target,
+                        indent,
+                    );
+                }
             }
         } else if (region.continue_projection) |projection| {
             if (projection.edge == null and projection.forwarding == null and
                 node_index + 1 == region.nodes.len and
                 (node.* == .branch or node.* == .latch_loop or node.* == .infinite_loop))
             {
-                if (region.continue_target != null and projection.target == region.continue_target.?) {
+                if (region.continue_target != null and projection.target == region.continue_target.? and !projection.via_flag) {
                     try emitNativeIterationCompletionSetForTarget(output, allocator, emission_plan, projection.target, indent);
                     try emitContinueStatement(output, allocator, emission_plan, projection.target, indent);
                 } else {
@@ -1680,9 +1687,11 @@ fn emitBranchArmImpl(
     }
     trace_stage = "continue_projection";
     if (region.continue_projection) |projection| {
+        // An empty arm is written in its holding region's `if`, with no wrapper of its own: a continue it carries by
+        // flag sets the flag and leaves the innermost wrapper, whose propagation carries the flag on to the loop.
+        const by_flag = region.continue_target == null or region.continue_target.? != projection.target or
+            projection.via_flag;
         if (try validateEmptyProjectedContinue(program, region, edge)) |projected_edge| {
-            const nonlocal = region.continue_target == null or
-                region.continue_target.? != projection.target;
             try emitProjectedContinue(
                 output,
                 allocator,
@@ -1693,13 +1702,14 @@ fn emitBranchArmImpl(
                 projection.target,
                 indent,
                 place_aliases,
-                nonlocal,
+                by_flag,
             );
+            if (by_flag) try emitEmptyArmFlagBreak(output, allocator, emission_plan, indent);
             return;
         }
         if (projection.edge == null and projection.forwarding == null) {
             if (region.nodes.len == 0) {
-                return emitProjectedContinue(
+                try emitProjectedContinue(
                     output,
                     allocator,
                     program,
@@ -1709,8 +1719,10 @@ fn emitBranchArmImpl(
                     projection.target,
                     indent,
                     place_aliases,
-                    false,
+                    by_flag,
                 );
+                if (by_flag) try emitEmptyArmFlagBreak(output, allocator, emission_plan, indent);
+                return;
             }
             const owns_target = switch (region.nodes[region.nodes.len - 1]) {
                 .branch => |branch| branch.join != null and branch.join.? == projection.target,
@@ -1741,6 +1753,21 @@ fn emitBranchArmImpl(
     try emitEdgeParametersUnlessConsumed(output, allocator, program, emission_plan, scopes, program.blocks[edge.target.index()], edge.arguments, indent, !enters_join and !enters_region_stop, place_aliases);
     trace_stage = "region";
     try emitRegion(output, allocator, program, emission_plan, scopes, region, indent, place_aliases);
+}
+
+/// The `break` after the escape flag of a continue an empty branch arm carries by flag: the arm is written in its
+/// holding region's `if` with no wrapper of its own, so the `break` must leave a transfer wrapper, whose
+/// propagation carries the flag on. Anywhere else the function is refused, and emitFunctionBody writes it in the
+/// flat layout.
+fn emitEmptyArmFlagBreak(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    emission_plan: *const EmissionPlan,
+    indent: []const u8,
+) (EmitError || std.mem.Allocator.Error)!void {
+    const innermost = emission_plan.state.continue_binder orelse return error.UnsupportedControlFlow;
+    if (innermost.kind != .wrapper) return error.UnsupportedControlFlow;
+    try emitBreakStatement(output, allocator, indent);
 }
 
 fn emitBranchArm(
@@ -1795,6 +1822,8 @@ fn validatedStopForwardingEdge(program: *const ir.Program, region: *const struct
 const ValidatedContinueProjection = struct {
     source_edge: ir.Edge,
     target_edge: ir.Edge,
+    /// Written as an escape flag: the target is not the region's continue target, or the projection is carried by
+    /// flag (`structure.markFlaggedContinues`).
     nonlocal: bool,
 };
 
@@ -1869,7 +1898,7 @@ fn validatedContinueProjectionAlloc(
             projection.target,
             forwarding,
         );
-        return .{ .source_edge = source_edge, .target_edge = forwarding.edge, .nonlocal = nonlocal };
+        return .{ .source_edge = source_edge, .target_edge = forwarding.edge, .nonlocal = nonlocal or projection.via_flag };
     }
     const continue_target = region.continue_target orelse return error.UnsupportedControlFlow;
     const expected = projection.edge orelse {
@@ -1889,7 +1918,7 @@ fn validatedContinueProjectionAlloc(
         ),
         else => return error.UnsupportedControlFlow,
     };
-    return .{ .source_edge = edge, .target_edge = edge, .nonlocal = false };
+    return .{ .source_edge = edge, .target_edge = edge, .nonlocal = projection.via_flag };
 }
 
 fn regionAlwaysFunctionTerminates(program: *const ir.Program, region: *const structure.Region) bool {
@@ -3218,12 +3247,33 @@ fn emitRegionEscapePropagation(
     }
     if (loop_header != null and
         !containsBlockId(targets, loop_header.?) and
-        structured_escape.regionHasNestedEscapeTo(region, loop_header.?))
+        structured_escape.regionHasNestedEscapeTo(region, loop_header.?) and
+        writesStopConsumer(emission_plan.state.continue_binder, loop_header.?))
     {
         // The target is the region's owning loop stop, so consume a nested
         // transfer after the temporary wrapper has closed as a loop continue.
         try emitEscapeContinueIfSet(output, allocator, program, emission_plan, loop_header.?, indent);
     }
+}
+
+/// Whether the flag consumer of a region whose stop is its continue target is written after the region's wrapper.
+/// Leaving the wrapper already reaches the stop, so the consumer is needed only where the stop is where the
+/// innermost loop continues. It is not written when the stop is another block (the local stop of a loop-boundary
+/// body, or of a region inside one that stops at the same block) and its `continue` would bind elsewhere: inside a
+/// wrapper that stops at another block, or to a loop whose next pass starts at another block. It is written, as
+/// before, where the innermost Luau loop statement reaches the stop, and where the stop is the innermost loop's
+/// continue point or no loop is around it, so that emitContinueStatement still refuses a captured `continue`.
+fn writesStopConsumer(binder: ?*const ContinueBinder, stop: ir.BlockId) bool {
+    if (continueBindsTo(binder, stop)) return true;
+    var outer = binder;
+    while (outer) |statement| : (outer = statement.parent) {
+        switch (statement.kind) {
+            .wrapper => continue,
+            .loop => return sameBlock(statement.header, stop) or sameBlock(statement.stop, stop),
+            .one_shot => return true,
+        }
+    }
+    return true;
 }
 
 fn regionOwnedContinueHeader(region: *const structure.Region) ?ir.BlockId {
@@ -4304,6 +4354,103 @@ test "a lexical continue is written only where its loop statement reaches the ta
             "      continue\n" ++
             "    end\n" ++
             "    if __lifter_escape_1 then\n" ++
+            "      do\n" ++
+            "        continue\n" ++
+            "      end\n" ++
+            "    end\n",
+        written.items,
+    );
+}
+
+test "a continue carried by flag owns its region's wrapper in the register budget" {
+    const header = ir.BlockId.fromIndex(1);
+    const join = ir.BlockId.fromIndex(2);
+    const exit = ir.BlockId.fromIndex(3);
+    var arm_nodes = [_]structure.Node{.{ .block = ir.BlockId.fromIndex(4) }};
+    var arm = structure.Region{
+        .nodes = &arm_nodes,
+        .stop = join,
+        .loop_exit = exit,
+        .continue_target = header,
+        .continue_projection = .{ .target = header, .edge = null },
+    };
+    var empty_arm = structure.Region{ .nodes = &.{}, .stop = join, .loop_exit = exit, .continue_target = header };
+    var body_nodes = [_]structure.Node{
+        .{ .branch = .{ .block = ir.BlockId.fromIndex(5), .then_region = &arm, .else_region = &empty_arm, .join = join } },
+        .{ .block = join },
+    };
+    var body = structure.Region{ .nodes = &body_nodes, .stop = header, .loop_exit = exit, .continue_target = header };
+    var root_nodes = [_]structure.Node{.{ .latch_loop = .{ .header = header, .body_region = &body, .exit = exit, .latch_count = 1 } }};
+    const root = structure.Region{ .nodes = &root_nodes, .stop = null, .loop_exit = null };
+    // Written as a lexical continue, the arm's continue adds no wrapper.
+    try std.testing.expectEqual(@as(usize, 0), structured_escape.maxOwnedDepth(&root));
+    // Carried by flag, it owns a wrapper around its arm, and the loop body owns the wrapper that consumes the flag:
+    // the register budget counts both flags.
+    arm.continue_projection.?.via_flag = true;
+    try std.testing.expect(structured_escape.regionOwnsEscape(&arm));
+    try std.testing.expect(structured_escape.regionOwnsEscape(&body));
+    try std.testing.expectEqual(@as(usize, 2), structured_escape.maxOwnedDepth(&root));
+}
+
+test "a flag consumer after a wrapper is written only where it reaches the stop or the loop continues there" {
+    const allocator = std.testing.allocator;
+    const function_id = ir.FunctionId.fromIndex(0);
+    const header = ir.BlockId.fromIndex(1);
+    const join = ir.BlockId.fromIndex(2);
+    const other = ir.BlockId.fromIndex(3);
+
+    const loop: ContinueBinder = .{ .kind = .loop, .header = header, .stop = header };
+    const at_other: ContinueBinder = .{ .kind = .wrapper, .stop = other, .parent = &loop };
+    const at_join: ContinueBinder = .{ .kind = .wrapper, .stop = join, .parent = &loop };
+    const once: ContinueBinder = .{ .kind = .one_shot, .parent = &loop };
+    // A stop where the loop continues: written, bound there or captured (emitContinueStatement then refuses).
+    try std.testing.expect(writesStopConsumer(&loop, header));
+    try std.testing.expect(writesStopConsumer(&at_other, header));
+    // Another stop: written where a wrapper stops at it, not where its continue would bind to the loop or to a
+    // wrapper that stops elsewhere.
+    try std.testing.expect(writesStopConsumer(&at_join, join));
+    try std.testing.expect(!writesStopConsumer(&loop, join));
+    try std.testing.expect(!writesStopConsumer(&at_other, join));
+    // Inside a `for` that runs its body once: written, so emitContinueStatement refuses the function.
+    try std.testing.expect(writesStopConsumer(&once, join));
+
+    // The writer: a region whose stop is its continue target, `join`, and whose nested arm escapes to it.
+    const function_blocks = [_]ir.BlockId{ ir.BlockId.fromIndex(0), header, join, other };
+    const blocks = [_]ir.Block{
+        .{ .id = ir.BlockId.fromIndex(0), .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = header, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = join, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = other, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const functions = [_]ir.Function{.{ .id = function_id, .blocks = &function_blocks, .entry_block = ir.BlockId.fromIndex(0) }};
+    const program: ir.Program = .{
+        .program_id = "stop-consumer",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &.{},
+    };
+    var plan = try EmissionPlan.init(allocator, &program, .standard_luau);
+    defer plan.deinit();
+    defer plan.state.continue_binder = null;
+    var escape_arm = structure.Region{ .nodes = &.{}, .stop = other, .loop_exit = null, .escape_projection = .{ .target = join, .edge = null } };
+    var empty_arm = structure.Region{ .nodes = &.{}, .stop = join, .loop_exit = null, .continue_target = join };
+    var nodes = [_]structure.Node{.{ .branch = .{ .block = other, .then_region = &escape_arm, .else_region = &empty_arm, .join = null } }};
+    const region = structure.Region{ .nodes = &nodes, .stop = join, .loop_exit = null, .continue_target = join };
+    var dropped: std.ArrayList(u8) = .empty;
+    defer dropped.deinit(allocator);
+    plan.state.continue_binder = &loop;
+    try emitRegionEscapePropagation(&dropped, allocator, &program, &plan, &region, "    ");
+    plan.state.continue_binder = &at_other;
+    try emitRegionEscapePropagation(&dropped, allocator, &program, &plan, &region, "    ");
+    try std.testing.expectEqualStrings("", dropped.items);
+    var written: std.ArrayList(u8) = .empty;
+    defer written.deinit(allocator);
+    plan.state.continue_binder = &at_join;
+    try emitRegionEscapePropagation(&written, allocator, &program, &plan, &region, "    ");
+    try std.testing.expectEqualStrings(
+        "    if __lifter_escape_2 then\n" ++
             "      do\n" ++
             "        continue\n" ++
             "      end\n" ++

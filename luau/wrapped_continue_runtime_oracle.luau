@@ -399,7 +399,76 @@ local function boundaryArmEscapeContinueExit(n: number, m: number, marker: any, 
 	return marker
 end
 
--- The chunk's twelve workers, in the builder's order, each with its reference.
+-- for index = 1, n do if f(index) then <the loop-boundary body, or with the arm, the arm with its else> end
+-- observe(100) end return marker.
+local function nativeForBoundaryEscapeContinueOf(withArm: boolean): Reference
+	return function(n: number, m: number, marker: any, f: any, g: any, observe: any): any
+		for index = 1, n do
+			if f(index) then
+				local returned = if withArm then boundaryArm(index, m, g, observe, true) else boundaryBody(index, m, g, observe)
+				if returned ~= nil then
+					return returned
+				end
+			end
+			observe(100)
+		end
+		return marker
+	end
+end
+
+local function latchBoundaryBodyEscapeContinue(n: number, m: number, marker: any, f: any, g: any, observe: any): any
+	local i = 0
+	repeat
+		local i1 = i + 1
+		if f(i1) then
+			local returned = boundaryBody(i1, m, g, observe)
+			if returned ~= nil then
+				return returned
+			end
+		end
+		observe(100)
+		i = i1
+	until n < i1
+	return marker
+end
+
+-- The inner loop with its exit test after its escape: j = 1 loop if g(j) then <leave to the join> end
+-- if m < j then break end observe(j) j += 1 end. Returns true when the loop left to the join.
+local function lateExitInnerLoopEscapes(m: number, g: any, observe: any): boolean
+	local j = 1
+	while not g(j) do
+		if m < j then
+			return false
+		end
+		observe(j)
+		j += 1
+	end
+	return true
+end
+
+local function boundaryBodyLateExitEscapeContinue(n: number, m: number, marker: any, f: any, g: any, observe: any): any
+	local i = 0
+	while true do
+		local i1 = i + 1
+		if f(i1) then
+			if g(i1) then
+				observe(i1)
+				if not lateExitInnerLoopEscapes(m, g, observe) then
+					observe(300)
+				end
+			else
+				return i1
+			end
+		end
+		observe(100)
+		if n < i1 then
+			return marker
+		end
+		i = i1
+	end
+end
+
+-- The chunk's sixteen workers, in the builder's order, each with its reference.
 local WORKERS: { { name: string, reference: Reference } } = {
 	{ name = "final_block_continue", reference = finalBlockContinue },
 	{ name = "continue_after_final_loop", reference = continueAfterFinalLoop },
@@ -413,6 +482,10 @@ local WORKERS: { { name: string, reference: Reference } } = {
 	{ name = "boundary_arm_escape_continue", reference = boundaryArmEscapeContinueOf(false) },
 	{ name = "boundary_arm_escape_continue_else", reference = boundaryArmEscapeContinueOf(true) },
 	{ name = "boundary_arm_escape_continue_exit", reference = boundaryArmEscapeContinueExit },
+	{ name = "native_for_boundary_body_escape_continue", reference = nativeForBoundaryEscapeContinueOf(false) },
+	{ name = "native_for_boundary_arm_escape_continue", reference = nativeForBoundaryEscapeContinueOf(true) },
+	{ name = "latch_boundary_body_escape_continue", reference = latchBoundaryBodyEscapeContinue },
+	{ name = "boundary_body_late_exit_escape_continue", reference = boundaryBodyLateExitEscapeContinue },
 }
 
 function WrappedContinueRuntimeOracle.run(chunk: any, _source: string, caseName: string): any
