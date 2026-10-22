@@ -1096,6 +1096,91 @@ function SourceRuntimeOracle.run(caseName: string, source: string, exported: any
 				and wrapped.failure_error_type == "string",
 			"wrapped coroutine did not convert its worker failure into a thrown string"
 		)
+	elseif caseName == "source-frontend-wrapped-local-continue" then
+		-- The worker against a copy of the source function over 15360 rows (n 0..4, m 0..2, 32 masks for f, 4 for g
+		-- and 8 for the values observe returns): the result and the order of the callback calls must match. A run
+		-- that makes more than 400 callback calls stops with the error "call cap".
+		local function reference(n: number, _m: number, marker: any, f: any, g: any, observe: any): any
+			local i = 0
+			while true do
+				local i1 = i + 1
+				if f(i1) then
+					if f(i1, 1) then
+						i = i1
+						continue
+					end
+					if g(i1) then
+						if observe(i1) then
+							observe(250)
+							i = i1
+							continue
+						end
+					else
+						return i1
+					end
+				end
+				observe(100)
+				if n < i1 then
+					return marker
+				end
+				i = i1
+			end
+		end
+		local function bit(mask: number, index: number): boolean
+			return bit32.band(mask, bit32.lshift(1, index)) ~= 0
+		end
+		local function runRow(worker: any, n: number, m: number, maskF: number, maskG: number, maskO: number): (string, string)
+			local log: { string } = {}
+			local calls = 0
+			local function tick(entry: string)
+				calls += 1
+				if calls > 400 then
+					error("call cap", 0)
+				end
+				table.insert(log, entry)
+			end
+			local function f(a: number, b: number?): boolean
+				tick(string.format("f(%s,%s)", tostring(a), tostring(b)))
+				if a > 5 then
+					return false
+				end
+				return bit(maskF, (a + (b or 0)) % 5)
+			end
+			local function g(a: number): boolean
+				tick(string.format("g(%s)", tostring(a)))
+				return bit(maskG, a % 2)
+			end
+			local function observe(value: number): boolean
+				tick(string.format("o(%s)", tostring(value)))
+				return bit(maskO, value % 3)
+			end
+			local ok, result = pcall(worker, n, m, "marker", f, g, observe)
+			local outcome = if ok then "ok:" .. tostring(result) else "err:" .. string.gsub(tostring(result), "^.-:%d+: ", "")
+			local shown = if #log <= 12 then table.concat(log, " ") else table.concat(log, " ", 1, 12) .. ` ... ({#log} calls)`
+			return outcome .. " [" .. table.concat(log, " ") .. "]", outcome .. " [" .. shown .. "]"
+		end
+		local rows, mismatches = 0, 0
+		local first = ""
+		for n = 0, 4 do
+			for m = 0, 2 do
+				for maskF = 0, 31 do
+					for maskG = 0, 3 do
+						for maskO = 0, 7 do
+							local expected, expectedShown = runRow(reference, n, m, maskF, maskG, maskO)
+							local actual, actualShown = runRow(exported, n, m, maskF, maskG, maskO)
+							rows += 1
+							if expected ~= actual then
+								mismatches += 1
+								if first == "" then
+									first = `n={n} m={m} maskF={maskF} maskG={maskG} maskO={maskO} expected={expectedShown} got={actualShown}`
+								end
+							end
+						end
+					end
+				end
+			end
+		end
+		assert(mismatches == 0, `a loop with two continues changed its behaviour: rows={rows} mismatches={mismatches} first: {first}`)
 	else
 		return false
 	end

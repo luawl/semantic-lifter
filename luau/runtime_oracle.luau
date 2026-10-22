@@ -8,6 +8,7 @@ local PackReturnStorageRuntimeOracle = require("./pack_return_storage_runtime_or
 local IterationExitTransferRuntimeOracle = require("./iteration_exit_transfer_runtime_oracle")
 local IterationBreakExitTransferRuntimeOracle = require("./iteration_break_exit_transfer_runtime_oracle")
 local IterationHeaderEntryRuntimeOracle = require("./iteration_header_entry_runtime_oracle")
+local WrappedContinueRuntimeOracle = require("./wrapped_continue_runtime_oracle")
 
 local caseName = process.args[1]
 local sourcePath = process.args[2]
@@ -368,6 +369,8 @@ elseif caseName == "iteration-continue-completion" then
 	exported = IterationHeaderEntryRuntimeOracle.run(chunk, source, caseName)
 elseif caseName == "iteration-boundary-body-continue" then
 	exported = IterationHeaderEntryRuntimeOracle.run(chunk, source, caseName)
+elseif caseName == "wrapped-continue" then
+	exported = WrappedContinueRuntimeOracle.run(chunk, source, caseName)
 else
 	exported, secondaryExport, tertiaryExport, quaternaryExport = chunk()
 end
@@ -670,6 +673,8 @@ elseif caseName == "iteration-continue-completion" then
 	assert(type(exported) == "function", "iteration continue-completion runtime oracle did not retain its worker")
 elseif caseName == "iteration-boundary-body-continue" then
 	assert(type(exported) == "function", "iteration boundary-body continue runtime oracle did not retain its worker")
+elseif caseName == "wrapped-continue" then
+	assert(type(exported) == "function", "wrapped-continue runtime oracle did not retain its worker")
 elseif caseName == "pack-materialized-adjustment" then
 	assert(type(secondaryExport) == "table", "pack materialization audit was not retained")
 	local narrowResults = secondaryExport.narrowResults

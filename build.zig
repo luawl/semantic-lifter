@@ -427,6 +427,38 @@ pub fn build(b: *std.Build) void {
         "iteration-boundary-body-continue",
         luau_iteration_boundary_body_continue_conformance.resolved_ir,
     );
+    const source_frontend_wrapped_local_continue_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/wrapped_local_continue_source.luau",
+        "source-frontend-wrapped-local-continue",
+    );
+    const wrapped_local_continue_dispatcher = addDispatcherRuntimeConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "source-frontend-wrapped-local-continue",
+        source_frontend_wrapped_local_continue_conformance.resolved_ir,
+    );
+    const luau_wrapped_continue_conformance = addLuauFixtureConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/wrapped_continue_conformance.luau",
+        "wrapped-continue",
+    );
+    const wrapped_continue_dispatcher = addDispatcherRuntimeConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "wrapped-continue",
+        luau_wrapped_continue_conformance.resolved_ir,
+    );
     const luau_open_pack_projection_conformance = addLuauFixtureConformance(
         b,
         exe,
@@ -1534,6 +1566,10 @@ pub fn build(b: *std.Build) void {
     conformance_step.dependOn(iteration_continue_completion_dispatcher);
     luau_iteration_boundary_body_continue_conformance.addTo(conformance_step);
     conformance_step.dependOn(iteration_boundary_body_continue_dispatcher);
+    source_frontend_wrapped_local_continue_conformance.addTo(conformance_step);
+    conformance_step.dependOn(wrapped_local_continue_dispatcher);
+    luau_wrapped_continue_conformance.addTo(conformance_step);
+    conformance_step.dependOn(wrapped_continue_dispatcher);
     luau_open_pack_projection_conformance.addTo(conformance_step);
     luau_closed_pack_discard_conformance.addTo(conformance_step);
     luau_table_conformance.addTo(conformance_step);
@@ -1845,6 +1881,7 @@ pub fn build(b: *std.Build) void {
     run_luau_ir_typecheck.addFileArg(b.path("luau/iteration_exit_transfer_runtime_oracle.luau"));
     run_luau_ir_typecheck.addFileArg(b.path("luau/iteration_break_exit_transfer_runtime_oracle.luau"));
     run_luau_ir_typecheck.addFileArg(b.path("luau/iteration_header_entry_runtime_oracle.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/wrapped_continue_runtime_oracle.luau"));
     run_luau_ir_typecheck.addFileInput(b.path("luau/json_codec.luau"));
     const run_frontend_tests = b.addSystemCommand(&.{ luneExe(b), "run" });
     run_frontend_tests.addFileArg(b.path("luau/frontend_contract_test.luau"));
@@ -2278,6 +2315,7 @@ fn addSourceRuntimeConformance(
     runtime_command.addFileInput(b.path("luau/iteration_exit_transfer_runtime_oracle.luau"));
     runtime_command.addFileInput(b.path("luau/iteration_break_exit_transfer_runtime_oracle.luau"));
     runtime_command.addFileInput(b.path("luau/iteration_header_entry_runtime_oracle.luau"));
+    runtime_command.addFileInput(b.path("luau/wrapped_continue_runtime_oracle.luau"));
     runtime_command.addArg(fixture_name);
     runtime_command.addFileArg(b.path(source_path));
     runtime_command.addFileArg(generated_luau);
@@ -2555,6 +2593,7 @@ fn addDispatcherRuntimeConformance(
     runtime_dispatcher.addFileInput(b.path("luau/iteration_exit_transfer_runtime_oracle.luau"));
     runtime_dispatcher.addFileInput(b.path("luau/iteration_break_exit_transfer_runtime_oracle.luau"));
     runtime_dispatcher.addFileInput(b.path("luau/iteration_header_entry_runtime_oracle.luau"));
+    runtime_dispatcher.addFileInput(b.path("luau/wrapped_continue_runtime_oracle.luau"));
     runtime_dispatcher.addArg(fixture_name);
     runtime_dispatcher.addFileArg(dispatcher_luau);
     runtime_dispatcher.expectExitCode(0);
@@ -2593,6 +2632,7 @@ fn addAutomaticRuntimeConformance(
     runtime_automatic.addFileInput(b.path("luau/iteration_exit_transfer_runtime_oracle.luau"));
     runtime_automatic.addFileInput(b.path("luau/iteration_break_exit_transfer_runtime_oracle.luau"));
     runtime_automatic.addFileInput(b.path("luau/iteration_header_entry_runtime_oracle.luau"));
+    runtime_automatic.addFileInput(b.path("luau/wrapped_continue_runtime_oracle.luau"));
     runtime_automatic.addArg(fixture_name);
     runtime_automatic.addFileArg(automatic_luau);
     runtime_automatic.expectExitCode(0);
@@ -2780,6 +2820,7 @@ fn addSerializedConformanceWithEngine(
     runtime_command.addFileInput(b.path("luau/iteration_exit_transfer_runtime_oracle.luau"));
     runtime_command.addFileInput(b.path("luau/iteration_break_exit_transfer_runtime_oracle.luau"));
     runtime_command.addFileInput(b.path("luau/iteration_header_entry_runtime_oracle.luau"));
+    runtime_command.addFileInput(b.path("luau/wrapped_continue_runtime_oracle.luau"));
     runtime_command.addArg(fixture_name);
     runtime_command.addFileArg(emitted_luau);
 
@@ -2839,6 +2880,7 @@ fn addLuauSourceConformanceForTarget(
     runtime_command.addFileInput(b.path("luau/iteration_exit_transfer_runtime_oracle.luau"));
     runtime_command.addFileInput(b.path("luau/iteration_break_exit_transfer_runtime_oracle.luau"));
     runtime_command.addFileInput(b.path("luau/iteration_header_entry_runtime_oracle.luau"));
+    runtime_command.addFileInput(b.path("luau/wrapped_continue_runtime_oracle.luau"));
     runtime_command.addArg(fixture_name);
     runtime_command.addFileArg(emitted_luau);
 

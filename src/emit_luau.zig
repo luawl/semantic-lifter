@@ -32,6 +32,7 @@ const PlaceAlias = lexical.PlaceAlias;
 
 const EmissionPlan = emission_planning.Plan;
 const NativeIterationCompletion = emission_planning.NativeIterationCompletion;
+const ContinueBinder = emission_planning.ContinueBinder;
 
 const ContainerGroupWrapper = struct {
     output_start: usize,
@@ -370,6 +371,10 @@ fn emitFunctionBody(
     indent: []const u8,
     place_aliases: []const PlaceAlias,
 ) (EmitError || std.mem.Allocator.Error)!void {
+    // A nested function's continues bind only to that function's own loops.
+    const enclosing_binder = emission_plan.state.continue_binder;
+    emission_plan.state.continue_binder = null;
+    defer emission_plan.state.continue_binder = enclosing_binder;
     var analysis = cfg.Analysis.init(allocator, program, function) catch |err| {
         std.debug.print("emit function={} stage=cfg error={s}\n", .{ function.id.index(), @errorName(err) });
         return error.UnsupportedControlFlow;
@@ -958,17 +963,23 @@ fn emitRegionWithPredeclaredBlock(
     }
     try output.appendSlice(allocator, region_indent);
     try output.appendSlice(allocator, "repeat\n");
-    try emitRegionBodyWithPredeclaredBlock(
-        output,
-        allocator,
-        program,
-        emission_plan,
-        scopes,
-        region,
-        body_indent,
-        place_aliases,
-        predeclared_block,
-    );
+    {
+        // A lexical `continue` in the wrapped body binds to this `repeat`, and leaving it reaches `target`.
+        const wrapper_binder: ContinueBinder = .{ .kind = .wrapper, .stop = target, .parent = emission_plan.state.continue_binder };
+        emission_plan.state.continue_binder = &wrapper_binder;
+        defer emission_plan.state.continue_binder = wrapper_binder.parent;
+        try emitRegionBodyWithPredeclaredBlock(
+            output,
+            allocator,
+            program,
+            emission_plan,
+            scopes,
+            region,
+            body_indent,
+            place_aliases,
+            predeclared_block,
+        );
+    }
     try output.appendSlice(allocator, region_indent);
     try output.appendSlice(allocator, "until true\n");
     try emitRegionEscapePropagation(output, allocator, program, emission_plan, region, region_indent);
@@ -1461,7 +1472,7 @@ fn emitRegionBodyWithPredeclaredBlock(
             {
                 if (region.continue_target != null and projection.target == region.continue_target.?) {
                     try emitNativeIterationCompletionSetForTarget(output, allocator, emission_plan, projection.target, indent);
-                    try emitContinueStatement(output, allocator, indent);
+                    try emitContinueStatement(output, allocator, emission_plan, projection.target, indent);
                 } else {
                     try emitEscapeFlagSet(output, allocator, program, emission_plan, projection.target, indent);
                 }
@@ -2072,6 +2083,10 @@ fn emitLoop(
 
     try output.appendSlice(allocator, indent);
     try output.appendSlice(allocator, "while true do\n");
+    // A lexical `continue` in the body or in the loop's own propagation binds to this loop.
+    const loop_binder: ContinueBinder = .{ .kind = .loop, .header = loop_plan.header, .stop = loop_plan.body_region.stop, .parent = emission_plan.state.continue_binder };
+    emission_plan.state.continue_binder = &loop_binder;
+    defer emission_plan.state.continue_binder = loop_binder.parent;
     const predeclared_header = if (structured_escape.regionHasNestedEscapeTo(loop_plan.body_region, loop_plan.header))
         loop_plan.header
     else
@@ -2291,7 +2306,16 @@ fn emitNumericForLoop(
         try emitNativeIterationCompletionAssignment(output, allocator, flag, false, loop_indent);
     }
 
-    try emitRegion(output, allocator, program, emission_plan, scopes, body_region, loop_indent, place_aliases);
+    {
+        // A lexical `continue` in the body binds to this loop; a `for` that runs its body once binds none.
+        const loop_binder: ContinueBinder = if (break_after_body)
+            .{ .kind = .one_shot, .parent = emission_plan.state.continue_binder }
+        else
+            .{ .kind = .loop, .header = body_region.stop, .stop = body_region.stop, .parent = emission_plan.state.continue_binder };
+        emission_plan.state.continue_binder = &loop_binder;
+        defer emission_plan.state.continue_binder = loop_binder.parent;
+        try emitRegion(output, allocator, program, emission_plan, scopes, body_region, loop_indent, place_aliases);
+    }
     // No termination test: a body region whose last node returns is written inside a transfer wrapper (when
     // that node is a branch, each returning arm is), so this write never follows a bare return; after a wrapped
     // region it is where a continue the wrapper captures resumes, so it must stay.
@@ -2451,7 +2475,16 @@ fn emitSemanticNormalizedNumericLoop(
     try output.appendSlice(allocator, " = ");
     try render.valueName(output, allocator, &emission_plan.names, numeric.operation.control);
     try output.appendSlice(allocator, "\n");
-    try emitRegion(output, allocator, program, emission_plan, scopes, body_region, loop_indent, place_aliases);
+    {
+        // A lexical `continue` in the body binds to this loop; a `for` that runs its body once binds none.
+        const loop_binder: ContinueBinder = if (break_after_body)
+            .{ .kind = .one_shot, .parent = emission_plan.state.continue_binder }
+        else
+            .{ .kind = .loop, .header = body_region.stop, .stop = body_region.stop, .parent = emission_plan.state.continue_binder };
+        emission_plan.state.continue_binder = &loop_binder;
+        defer emission_plan.state.continue_binder = loop_binder.parent;
+        try emitRegion(output, allocator, program, emission_plan, scopes, body_region, loop_indent, place_aliases);
+    }
     if (break_after_body and !regionAlwaysFunctionTerminates(program, body_region)) {
         try emitBreakStatement(output, allocator, loop_indent);
     }
@@ -2525,7 +2558,16 @@ fn emitGenericForLoop(
         try emitNativeIterationCompletionAssignment(output, allocator, flag, false, loop_indent);
     }
 
-    try emitRegion(output, allocator, program, emission_plan, scopes, body_region, loop_indent, place_aliases);
+    {
+        // A lexical `continue` in the body binds to this loop; a `for` that runs its body once binds none.
+        const loop_binder: ContinueBinder = if (break_after_body)
+            .{ .kind = .one_shot, .parent = emission_plan.state.continue_binder }
+        else
+            .{ .kind = .loop, .header = body_region.stop, .stop = body_region.stop, .parent = emission_plan.state.continue_binder };
+        emission_plan.state.continue_binder = &loop_binder;
+        defer emission_plan.state.continue_binder = loop_binder.parent;
+        try emitRegion(output, allocator, program, emission_plan, scopes, body_region, loop_indent, place_aliases);
+    }
     // No termination test: a body region whose last node returns is written inside a transfer wrapper (when
     // that node is a branch, each returning arm is), so this write never follows a bare return; after a wrapped
     // region it is where a continue the wrapper captures resumes, so it must stay.
@@ -2821,29 +2863,35 @@ fn emitLatchLoop(
         null;
     try output.appendSlice(allocator, indent);
     try output.appendSlice(allocator, "while true do\n");
-    if (predeclared_header) |header| {
-        try emitEscapeFlagDeclaration(output, allocator, program, emission_plan, header, loop_indent);
+    {
+        // A lexical `continue` in the body or in the loop's own propagation binds to this loop.
+        const loop_binder: ContinueBinder = .{ .kind = .loop, .header = loop_plan.header, .stop = loop_plan.body_region.stop, .parent = emission_plan.state.continue_binder };
+        emission_plan.state.continue_binder = &loop_binder;
+        defer emission_plan.state.continue_binder = loop_binder.parent;
+        if (predeclared_header) |header| {
+            try emitEscapeFlagDeclaration(output, allocator, program, emission_plan, header, loop_indent);
+        }
+        try emitRegionWithPredeclaredBlock(
+            output,
+            allocator,
+            program,
+            emission_plan,
+            scopes,
+            loop_plan.body_region,
+            loop_indent,
+            place_aliases,
+            predeclared_header,
+        );
+        try emitLoopEscapePropagation(
+            output,
+            allocator,
+            program,
+            emission_plan,
+            .{ .latch_loop = loop_plan },
+            loop_indent,
+            true,
+        );
     }
-    try emitRegionWithPredeclaredBlock(
-        output,
-        allocator,
-        program,
-        emission_plan,
-        scopes,
-        loop_plan.body_region,
-        loop_indent,
-        place_aliases,
-        predeclared_header,
-    );
-    try emitLoopEscapePropagation(
-        output,
-        allocator,
-        program,
-        emission_plan,
-        .{ .latch_loop = loop_plan },
-        loop_indent,
-        true,
-    );
     try output.appendSlice(allocator, indent);
     try output.appendSlice(allocator, "end\n");
 }
@@ -2905,29 +2953,35 @@ fn emitInfiniteLoop(
         null;
     try output.appendSlice(allocator, indent);
     try output.appendSlice(allocator, "while true do\n");
-    if (predeclared_header) |header| {
-        try emitEscapeFlagDeclaration(output, allocator, program, emission_plan, header, loop_indent);
+    {
+        // A lexical `continue` in the body or in the loop's own propagation binds to this loop.
+        const loop_binder: ContinueBinder = .{ .kind = .loop, .header = loop_plan.header, .stop = loop_plan.body_region.stop, .parent = emission_plan.state.continue_binder };
+        emission_plan.state.continue_binder = &loop_binder;
+        defer emission_plan.state.continue_binder = loop_binder.parent;
+        if (predeclared_header) |header| {
+            try emitEscapeFlagDeclaration(output, allocator, program, emission_plan, header, loop_indent);
+        }
+        try emitRegionWithPredeclaredBlock(
+            output,
+            allocator,
+            program,
+            emission_plan,
+            scopes,
+            loop_plan.body_region,
+            loop_indent,
+            place_aliases,
+            predeclared_header,
+        );
+        try emitLoopEscapePropagation(
+            output,
+            allocator,
+            program,
+            emission_plan,
+            .{ .infinite_loop = loop_plan },
+            loop_indent,
+            true,
+        );
     }
-    try emitRegionWithPredeclaredBlock(
-        output,
-        allocator,
-        program,
-        emission_plan,
-        scopes,
-        loop_plan.body_region,
-        loop_indent,
-        place_aliases,
-        predeclared_header,
-    );
-    try emitLoopEscapePropagation(
-        output,
-        allocator,
-        program,
-        emission_plan,
-        .{ .infinite_loop = loop_plan },
-        loop_indent,
-        true,
-    );
     try output.appendSlice(allocator, indent);
     try output.appendSlice(allocator, "end\n");
     if (loop_plan.shared_side_exit) |side_exit| {
@@ -3066,7 +3120,7 @@ fn emitEscapePropagation(
     targets: []const ir.BlockId,
     indent: []const u8,
     loop_header: ?ir.BlockId,
-) std.mem.Allocator.Error!void {
+) (EmitError || std.mem.Allocator.Error)!void {
     if (targets.len == 0) return;
     const break_indent = try allocDeeperIndent(allocator, indent);
     defer allocator.free(break_indent);
@@ -3078,6 +3132,7 @@ fn emitEscapePropagation(
         try output.appendSlice(allocator, flag);
         try output.appendSlice(allocator, " then\n");
         if (escapePropagationIsLoopContinue(target, loop_header)) {
+            if (!continueBindsTo(emission_plan.state.continue_binder, target)) return error.UnsupportedControlFlow;
             try emitNativeIterationCompletionSetForTarget(output, allocator, emission_plan, target, break_indent);
             try output.appendSlice(allocator, break_indent);
             try output.appendSlice(allocator, "continue\n");
@@ -3097,7 +3152,7 @@ fn emitEscapeContinueIfSet(
     emission_plan: *const EmissionPlan,
     target: ir.BlockId,
     indent: []const u8,
-) std.mem.Allocator.Error!void {
+) (EmitError || std.mem.Allocator.Error)!void {
     const flag = try escapeFlagNameAlloc(allocator, program, emission_plan, target);
     defer allocator.free(flag);
     const body_indent = try allocDeeperIndent(allocator, indent);
@@ -3107,7 +3162,7 @@ fn emitEscapeContinueIfSet(
     try output.appendSlice(allocator, flag);
     try output.appendSlice(allocator, " then\n");
     try emitNativeIterationCompletionSetForTarget(output, allocator, emission_plan, target, body_indent);
-    try emitContinueStatement(output, allocator, body_indent);
+    try emitContinueStatement(output, allocator, emission_plan, target, body_indent);
     try output.appendSlice(allocator, indent);
     try output.appendSlice(allocator, "end\n");
 }
@@ -3124,7 +3179,7 @@ fn emitLoopEscapePropagation(
     node: structure.Node,
     indent: []const u8,
     consume_header_continue: bool,
-) std.mem.Allocator.Error!void {
+) (EmitError || std.mem.Allocator.Error)!void {
     const targets = try structured_escape.loopFreeTargetsAlloc(allocator, node);
     defer allocator.free(targets);
     const loop_header = if (consume_header_continue) node.blockId() else null;
@@ -3144,7 +3199,7 @@ fn emitRegionEscapePropagation(
     emission_plan: *const EmissionPlan,
     region: *const structure.Region,
     indent: []const u8,
-) std.mem.Allocator.Error!void {
+) (EmitError || std.mem.Allocator.Error)!void {
     const targets = try structured_escape.regionFreeTargetsAlloc(allocator, region);
     defer allocator.free(targets);
     const loop_header = regionOwnedContinueHeader(region);
@@ -3305,7 +3360,7 @@ fn emitProjectedContinue(
         place_aliases,
     );
     try emitNativeIterationCompletionSetForTarget(output, allocator, emission_plan, target, indent);
-    try emitContinueStatement(output, allocator, indent);
+    try emitContinueStatement(output, allocator, emission_plan, target, indent);
 }
 
 fn emitProjectedContinueAfterTransferredEdge(
@@ -3319,10 +3374,45 @@ fn emitProjectedContinueAfterTransferredEdge(
 ) (EmitError || std.mem.Allocator.Error)!void {
     _ = try loop_continue_projection.validateEntry(program, target, edge);
     try emitNativeIterationCompletionSetForTarget(output, allocator, emission_plan, target, indent);
-    try emitContinueStatement(output, allocator, indent);
+    try emitContinueStatement(output, allocator, emission_plan, target, indent);
 }
 
-fn emitContinueStatement(output: *std.ArrayList(u8), allocator: std.mem.Allocator, indent: []const u8) std.mem.Allocator.Error!void {
+/// Whether a lexical `continue` written under `binder`, the innermost Luau loop statement, reaches `target`: the
+/// binder is a loop whose header or body stop is `target`, or a transfer wrapper whose stop is `target` (leaving a
+/// wrapper reaches its stop) or is the body stop of the innermost loop around it, whose header is `target`. A `for`
+/// that runs its body once binds no `continue`, and neither does the absence of a loop statement.
+fn continueBindsTo(binder: ?*const ContinueBinder, target: ir.BlockId) bool {
+    const innermost = binder orelse return false;
+    switch (innermost.kind) {
+        .loop => return sameBlock(innermost.header, target) or sameBlock(innermost.stop, target),
+        .one_shot => return false,
+        .wrapper => {
+            if (sameBlock(innermost.stop, target)) return true;
+            var outer = innermost.parent;
+            while (outer) |enclosing| : (outer = enclosing.parent) {
+                if (enclosing.kind == .wrapper) continue;
+                return enclosing.kind == .loop and sameBlock(enclosing.header, target) and
+                    enclosing.stop != null and sameBlock(innermost.stop, enclosing.stop.?);
+            }
+            return false;
+        },
+    }
+}
+
+fn sameBlock(block: ?ir.BlockId, target: ir.BlockId) bool {
+    return block != null and block.? == target;
+}
+
+/// A lexical `continue` to `target`, written only where it binds to a loop statement that reaches `target`;
+/// anywhere else the function is refused, and emitFunctionBody writes it in the flat layout.
+fn emitContinueStatement(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    emission_plan: *const EmissionPlan,
+    target: ir.BlockId,
+    indent: []const u8,
+) (EmitError || std.mem.Allocator.Error)!void {
+    if (!continueBindsTo(emission_plan.state.continue_binder, target)) return error.UnsupportedControlFlow;
     const transfer_indent = try allocDeeperIndent(allocator, indent);
     defer allocator.free(transfer_indent);
     try output.appendSlice(allocator, indent);
@@ -3538,7 +3628,7 @@ fn emitLoopBoundaryBodyImpl(
             try emitEscapeFlagSet(output, allocator, program, emission_plan, transfer.target, indent);
         } else {
             try emitNativeIterationCompletionSetForTarget(output, allocator, emission_plan, transfer.target, indent);
-            try emitContinueStatement(output, allocator, indent);
+            try emitContinueStatement(output, allocator, emission_plan, transfer.target, indent);
         }
         return;
     }
@@ -3554,7 +3644,7 @@ fn emitLoopBoundaryBodyImpl(
             continue_target orelse return error.UnsupportedControlFlow,
             indent,
         );
-        try emitContinueStatement(output, allocator, indent);
+        try emitContinueStatement(output, allocator, emission_plan, continue_target.?, indent);
     }
 }
 
@@ -3967,6 +4057,9 @@ test "a propagated continue to a guarded native header writes its completion fla
     var completion: NativeIterationCompletion = .{ .header = header, .flag_name = "__lifter_native_iteration_complete_1" };
     plan.state.native_iteration_completion = &completion;
     defer plan.state.native_iteration_completion = null;
+    const header_loop: ContinueBinder = .{ .kind = .loop, .header = header, .stop = header };
+    plan.state.continue_binder = &header_loop;
+    defer plan.state.continue_binder = null;
 
     var propagated: std.ArrayList(u8) = .empty;
     defer propagated.deinit(allocator);
@@ -4055,6 +4148,9 @@ test "explicit continues to a guarded native header write its completion flag be
     var completion: NativeIterationCompletion = .{ .header = header, .flag_name = "__lifter_native_iteration_complete_1" };
     plan.state.native_iteration_completion = &completion;
     defer plan.state.native_iteration_completion = null;
+    const header_loop: ContinueBinder = .{ .kind = .loop, .header = header, .stop = header };
+    plan.state.continue_binder = &header_loop;
+    defer plan.state.continue_binder = null;
     const to_header: ir.Edge = .{ .target = header };
     const guarded_continue =
         "    __lifter_native_iteration_complete_1 = true\n" ++
@@ -4132,6 +4228,88 @@ test "explicit continues to a guarded native header write its completion flag be
     defer unmatched.deinit(allocator);
     try emitProjectedContinueAfterTransferredEdge(&unmatched, allocator, &program, &plan, to_header, header, "    ");
     try std.testing.expectEqualStrings("    do\n      continue\n    end\n", unmatched.items);
+}
+
+test "a lexical continue is written only where its loop statement reaches the target" {
+    const allocator = std.testing.allocator;
+    const function_id = ir.FunctionId.fromIndex(0);
+    const header = ir.BlockId.fromIndex(1);
+    const forwarder = ir.BlockId.fromIndex(2);
+    const join = ir.BlockId.fromIndex(3);
+
+    // A loop continues at its header, and at its body stop when that block forwards to the header.
+    const header_loop: ContinueBinder = .{ .kind = .loop, .header = header, .stop = header };
+    const forwarded_loop: ContinueBinder = .{ .kind = .loop, .header = header, .stop = forwarder };
+    try std.testing.expect(continueBindsTo(&header_loop, header));
+    try std.testing.expect(continueBindsTo(&forwarded_loop, header));
+    try std.testing.expect(continueBindsTo(&forwarded_loop, forwarder));
+    try std.testing.expect(!continueBindsTo(&header_loop, join));
+    // Leaving a transfer wrapper reaches its stop: a continue to that stop is right, and so is a continue to the
+    // header of the innermost loop whose body stop the wrapper stops at; a continue to the header inside a wrapper
+    // that stops at a join is not.
+    const stops_at_join: ContinueBinder = .{ .kind = .wrapper, .stop = join, .parent = &header_loop };
+    try std.testing.expect(continueBindsTo(&stops_at_join, join));
+    try std.testing.expect(!continueBindsTo(&stops_at_join, header));
+    const stops_at_forwarder: ContinueBinder = .{ .kind = .wrapper, .stop = forwarder, .parent = &forwarded_loop };
+    const nested_at_forwarder: ContinueBinder = .{ .kind = .wrapper, .stop = forwarder, .parent = &stops_at_forwarder };
+    const nested_at_join: ContinueBinder = .{ .kind = .wrapper, .stop = join, .parent = &stops_at_forwarder };
+    try std.testing.expect(continueBindsTo(&stops_at_forwarder, header));
+    try std.testing.expect(continueBindsTo(&nested_at_forwarder, header));
+    try std.testing.expect(!continueBindsTo(&nested_at_join, header));
+    // A `for` that runs its body once binds no continue, and a wrapper inside it reaches only its own stop.
+    const once: ContinueBinder = .{ .kind = .one_shot, .parent = &header_loop };
+    const inside_once: ContinueBinder = .{ .kind = .wrapper, .stop = join, .parent = &once };
+    try std.testing.expect(!continueBindsTo(&once, header));
+    try std.testing.expect(!continueBindsTo(&inside_once, header));
+    try std.testing.expect(continueBindsTo(&inside_once, join));
+    // Outside every loop statement nothing binds.
+    try std.testing.expect(!continueBindsTo(null, header));
+
+    // The writers refuse a continue whose binder does not reach the target, and write it where it does.
+    const function_blocks = [_]ir.BlockId{ ir.BlockId.fromIndex(0), header, forwarder, join };
+    const blocks = [_]ir.Block{
+        .{ .id = ir.BlockId.fromIndex(0), .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = header, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = forwarder, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = join, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const functions = [_]ir.Function{.{ .id = function_id, .blocks = &function_blocks, .entry_block = ir.BlockId.fromIndex(0) }};
+    const program: ir.Program = .{
+        .program_id = "continue-binder",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &.{},
+    };
+    var plan = try EmissionPlan.init(allocator, &program, .standard_luau);
+    defer plan.deinit();
+    defer plan.state.continue_binder = null;
+    var refused: std.ArrayList(u8) = .empty;
+    defer refused.deinit(allocator);
+    for ([_]?*const ContinueBinder{ null, &stops_at_join, &once, &inside_once }) |binder| {
+        plan.state.continue_binder = binder;
+        try std.testing.expectError(error.UnsupportedControlFlow, emitContinueStatement(&refused, allocator, &plan, header, "    "));
+        try std.testing.expectError(error.UnsupportedControlFlow, emitEscapeContinueIfSet(&refused, allocator, &program, &plan, header, "    "));
+        try std.testing.expectError(error.UnsupportedControlFlow, emitEscapePropagation(&refused, allocator, &program, &plan, &.{header}, "    ", header));
+    }
+    plan.state.continue_binder = &stops_at_join;
+    var written: std.ArrayList(u8) = .empty;
+    defer written.deinit(allocator);
+    try emitContinueStatement(&written, allocator, &plan, join, "    ");
+    plan.state.continue_binder = &nested_at_forwarder;
+    try emitEscapeContinueIfSet(&written, allocator, &program, &plan, header, "    ");
+    try std.testing.expectEqualStrings(
+        "    do\n" ++
+            "      continue\n" ++
+            "    end\n" ++
+            "    if __lifter_escape_1 then\n" ++
+            "      do\n" ++
+            "        continue\n" ++
+            "      end\n" ++
+            "    end\n",
+        written.items,
+    );
 }
 
 test "wrapped region exposes only its owning loop continuation" {

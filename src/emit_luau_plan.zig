@@ -19,8 +19,22 @@ pub const NativeIterationCompletion = struct {
     parent: ?*NativeIterationCompletion = null,
 };
 
+/// The innermost Luau loop statement around the text being written, which a lexical `continue` binds to: a
+/// transfer wrapper (`repeat ... until true`), whose end reaches its `stop`; a loop, whose next pass starts at its
+/// `header` (`stop` is its body region's stop: the header, or a block that forwards to it); or a `for` written to
+/// run its body once, which binds no `continue`. `parent` is the statement around it.
+pub const ContinueBinder = struct {
+    kind: Kind,
+    header: ?ir.BlockId = null,
+    stop: ?ir.BlockId = null,
+    parent: ?*const ContinueBinder = null,
+
+    pub const Kind = enum { wrapper, loop, one_shot };
+};
+
 pub const EmitState = struct {
     native_iteration_completion: ?*NativeIterationCompletion = null,
+    continue_binder: ?*const ContinueBinder = null,
 };
 
 pub const Plan = struct {
