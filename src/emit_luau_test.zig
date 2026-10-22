@@ -3704,3 +3704,96 @@ test "a generic-for initializer result read after the loop keeps its triple in p
     // (D3) the producer is written exactly once.
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "f(t)"));
 }
+
+test "a loop left through the exit of the loop around it declares that exit's flag in the outer loop" {
+    const proof = ir.EvidenceId.fromIndex(0);
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const outer_header = ir.BlockId.fromIndex(1);
+    const inner_header = ir.BlockId.fromIndex(2);
+    const inner_body = ir.BlockId.fromIndex(3);
+    const exit_block = ir.BlockId.fromIndex(4);
+    const inner_latch = ir.BlockId.fromIndex(5);
+    const outer_call = ir.InstructionId.fromIndex(0);
+    const latch_call = ir.InstructionId.fromIndex(1);
+    const again = ir.ValueId.fromIndex(0);
+    const stay = ir.ValueId.fromIndex(1);
+    const observe = ir.ValueId.fromIndex(2);
+    const go = ir.ValueId.fromIndex(3);
+    const values = [_]ir.Value{
+        .{ .id = again, .function = function_id, .type = .boolean, .name_hint = "again", .origin = .{ .parameter = 0 } },
+        .{ .id = stay, .function = function_id, .type = .boolean, .name_hint = "stay", .origin = .{ .parameter = 1 } },
+        .{ .id = observe, .function = function_id, .type = .function, .name_hint = "observe", .origin = .{ .parameter = 2 } },
+        .{ .id = go, .function = function_id, .type = .boolean, .name_hint = "go", .origin = .{ .parameter = 3 } },
+    };
+    const instructions = [_]ir.Instruction{
+        .{ .id = outer_call, .block = outer_header, .operation = .{ .call = .{ .callee = observe, .arguments = &.{}, .result_arity = .{ .fixed = 0 } } }, .results = &.{}, .effects = .dynamic_call, .evidence = &.{proof} },
+        .{ .id = latch_call, .block = inner_latch, .operation = .{ .call = .{ .callee = observe, .arguments = &.{}, .result_arity = .{ .fixed = 0 } } }, .results = &.{}, .effects = .dynamic_call, .evidence = &.{proof} },
+    };
+    // The outer loop (header 1) is left only through the inner loop's exit (block 4); the inner body (block 3)
+    // continues the outer loop or, through block 5, the inner loop.
+    var blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .jump = .{ .target = outer_header } }, .evidence = &.{proof} },
+        .{ .id = outer_header, .function = function_id, .instructions = &.{outer_call}, .terminator = .{ .jump = .{ .target = inner_header } }, .evidence = &.{proof} },
+        .{ .id = inner_header, .function = function_id, .terminator = .{ .branch = .{
+            .condition = again,
+            .then_edge = .{ .target = inner_body },
+            .else_edge = .{ .target = exit_block },
+        } }, .evidence = &.{proof} },
+        .{ .id = inner_body, .function = function_id, .terminator = .{ .branch = .{
+            .condition = stay,
+            .then_edge = .{ .target = outer_header },
+            .else_edge = .{ .target = inner_latch },
+        } }, .evidence = &.{proof} },
+        .{ .id = exit_block, .function = function_id, .terminator = .{ .return_values = &.{} }, .evidence = &.{proof} },
+        .{ .id = inner_latch, .function = function_id, .instructions = &.{latch_call}, .terminator = .{ .jump = .{ .target = inner_header } }, .evidence = &.{proof} },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .parameters = &.{ again, stay, observe, go },
+        .blocks = &.{ entry, outer_header, inner_header, inner_body, exit_block, inner_latch },
+        .entry_block = entry,
+        .evidence = &.{proof},
+    }};
+    const evidence = [_]ir.Evidence{.{ .id = proof, .kind = .dynamic_fixture, .locator = "fixture:nested-loop-enclosing-exit" }};
+    const program: ir.Program = .{
+        .program_id = "generic-nested-loop-enclosing-exit",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+        .evidence = &evidence,
+    };
+
+    // An outer loop with no exit test of its own.
+    const untested = try emitAlloc(std.testing.allocator, &program);
+    defer std.testing.allocator.free(untested);
+    try expectExitFlagDeclaredInOuterLoop(untested);
+
+    // The same loops with an exit test in the outer header.
+    blocks[outer_header.index()].terminator = .{ .branch = .{
+        .condition = go,
+        .then_edge = .{ .target = inner_header },
+        .else_edge = .{ .target = exit_block },
+    } };
+    const tested = try emitAlloc(std.testing.allocator, &program);
+    defer std.testing.allocator.free(tested);
+    try expectExitFlagDeclaredInOuterLoop(tested);
+}
+
+/// The flag of block 4 (the exit both loops share) is declared once, inside the outer loop and before its body,
+/// and before any read or write of it.
+fn expectExitFlagDeclaredInOuterLoop(source: []const u8) !void {
+    const declaration_text = "local __lifter_escape_4 = false\n";
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, declaration_text));
+    const declaration = std.mem.indexOf(u8, source, declaration_text) orelse return error.TestUnexpectedResult;
+    const outer_loop = std.mem.indexOf(u8, source, "while true do\n") orelse return error.TestUnexpectedResult;
+    const body_wrapper = std.mem.indexOf(u8, source, "repeat\n") orelse return error.TestUnexpectedResult;
+    const first_write = std.mem.indexOf(u8, source, "__lifter_escape_4 = true\n") orelse return error.TestUnexpectedResult;
+    const first_read = std.mem.indexOf(u8, source, "if __lifter_escape_4 then\n") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(outer_loop < declaration);
+    try std.testing.expect(declaration < body_wrapper);
+    try std.testing.expect(declaration < first_write);
+    try std.testing.expect(declaration < first_read);
+}

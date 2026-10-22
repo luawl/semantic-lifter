@@ -2123,6 +2123,10 @@ fn emitLoop(
     if (predeclared_header) |header_flag| {
         try emitEscapeFlagDeclaration(output, allocator, program, emission_plan, header_flag, loop_indent);
     }
+    // The flag of the exit this loop owns starts false on every pass (`loopOwnedExitFlag`).
+    if (structured_escape.loopOwnedExitFlag(enclosing_region, .{ .loop = loop_plan })) |exit_flag| {
+        try emitEscapeFlagDeclaration(output, allocator, program, emission_plan, exit_flag, loop_indent);
+    }
     try emitBlockInstructionsWithDeclaration(output, allocator, program, emission_plan, scopes, header, loop_indent, false, place_aliases, null);
     try output.appendSlice(allocator, loop_indent);
     try output.appendSlice(allocator, "if ");
@@ -2318,6 +2322,11 @@ fn emitNumericForLoop(
 
     const loop_indent = try allocDeeperIndent(allocator, indent);
     defer allocator.free(loop_indent);
+    // The flag of the exit this loop owns starts false on every pass (`loopOwnedExitFlag`). A `for` written for a
+    // branch or a loop boundary finds no loop node at `node_index`, so it declares nothing.
+    if (structured_escape.loopOwnedExitFlag(enclosing_region, enclosing_region.nodes[node_index])) |exit_flag| {
+        try emitEscapeFlagDeclaration(output, allocator, program, emission_plan, exit_flag, loop_indent);
+    }
 
     const completion_state = emission_plan.state;
     const previous_completion = completion_state.native_iteration_completion;
@@ -2440,6 +2449,11 @@ fn emitSemanticNormalizedNumericLoop(
     defer allocator.free(loop_indent);
     const branch_indent = try allocDeeperIndent(allocator, loop_indent);
     defer allocator.free(branch_indent);
+    // The flag of the exit this loop owns starts false on every pass (`loopOwnedExitFlag`). A `for` written for a
+    // branch or a loop boundary finds no loop node at `node_index`, so it declares nothing.
+    if (structured_escape.loopOwnedExitFlag(enclosing_region, enclosing_region.nodes[node_index])) |exit_flag| {
+        try emitEscapeFlagDeclaration(output, allocator, program, emission_plan, exit_flag, loop_indent);
+    }
 
     try output.appendSlice(allocator, loop_indent);
     try render.valueName(output, allocator, &emission_plan.names, numeric.operation.control);
@@ -2570,6 +2584,11 @@ fn emitGenericForLoop(
 
     const loop_indent = try allocDeeperIndent(allocator, indent);
     defer allocator.free(loop_indent);
+    // The flag of the exit this loop owns starts false on every pass (`loopOwnedExitFlag`). A `for` written for a
+    // branch or a loop boundary finds no loop node at `node_index`, so it declares nothing.
+    if (structured_escape.loopOwnedExitFlag(enclosing_region, enclosing_region.nodes[node_index])) |exit_flag| {
+        try emitEscapeFlagDeclaration(output, allocator, program, emission_plan, exit_flag, loop_indent);
+    }
 
     const completion_state = emission_plan.state;
     const previous_completion = completion_state.native_iteration_completion;
@@ -2900,6 +2919,10 @@ fn emitLatchLoop(
         if (predeclared_header) |header| {
             try emitEscapeFlagDeclaration(output, allocator, program, emission_plan, header, loop_indent);
         }
+        // The flag of the exit this loop owns starts false on every pass (`loopOwnedExitFlag`).
+        if (structured_escape.loopOwnedExitFlag(enclosing_region, .{ .latch_loop = loop_plan })) |exit_flag| {
+            try emitEscapeFlagDeclaration(output, allocator, program, emission_plan, exit_flag, loop_indent);
+        }
         try emitRegionWithPredeclaredBlock(
             output,
             allocator,
@@ -2989,6 +3012,10 @@ fn emitInfiniteLoop(
         defer emission_plan.state.continue_binder = loop_binder.parent;
         if (predeclared_header) |header| {
             try emitEscapeFlagDeclaration(output, allocator, program, emission_plan, header, loop_indent);
+        }
+        // The flag of the exit this loop owns starts false on every pass (`loopOwnedExitFlag`).
+        if (structured_escape.loopOwnedExitFlag(enclosing_region, .{ .infinite_loop = loop_plan })) |exit_flag| {
+            try emitEscapeFlagDeclaration(output, allocator, program, emission_plan, exit_flag, loop_indent);
         }
         try emitRegionWithPredeclaredBlock(
             output,
@@ -4457,6 +4484,51 @@ test "a flag consumer after a wrapper is written only where it reaches the stop 
             "    end\n",
         written.items,
     );
+}
+
+test "a loop that owns its exit declares that exit's flag and counts it in the register budget" {
+    const header = ir.BlockId.fromIndex(1);
+    const inner_header = ir.BlockId.fromIndex(2);
+    const exit = ir.BlockId.fromIndex(3);
+    const inner_block = ir.BlockId.fromIndex(4);
+    // An infinite loop whose body holds an inner loop that leaves through the outer loop's exit: the inner loop's exit
+    // is an escape, carried by the flag of the exit the outer loop owns.
+    var inner_nodes = [_]structure.Node{.{ .block = inner_block }};
+    var inner_body = structure.Region{ .nodes = &inner_nodes, .stop = inner_header, .loop_exit = exit, .continue_target = inner_header };
+    var body_nodes = [_]structure.Node{
+        .{ .block = header },
+        .{ .loop = .{
+            .header = inner_header,
+            .body_region = &inner_body,
+            .body_edge = .{ .target = inner_block },
+            .exit_edge = .{ .target = exit },
+            .exit_is_escape = true,
+            .continue_on_true = true,
+        } },
+    };
+    var body = structure.Region{ .nodes = &body_nodes, .stop = header, .loop_exit = exit, .continue_target = header };
+    var root_nodes = [_]structure.Node{
+        .{ .infinite_loop = .{ .header = header, .body_region = &body, .exit = exit } },
+        .{ .block = exit },
+    };
+    var root = structure.Region{ .nodes = &root_nodes, .stop = null, .loop_exit = null };
+    try std.testing.expectEqual(@as(?ir.BlockId, exit), structured_escape.loopOwnedExitFlag(&root, root_nodes[0]));
+    // The inner loop leaves through an escape, so it owns no exit.
+    try std.testing.expectEqual(@as(?ir.BlockId, null), structured_escape.loopOwnedExitFlag(&body, body_nodes[1]));
+    // The owned exit's flag lives through the outer loop's body: one flag in the register budget.
+    try std.testing.expectEqual(@as(usize, 1), structured_escape.maxOwnedDepth(&root));
+    // A holding region whose stop is the exit declares the flag before its wrapper, so the loop does not.
+    root.stop = exit;
+    try std.testing.expectEqual(@as(?ir.BlockId, null), structured_escape.loopOwnedExitFlag(&root, root_nodes[0]));
+    root.stop = null;
+    // A loop whose exit is itself an escape owns no exit.
+    root_nodes[0].infinite_loop.exit_is_escape = true;
+    try std.testing.expectEqual(@as(?ir.BlockId, null), structured_escape.loopOwnedExitFlag(&root, root_nodes[0]));
+    root_nodes[0].infinite_loop.exit_is_escape = false;
+    // With no escape to the exit in the body there is no flag to declare and none to count.
+    body_nodes[1].loop.exit_is_escape = false;
+    try std.testing.expectEqual(@as(?ir.BlockId, null), structured_escape.loopOwnedExitFlag(&root, root_nodes[0]));
+    try std.testing.expectEqual(@as(usize, 0), structured_escape.maxOwnedDepth(&root));
 }
 
 test "wrapped region exposes only its owning loop continuation" {

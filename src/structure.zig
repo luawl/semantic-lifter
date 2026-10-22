@@ -597,6 +597,27 @@ pub fn regionHasNestedEscapeTo(region: *const Region, target: ir.BlockId) bool {
     return false;
 }
 
+/// The exit of a loop node whose escape flag the loop declares at the top of each pass, or null.
+///
+/// The escape census lets a loop own its exit: `collectLoopFreeTargets` puts an exit that is not itself an escape
+/// in the capture chain of the body, so an escape to it from the body (a nested loop that leaves through it, a
+/// loop-boundary escape or side escape to it, or a projection of a region in the body) is no free target above the
+/// loop and no transfer wrapper's stop. The region that holds the loop declares the flag before its wrapper when its
+/// stop is the exit. Otherwise every read and write of the flag lies inside the loop, and the loop declares it at
+/// the top of every pass, so a loop that runs again starts with the flag false; a function-scope declaration of the
+/// same flag (for a loop-boundary exit to the same block) is shadowed inside the loop.
+pub fn loopOwnedExitFlag(holding_region: *const Region, node: Node) ?ir.BlockId {
+    const owned: struct { exit: ir.BlockId, body: *const Region } = switch (node) {
+        .loop => |loop| if (loop.exit_is_escape) return null else .{ .exit = loop.exit_edge.target, .body = loop.body_region },
+        .latch_loop => |loop| if (loop.exit_is_escape) return null else .{ .exit = loop.exit, .body = loop.body_region },
+        .infinite_loop => |loop| if (loop.exit_is_escape) return null else .{ .exit = loop.exit orelse return null, .body = loop.body_region },
+        else => return null,
+    };
+    if (holding_region.stop != null and holding_region.stop.? == owned.exit) return null;
+    if (!regionEscapesTo(owned.body, owned.exit)) return null;
+    return owned.exit;
+}
+
 /// Reports whether this region contains a loop-boundary exit to `target`.
 ///
 /// Unlike an ordinary nonlocal escape, a loop-boundary exit is owned by the

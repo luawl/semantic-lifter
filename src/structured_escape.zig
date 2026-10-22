@@ -10,6 +10,10 @@ pub fn regionHasNestedEscapeTo(region: *const structure.Region, target: ir.Block
     return structure.regionHasNestedEscapeTo(region, target);
 }
 
+pub fn loopOwnedExitFlag(holding_region: *const structure.Region, node: structure.Node) ?ir.BlockId {
+    return structure.loopOwnedExitFlag(holding_region, node);
+}
+
 pub fn regionHasLoopBoundaryExitTo(region: *const structure.Region, target: ir.BlockId) bool {
     return structure.regionHasLoopBoundaryExitTo(region, target);
 }
@@ -60,7 +64,8 @@ pub fn maxOwnedDepth(region: *const structure.Region) usize {
 fn maxRegionDepth(region: *const structure.Region, depth: usize) usize {
     const nested_depth = depth + @intFromBool(regionOwnsEscape(region));
     var maximum = nested_depth;
-    for (region.nodes) |node| maximum = @max(maximum, maxNodeDepth(node, nested_depth));
+    // A loop that declares its owned exit's flag at the top of each pass holds one more flag through its body.
+    for (region.nodes) |node| maximum = @max(maximum, maxNodeDepth(node, nested_depth + @intFromBool(loopOwnedExitFlag(region, node) != null)));
     return maximum;
 }
 
