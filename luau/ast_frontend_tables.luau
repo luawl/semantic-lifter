@@ -18,6 +18,7 @@ type Host = {
 	node_tag: (Record) -> string,
 	scalar_result: (any, Record, Record, Record, string?, Record) -> any,
 	instruction_options: (any, Record, Record, { number }?) -> Record,
+	defer_register_local: (any, Record) -> (() -> any)?,
 }
 
 local function item(host: Host, value: any): Record
@@ -122,19 +123,26 @@ local function lowerOrdered(expressions: any, host: Host, context: any, node: Re
 				addWrite(host, context, tableItem, tableValue, key, valueOutcome.value)
 			end
 		elseif tableItem.kind == "record" or tableItem.kind == "general" then
-			local keyOutcome = expressions:lower(
-				context,
-				host.expect_record(tableItem.key, "malformed_table_item", "keyed table item is missing its key"),
-				nil
-			)
-			if keyOutcome.kind == "terminated" then
-				return keyOutcome
+			-- Luau reads a register local key at the item's store, after the item's value ran;
+			-- any other key is computed before the value, in source order.
+			local keyNode = host.expect_record(tableItem.key, "malformed_table_item", "keyed table item is missing its key")
+			local readKey = host.defer_register_local(context, keyNode)
+			local key: any = nil
+			if readKey == nil then
+				local keyOutcome = expressions:lower(context, keyNode, nil)
+				if keyOutcome.kind == "terminated" then
+					return keyOutcome
+				end
+				key = keyOutcome.value
 			end
 			local valueOutcome = expressions:lower(context, valueNode, nil)
 			if valueOutcome.kind == "terminated" then
 				return valueOutcome
 			end
-			addWrite(host, context, tableItem, tableValue, keyOutcome.value, valueOutcome.value)
+			if readKey ~= nil then
+				key = readKey()
+			end
+			addWrite(host, context, tableItem, tableValue, key, valueOutcome.value)
 		else
 			host.diagnostic("unsupported_table_item_kind", tableItem, `table item kind {tostring(tableItem.kind)} is not mapped`)
 		end
@@ -164,19 +172,26 @@ local function lowerLiteral(expressions: any, host: Host, context: any, node: Re
 				table.insert(fields, LifterIR.TableConstructorField.list(valueOutcome.value.id))
 			end
 		elseif tableItem.kind == "record" or tableItem.kind == "general" then
-			local keyOutcome = expressions:lower(
-				context,
-				host.expect_record(tableItem.key, "malformed_table_item", "keyed table item is missing its key"),
-				nil
-			)
-			if keyOutcome.kind == "terminated" then
-				return keyOutcome
+			-- Luau reads a register local key at the item's store, after the item's value ran;
+			-- any other key is computed before the value, in source order.
+			local keyNode = host.expect_record(tableItem.key, "malformed_table_item", "keyed table item is missing its key")
+			local readKey = host.defer_register_local(context, keyNode)
+			local key: any = nil
+			if readKey == nil then
+				local keyOutcome = expressions:lower(context, keyNode, nil)
+				if keyOutcome.kind == "terminated" then
+					return keyOutcome
+				end
+				key = keyOutcome.value
 			end
 			local valueOutcome = expressions:lower(context, itemValue(host, tableItem), nil)
 			if valueOutcome.kind == "terminated" then
 				return valueOutcome
 			end
-			table.insert(fields, LifterIR.TableConstructorField.keyed(keyOutcome.value.id, valueOutcome.value.id))
+			if readKey ~= nil then
+				key = readKey()
+			end
+			table.insert(fields, LifterIR.TableConstructorField.keyed(key.id, valueOutcome.value.id))
 		else
 			host.diagnostic("unsupported_table_item_kind", tableItem, `table item kind {tostring(tableItem.kind)} is not mapped`)
 		end

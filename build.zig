@@ -1085,6 +1085,23 @@ pub fn build(b: *std.Build) void {
         "source-frontend-multiple-assignment-store-order-direct-locals",
         "direct-locals-luau",
     );
+    const source_frontend_table_constructor_key_read_order_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/table_constructor_key_read_order_source.luau",
+        "source-frontend-table-constructor-key-read-order",
+    );
+    const source_frontend_table_constructor_key_read_order_direct_locals_conformance = addLuauSourceConformanceForTarget(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/table_constructor_key_read_order_source.luau",
+        "source-frontend-table-constructor-key-read-order-direct-locals",
+        "direct-locals-luau",
+    );
     const source_frontend_table_pack_conformance = addLuauSourceConformance(
         b,
         exe,
@@ -1458,6 +1475,8 @@ pub fn build(b: *std.Build) void {
     source_frontend_multiple_assignment_value_read_order_direct_locals_conformance.addTo(conformance_step);
     source_frontend_multiple_assignment_store_order_conformance.addTo(conformance_step);
     source_frontend_multiple_assignment_store_order_direct_locals_conformance.addTo(conformance_step);
+    source_frontend_table_constructor_key_read_order_conformance.addTo(conformance_step);
+    source_frontend_table_constructor_key_read_order_direct_locals_conformance.addTo(conformance_step);
     source_frontend_table_pack_conformance.addTo(conformance_step);
     source_frontend_function_statement_conformance.addTo(conformance_step);
     source_frontend_closure_store_environment_conformance.addTo(conformance_step);

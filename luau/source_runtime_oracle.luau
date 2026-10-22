@@ -285,6 +285,15 @@ function SourceRuntimeOracle.run(caseName: string, source: string, exported: any
 		assert(raisingStore == "false/new/last/false/nil", "source frontend misordered local writes around a raising store")
 		assert(typeLevel == "new/new/new/new/new/x=new;y=new;old", "source frontend counted a type-level name as a conflicting use")
 		assert(combined == "x=new;new", "source frontend misordered an early local write against a later store's operand read")
+	elseif caseName == "source-frontend-table-constructor-key-read-order" or caseName == "source-frontend-table-constructor-key-read-order-direct-locals" then
+		local literal, ordered, grouped, parameter, snapshot, earlierItem, listItem = exported("a")
+		assert(literal == "nil/1", "source frontend read a register local table constructor key before the item value ran")
+		assert(ordered == "nil/1,2", "source frontend read a register local key of an ordered table constructor before the item value ran")
+		assert(grouped == "nil/1", "source frontend read a grouped register local table constructor key before the item value ran")
+		assert(parameter == "nil/1", "source frontend read a register parameter table constructor key before the item value ran")
+		assert(snapshot == "1/nil", "source frontend changed Luau's upvalue snapshot of a table constructor key in a child function")
+		assert(earlierItem == "1/2", "source frontend changed Luau's key read after an earlier item's call")
+		assert(listItem == "old/new", "source frontend changed Luau's in-order copy of a table constructor list item")
 	elseif caseName == "source-frontend-if-expression" then
 		assert(
 			string.find(source, 'consume(if condition() then arm("t") else arm("f"))', 1, true) ~= nil,
