@@ -1119,6 +1119,76 @@ pub fn build(b: *std.Build) void {
         "source-frontend-method-receiver-read-order-direct-locals",
         "direct-locals-luau",
     );
+    const source_frontend_builtin_fastcall_read_order_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/builtin_fastcall_argument_read_order_source.luau",
+        "source-frontend-builtin-fastcall-read-order",
+    );
+    const source_frontend_builtin_fastcall_read_order_direct_locals_conformance = addLuauSourceConformanceForTarget(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/builtin_fastcall_argument_read_order_source.luau",
+        "source-frontend-builtin-fastcall-read-order-direct-locals",
+        "direct-locals-luau",
+    );
+    const source_frontend_builtin_fastcall_optimize0_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/builtin_fastcall_optimize0_source.luau",
+        "source-frontend-builtin-fastcall-optimize0",
+    );
+    const source_frontend_builtin_fastcall_optimize0_direct_locals_conformance = addLuauSourceConformanceForTarget(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/builtin_fastcall_optimize0_source.luau",
+        "source-frontend-builtin-fastcall-optimize0-direct-locals",
+        "direct-locals-luau",
+    );
+    const source_frontend_builtin_fastcall_optimize2_refusal = b.addSystemCommand(&.{ luneExe(b), "run" });
+    source_frontend_builtin_fastcall_optimize2_refusal.addFileArg(b.path("luau/lift_source.luau"));
+    source_frontend_builtin_fastcall_optimize2_refusal.addFileInput(b.path("luau/ast_frontend.luau"));
+    source_frontend_builtin_fastcall_optimize2_refusal.addFileInput(b.path("luau/ast_local_binding.luau"));
+    source_frontend_builtin_fastcall_optimize2_refusal.addFileInput(b.path("luau/ast_local_identity.luau"));
+    source_frontend_builtin_fastcall_optimize2_refusal.addFileInput(b.path("luau/ast_lexical_scope.luau"));
+    source_frontend_builtin_fastcall_optimize2_refusal.addFileInput(b.path("luau/ast_runtime_context.luau"));
+    source_frontend_builtin_fastcall_optimize2_refusal.addFileInput(b.path("luau/ast_expression_slots.luau"));
+    source_frontend_builtin_fastcall_optimize2_refusal.addFileInput(b.path("luau/ast_expression_scalar.luau"));
+    source_frontend_builtin_fastcall_optimize2_refusal.addFileInput(b.path("luau/ast_statement_slots.luau"));
+    source_frontend_builtin_fastcall_optimize2_refusal.addFileInput(b.path("luau/ast_admission.luau"));
+    source_frontend_builtin_fastcall_optimize2_refusal.addFileInput(b.path("luau/ast_target_recovery.luau"));
+    source_frontend_builtin_fastcall_optimize2_refusal.addFileInput(b.path("luau/ast_frontend_outcome.luau"));
+    source_frontend_builtin_fastcall_optimize2_refusal.addFileInput(b.path("luau/ast_frontend_expressions.luau"));
+    source_frontend_builtin_fastcall_optimize2_refusal.addFileInput(b.path("luau/ast_frontend_tables.luau"));
+    source_frontend_builtin_fastcall_optimize2_refusal.addFileInput(b.path("luau/ast_frontend_operator_domains.luau"));
+    source_frontend_builtin_fastcall_optimize2_refusal.addFileInput(b.path("luau/ast_frontend_place_domains.luau"));
+    source_frontend_builtin_fastcall_optimize2_refusal.addFileInput(b.path("luau/ast_frontend_control.luau"));
+    source_frontend_builtin_fastcall_optimize2_refusal.addFileInput(b.path("luau/ast_frontend_iteration.luau"));
+    source_frontend_builtin_fastcall_optimize2_refusal.addFileInput(b.path("luau/intrinsic_bindings.luau"));
+    source_frontend_builtin_fastcall_optimize2_refusal.addFileInput(b.path("luau/recovery_admission.luau"));
+    source_frontend_builtin_fastcall_optimize2_refusal.addFileInput(b.path("luau/lifter_ir.luau"));
+    source_frontend_builtin_fastcall_optimize2_refusal.addFileInput(b.path("luau/json_codec.luau"));
+    source_frontend_builtin_fastcall_optimize2_refusal.addFileInput(b.path("luau/recovery_manifest.luau"));
+    addTemporalIdentityInputs(b, source_frontend_builtin_fastcall_optimize2_refusal);
+    source_frontend_builtin_fastcall_optimize2_refusal.addFileInput(b.path("luau/target_recovery.luau"));
+    source_frontend_builtin_fastcall_optimize2_refusal.addFileInput(b.path("luau/target_result_contracts.luau"));
+    source_frontend_builtin_fastcall_optimize2_refusal.addFileInput(b.path("luau/target_proof_bundle.luau"));
+    source_frontend_builtin_fastcall_optimize2_refusal.addFileArg(.{ .cwd_relative = luauAstExe(b) });
+    source_frontend_builtin_fastcall_optimize2_refusal.addFileArg(b.path("luau/fixtures/builtin_fastcall_optimize2_source.luau"));
+    source_frontend_builtin_fastcall_optimize2_refusal.addArg("source-frontend-builtin-fastcall-optimize2");
+    _ = source_frontend_builtin_fastcall_optimize2_refusal.addOutputFileArg("source-frontend-builtin-fastcall-optimize2.lifter-ir.json");
+    source_frontend_builtin_fastcall_optimize2_refusal.addArg("source-frontend-builtin-fastcall-optimize2");
+    source_frontend_builtin_fastcall_optimize2_refusal.expectExitCode(1);
+    source_frontend_builtin_fastcall_optimize2_refusal.expectStdErrMatch("unsupported_optimization_level at ");
+    source_frontend_builtin_fastcall_optimize2_refusal.expectStdErrMatch("asks for optimisation level 2");
     const source_frontend_table_pack_conformance = addLuauSourceConformance(
         b,
         exe,
@@ -1496,6 +1566,11 @@ pub fn build(b: *std.Build) void {
     source_frontend_table_constructor_key_read_order_direct_locals_conformance.addTo(conformance_step);
     source_frontend_method_receiver_read_order_conformance.addTo(conformance_step);
     source_frontend_method_receiver_read_order_direct_locals_conformance.addTo(conformance_step);
+    source_frontend_builtin_fastcall_read_order_conformance.addTo(conformance_step);
+    source_frontend_builtin_fastcall_read_order_direct_locals_conformance.addTo(conformance_step);
+    source_frontend_builtin_fastcall_optimize0_conformance.addTo(conformance_step);
+    source_frontend_builtin_fastcall_optimize0_direct_locals_conformance.addTo(conformance_step);
+    conformance_step.dependOn(&source_frontend_builtin_fastcall_optimize2_refusal.step);
     source_frontend_table_pack_conformance.addTo(conformance_step);
     source_frontend_function_statement_conformance.addTo(conformance_step);
     source_frontend_closure_store_environment_conformance.addTo(conformance_step);

@@ -110,6 +110,9 @@ type FrontendState = {
 	mutable_locals: { [string]: boolean },
 	reassigned_locals: { [string]: boolean },
 	closure_bound_by_function: { [number]: { [string]: boolean } },
+	written_globals: { [string]: boolean },
+	builtin_aliases: { [string]: boolean },
+	fastcall_level: number,
 }
 
 local FrontendDiagnostic = {}
@@ -446,6 +449,15 @@ expressionLowerer = AstExpressions.new({
 		local places = context.frontend.closure_bound_by_function[context.id]
 		return places ~= nil and places[localKey(operand["local"])] == true
 	end,
+	fastcall_level = function(context: FunctionContext): number
+		return context.frontend.fastcall_level
+	end,
+	builtin_alias = function(context: FunctionContext, localNode: Record): boolean
+		return context.frontend.builtin_aliases[localKey(localNode)] == true
+	end,
+	global_written = function(context: FunctionContext, name: string): boolean
+		return context.frontend.written_globals[name] == true
+	end,
 	resolve_intrinsic_alias = function(context: FunctionContext, localNode: Record): any?
 		local binding = resolveLocalBinding(context, localNode)
 		if binding.kind == "value" and binding.value ~= nil then
@@ -663,6 +675,39 @@ bindDeclaredLocal = function(context: FunctionContext, node: Record, localNode: 
 	end
 end
 
+-- The Luau compiler takes its optimisation level from a `--!optimize <n>` hot comment before the first
+-- token (the last one wins; the value is read like atoi and clamped to 0..2); the default is 1.
+local function headerOptimizationLevel(sourceText: string?): number
+	if sourceText == nil then
+		return 1
+	end
+	local level = 1
+	local position = 1
+	while true do
+		local start = string.find(sourceText, "%S", position)
+		if start == nil or string.sub(sourceText, start, start + 1) ~= "--" then
+			break
+		end
+		local equals = string.match(sourceText, "^%-%-%[(=*)%[", start)
+		if equals ~= nil then
+			local _, finish = string.find(sourceText, "]" .. equals .. "]", start + 4 + #equals, true)
+			if finish == nil then
+				break
+			end
+			position = finish + 1
+		else
+			local lineEnd = string.find(sourceText, "\n", start, true) or (#sourceText + 1)
+			local content = string.sub(sourceText, start + 2, lineEnd - 1)
+			if string.sub(content, 1, 10) == "!optimize " then
+				local digits = string.match(string.sub(content, 11), "^%s*([%-+]?%d*)")
+				level = math.clamp(tonumber(digits) or 0, 0, 2)
+			end
+			position = lineEnd
+		end
+	end
+	return level
+end
+
 local function lowerLocal(context: FunctionContext, node: Record)
 	local variableNodes = expectArray(node.vars, node, "vars")
 	local expressionNodes = expectArray(node.values, node, "values")
@@ -680,6 +725,16 @@ local function lowerLocal(context: FunctionContext, node: Record)
 	local values = valuesOutcome.value
 	for index, localNode in locals do
 		bindDeclaredLocal(context, node, localNode, values[index])
+	end
+	-- A never-written local initialised with a builtin path is a builtin callee too (the compiler follows a
+	-- local's initialiser when the local is never assigned).
+	for index, localNode in locals do
+		local initializer = expressionNodes[index]
+		if type(initializer) == "table" and not context.frontend.mutable_locals[localKey(localNode)]
+			and expressionLowerer:isFastcallBuiltin(context, initializer)
+		then
+			context.frontend.builtin_aliases[localKey(localNode)] = true
+		end
 	end
 end
 
@@ -1292,6 +1347,13 @@ local function liftUnchecked(document: Record, options: Options): Record
 		end
 		admittedSourceText = value :: string
 	end
+	if admittedSourceText ~= nil and headerOptimizationLevel(admittedSourceText) == 2 then
+		diagnostic(
+			"unsupported_optimization_level",
+			root,
+			"the source asks for optimisation level 2, whose inliner changes what the program reads, and the source frontend models levels 0 and 1 only"
+		)
+	end
 	local verifiedTargetRecovery: TargetRecovery.Verified? = nil
 	if options.target_recovery ~= nil then
 		if admittedSourceText == nil then
@@ -1310,6 +1372,10 @@ local function liftUnchecked(document: Record, options: Options): Record
 	local reassignedLocals = {}
 	for _, localNode in (inspection :: AstAdmission.Inspection).reassigned_local_nodes do
 		reassignedLocals[localKey(localNode)] = true
+	end
+	local writtenGlobals = {}
+	for _, name in (inspection :: AstAdmission.Inspection).written_global_names do
+		writtenGlobals[name] = true
 	end
 	local builder = LifterIR.Builder.new(options.program_id)
 	local intrinsicEvidenceByPath = {}
@@ -1348,6 +1414,9 @@ local function liftUnchecked(document: Record, options: Options): Record
 		mutable_locals = mutableLocals,
 		reassigned_locals = reassignedLocals,
 		closure_bound_by_function = {},
+		written_globals = writtenGlobals,
+		builtin_aliases = {},
+		fastcall_level = headerOptimizationLevel(admittedSourceText),
 	}
 	local chunk = builder:reserveFunction({
 		name_hint = "chunk",

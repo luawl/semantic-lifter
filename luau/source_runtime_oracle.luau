@@ -302,6 +302,17 @@ function SourceRuntimeOracle.run(caseName: string, source: string, exported: any
 		assert(loopFirst == "new1" and loopSecond == "new2", "source frontend read a per-iteration register local receiver before the arguments ran")
 		assert(fieldReceiver == "old", "source frontend changed Luau's in-order field-read method receiver")
 		assert(snapshot == "old", "source frontend changed Luau's upvalue snapshot of a method receiver in a child function")
+	elseif caseName == "source-frontend-builtin-fastcall-read-order" or caseName == "source-frontend-builtin-fastcall-read-order-direct-locals" then
+		local maximum, arithmetic, clamped, same, inserted, sub, aliased, openLast, generic, fourArguments, fieldCallee = exported(1)
+		assert(maximum == 10 and arithmetic == 10 and clamped == 10, "source frontend read a register local builtin fast-call argument before a later argument ran")
+		assert(same == true, "source frontend read a register local rawequal argument before a later argument ran")
+		assert(inserted == "0/1" and sub == "xy", "source frontend read a register local library fast-call argument before a later argument ran")
+		assert(aliased == 10, "source frontend read a register local argument of a builtin alias before a later argument ran")
+		assert(openLast == 1 and generic == 1, "source frontend changed Luau's in-order copy of generic call arguments")
+		assert(fourArguments == 1 and fieldCallee == 1, "source frontend treated a four-argument or field-read builtin call as a fast call")
+	elseif caseName == "source-frontend-builtin-fastcall-optimize0" or caseName == "source-frontend-builtin-fastcall-optimize0-direct-locals" then
+		local maximum, clamped, aliased = exported(1)
+		assert(maximum == 1 and clamped == 1 and aliased == 1, "source frontend treated a builtin call as a fast call at optimisation level 0")
 	elseif caseName == "source-frontend-if-expression" then
 		assert(
 			string.find(source, 'consume(if condition() then arm("t") else arm("f"))', 1, true) ~= nil,

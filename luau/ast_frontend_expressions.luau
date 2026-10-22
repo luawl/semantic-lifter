@@ -31,6 +31,9 @@ type Host = {
 	mark_target_recovery_resolution_used: (any, Record) -> (),
 	resolve_local: (any, Record, Record) -> any,
 	defer_register_local: (any, Record) -> (() -> any)?,
+	global_written: (any, string) -> boolean,
+	fastcall_level: (any) -> number,
+	builtin_alias: (any, Record) -> boolean,
 	place_closure_bound: (any, Record) -> boolean,
 	resolve_intrinsic_alias: (any, Record) -> any?,
 	lower_function: (any, Record, string?) -> any,
@@ -245,6 +248,41 @@ local function splitCallArguments(host: Host, node: Record): ({ any }, number, R
 		end
 	end
 	return argumentNodes, scalarCount, openArgument
+end
+
+-- Callees luau-compile 0.720 compiles as builtins at -O1 ("REMARK builtin"; measured with a census
+-- script over luau-compile's builtin remarks). With two or three fixed arguments the call
+-- is a FASTCALL2/FASTCALL3, which reads register-local arguments at the call, after every argument ran.
+local fastcallGlobals = table.freeze({ assert = true, getmetatable = true, rawequal = true, rawget = true, rawlen = true, rawset = true, setmetatable = true, tonumber = true, tostring = true, type = true, typeof = true, unpack = true })
+local fastcallLibraries = table.freeze({
+	bit32 = table.freeze({ arshift = true, band = true, bnot = true, bor = true, btest = true, bxor = true, byteswap = true, countlz = true, countrz = true, extract = true, lrotate = true, lshift = true, replace = true, rrotate = true, rshift = true }),
+	buffer = table.freeze({ readf32 = true, readf64 = true, readi16 = true, readi32 = true, readi8 = true, readu16 = true, readu32 = true, readu8 = true, writef32 = true, writef64 = true, writei16 = true, writei32 = true, writei8 = true, writeu16 = true, writeu32 = true, writeu8 = true }),
+	math = table.freeze({ abs = true, acos = true, asin = true, atan = true, atan2 = true, ceil = true, clamp = true, cos = true, cosh = true, deg = true, exp = true, floor = true, fmod = true, frexp = true, isfinite = true, isinf = true, isnan = true, ldexp = true, lerp = true, log = true, log10 = true, max = true, min = true, modf = true, pow = true, rad = true, round = true, sign = true, sin = true, sinh = true, sqrt = true, tan = true, tanh = true }),
+	string = table.freeze({ byte = true, char = true, len = true, sub = true }),
+	table = table.freeze({ insert = true, unpack = true }),
+	vector = table.freeze({ abs = true, ceil = true, clamp = true, create = true, cross = true, dot = true, floor = true, lerp = true, magnitude = true, max = true, min = true, normalize = true, sign = true }),
+})
+
+local function fastcallBuiltin(host: Host, context: any, functionNode: Record): boolean
+	local tag = host.node_tag(functionNode)
+	if tag == "AstExprGlobal" then
+		local name = functionNode.global
+		return type(name) == "string" and fastcallGlobals[name] == true and not host.global_written(context, name)
+	elseif tag == "AstExprIndexName" and type(functionNode.index) == "string" and type(functionNode.expr) == "table" then
+		local base = functionNode.expr :: Record
+		if base.type ~= "AstExprGlobal" or type(base.global) ~= "string" then
+			return false
+		end
+		local library = fastcallLibraries[base.global]
+		return library ~= nil and library[functionNode.index] == true and not host.global_written(context, base.global)
+	elseif tag == "AstExprLocal" then
+		return host.builtin_alias(context, host.expect_record(functionNode["local"], "malformed_local_expression", "local expression has no declaration identity"))
+	end
+	return false
+end
+
+function ExpressionLowerer:isFastcallBuiltin(context: any, node: Record): boolean
+	return fastcallBuiltin(self.host, context, node)
 end
 
 local function staticIntrinsicPath(host: Host, functionNode: Record): string?
@@ -645,16 +683,26 @@ function ExpressionLowerer:lowerCall(context: any, node: Record, resultCount: nu
 			callee = calleeValue
 		end
 	end
+	local deferArguments = intrinsicKind == nil and namecallMethod == nil and callee ~= nil and recoveredResolution == nil
+		and openArgument == nil and (scalarCount == 2 or scalarCount == 3) and host.fastcall_level(context) >= 1
+		and fastcallBuiltin(host, context, functionNode)
+	local deferredArguments = {}
 	for index = 1, scalarCount do
-		local argumentOutcome = self:lower(
-			context,
-			host.expect_record(argumentNodes[index], "malformed_call", "call argument is not an AST node"),
-			nil :: any
-		)
-		if argumentOutcome.kind == "terminated" then
-			return argumentOutcome
+		local argumentNode = host.expect_record(argumentNodes[index], "malformed_call", "call argument is not an AST node")
+		local readArgument = if deferArguments then host.defer_register_local(context, argumentNode) else nil
+		if readArgument ~= nil then
+			table.insert(arguments, -1)
+			table.insert(deferredArguments, { index = index, read = readArgument })
+		else
+			local argumentOutcome = self:lower(context, argumentNode, nil :: any)
+			if argumentOutcome.kind == "terminated" then
+				return argumentOutcome
+			end
+			table.insert(arguments, argumentOutcome.value.id)
 		end
-		table.insert(arguments, argumentOutcome.value.id)
+	end
+	for _, deferred in deferredArguments do
+		arguments[deferred.index] = deferred.read().id
 	end
 	if openArgument ~= nil then
 		local argumentOutcome = self:lowerOpen(context, openArgument)

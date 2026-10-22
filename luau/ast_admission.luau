@@ -31,6 +31,7 @@ export type Problem = {
 export type Inspection = {
 	mutable_local_nodes: { Record },
 	reassigned_local_nodes: { Record },
+	written_global_names: { string },
 	table_count: number,
 	entry_count: number,
 	max_depth: number,
@@ -189,10 +190,17 @@ local function appendMutableLocal(nodes: { Record }, value: any)
 	end
 end
 
+local function appendWrittenGlobal(names: { string }, value: any)
+	if type(value) == "table" and value.type == "AstExprGlobal" and type(value.global) == "string" then
+		table.insert(names, value.global)
+	end
+end
+
 local function collectMutationCandidates(
 	record: Record,
 	mutableNodes: { Record },
 	reassignedNodes: { Record },
+	writtenGlobals: { string },
 	limit: number
 ): Problem?
 	if record.type == "AstStatAssign" and type(record.vars) == "table" then
@@ -204,15 +212,18 @@ local function collectMutationCandidates(
 			end
 			appendMutableLocal(mutableNodes, target)
 			appendMutableLocal(reassignedNodes, target)
+			appendWrittenGlobal(writtenGlobals, target)
 		end
 	elseif record.type == "AstStatCompoundAssign" then
 		appendMutableLocal(mutableNodes, record.var)
 		appendMutableLocal(reassignedNodes, record.var)
+		appendWrittenGlobal(writtenGlobals, record.var)
 	elseif record.type == "AstStatLocalFunction" and type(record.name) == "table" then
 		table.insert(mutableNodes, record.name :: Record)
 	elseif record.type == "AstStatFunction" then
 		appendMutableLocal(mutableNodes, record.name)
 		appendMutableLocal(reassignedNodes, record.name)
+		appendWrittenGlobal(writtenGlobals, record.name)
 	end
 	return nil
 end
@@ -248,6 +259,7 @@ function AstAdmission.inspect(value: any, requestedLimits: Limits?): (Inspection
 	local active: { [any]: boolean } = {}
 	local mutableLocalNodes: { Record } = {}
 	local reassignedLocalNodes: { Record } = {}
+	local writtenGlobalNames: { string } = {}
 	local runtimeDeclarationRecords: { AstLocalIdentity.OwnedRecord } = {}
 	local runtimeReferenceRecords: { AstLocalIdentity.OwnedRecord } = {}
 	local functionParents: { [number]: number } = {}
@@ -497,7 +509,7 @@ function AstAdmission.inspect(value: any, requestedLimits: Limits?): (Inspection
 		end
 	end)
 	for _, record in mutationRecords do
-		local mutationProblem = collectMutationCandidates(record, mutableLocalNodes, reassignedLocalNodes, limits.max_entries)
+		local mutationProblem = collectMutationCandidates(record, mutableLocalNodes, reassignedLocalNodes, writtenGlobalNames, limits.max_entries)
 		if mutationProblem ~= nil then
 			return nil, mutationProblem
 		end
@@ -506,6 +518,7 @@ function AstAdmission.inspect(value: any, requestedLimits: Limits?): (Inspection
 	return {
 		mutable_local_nodes = mutableLocalNodes,
 		reassigned_local_nodes = reassignedLocalNodes,
+		written_global_names = writtenGlobalNames,
 		table_count = tableCount,
 		entry_count = entryCount,
 		max_depth = maximumDepth,
