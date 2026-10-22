@@ -2087,13 +2087,13 @@ fn emitLoop(
     if (loop_plan.continue_on_true) {
         try emitLoopBody(output, allocator, program, emission_plan, scopes, loop_plan, arm_indent, place_aliases, predeclared_header);
     } else {
-        try emitLoopExitTransfer(output, allocator, program, emission_plan, loop_plan.exit_edge, inline_return_exit, arm_indent, place_aliases);
+        try emitLoopExitTransfer(output, allocator, program, emission_plan, scopes, loop_plan.exit_edge, inline_return_exit, arm_indent, place_aliases);
     }
 
     try output.appendSlice(allocator, loop_indent);
     try output.appendSlice(allocator, "else\n");
     if (loop_plan.continue_on_true) {
-        try emitLoopExitTransfer(output, allocator, program, emission_plan, loop_plan.exit_edge, inline_return_exit, arm_indent, place_aliases);
+        try emitLoopExitTransfer(output, allocator, program, emission_plan, scopes, loop_plan.exit_edge, inline_return_exit, arm_indent, place_aliases);
     } else {
         try emitLoopBody(output, allocator, program, emission_plan, scopes, loop_plan, arm_indent, place_aliases, predeclared_header);
     }
@@ -2278,6 +2278,9 @@ fn emitNumericForLoop(
     const completion_state = emission_plan.state;
     const previous_completion = completion_state.native_iteration_completion;
     var completion_context: NativeIterationCompletion = undefined;
+    defer {
+        if (completion_flag != null) completion_state.native_iteration_completion = previous_completion;
+    }
     if (completion_flag) |flag| {
         completion_context = .{
             .header = body_region.stop.?,
@@ -2287,11 +2290,11 @@ fn emitNumericForLoop(
         completion_state.native_iteration_completion = &completion_context;
         try emitNativeIterationCompletionAssignment(output, allocator, flag, false, loop_indent);
     }
-    defer {
-        if (completion_flag != null) completion_state.native_iteration_completion = previous_completion;
-    }
 
     try emitRegion(output, allocator, program, emission_plan, scopes, body_region, loop_indent, place_aliases);
+    // No termination test: a body region whose last node returns is written inside a transfer wrapper (when
+    // that node is a branch, each returning arm is), so this write never follows a bare return; after a wrapped
+    // region it is where a continue the wrapper captures resumes, so it must stay.
     if (completion_flag) |flag| try emitNativeIterationCompletionAssignment(output, allocator, flag, true, loop_indent);
     if (break_after_body and !regionAlwaysFunctionTerminates(program, body_region)) {
         try emitBreakStatement(output, allocator, loop_indent);
@@ -2509,6 +2512,9 @@ fn emitGenericForLoop(
     const completion_state = emission_plan.state;
     const previous_completion = completion_state.native_iteration_completion;
     var completion_context: NativeIterationCompletion = undefined;
+    defer {
+        if (completion_flag != null) completion_state.native_iteration_completion = previous_completion;
+    }
     if (completion_flag) |flag| {
         completion_context = .{
             .header = body_region.stop.?,
@@ -2518,11 +2524,11 @@ fn emitGenericForLoop(
         completion_state.native_iteration_completion = &completion_context;
         try emitNativeIterationCompletionAssignment(output, allocator, flag, false, loop_indent);
     }
-    defer {
-        if (completion_flag != null) completion_state.native_iteration_completion = previous_completion;
-    }
 
     try emitRegion(output, allocator, program, emission_plan, scopes, body_region, loop_indent, place_aliases);
+    // No termination test: a body region whose last node returns is written inside a transfer wrapper (when
+    // that node is a branch, each returning arm is), so this write never follows a bare return; after a wrapped
+    // region it is where a continue the wrapper captures resumes, so it must stay.
     if (completion_flag) |flag| try emitNativeIterationCompletionAssignment(output, allocator, flag, true, loop_indent);
     if (break_after_body and !regionAlwaysFunctionTerminates(program, body_region)) {
         try emitBreakStatement(output, allocator, loop_indent);
@@ -2941,8 +2947,8 @@ fn emitInfiniteLoop(
     }
 }
 
-fn emitLoopExit(output: *std.ArrayList(u8), allocator: std.mem.Allocator, program: *const ir.Program, emission_plan: *const EmissionPlan, edge: ir.Edge, indent: []const u8, place_aliases: []const PlaceAlias) !void {
-    try emitEdgeParameters(output, allocator, program, emission_plan, program.blocks[edge.target.index()], edge.arguments, indent, false, place_aliases);
+fn emitLoopExit(output: *std.ArrayList(u8), allocator: std.mem.Allocator, program: *const ir.Program, emission_plan: *const EmissionPlan, scopes: *const emission_scope.Plan, edge: ir.Edge, indent: []const u8, place_aliases: []const PlaceAlias) !void {
+    try emitEdgeParametersUnlessConsumed(output, allocator, program, emission_plan, scopes, program.blocks[edge.target.index()], edge.arguments, indent, false, place_aliases);
     try emitBreakStatement(output, allocator, indent);
 }
 
@@ -2980,6 +2986,7 @@ fn emitLoopExitTransfer(
     allocator: std.mem.Allocator,
     program: *const ir.Program,
     emission_plan: *const EmissionPlan,
+    scopes: *const emission_scope.Plan,
     edge: ir.Edge,
     exit_is_return_clone: bool,
     indent: []const u8,
@@ -2995,7 +3002,7 @@ fn emitLoopExitTransfer(
         try output.appendSlice(allocator, "end\n");
         return;
     }
-    try emitLoopExit(output, allocator, program, emission_plan, edge, indent, place_aliases);
+    try emitLoopExit(output, allocator, program, emission_plan, scopes, edge, indent, place_aliases);
 }
 
 fn emitBreakStatement(output: *std.ArrayList(u8), allocator: std.mem.Allocator, indent: []const u8) std.mem.Allocator.Error!void {
@@ -3070,11 +3077,12 @@ fn emitEscapePropagation(
         try output.appendSlice(allocator, "if ");
         try output.appendSlice(allocator, flag);
         try output.appendSlice(allocator, " then\n");
-        try output.appendSlice(allocator, break_indent);
         if (escapePropagationIsLoopContinue(target, loop_header)) {
             try emitNativeIterationCompletionSetForTarget(output, allocator, emission_plan, target, break_indent);
+            try output.appendSlice(allocator, break_indent);
             try output.appendSlice(allocator, "continue\n");
         } else {
+            try output.appendSlice(allocator, break_indent);
             try output.appendSlice(allocator, "break\n");
         }
         try output.appendSlice(allocator, indent);
@@ -3217,7 +3225,7 @@ fn emitLoopControl(
             try render.valueUseScalar(output, allocator, program, valuePlan(emission_plan, place_aliases), branch.condition);
         }
         try output.appendSlice(allocator, " then\n");
-        try emitLoopExit(output, allocator, program, emission_plan, control.exit_edge, arm_indent, place_aliases);
+        try emitLoopExit(output, allocator, program, emission_plan, scopes, control.exit_edge, arm_indent, place_aliases);
         try output.appendSlice(allocator, indent);
         try output.appendSlice(allocator, "end\n");
         return;
@@ -3229,12 +3237,12 @@ fn emitLoopControl(
     if (control.continue_on_true) {
         try emitLoopContinue(output, allocator, program, emission_plan, scopes, control.continue_edge, arm_indent, place_aliases);
     } else {
-        try emitLoopExit(output, allocator, program, emission_plan, control.exit_edge, arm_indent, place_aliases);
+        try emitLoopExit(output, allocator, program, emission_plan, scopes, control.exit_edge, arm_indent, place_aliases);
     }
     try output.appendSlice(allocator, indent);
     try output.appendSlice(allocator, "else\n");
     if (control.continue_on_true) {
-        try emitLoopExit(output, allocator, program, emission_plan, control.exit_edge, arm_indent, place_aliases);
+        try emitLoopExit(output, allocator, program, emission_plan, scopes, control.exit_edge, arm_indent, place_aliases);
     } else {
         try emitLoopContinue(output, allocator, program, emission_plan, scopes, control.continue_edge, arm_indent, place_aliases);
     }
@@ -3535,6 +3543,9 @@ fn emitLoopBoundaryBodyImpl(
         return;
     }
     try emitRegion(output, allocator, program, emission_plan, scopes, control.body_region, indent, place_aliases);
+    // No termination test: a body region whose last node returns is written inside a transfer wrapper (when
+    // that node is a branch, each returning arm is), so this continue never follows a bare return; after a
+    // wrapped region it is where a continue the wrapper captures resumes, so it must stay.
     if (body_exit == .continue_target and control.body_region.continue_projection == null) {
         try emitNativeIterationCompletionSetForTarget(
             output,
@@ -3605,11 +3616,12 @@ fn emitLoopBoundaryArmImpl(
 ) !void {
     switch (boundary) {
         .exit => |edge| {
-            try emitEdgeParameters(
+            try emitEdgeParametersUnlessConsumed(
                 output,
                 allocator,
                 program,
                 emission_plan,
+                scopes,
                 program.blocks[edge.target.index()],
                 edge.arguments,
                 indent,
@@ -3620,7 +3632,7 @@ fn emitLoopBoundaryArmImpl(
             try emitBreakStatement(output, allocator, indent);
         },
         .escape => |edge| {
-            try emitEdgeParameters(output, allocator, program, emission_plan, program.blocks[edge.target.index()], edge.arguments, indent, false, place_aliases);
+            try emitEdgeParametersUnlessConsumed(output, allocator, program, emission_plan, scopes, program.blocks[edge.target.index()], edge.arguments, indent, false, place_aliases);
             try emitEscapeFlagSet(output, allocator, program, emission_plan, edge.target, indent);
             try emitBreakStatement(output, allocator, indent);
         },
@@ -3930,6 +3942,196 @@ test "propagated escape to the current loop header continues the loop" {
     try std.testing.expect(escapePropagationIsLoopContinue(header, header));
     try std.testing.expect(!escapePropagationIsLoopContinue(outer, header));
     try std.testing.expect(!escapePropagationIsLoopContinue(header, null));
+}
+
+test "a propagated continue to a guarded native header writes its completion flag at the arm's indent" {
+    const allocator = std.testing.allocator;
+    const function_id = ir.FunctionId.fromIndex(0);
+    const header = ir.BlockId.fromIndex(1);
+    const function_blocks = [_]ir.BlockId{ ir.BlockId.fromIndex(0), header };
+    const blocks = [_]ir.Block{
+        .{ .id = ir.BlockId.fromIndex(0), .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = header, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const functions = [_]ir.Function{.{ .id = function_id, .blocks = &function_blocks, .entry_block = ir.BlockId.fromIndex(0) }};
+    const program: ir.Program = .{
+        .program_id = "native-completion-propagated-continue",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &.{},
+    };
+    var plan = try EmissionPlan.init(allocator, &program, .standard_luau);
+    defer plan.deinit();
+    var completion: NativeIterationCompletion = .{ .header = header, .flag_name = "__lifter_native_iteration_complete_1" };
+    plan.state.native_iteration_completion = &completion;
+    defer plan.state.native_iteration_completion = null;
+
+    var propagated: std.ArrayList(u8) = .empty;
+    defer propagated.deinit(allocator);
+    try emitEscapePropagation(&propagated, allocator, &program, &plan, &.{header}, "    ", header);
+    try std.testing.expectEqualStrings(
+        "    if __lifter_escape_1 then\n" ++
+            "      __lifter_native_iteration_complete_1 = true\n" ++
+            "      continue\n" ++
+            "    end\n",
+        propagated.items,
+    );
+
+    var continued: std.ArrayList(u8) = .empty;
+    defer continued.deinit(allocator);
+    try emitEscapeContinueIfSet(&continued, allocator, &program, &plan, header, "    ");
+    try std.testing.expectEqualStrings(
+        "    if __lifter_escape_1 then\n" ++
+            "      __lifter_native_iteration_complete_1 = true\n" ++
+            "      do\n" ++
+            "        continue\n" ++
+            "      end\n" ++
+            "    end\n",
+        continued.items,
+    );
+
+    // Without a context for the header neither writer writes a completion flag.
+    plan.state.native_iteration_completion = null;
+    var unguarded: std.ArrayList(u8) = .empty;
+    defer unguarded.deinit(allocator);
+    try emitEscapePropagation(&unguarded, allocator, &program, &plan, &.{header}, "    ", header);
+    try emitEscapeContinueIfSet(&unguarded, allocator, &program, &plan, header, "    ");
+    try std.testing.expectEqualStrings(
+        "    if __lifter_escape_1 then\n" ++
+            "      continue\n" ++
+            "    end\n" ++
+            "    if __lifter_escape_1 then\n" ++
+            "      do\n" ++
+            "        continue\n" ++
+            "      end\n" ++
+            "    end\n",
+        unguarded.items,
+    );
+}
+
+test "explicit continues to a guarded native header write its completion flag before do continue end" {
+    const allocator = std.testing.allocator;
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const header = ir.BlockId.fromIndex(1);
+    const function_blocks = [_]ir.BlockId{ entry, header };
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .jump = .{ .target = header } } },
+        .{ .id = header, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const functions = [_]ir.Function{.{ .id = function_id, .blocks = &function_blocks, .entry_block = entry }};
+    const program: ir.Program = .{
+        .program_id = "native-completion-explicit-continues",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &.{},
+    };
+    var plan = try EmissionPlan.init(allocator, &program, .standard_luau);
+    defer plan.deinit();
+    // The scope plan of the program's one function: the writers below read it only to ask whether a native loop
+    // consumes the header's parameters (it does not here, and the header has none).
+    var analysis = try cfg.Analysis.init(allocator, &program, functions[0]);
+    defer analysis.deinit();
+    var structured = try structure.Plan.initWithArbitraryFallback(allocator, &analysis);
+    defer structured.deinit();
+    var scopes = try emission_scope.Plan.init(
+        allocator,
+        &program,
+        functions[0],
+        &analysis,
+        &structured,
+        &plan.packs,
+        &plan.dead,
+        &plan.place_writes,
+        &plan.place_reads,
+        &plan.fused_values,
+        &plan.closure_stores,
+    );
+    defer scopes.deinit();
+    var completion: NativeIterationCompletion = .{ .header = header, .flag_name = "__lifter_native_iteration_complete_1" };
+    plan.state.native_iteration_completion = &completion;
+    defer plan.state.native_iteration_completion = null;
+    const to_header: ir.Edge = .{ .target = header };
+    const guarded_continue =
+        "    __lifter_native_iteration_complete_1 = true\n" ++
+        "    do\n" ++
+        "      continue\n" ++
+        "    end\n";
+
+    var escaped: std.ArrayList(u8) = .empty;
+    defer escaped.deinit(allocator);
+    try emitEscapeContinueIfSet(&escaped, allocator, &program, &plan, header, "    ");
+    try std.testing.expectEqualStrings(
+        "    if __lifter_escape_1 then\n" ++
+            "      __lifter_native_iteration_complete_1 = true\n" ++
+            "      do\n" ++
+            "        continue\n" ++
+            "      end\n" ++
+            "    end\n",
+        escaped.items,
+    );
+
+    var projected: std.ArrayList(u8) = .empty;
+    defer projected.deinit(allocator);
+    try emitProjectedContinue(&projected, allocator, &program, &plan, &scopes, to_header, header, "    ", &.{}, false);
+    try std.testing.expectEqualStrings(guarded_continue, projected.items);
+
+    var transferred: std.ArrayList(u8) = .empty;
+    defer transferred.deinit(allocator);
+    try emitProjectedContinueAfterTransferredEdge(&transferred, allocator, &program, &plan, to_header, header, "    ");
+    try std.testing.expectEqualStrings(guarded_continue, transferred.items);
+
+    // An empty loop-boundary body whose local continue projection enters the header.
+    var empty_nodes = [_]structure.Node{};
+    var projected_region = structure.Region{
+        .nodes = &empty_nodes,
+        .stop = entry,
+        .loop_exit = null,
+        .continue_target = header,
+        .continue_projection = .{ .target = header, .edge = null },
+    };
+    const projected_control: structure.LoopBoundaryControl = .{
+        .block = entry,
+        .body_edge = to_header,
+        .body_region = &projected_region,
+        .boundary = .{ .exit = .{ .target = entry } },
+        .body_on_true = true,
+    };
+    var empty_body: std.ArrayList(u8) = .empty;
+    defer empty_body.deinit(allocator);
+    try emitLoopBoundaryBodyImpl(&empty_body, allocator, &program, &plan, &scopes, projected_control, .parent_stop, header, "    ", &.{});
+    try std.testing.expectEqualStrings(guarded_continue, empty_body.items);
+
+    // A loop-boundary body region that stops at the holding region's continue target.
+    var stopping_region = structure.Region{
+        .nodes = &empty_nodes,
+        .stop = header,
+        .loop_exit = null,
+        .continue_target = header,
+    };
+    const stopping_control: structure.LoopBoundaryControl = .{
+        .block = entry,
+        .body_edge = to_header,
+        .body_region = &stopping_region,
+        .boundary = .{ .exit = .{ .target = entry } },
+        .body_on_true = true,
+    };
+    var stopping_body: std.ArrayList(u8) = .empty;
+    defer stopping_body.deinit(allocator);
+    try emitLoopBoundaryBodyImpl(&stopping_body, allocator, &program, &plan, &scopes, stopping_control, .continue_target, header, "    ", &.{});
+    try std.testing.expectEqualStrings(guarded_continue, stopping_body.items);
+
+    // A context for another header writes no completion flag.
+    var other: NativeIterationCompletion = .{ .header = entry, .flag_name = "__lifter_native_iteration_complete_0" };
+    plan.state.native_iteration_completion = &other;
+    var unmatched: std.ArrayList(u8) = .empty;
+    defer unmatched.deinit(allocator);
+    try emitProjectedContinueAfterTransferredEdge(&unmatched, allocator, &program, &plan, to_header, header, "    ");
+    try std.testing.expectEqualStrings("    do\n      continue\n    end\n", unmatched.items);
 }
 
 test "wrapped region exposes only its owning loop continuation" {

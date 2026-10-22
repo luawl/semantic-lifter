@@ -1,7 +1,7 @@
 -- A local read by an outer condition and by an inner condition that resolution proves from the
 -- outer arm (internal_facts, proved_branch): the inner condition's block is threaded past and
 -- left unreachable, and its exact-pure read of the local must not release the local's
--- declaration (EMIT-UNDECLARED-LOCAL-AFTER-PROVED-BRANCH).
+-- declaration.
 return function(limit)
 	local a = "a"
 	local k = "k"

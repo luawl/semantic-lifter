@@ -928,7 +928,7 @@ function ExpressionLowerer:lower(context: any, node: Record, nameHint: string?):
 		end
 		-- Luau reads a register local named by the left operand of an arithmetic or comparison
 		-- operator at the operator instruction, after the right operand ran; a concatenation copies
-		-- its operands in order (SOURCE-FRONTEND-READ-ORDER).
+		-- its operands in order.
 		local leftNode = host.expect_record(node.left, "malformed_binary", "binary expression is missing its left operand")
 		local deferredLeft = if node.op ~= "Concat" then host.defer_register_local(context, leftNode) else nil
 		local left = nil

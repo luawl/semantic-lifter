@@ -7,6 +7,7 @@ local PackMultiLatchRuntimeOracle = require("./pack_multi_latch_runtime_oracle")
 local PackReturnStorageRuntimeOracle = require("./pack_return_storage_runtime_oracle")
 local IterationExitTransferRuntimeOracle = require("./iteration_exit_transfer_runtime_oracle")
 local IterationBreakExitTransferRuntimeOracle = require("./iteration_break_exit_transfer_runtime_oracle")
+local IterationHeaderEntryRuntimeOracle = require("./iteration_header_entry_runtime_oracle")
 
 local caseName = process.args[1]
 local sourcePath = process.args[2]
@@ -361,6 +362,12 @@ elseif caseName == "iteration-escape-join-exit" then
 	exported = IterationBreakExitTransferRuntimeOracle.run(chunk, source, caseName)
 elseif caseName == "iteration-dominating-break-exit" then
 	exported = IterationBreakExitTransferRuntimeOracle.run(chunk, source, caseName)
+elseif caseName == "iteration-header-entry" then
+	exported = IterationHeaderEntryRuntimeOracle.run(chunk, source, caseName)
+elseif caseName == "iteration-continue-completion" then
+	exported = IterationHeaderEntryRuntimeOracle.run(chunk, source, caseName)
+elseif caseName == "iteration-boundary-body-continue" then
+	exported = IterationHeaderEntryRuntimeOracle.run(chunk, source, caseName)
 else
 	exported, secondaryExport, tertiaryExport, quaternaryExport = chunk()
 end
@@ -657,6 +664,12 @@ elseif caseName == "iteration-escape-join-exit" then
 	assert(type(exported) == "function", "iteration escape-to-join runtime oracle did not retain its worker")
 elseif caseName == "iteration-dominating-break-exit" then
 	assert(type(exported) == "function", "iteration dominating-exit runtime oracle did not retain its worker")
+elseif caseName == "iteration-header-entry" then
+	assert(type(exported) == "function", "iteration header-entry runtime oracle did not retain its worker")
+elseif caseName == "iteration-continue-completion" then
+	assert(type(exported) == "function", "iteration continue-completion runtime oracle did not retain its worker")
+elseif caseName == "iteration-boundary-body-continue" then
+	assert(type(exported) == "function", "iteration boundary-body continue runtime oracle did not retain its worker")
 elseif caseName == "pack-materialized-adjustment" then
 	assert(type(secondaryExport) == "table", "pack materialization audit was not retained")
 	local narrowResults = secondaryExport.narrowResults
