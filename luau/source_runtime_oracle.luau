@@ -271,6 +271,20 @@ function SourceRuntimeOracle.run(caseName: string, source: string, exported: any
 		assert(snapshot == "old/5", "source frontend changed Luau's upvalue snapshot of a multiple-assignment value in a child function")
 		assert(single == "old", "source frontend changed a single table assignment")
 		assert(ownWrite == "new/old", "source frontend read a table target's value after the statement wrote its own local")
+	elseif caseName == "source-frontend-multiple-assignment-store-order" or caseName == "source-frontend-multiple-assignment-store-order-direct-locals" then
+		local storeOperands, environment, upvalueStore, localTiming, controls, valueObservers, conflicts, orders, raisingStore, typeLevel, combined =
+			exported("old")
+		assert(storeOperands == "nil/2/nil/3/new", "source frontend read a later table store's register-local table, key or value before an earlier store ran")
+		assert(environment == "GLOBAL_A=new;GLOBAL_B=new;new/nil/2/new", "source frontend misordered global and upvalue stores against the environment's __newindex")
+		assert(upvalueStore == "new", "source frontend read an upvalue store's register-local value before an earlier store ran")
+		assert(localTiming == "x=new;hook/last", "source frontend wrote a multiple assignment's local target at the wrong point")
+		assert(controls == "old/nil/old", "source frontend changed Luau's value-time copy of a spread value or an upvalue store's place")
+		assert(valueObservers == "new/new", "source frontend wrote a local target after a later value ran")
+		assert(conflicts == "x=old/old;old=old/1;new", "source frontend wrote a conflicting local target before the stores")
+		assert(orders == "x=old;old/new/new", "source frontend misordered a spread-covered local target or Luau's marking order")
+		assert(raisingStore == "false/new/last/false/nil", "source frontend misordered local writes around a raising store")
+		assert(typeLevel == "new/new/new/new/new/x=new;y=new;old", "source frontend counted a type-level name as a conflicting use")
+		assert(combined == "x=new;new", "source frontend misordered an early local write against a later store's operand read")
 	elseif caseName == "source-frontend-if-expression" then
 		assert(
 			string.find(source, 'consume(if condition() then arm("t") else arm("f"))', 1, true) ~= nil,

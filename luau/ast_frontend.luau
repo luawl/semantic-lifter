@@ -330,7 +330,16 @@ local lowerFunctionExpression: (FunctionContext, Record, string?) -> ValueRef
 local lowerStatement: (FunctionContext, Record) -> ()
 local lowerStatementBlock: (FunctionContext, Record, boolean) -> ()
 local bindDeclaredLocal: (FunctionContext, Record, Record, ValueRef) -> ()
-local lowerValueList: (FunctionContext, { any }, number, { string }, Record, string, { Record }?) -> any
+local lowerValueList: (
+	FunctionContext,
+	{ any },
+	number,
+	{ string },
+	Record,
+	string,
+	{ [number]: () -> ValueRef }?,
+	((number, ValueRef) -> ())?
+) -> any
 local expressionLowerer: any
 
 local iterationLowerer = AstIteration.new({
@@ -505,7 +514,8 @@ lowerValueList = function(
 	nameHints: { string },
 	ownerNode: Record,
 	malformedCode: string,
-	targets: { Record }?
+	deferredValues: { [number]: () -> ValueRef }?,
+	onValue: ((number, ValueRef) -> ())?
 ): { any }
 	local results: { any } = {}
 	local scalarCount = #expressionNodes
@@ -521,13 +531,7 @@ lowerValueList = function(
 
 	for index = 1, scalarCount do
 		local valueNode = expectRecord(expressionNodes[index], malformedCode, "value-list member is not an AST node")
-		local deferredValue = nil
-		if targets ~= nil and index <= targetCount then
-			local target = targets[index]
-			if target ~= nil and target.kind == "table" then
-				deferredValue = expressionLowerer.host.defer_register_local(context, valueNode)
-			end
-		end
+		local deferredValue = if deferredValues ~= nil and index <= targetCount then deferredValues[index] else nil
 		if deferredValue ~= nil then
 			if #results < targetCount then
 				table.insert(results, deferredValue)
@@ -543,6 +547,9 @@ lowerValueList = function(
 			end
 			if #results < targetCount then
 				table.insert(results, valueOutcome.value)
+				if onValue ~= nil then
+					onValue(index, valueOutcome.value)
+				end
 			end
 		end
 	end
@@ -575,6 +582,9 @@ lowerValueList = function(
 			)
 			for index, valueId in adjusted do
 				table.insert(results, { id = valueId, type = adjustedTypes[index] })
+				if onValue ~= nil then
+					onValue(scalarCount + index, results[#results])
+				end
 			end
 		elseif nodeTag(openExpression) == "AstExprCall" then
 			local callOutcome = lowerCall(context, openExpression, 0)
@@ -826,6 +836,150 @@ local function lowerFunctionStatement(context: FunctionContext, node: Record)
 	writeAssignmentTarget(context, node, targetOutcome.value, closureOutcome.value)
 end
 
+-- A multiple assignment runs in Luau's order (luau-compile 0.720 emits the same order at -O0 and at the
+-- default level):
+-- 1. The targets' computed tables and keys run first, in target order; a register-local table or key
+--    stays unread (read_table, read_key).
+-- 2. The values run left to right. A register-local target that does not conflict is written as soon as
+--    its own value exists, unless the last value is spread over it. The register-local value of a table,
+--    global or upvalue target stays unread, unless it is the last value spread over more targets.
+-- 3. The table, global and upvalue stores run in target order, each reading its deferred table, key and
+--    value at the store, so code that an earlier store ran (a __newindex) is seen.
+-- 4. The conflicting and spread-covered register locals are written last, in target order.
+-- A register local conflicts when a value scanned after it is marked names it at run time, or when it is
+-- the table or the key of a table target (through groups and type assertions). Each local target's own
+-- value is scanned and then the target is marked; then the other targets' values; then the trailing values.
+
+-- The keys of the locals a value names at run time: a walk over every field that skips type annotations,
+-- generic and type declarations, and declaration records (an AstExprLocal's `local` field embeds its
+-- declaration record, annotation included).
+local function runtimeLocalNames(node: any, into: { [string]: boolean })
+	if type(node) ~= "table" then
+		return
+	end
+	local tag = node.type
+	if type(tag) == "string" then
+		if tag == "AstExprLocal" then
+			if type(node["local"]) == "table" then
+				into[localKey(node["local"])] = true
+			end
+			return
+		end
+		if
+			string.sub(tag, 1, 7) == "AstType"
+			or tag == "AstLocal"
+			or tag == "AstGenericType"
+			or tag == "AstGenericTypePack"
+			or tag == "AstStatTypeAlias"
+			or tag == "AstStatTypeFunction"
+		then
+			return
+		end
+	end
+	for _, child in node do
+		runtimeLocalNames(child, into)
+	end
+end
+
+local function operandLocalKey(node: any): string?
+	local operand = node
+	while type(operand) == "table" and (operand.type == "AstExprGroup" or operand.type == "AstExprTypeAssertion") do
+		operand = operand.expr
+	end
+	if type(operand) == "table" and operand.type == "AstExprLocal" and type(operand["local"]) == "table" then
+		return localKey(operand["local"])
+	end
+	return nil
+end
+
+local function isRegisterLocalTarget(context: FunctionContext, target: Record): boolean
+	if target.kind ~= "local" then
+		return false
+	end
+	local place = (target.binding :: Binding).place
+	local placeRecord = if place ~= nil then context.frontend.builder.program.places[(place :: number) + 1] else nil
+	return placeRecord ~= nil and placeRecord.origin.capture == nil
+end
+
+local function assignmentOrder(
+	context: FunctionContext,
+	targetNodes: { any },
+	targets: { Record },
+	expressionNodes: { any }
+): ({ [number]: boolean }, { [number]: boolean }, { [number]: () -> ValueRef })
+	local targetCount = #targets
+	local valueCount = #expressionNodes
+	local registerLocal: { [number]: boolean } = {}
+	local keys: { [number]: string } = {}
+	for index, target in targets do
+		if isRegisterLocalTarget(context, target) then
+			registerLocal[index] = true
+			keys[index] = localKey(expectRecord(targetNodes[index]["local"], "malformed_assignment", "local assignment has no declaration identity"))
+		end
+	end
+	local marked: { [string]: boolean } = {}
+	local conflicting: { [string]: boolean } = {}
+	local function scan(valueNode: any)
+		local named: { [string]: boolean } = {}
+		runtimeLocalNames(valueNode, named)
+		for key in named do
+			if marked[key] then
+				conflicting[key] = true
+			end
+		end
+	end
+	for index = 1, targetCount do
+		local key = keys[index]
+		if key ~= nil then
+			if index <= valueCount then
+				scan(expressionNodes[index])
+			end
+			marked[key] = true
+		end
+	end
+	for index = 1, math.min(targetCount, valueCount) do
+		if keys[index] == nil then
+			scan(expressionNodes[index])
+		end
+	end
+	for index = targetCount + 1, valueCount do
+		scan(expressionNodes[index])
+	end
+	for _, targetNode in targetNodes do
+		local tag = nodeTag(targetNode)
+		if tag == "AstExprIndexName" or tag == "AstExprIndexExpr" then
+			local tableKey = operandLocalKey(targetNode.expr)
+			if tableKey ~= nil and marked[tableKey] then
+				conflicting[tableKey] = true
+			end
+			if tag == "AstExprIndexExpr" then
+				local indexKey = operandLocalKey(targetNode.index)
+				if indexKey ~= nil and marked[indexKey] then
+					conflicting[indexKey] = true
+				end
+			end
+		end
+	end
+	local early: { [number]: boolean } = {}
+	local valueReaders: { [number]: () -> ValueRef } = {}
+	for index = 1, math.min(targetCount, valueCount) do
+		local spread = index == valueCount and targetCount > valueCount
+		if not spread then
+			if registerLocal[index] then
+				if not conflicting[keys[index]] then
+					early[index] = true
+				end
+			else
+				local reader = expressionLowerer.host.defer_register_local(context, expressionNodes[index])
+				if reader ~= nil then
+					valueReaders[index] = reader
+				end
+			end
+		end
+	end
+	return registerLocal, early, valueReaders
+end
+
 local function lowerAssignment(context: FunctionContext, node: Record)
 	local targetNodes = expectArray(node.vars, node, "vars")
 	local expressionNodes = expectArray(node.values, node, "values")
@@ -840,25 +994,35 @@ local function lowerAssignment(context: FunctionContext, node: Record)
 		table.insert(targets, targetOutcome.value)
 		table.insert(names, `assigned_{index}`)
 	end
-	local valuesOutcome = lowerValueList(context, expressionNodes, #targets, names, node, "malformed_assignment", targets)
+	local registerLocal, early, valueReaders = assignmentOrder(context, targetNodes, targets, expressionNodes)
+	local valuesOutcome = lowerValueList(
+		context,
+		expressionNodes,
+		#targets,
+		names,
+		node,
+		"malformed_assignment",
+		valueReaders,
+		function(index: number, value: ValueRef)
+			if early[index] then
+				writeAssignmentTarget(context, node, targets[index], value)
+			end
+		end
+	)
 	if valuesOutcome.kind == "terminated" then
 		return
 	end
 	local values = valuesOutcome.value
-	-- Luau stores through a register-local base or key as it is after every value ran and before the
-	-- statement assigns any of its locals, so every deferred read comes before the first write.
 	for index, target in targets do
-		if target.kind == "table" then
-			local tableValue, keyValue = tableTargetOperands(target)
-			targets[index] = { kind = "table", table_value = tableValue, key = keyValue }
-			local deferredValue = values[index]
-			if type(deferredValue) == "function" then
-				values[index] = deferredValue()
-			end
+		if not registerLocal[index] then
+			local reader = valueReaders[index]
+			writeAssignmentTarget(context, node, target, if reader ~= nil then reader() else values[index])
 		end
 	end
 	for index, target in targets do
-		writeAssignmentTarget(context, node, target, values[index])
+		if registerLocal[index] and not early[index] then
+			writeAssignmentTarget(context, node, target, values[index])
+		end
 	end
 end
 
