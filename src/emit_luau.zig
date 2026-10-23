@@ -1757,8 +1757,9 @@ fn emitBranchArmImpl(
 
 /// The `break` after the escape flag of a continue an empty branch arm carries by flag: the arm is written in its
 /// holding region's `if` with no wrapper of its own, so the `break` must leave a transfer wrapper, whose
-/// propagation carries the flag on. Anywhere else the function is refused, and emitFunctionBody writes it in the
-/// flat layout.
+/// propagation carries the flag on. A loop boundary's body exit continue carried by flag, written in its holding
+/// region's text, takes the same `break`. Anywhere else the function is refused, and emitFunctionBody writes it in
+/// the flat layout.
 fn emitEmptyArmFlagBreak(
     output: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
@@ -3714,6 +3715,14 @@ fn emitLoopBoundaryBodyImpl(
     // that node is a branch, each returning arm is), so this continue never follows a bare return; after a
     // wrapped region it is where a continue the wrapper captures resumes, so it must stay.
     if (body_exit == .continue_target and control.body_region.continue_projection == null) {
+        if (control.continue_via_flag) {
+            // Carried by flag (`structure.markFlaggedContinues`): the innermost Luau loop statement here is a transfer
+            // wrapper that stops at another block, so set the loop header's flag and leave the wrapper; each wrapper on
+            // the way forwards the flag, and the loop body's wrapper consumes it as a `continue`.
+            try emitEscapeFlagSet(output, allocator, program, emission_plan, continue_target orelse return error.UnsupportedControlFlow, indent);
+            try emitEmptyArmFlagBreak(output, allocator, emission_plan, indent);
+            return;
+        }
         try emitNativeIterationCompletionSetForTarget(
             output,
             allocator,
