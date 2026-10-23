@@ -45,7 +45,7 @@ zig build -Doptimize=ReleaseFast -Dlune=<path> -Dluau-compile=<path> -Dluau-ast=
 `semantic-lifter` is installed under `zig-out/bin/`:
 
 ```sh
-lune run luau/lift_source.luau <path to luau-ast> <input.luau> <program-id> <program.ir.json>
+lune run luau/lift_source.luau <path to luau-ast> <path to luau-compile> <input.luau> <program-id> <program.ir.json>
 semantic-lifter emit-luau <program.ir.json> <output.luau> standard-luau <path to luau-compile>
 ```
 
@@ -76,7 +76,7 @@ end
 lifted through the source path and emitted (see [command-line use](usage.md#command-line-use)):
 
 ```sh
-lune run luau/lift_source.luau <path to luau-ast> luau/fixtures/loop_control_source.luau loop_control loop_control.ir.json
+lune run luau/lift_source.luau <path to luau-ast> <path to luau-compile> luau/fixtures/loop_control_source.luau loop_control loop_control.ir.json
 semantic-lifter emit-luau loop_control.ir.json loop_control.luau standard-luau <path to luau-compile>
 ```
 

@@ -215,10 +215,9 @@ local exactInteger = AstFrontend.tryLift({
 	program_id = "frontend-exact-integer",
 	source_name = "frontend-exact-integer",
 })
-assert(exactInteger.program ~= nil and #exactInteger.diagnostics == 0, "exact integer node was not admitted")
-local exactOperation = (exactInteger.program :: any).instructions[1].operation
-assert(exactOperation.constant.integer == "18446744073709551615", "exact integer transport lost precision")
-assert((exactInteger.program :: any).values[1].type.bit_width == 65535, "exact integer transport made a false i64 claim")
+assert(exactInteger.program == nil and #exactInteger.diagnostics == 1, "an i-suffixed integer literal was admitted")
+assert(exactInteger.diagnostics[1].code == "unsupported_integer_literal", "the i-suffixed integer literal refusal changed its code")
+assert(exactInteger.diagnostics[1].location == "0,7 - 0,27", "the i-suffixed integer literal refusal lost its location")
 
 local declaredClass = AstFrontend.tryLift({
 	root = {
@@ -940,24 +939,24 @@ local function joinedExpressionType(name: string, expression: any, bindings: { a
 	error(`joined expression {name} has no result parameter`)
 end
 
-local wideIntegerType = joinedExpressionType("matching-wide-integer-join", intrinsicNode({
+local matchingIntegerType = joinedExpressionType("matching-integer-join", intrinsicNode({
 	type = "AstExprIfElse",
 	condition = intrinsicGlobal("condition"),
-	trueExpr = intrinsicNode({ type = "AstExprConstantInteger", value = "1" }),
-	falseExpr = intrinsicNode({ type = "AstExprConstantInteger", value = "2" }),
-}), nil)
-assert(
-	wideIntegerType.kind == "integer" and wideIntegerType.bit_width == 65535 and wideIntegerType.signed == false,
-	"matching exact integer domains collapsed at an if-expression join"
-)
-
-local mismatchedIntegerType = joinedExpressionType("mismatched-integer-width-join", intrinsicNode({
-	type = "AstExprIfElse",
-	condition = intrinsicGlobal("condition"),
-	trueExpr = intrinsicNode({ type = "AstExprConstantInteger", value = "1" }),
+	trueExpr = intrinsicNumber(1),
 	falseExpr = intrinsicNumber(2),
 }), nil)
-assert(mismatchedIntegerType.kind == "dynamic", "same-kind integer width mismatch produced a false joined domain")
+assert(
+	matchingIntegerType.kind == "integer" and matchingIntegerType.bit_width == 64 and matchingIntegerType.signed == true,
+	"matching integer domains collapsed at an if-expression join"
+)
+
+local mismatchedNumericType = joinedExpressionType("mismatched-numeric-join", intrinsicNode({
+	type = "AstExprIfElse",
+	condition = intrinsicGlobal("condition"),
+	trueExpr = intrinsicNumber(1),
+	falseExpr = intrinsicNumber(2.5),
+}), nil)
+assert(mismatchedNumericType.kind == "dynamic", "an integer and a number domain produced a false joined domain")
 
 local survivingStringType = joinedExpressionType("surviving-string-join", intrinsicNode({
 	type = "AstExprIfElse",

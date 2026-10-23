@@ -11,13 +11,6 @@ type Case = {
 	location: string?,
 }
 
-type IntegerCase = {
-	value: any,
-	decimal: string,
-	wide: boolean,
-	signed: boolean,
-}
-
 local function deadStatement(statement: any): any
 	return {
 		root = {
@@ -55,8 +48,18 @@ local malformedCases: { Case } = {
 	},
 	{
 		statement = { type = "AstStatReturn", list = { { type = "AstExprConstantInteger", value = "01" } } },
-		code = "malformed_integer_literal",
+		code = "unsupported_integer_literal",
 		label = "dead-integer-payload-admission",
+	},
+	{
+		statement = { type = "AstStatReturn", list = { { type = "AstExprConstantInteger", value = 1 } } },
+		code = "unsupported_integer_literal",
+		label = "dead-small-integer-admission",
+	},
+	{
+		statement = { type = "AstStatReturn", list = { { type = "AstExprConstantInteger", value = "9223372036854775807" } } },
+		code = "unsupported_integer_literal",
+		label = "dead-wide-integer-admission",
 	},
 	{
 		statement = { type = "AstStatReturn", list = { { type = "AstExprConstantString", value = false } } },
@@ -80,7 +83,7 @@ local malformedCases: { Case } = {
 		statement = { type = "AstStatReturn", list = { {
 			type = "AstExprUnary",
 			op = "Unsupported",
-			expr = { type = "AstExprConstantInteger", value = 1 },
+			expr = { type = "AstExprConstantNumber", value = 1 },
 		} } },
 		code = "unsupported_unary_operator",
 		label = "dead-unary-operator-admission",
@@ -89,8 +92,8 @@ local malformedCases: { Case } = {
 		statement = { type = "AstStatReturn", list = { {
 			type = "AstExprBinary",
 			op = "Unsupported",
-			left = { type = "AstExprConstantInteger", value = 1 },
-			right = { type = "AstExprConstantInteger", value = 2 },
+			left = { type = "AstExprConstantNumber", value = 1 },
+			right = { type = "AstExprConstantNumber", value = 2 },
 		} } },
 		code = "unsupported_binary_operator",
 		label = "dead-binary-operator-admission",
@@ -104,7 +107,7 @@ local malformedCases: { Case } = {
 		statement = { type = "AstStatReturn", list = { {
 			type = "AstExprInterpString",
 			strings = ({ "value: ", false } :: { any }),
-			expressions = { { type = "AstExprConstantInteger", value = 1 } },
+			expressions = { { type = "AstExprConstantNumber", value = 1 } },
 		} } },
 		code = "malformed_interpolation",
 		label = "dead-interpolation-segment-admission",
@@ -113,7 +116,7 @@ local malformedCases: { Case } = {
 		statement = { type = "AstStatReturn", list = { {
 			type = "AstExprInterpString",
 			strings = { "value: " },
-			expressions = { { type = "AstExprConstantInteger", value = 1 } },
+			expressions = { { type = "AstExprConstantNumber", value = 1 } },
 		} } },
 		code = "malformed_interpolation",
 		label = "dead-interpolation-arity-admission",
@@ -122,7 +125,7 @@ local malformedCases: { Case } = {
 		statement = {
 			type = "AstStatCompoundAssign",
 			var = { type = "AstExprGlobal", global = "value" },
-			value = { type = "AstExprConstantInteger", value = 1 },
+			value = { type = "AstExprConstantNumber", value = 1 },
 		},
 		code = "malformed_compound_assignment",
 		label = "dead-compound-operator-shape-admission",
@@ -132,7 +135,7 @@ local malformedCases: { Case } = {
 			type = "AstStatCompoundAssign",
 			op = "Unsupported",
 			var = { type = "AstExprGlobal", global = "value" },
-			value = { type = "AstExprConstantInteger", value = 1 },
+			value = { type = "AstExprConstantNumber", value = 1 },
 		},
 		code = "unsupported_binary_operator",
 		label = "dead-compound-operator-admission",
@@ -142,7 +145,7 @@ local malformedCases: { Case } = {
 			type = "AstStatCompoundAssign",
 			op = "And",
 			var = { type = "AstExprGlobal", global = "value" },
-			value = { type = "AstExprConstantInteger", value = 1 },
+			value = { type = "AstExprConstantNumber", value = 1 },
 		},
 		code = "unsupported_compound_short_circuit",
 		label = "dead-compound-short-circuit-admission",
@@ -169,7 +172,7 @@ expectProblem({
 			type = "AstExprBinary",
 			op = "Unsupported",
 			left = parserError,
-			right = { type = "AstExprConstantInteger", value = 1 },
+			right = { type = "AstExprConstantNumber", value = 1 },
 		} },
 	},
 	code = "malformed_source_expression",
@@ -185,27 +188,6 @@ expectProblem({
 	code = "malformed_source_expression",
 	label = "compound-operator-postorder-admission",
 })
-
-local integerCases: { IntegerCase } = {
-	{ value = 1, decimal = "1", wide = false, signed = false },
-	{ value = "0", decimal = "0", wide = true, signed = false },
-	{ value = "-1", decimal = "-1", wide = true, signed = true },
-	{ value = "18446744073709551615", decimal = "18446744073709551615", wide = true, signed = false },
-}
-for _, integerCase in integerCases do
-	local integerValue, integerProblem = AstExpressionScalar.integerValue({
-		type = "AstExprConstantInteger",
-		value = integerCase.value,
-	})
-	assert(integerProblem == nil and integerValue ~= nil, "canonical integer scalar was rejected")
-	local normalized = integerValue :: AstExpressionScalar.IntegerValue
-	assert(
-		normalized.decimal == integerCase.decimal
-			and normalized.wide == integerCase.wide
-			and normalized.signed == integerCase.signed,
-		"integer scalar normalization changed"
-	)
-end
 
 local specialNumberCases = {
 	{ label = "nan", value = 0 / 0 },
@@ -261,7 +243,7 @@ local arbitrarySegmentResult = AstFrontend.tryLift({ root = {
 	body = { { type = "AstStatReturn", list = { {
 		type = "AstExprInterpString",
 		strings = { arbitraryByte, "" },
-		expressions = { { type = "AstExprConstantInteger", value = 1 } },
+		expressions = { { type = "AstExprConstantNumber", value = 1 } },
 	} } } },
 } }, { program_id = "arbitrary-byte-interpolation", source_name = "arbitrary-byte-interpolation" })
 assert(arbitrarySegmentResult.program ~= nil and #arbitrarySegmentResult.diagnostics == 0, "arbitrary interpolation byte did not lower")
@@ -283,7 +265,7 @@ end
 local validInterpolation = AstFrontend.tryLift(deadExpression({
 	type = "AstExprInterpString",
 	strings = { "value: ", "" },
-	expressions = { { type = "AstExprConstantInteger", value = 1 } },
+	expressions = { { type = "AstExprConstantNumber", value = 1 } },
 }), { program_id = "valid-dead-interpolation", source_name = "valid-dead-interpolation" })
 assert(validInterpolation.program ~= nil and #validInterpolation.diagnostics == 0, "valid dead interpolation was rejected")
 

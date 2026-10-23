@@ -418,8 +418,8 @@ local function declarationRoleStatement(label: string, identity: any): any
 			type = "AstStatFor",
 			location = ownerLocation,
 			var = identity,
-			from = { type = "AstExprConstantInteger", value = 1 },
-			to = { type = "AstExprConstantInteger", value = 2 },
+			from = { type = "AstExprConstantNumber", value = 1 },
+			to = { type = "AstExprConstantNumber", value = 2 },
 			body = statementBlock({}),
 		}
 	elseif label == "generic-for" then

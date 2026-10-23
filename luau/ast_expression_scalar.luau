@@ -13,12 +13,6 @@ export type Problem = {
 	detail: string,
 }
 
-export type IntegerValue = {
-	decimal: string,
-	wide: boolean,
-	signed: boolean,
-}
-
 export type InterpolationValue = {
 	segments: { string },
 	expressions: { any },
@@ -94,27 +88,6 @@ function AstExpressionScalar.specialNumberName(value: number): SpecialNumberName
 		return "negative_infinity"
 	end
 	return nil
-end
-
-function AstExpressionScalar.integerValue(node: Record): (IntegerValue?, Problem?)
-	local value = node.value
-	if type(value) == "string" then
-		local digits = value
-		if string.sub(digits, 1, 1) == "-" then
-			digits = string.sub(digits, 2)
-		end
-		if digits == ""
-			or string.match(digits, "^%d+$") == nil
-			or (#digits > 1 and string.sub(digits, 1, 1) == "0")
-			or value == "-0"
-		then
-			return nil, problem("malformed_integer_literal", node, "integer literal is not canonical signed decimal")
-		end
-		return { decimal = value, wide = true, signed = string.sub(value, 1, 1) == "-" }, nil
-	elseif type(value) == "number" and value % 1 == 0 and math.abs(value) <= 9007199254740991 then
-		return { decimal = string.format("%.0f", value), wide = false, signed = value < 0 }, nil
-	end
-	return nil, problem("malformed_integer_literal", node, "integer literal has no exact numeric value")
 end
 
 function AstExpressionScalar.stringValue(node: Record): (string?, Problem?)
@@ -218,8 +191,11 @@ function AstExpressionScalar.validatePreorder(node: Record): Problem?
 		local _, valueProblem = AstExpressionScalar.numberValue(node)
 		return valueProblem
 	elseif node.type == "AstExprConstantInteger" then
-		local _, valueProblem = AstExpressionScalar.integerValue(node)
-		return valueProblem
+		return problem(
+			"unsupported_integer_literal",
+			node,
+			"an i-suffixed integer literal has Luau's integer type, not the number type, and the source frontend lowers Luau numbers only"
+		)
 	elseif node.type == "AstExprConstantString" then
 		local _, valueProblem = AstExpressionScalar.stringValue(node)
 		return valueProblem

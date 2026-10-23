@@ -59,15 +59,20 @@ from the repository root.
 Source path (Luau source, parsed by `luau-ast`):
 
 ```sh
-lune run luau/lift_source.luau <path to luau-ast> <input.luau> <program-id> <program.ir.json>
+lune run luau/lift_source.luau <path to luau-ast> <path to luau-compile> <input.luau> <program-id> <program.ir.json>
 ```
+
+The frontend compiles the source with that `luau-compile` and `--fflags=LuauIntegerType=false` before `luau-ast`
+parses it, and refuses a source that does not compile: an `i`-suffixed integer literal, which has Luau's integer
+type rather than the number type, as `unsupported_integer_literal` at the literal's zero-based line and column,
+and any other compile error as `source_compile_refused`.
 
 Compiler-disassembly path (the frontend reads the `luau-compile --text` listing, turns the function
 that `function_index` selects into a handoff document, then into IR; the one-liner below runs the
 compiler and the adapter in one step):
 
 ```sh
-node --input-type=module -e "import { execFileSync } from 'node:child_process'; import { writeFileSync } from 'node:fs'; import { parseDisassembly } from './frontends/disassembly/compiler_disassembly_adapter.mjs'; const [compiler, source, out] = process.argv.slice(1); writeFileSync(out, JSON.stringify(parseDisassembly(execFileSync(compiler, ['--text', '--dump-constants', '-O0', '-g0', source], { encoding: 'utf8' }), { function_index: 0, parameter_count: 2 })));" <path to luau-compile> <input.luau> <handoff.json>
+node --input-type=module -e "import { execFileSync } from 'node:child_process'; import { writeFileSync } from 'node:fs'; import { parseDisassembly } from './frontends/disassembly/compiler_disassembly_adapter.mjs'; const [compiler, source, out] = process.argv.slice(1); writeFileSync(out, JSON.stringify(parseDisassembly(execFileSync(compiler, ['--text', '--dump-constants', '-O0', '-g0', '--fflags=LuauIntegerType=false', source], { encoding: 'utf8' }), { function_index: 0, parameter_count: 2 })));" <path to luau-compile> <input.luau> <handoff.json>
 lune run frontends/disassembly/lift_compiler_disassembly.luau <handoff.json> <program.ir.json> <program-id>
 ```
 

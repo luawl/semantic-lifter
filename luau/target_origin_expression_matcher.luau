@@ -34,12 +34,6 @@ local function matchesAccessKey(value: any, origin: Record, matchesLocal: LocalM
 		local sourceValue = expression.value
 		if expression.type == "AstExprConstantNumber" and type(sourceValue) == "number" then
 			return sourceValue == origin.value
-		elseif expression.type == "AstExprConstantInteger" then
-			if type(sourceValue) == "number" then
-				return sourceValue == origin.value
-			elseif type(sourceValue) == "string" then
-				return tonumber(sourceValue) == origin.value
-			end
 		end
 		return false
 	end

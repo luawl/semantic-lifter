@@ -41,7 +41,6 @@ local function isDefinitelyValidKey(host: Host, originalNode: Record): boolean
 		tag = host.node_tag(node)
 	end
 	if tag == "AstExprConstantBool"
-		or tag == "AstExprConstantInteger"
 		or tag == "AstExprConstantString"
 		or tag == "AstExprTable"
 		or tag == "AstExprFunction"

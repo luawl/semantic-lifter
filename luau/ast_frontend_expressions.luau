@@ -85,23 +85,6 @@ function ExpressionLowerer:_constantNumber(context: any, node: Record, nameHint:
 	)
 end
 
-function ExpressionLowerer:_constantInteger(context: any, node: Record, nameHint: string?): any
-	local value, valueProblem = AstExpressionScalar.integerValue(node)
-	if valueProblem ~= nil then
-		self.host.diagnostic(valueProblem.code, valueProblem.node, valueProblem.detail)
-	end
-	local integerValue = value :: AstExpressionScalar.IntegerValue
-	local valueType = if integerValue.wide then LifterIR.Types.integer(65535, integerValue.signed) else LifterIR.Types.integer()
-	return self.host.scalar_result(
-		context,
-		node,
-		LifterIR.Operation.constant(LifterIR.Literal.integer(integerValue.decimal)),
-		valueType,
-		nameHint,
-		LifterIR.Effects.pure()
-	)
-end
-
 function ExpressionLowerer:_constantString(context: any, node: Record, value: string, nameHint: string?): any
 	return self.host.scalar_result(
 		context,
@@ -435,16 +418,6 @@ local function staticErrorLevel(host: Host, originalNode: Record): number?
 		local value = node.value
 		if type(value) == "number" and value >= 0 and value <= maxErrorLevel and value % 1 == 0 then
 			return value
-		end
-	elseif tag == "AstExprConstantInteger" then
-		local value = node.value
-		if type(value) == "number" and value >= 0 and value <= maxErrorLevel and value % 1 == 0 then
-			return value
-		elseif type(value) == "string" and string.match(value, "^%d+$") ~= nil then
-			local parsed = tonumber(value)
-			if parsed ~= nil and parsed <= maxErrorLevel then
-				return parsed
-			end
 		end
 	end
 	return nil
@@ -873,8 +846,6 @@ function ExpressionLowerer:lower(context: any, node: Record, nameHint: string?):
 		))
 	elseif tag == "AstExprConstantNumber" then
 		return Outcome.value(self:_constantNumber(context, node, nameHint))
-	elseif tag == "AstExprConstantInteger" then
-		return Outcome.value(self:_constantInteger(context, node, nameHint))
 	elseif tag == "AstExprConstantString" then
 		local value, valueProblem = AstExpressionScalar.stringValue(node)
 		if valueProblem ~= nil then

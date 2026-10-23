@@ -1,8 +1,10 @@
 import { createHash } from 'node:crypto';
 
-// Supported input: the text listing of `luau-compile --text --dump-constants -O0 -g0` from
-// Luau 0.720, the pinned compiler. Other optimization levels, binary bytecode and original source ASTs are not
-// inputs. Everything this adapter cannot represent faithfully is refused with a typed DisassemblyRefusal.
+// Supported input: the text listing of `luau-compile --text --dump-constants -O0 -g0 --fflags=LuauIntegerType=false`
+// from Luau 0.720, the pinned compiler. The listing prints an i-suffixed integer constant (Luau's integer type)
+// exactly like a number, so the flag stays off, under which a source that holds such a literal does not compile.
+// Other optimization levels, binary bytecode and original source ASTs are not inputs. Everything this adapter
+// cannot represent faithfully is refused with a typed DisassemblyRefusal.
 // A caller may declare that level (`optimization_level: 0`); only then is a DUPTABLE record template lifted, from its
 // `REMARK allocation: table template N` line and its N record stores.
 // Iteration, at that -O0 -g0 level only: FORNPREP/FORGPREP become `iteration_prepare` and

@@ -11,18 +11,20 @@ local RecoveryManifest = require("./recovery_manifest")
 local TargetProofBundle = require("./target_proof_bundle")
 
 local parserPath = process.args[1]
-local sourcePath = process.args[2]
-local programId = process.args[3]
-local outputPath = process.args[4]
-local sourceName = process.args[5] or programId
-local recoveryArgument = process.args[6]
+local compilerPath = process.args[2]
+local sourcePath = process.args[3]
+local programId = process.args[4]
+local outputPath = process.args[5]
+local sourceName = process.args[6] or programId
+local recoveryArgument = process.args[7]
 local recoveryManifestPath = if recoveryArgument == "omit-name-hints" then nil else recoveryArgument
-local proofBundlePath = process.args[7]
-local proofVerifierPath = process.args[8]
-local trustedProofPublicKey = process.args[9]
-local nameHintPolicy = if recoveryArgument == "omit-name-hints" then recoveryArgument else process.args[10]
+local proofBundlePath = process.args[8]
+local proofVerifierPath = process.args[9]
+local trustedProofPublicKey = process.args[10]
+local nameHintPolicy = if recoveryArgument == "omit-name-hints" then recoveryArgument else process.args[11]
 
 assert(parserPath ~= nil and parserPath ~= "", "expected a luau-ast parser path")
+assert(compilerPath ~= nil and compilerPath ~= "", "expected a luau-compile path")
 assert(sourcePath ~= nil and sourcePath ~= "", "expected a Luau source path")
 assert(programId ~= nil and programId ~= "", "expected a program ID")
 assert(outputPath ~= nil and outputPath ~= "", "expected an output JSON path")
@@ -44,6 +46,32 @@ local function omitNameHints(value: any)
 end
 
 local sourceText = AstAdmission.expectSourceBytes(fs.readFile(sourcePath), sourcePath)
+-- luau-ast writes nothing for an i-suffixed integer literal (Luau's integer type), so a source holding one would
+-- lift without the literal. The source is compiled first with that type switched off, which makes every such
+-- literal a syntax error; when the default compile accepts the source, or rejects it only for an integer literal
+-- that overflows or is malformed, the refusal names the literal. A compiler that does not know the flag only warns.
+local integerTypeOff = process.exec(compilerPath, { "--null", "--fflags=LuauIntegerType=false", sourcePath })
+if string.find(integerTypeOff.stderr, "unrecognized flag", 1, true) ~= nil then
+	error(`unsupported_compiler: {compilerPath} does not know the LuauIntegerType flag; pass the Luau 0.720 luau-compile`, 0)
+end
+if not integerTypeOff.ok then
+	local line, column = string.match(integerTypeOff.stderr, "%((%d+),(%d+)%): SyntaxError")
+	local at = sourceName
+	if line ~= nil and column ~= nil then
+		at = `{(tonumber(line) :: number) - 1},{(tonumber(column) :: number) - 1}`
+	end
+	local integerTypeOn = process.exec(compilerPath, { "--null", sourcePath })
+	if integerTypeOn.ok
+		or string.find(integerTypeOn.stderr, "SyntaxError: Integer overflow", 1, true) ~= nil
+		or string.find(integerTypeOn.stderr, "SyntaxError: Malformed integer", 1, true) ~= nil
+	then
+		error(
+			`unsupported_integer_literal at {at}: the source holds an i-suffixed integer literal, which has Luau's integer type, not the number type, and the source frontend lifts Luau numbers only`,
+			0
+		)
+	end
+	error(`source_compile_refused at {at}: {(string.gsub(integerTypeOff.stderr, "%s+$", ""))}`, 0)
+end
 local parsed = process.exec(parserPath, { sourcePath })
 if not parsed.ok then
 	error(`luau-ast failed with exit code {parsed.code}: {parsed.stderr}`, 0)

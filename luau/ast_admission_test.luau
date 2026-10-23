@@ -304,8 +304,8 @@ for _, loopType in { "AstStatWhile", "AstStatRepeat", "AstStatFor", "AstStatForI
 		loop.condition = { type = "AstExprConstantBool", value = true }
 	elseif loopType == "AstStatFor" then
 		loop.var = { type = "AstLocal", name = "item", location = "runtime-context-numeric-item" }
-		loop.from = { type = "AstExprConstantInteger", value = 1 }
-		loop.to = { type = "AstExprConstantInteger", value = 2 }
+		loop.from = { type = "AstExprConstantNumber", value = 1 }
+		loop.to = { type = "AstExprConstantNumber", value = 2 }
 	else
 		loop.vars = { { type = "AstLocal", name = "item", location = "runtime-context-generic-item" } }
 		loop.values = { { type = "AstExprConstantNil" } }
@@ -439,7 +439,7 @@ local orderedTableTailPack = {
 						type = "AstExprTableItem",
 						kind = "general",
 						key = { type = "AstExprGlobal", global = "dynamic_key" },
-						value = { type = "AstExprConstantInteger", value = 1 },
+						value = { type = "AstExprConstantNumber", value = 1 },
 					},
 					{
 						type = "AstExprTableItem",
@@ -531,8 +531,8 @@ local optionalChildCases: { {
 			type = "AstStatFor",
 			location = "numeric-for-step-owner",
 			var = { type = "AstLocal", name = "index", location = "numeric-for-step-local" },
-			from = { type = "AstExprConstantInteger", value = 1 },
-			to = { type = "AstExprConstantInteger", value = 2 },
+			from = { type = "AstExprConstantNumber", value = 1 },
+			to = { type = "AstExprConstantNumber", value = 2 },
 			step = "not-an-expression",
 			body = { type = "AstStatBlock", body = {} },
 		},
@@ -652,7 +652,7 @@ local collectionShapeCases: { any } = {
 		statement = {
 			type = "AstStatReturn",
 			location = "array-shape-expression-list",
-			list = { forged = { type = "AstExprConstantInteger", value = 7 } },
+			list = { forged = { type = "AstExprConstantNumber", value = 7 } },
 		},
 	},
 	{
@@ -681,7 +681,7 @@ local collectionShapeCases: { any } = {
 		statement = tableItemStatement({
 			location = "collection-shape-missing-table-item-tag",
 			kind = "item",
-			value = { type = "AstExprConstantInteger", value = 1 },
+			value = { type = "AstExprConstantNumber", value = 1 },
 		}),
 	},
 	{
@@ -693,7 +693,7 @@ local collectionShapeCases: { any } = {
 			type = "AstExprConstantNil",
 			location = "collection-shape-wrong-table-item-tag",
 			kind = "item",
-			value = { type = "AstExprConstantInteger", value = 1 },
+			value = { type = "AstExprConstantNumber", value = 1 },
 		}),
 	},
 	{
@@ -748,7 +748,7 @@ local collectionShapeCases: { any } = {
 				func = { type = "AstExprGlobal", global = "key_effect" },
 				args = {},
 			},
-			value = { type = "AstExprConstantInteger", value = 1 },
+			value = { type = "AstExprConstantNumber", value = 1 },
 		}),
 	},
 	{
@@ -765,7 +765,7 @@ local collectionShapeCases: { any } = {
 				func = { type = "AstExprGlobal", global = "key_effect" },
 				args = {},
 			},
-			value = { type = "AstExprConstantInteger", value = 1 },
+			value = { type = "AstExprConstantNumber", value = 1 },
 		}),
 	},
 }
@@ -801,7 +801,7 @@ local validTableItemCases: { any } = {
 			type = "AstExprTableItem",
 			kind = "record",
 			key = { type = "AstExprConstantString", value = "field" },
-			value = { type = "AstExprConstantInteger", value = 1 },
+			value = { type = "AstExprConstantNumber", value = 1 },
 		},
 	},
 	{
@@ -815,7 +815,7 @@ local validTableItemCases: { any } = {
 				func = { type = "AstExprGlobal", global = "key_effect" },
 				args = {},
 			},
-			value = { type = "AstExprConstantInteger", value = 1 },
+			value = { type = "AstExprConstantNumber", value = 1 },
 		},
 	},
 }
