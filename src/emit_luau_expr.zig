@@ -8,6 +8,7 @@ const place_read_fusion = @import("place_read_fusion.zig");
 const value_fusion = @import("value_fusion.zig");
 const place_render = @import("emit_luau_place.zig");
 const name_plan = @import("name_plan.zig");
+const numerals = @import("numerals.zig");
 
 pub const RenderError = std.mem.Allocator.Error || error{UnsupportedOperation};
 
@@ -760,7 +761,7 @@ pub fn literal(output: *std.ArrayList(u8), allocator: std.mem.Allocator, value: 
         .nil_value => try output.appendSlice(allocator, "nil"),
         .boolean => |item| try output.appendSlice(allocator, if (item) "true" else "false"),
         .integer => |item| try output.appendSlice(allocator, item),
-        .number => |item| try output.print(allocator, "{d}", .{item}),
+        .number => |item| try numberLiteral(output, allocator, item),
         .special_number => |item| try output.appendSlice(allocator, switch (item) {
             .nan => "(0 / 0)",
             .positive_infinity => "(1 / 0)",
@@ -768,6 +769,18 @@ pub fn literal(output: *std.ArrayList(u8), allocator: std.mem.Allocator, value: 
         }),
         .string => |item| try quoted(output, allocator, item),
     }
+}
+
+/// From 2^53 up every double is an integer, and `{d}` writes its shortest round-trip digits padded with zeros, which
+/// can name another integer (2^64 as 18446744073709552000, a literal luau-analyze reports as IntegerParsing). Such a
+/// value is written with its exact digits, which Luau reads back as the same double.
+fn numberLiteral(output: *std.ArrayList(u8), allocator: std.mem.Allocator, value: f64) !void {
+    if (!std.math.isFinite(value) or @abs(value) < 0x1p53) return output.print(allocator, "{d}", .{value});
+    const exact = (try numerals.exactF64RationalAlloc(allocator, value)).?;
+    defer allocator.free(exact.numerator);
+    defer allocator.free(exact.denominator);
+    std.debug.assert(std.mem.eql(u8, exact.denominator, "1"));
+    try output.appendSlice(allocator, exact.numerator);
 }
 
 fn quoted(output: *std.ArrayList(u8), allocator: std.mem.Allocator, text: []const u8) !void {
@@ -1166,6 +1179,36 @@ test "Luau string literal emission preserves arbitrary bytes" {
     defer output.deinit(std.testing.allocator);
     try literal(&output, std.testing.allocator, .{ .string = "\xff\x00\xc3\xa9" });
     try std.testing.expectEqualStrings("\"\\xff\\x00\\xc3\\xa9\"", output.items);
+}
+
+test "Luau number literal emission spells an integral double beyond 2^53 with its exact digits" {
+    const cases = [_]struct { value: f64, text: []const u8 }{
+        .{ .value = 0x1p53, .text = "9007199254740992" },
+        .{ .value = 0x1p53 + 2, .text = "9007199254740994" },
+        .{ .value = 1e20, .text = "100000000000000000000" },
+        .{ .value = 1e22, .text = "10000000000000000000000" },
+        .{ .value = 9007199254740991.0, .text = "9007199254740991" },
+        .{ .value = -4294967296.0, .text = "-4294967296" },
+        .{ .value = 0.5, .text = "0.5" },
+        .{ .value = 2251799813685248.5, .text = "2251799813685248.5" },
+        .{ .value = @as(f64, -0.0), .text = "-0" },
+        .{ .value = 0x1p63, .text = "9223372036854775808" },
+        .{ .value = 0x1p64, .text = "18446744073709551616" },
+        .{ .value = -0x1p64, .text = "-18446744073709551616" },
+        .{ .value = 0x1p56, .text = "72057594037927936" },
+        .{ .value = 1e23, .text = "99999999999999991611392" },
+        .{ .value = 0x1p1023, .text = "89884656743115795386465259539451236680898848947115328636715040578866337902750481566354238661203768010560056939935696678829394884407208311246423715319737062188883946712432742638151109800623047059726541476042502884419075341171231440736956555270413618581675255342293149119973622969239858152417678164812112068608" },
+        .{ .value = std.math.floatMax(f64), .text = "179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368" },
+    };
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(std.testing.allocator);
+    for (cases) |case| {
+        output.clearRetainingCapacity();
+        try literal(&output, std.testing.allocator, .{ .number = case.value });
+        try std.testing.expectEqualStrings(case.text, output.items);
+        // literalStartsWithMinus reads the sign bit, so the text starts with a minus exactly when it is set.
+        try std.testing.expectEqual(std.math.signbit(case.value), output.items[0] == '-');
+    }
 }
 
 test "Luau precedence preserves parser grouping by operand side" {

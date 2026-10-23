@@ -1187,6 +1187,28 @@ function SourceRuntimeOracle.run(caseName: string, source: string, exported: any
 		assert(notEqualArm == "then-arm", "inequality with a double chain rounded beyond 2^53 followed exact integer arithmetic")
 	elseif caseName == "source-frontend-double-rounding-comparison-in-range" then
 		assert(exported() == "else-arm", "equality with a double chain rounded to 2^53 followed exact integer arithmetic")
+	elseif caseName == "source-frontend-wide-integral-number" then
+		local passed: { [number]: any, n: number } = { n = 0 }
+		local returned = table.pack(exported(function(...: any)
+			passed = table.pack(...)
+		end))
+		local record, list = returned[8], returned[9]
+		assert(passed.n == 3 and returned.n == 9 and #list == 3, "wide integral numbers changed their count")
+		local observed = {
+			passed[1], passed[2], passed[3],
+			returned[1], returned[2], returned[3], returned[4], returned[5], returned[6], returned[7],
+			record.p53, record.p53plus2, record.p63, record.p64, record.e20, record.neg64, record.half64, record.half64expr,
+			list[1], list[2], list[3],
+		}
+		local expected = {
+			9223372036854775808, 18446744073709551616, -18446744073709551616,
+			9007199254740992, 9007199254740994, 9223372036854775808, 18446744073709551616, 100000000000000000000, -18446744073709551616, 9223372036854775808,
+			9007199254740992, 9007199254740994, 9223372036854775808, 18446744073709551616, 100000000000000000000, -18446744073709551616, 9223372036854775808, 9223372036854775808,
+			9007199254740994, 18446744073709551616, 100000000000000000000,
+		}
+		for index, value in expected do
+			assert(observed[index] == value, `wide integral number {index} changed its value`)
+		end
 	else
 		return false
 	end

@@ -15,7 +15,17 @@ local function collectUnknownGlobals(output: string): NameSet
 	return names
 end
 
-local function analyze(analyzerPath: string, sourcePath: string): NameSet
+-- luau-analyze reports an all-digit number literal of 2^53 or more that is not the exact digits of its value
+-- (2^64 written as 18446744073709552000) as IntegerParsing and still exits 0, so the lines are counted.
+local function countIntegerParsing(output: string): number
+	local count = 0
+	for _ in string.gmatch(output, "IntegerParsing: ") do
+		count += 1
+	end
+	return count
+end
+
+local function analyze(analyzerPath: string, sourcePath: string): (NameSet, number)
 	local result = process.exec(analyzerPath, { "--mode=strict", sourcePath })
 	local output = result.stdout .. "\n" .. result.stderr
 	assert(#output <= MAX_DIAGNOSTIC_BYTES, `luau-analyze diagnostics exceeded the bounded oracle limit for {sourcePath}`)
@@ -25,7 +35,7 @@ local function analyze(analyzerPath: string, sourcePath: string): NameSet
 			`luau-analyze failed for {sourcePath} with exit code {result.code}: {output}`
 		)
 	end
-	return collectUnknownGlobals(output)
+	return collectUnknownGlobals(output), countIntegerParsing(output)
 end
 
 local function unexpectedNames(sourceNames: NameSet, generatedNames: NameSet): { string }
@@ -46,6 +56,15 @@ local function assertNoIntroducedGlobals(sourceNames: NameSet, generatedNames: N
 	end
 end
 
+local function assertNoIntroducedIntegerParsing(sourceCount: number, generatedCount: number, generatedPath: string)
+	if generatedCount > sourceCount then
+		error(
+			`generated Luau has {generatedCount} IntegerParsing lines where its source has {sourceCount} in {generatedPath}`,
+			0
+		)
+	end
+end
+
 local mode = process.args[1]
 local analyzerPath = process.args[2]
 assert(mode ~= nil and mode ~= "", "expected an oracle mode")
@@ -56,7 +75,10 @@ if mode == "check" then
 	local generatedPath = process.args[4]
 	assert(sourcePath ~= nil and sourcePath ~= "", "expected a source Luau path")
 	assert(generatedPath ~= nil and generatedPath ~= "", "expected a generated Luau path")
-	assertNoIntroducedGlobals(analyze(analyzerPath, sourcePath), analyze(analyzerPath, generatedPath), generatedPath)
+	local sourceNames, sourceIntegerParsing = analyze(analyzerPath, sourcePath)
+	local generatedNames, generatedIntegerParsing = analyze(analyzerPath, generatedPath)
+	assertNoIntroducedGlobals(sourceNames, generatedNames, generatedPath)
+	assertNoIntroducedIntegerParsing(sourceIntegerParsing, generatedIntegerParsing, generatedPath)
 elseif mode == "self-test" then
 	local sourcePath = process.args[3]
 	local generatedPath = process.args[4]
@@ -72,6 +94,16 @@ elseif mode == "self-test" then
 	assertNoIntroducedGlobals(sourceNames, sourceNames, sourcePath)
 	local ok = pcall(assertNoIntroducedGlobals, sourceNames, generatedNames, generatedPath)
 	assert(not ok, "negative lexical oracle did not reject")
+
+	-- 2^64 with its exact digits, and the same double with its shortest digits padded with zeros.
+	fs.writeFile(sourcePath, "return 18446744073709551616\n")
+	fs.writeFile(generatedPath, "return 18446744073709552000\n")
+	local _, exactCount = analyze(analyzerPath, sourcePath)
+	local _, paddedCount = analyze(analyzerPath, generatedPath)
+	assert(exactCount == 0 and paddedCount == 1, "integer parsing diagnostic census changed")
+	assertNoIntroducedIntegerParsing(exactCount, exactCount, sourcePath)
+	local integerParsingOk = pcall(assertNoIntroducedIntegerParsing, exactCount, paddedCount, generatedPath)
+	assert(not integerParsingOk, "negative integer parsing oracle did not reject")
 else
 	error(`unknown generated lexical oracle mode {mode}`, 0)
 end
