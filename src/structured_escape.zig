@@ -6,6 +6,14 @@ pub fn regionOwnsEscape(region: *const structure.Region) bool {
     return structure.regionOwnsEscape(region);
 }
 
+pub fn regionWritesOwnedEscape(region: *const structure.Region) bool {
+    return structure.regionWritesOwnedEscape(region);
+}
+
+pub fn regionSideEscapeFallsThrough(region: *const structure.Region) bool {
+    return structure.regionSideEscapeFallsThrough(region);
+}
+
 pub fn regionHasNestedEscapeTo(region: *const structure.Region, target: ir.BlockId) bool {
     return structure.regionHasNestedEscapeTo(region, target);
 }

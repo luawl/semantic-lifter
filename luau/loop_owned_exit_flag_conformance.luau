@@ -18,7 +18,13 @@
 -- loop over the first three arguments whose exhaustion edge passes marker to the exit block:
 --   for index do while step("I") do if step("B") then <next index> end step("C") end return index end
 --   return marker
--- The chunk returns the seven workers in this order.
+-- The eighth is worker(step) again: a loop boundary in an inner loop whose side escape leaves for the exit the
+-- middle loop owns, while its side region continues the middle loop on one arm. That arm is a free target of the
+-- side region, so the region is written inside a transfer wrapper, and the side arm sets the exit's flag after it:
+--   side_escape_free_target: step("entry") while step("Z") do while true do step("H") while step("I") do
+--     if step("B") then if step("L") then <next pass of the middle loop> end <leave the middle loop> end
+--     step("C") end step("E") <leave the middle loop> end end return "done"
+-- The chunk returns the eight workers in this order.
 local fs = require("@lune/fs")
 local process = require("@lune/process")
 local LifterIR = require("./lifter_ir")
@@ -98,6 +104,17 @@ local SHAPES = {
 		{ name = "outer_latch", steps = { { "decide", "L" } }, exit = { "branch", "outer_header", "left" } },
 		{ name = "inner_latch", steps = { { "note", "C" } }, exit = { "jump", "inner_header" } },
 	},
+	side_escape_free_target = {
+		{ name = "entry", steps = { { "note", "entry" } }, exit = { "jump", "outer_header" } },
+		{ name = "outer_header", steps = { { "decide", "Z" } }, exit = { "branch", "middle_header", "done" } },
+		{ name = "middle_header", steps = { { "note", "H" } }, exit = { "jump", "inner_header" } },
+		{ name = "inner_header", steps = { { "decide", "I" } }, exit = { "branch", "inner_body", "middle_left" } },
+		{ name = "inner_body", steps = { { "decide", "B" } }, exit = { "branch", "side", "inner_latch" } },
+		{ name = "side", steps = { { "decide", "L" } }, exit = { "branch", "middle_header", "outer_header" } },
+		{ name = "inner_latch", steps = { { "note", "C" } }, exit = { "jump", "inner_header" } },
+		{ name = "middle_left", steps = { { "note", "E" } }, exit = { "jump", "outer_header" } },
+		{ name = "done", steps = {}, exit = { "return", "done" } },
+	},
 }
 
 -- The order in which each step shape's blocks receive their steps and terminators.
@@ -117,6 +134,17 @@ local FILL_ORDER = {
 		"done",
 	},
 	owned_exit_latch = { "entry", "outer_header", "inner_header", "inner_body", "left", "outer_latch", "inner_latch" },
+	side_escape_free_target = {
+		"entry",
+		"outer_header",
+		"middle_header",
+		"inner_header",
+		"inner_body",
+		"side",
+		"inner_latch",
+		"middle_left",
+		"done",
+	},
 }
 
 local function addStepWorker(shape)
@@ -238,6 +266,7 @@ end
 for _, kind in { "numeric", "generic", "semantic" } do
 	export(addNativeWorker(kind))
 end
+export(addStepWorker("side_escape_free_target"))
 builder:finalizeBlock(chunkBlock, LifterIR.Terminator.returnValues(exports))
 builder:finalizeFunction(chunk)
 

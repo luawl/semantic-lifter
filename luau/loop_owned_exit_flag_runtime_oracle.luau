@@ -5,7 +5,9 @@
 -- so a flag the text never declares fails the row that reaches it. Every worker runs once for each script of twelve
 -- step results against a reference written by hand: the result and the order of the step labels must match. A
 -- script that runs out raises, which bounds every loop. One row is also checked against its trace written out: the
--- third worker's second entry to its middle loop must not see the flag its first entry left set.
+-- third worker's second entry to its middle loop must not see the flag its first entry left set. The eighth worker
+-- leaves its inner loop by a loop boundary's side escape, whose side arm sets the flag of the exit the middle loop
+-- owns after the side region: that set must reach the flag the middle loop reads.
 -- A passing case prints nothing. A failing case prints one line per failing worker, `<case> <worker> rows=<R>
 -- mismatches=<M> trapped=<T>` with the first differing row, a line for the written-out row when it differs, and
 -- fails one assertion that counts the failed workers.
@@ -118,6 +120,35 @@ local function ownedExitLatch(step: (string) -> any): any
 	return "exit"
 end
 
+local function sideEscapeFreeTarget(step: (string) -> any): any
+	step("entry")
+	while step("Z") do
+		while true do
+			step("H")
+			local outcome: string? = nil
+			while step("I") do
+				if step("B") then
+					if step("L") then
+						outcome = "middle"
+					else
+						outcome = "outer"
+					end
+					break
+				end
+				step("C")
+			end
+			if outcome == "middle" then
+				continue
+			end
+			if outcome == nil then
+				step("E")
+			end
+			break
+		end
+	end
+	return "done"
+end
+
 -- The native loops run index over 1, 2, 3.
 local function ownedExitFor(step: (string) -> any): any
 	for index = 1, 3 do
@@ -163,6 +194,7 @@ local WORKERS: { WorkerEntry } = {
 	{ name = "owned_exit_numeric_for", reference = ownedExitFor, invoke = numericInvoke },
 	{ name = "owned_exit_generic_for", reference = ownedExitFor, invoke = genericInvoke },
 	{ name = "owned_exit_semantic_for", reference = ownedExitFor, invoke = semanticInvoke },
+	{ name = "side_escape_free_target", reference = sideEscapeFreeTarget, invoke = stepInvoke },
 }
 
 local function scriptText(bits: { boolean }): string

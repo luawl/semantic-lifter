@@ -428,6 +428,43 @@ pub fn regionOwnsEscape(region: *const Region) bool {
     return nodesEscapeTo(region.nodes, target);
 }
 
+/// Whether `region`'s side escape only falls through to the region's end: its last node is a loop boundary whose side
+/// escape targets the region's own stop (the side region stops there), the region writes nothing after that node (no
+/// escape, terminal or continue projection), nothing after the region reads the stop's flag (the region does not
+/// continue at its stop, and no loop-boundary exit to the stop shares the flag), and no other node and not the
+/// boundary's body region escapes to the stop. The side arm's flag and `break` would only reach the end of the
+/// region's transfer wrapper, which leaving the boundary's `if` reaches as well, so the writer leaves both out
+/// (`emitLoopBoundaryArmImpl`) and writes no wrapper for that escape (`regionWritesOwnedEscape`).
+pub fn regionSideEscapeFallsThrough(region: *const Region) bool {
+    const stop = region.stop orelse return false;
+    if (region.nodes.len == 0) return false;
+    const last = region.nodes.len - 1;
+    const control = switch (region.nodes[last]) {
+        .loop_boundary => |value| value,
+        else => return false,
+    };
+    const side = switch (control.boundary) {
+        .side_escape => |value| value,
+        else => return false,
+    };
+    if (side.target != stop) return false;
+    if (region.escape_projection != null or region.terminal_projection != null or
+        region.continue_projection != null) return false;
+    if (region.continue_target != null and region.continue_target.? == stop) return false;
+    if (regionHasLoopBoundaryExitTo(region, stop)) return false;
+    if (nodesEscapeTo(region.nodes[0..last], stop)) return false;
+    return !regionEscapesTo(control.body_region, stop);
+}
+
+/// Whether the readable writer leaves `region` by its stop's flag and a `break` for an escape the region owns, and so
+/// writes it inside a transfer wrapper (`emitRegionWithPredeclaredBlock`, and `regionIsWrapped`, the model
+/// `markFlaggedContinues` uses): `regionOwnsEscape`, unless that escape is a side escape that falls through to the
+/// region's end (`regionSideEscapeFallsThrough`). `regionOwnsEscape` stays the planner's question (an arm that
+/// reaches its join) and the certificates' count, which keep counting such a region.
+pub fn regionWritesOwnedEscape(region: *const Region) bool {
+    return regionOwnsEscape(region) and !regionSideEscapeFallsThrough(region);
+}
+
 /// Whether a region's continue projection is written as an escape flag, which every transfer wrapper on the way
 /// forwards and the loop body's wrapper consumes as a `continue`, rather than as a lexical `continue`: its target is
 /// not the region's continue target, or `markFlaggedContinues` found that a lexical `continue` would bind to a
@@ -463,9 +500,10 @@ pub fn markFlaggedContinues(allocator: std.mem.Allocator, root: *Region) std.mem
 }
 
 /// The readable writer's wrapper test (`emitRegionWithPredeclaredBlock`): a region is written inside a transfer
-/// wrapper when it owns an escape to its stop or has a free target.
+/// wrapper when it leaves by its stop's flag and a `break` for an escape it owns (`regionWritesOwnedEscape`) or has a
+/// free target.
 fn regionIsWrapped(allocator: std.mem.Allocator, region: *const Region) std.mem.Allocator.Error!bool {
-    if (regionOwnsEscape(region)) return true;
+    if (regionWritesOwnedEscape(region)) return true;
     if (region.stop == null) return false;
     const targets = try regionFreeTargetsAlloc(allocator, region);
     defer allocator.free(targets);
@@ -671,17 +709,23 @@ pub fn regionHasLoopBoundaryExitTo(region: *const Region, target: ir.BlockId) bo
 /// Reports a loop-boundary body arm that the writer would end with a lexical
 /// `continue` to a block other than `stop`.
 ///
-/// When a region owns an escape it is written inside a `repeat ... until true`
-/// transfer wrapper. A nested loop boundary whose body arm continues the
-/// enclosing loop is written as a lexical `continue`, which Luau binds to that
-/// `repeat` and so reaches `stop`, not the loop header. This is the
-/// escape-wrapper case the loop-boundary exit path already carries; keep it
-/// separate so the emitter can refuse and fall back to the flat layout. The
-/// node is reported on the `.continue_target` condition alone: its body region's
-/// stop is set, differs from the holding region's stop, and equals the holding
-/// region's continue target, whatever the body region's continue projection.
-/// A node whose body exit continue `markFlaggedContinues` carries by flag is not
+/// When a region is written inside a `repeat ... until true` transfer wrapper,
+/// a loop boundary among its own nodes whose body arm continues the enclosing
+/// loop is written as a lexical `continue`, which Luau binds to that `repeat`
+/// and so reaches `stop`, not the loop header. This is the escape-wrapper case
+/// the loop-boundary exit path already carries; keep it separate so the
+/// emitter can refuse and fall back to the flat layout. The node is reported on
+/// the `.continue_target` condition alone: its body region's stop is set,
+/// differs from the holding region's stop, and equals the holding region's
+/// continue target, whatever the body region's continue projection. A node
+/// whose body exit continue `markFlaggedContinues` carries by flag is not
 /// reported: its writer sets the flag and leaves the wrapper instead.
+///
+/// Only the region's own nodes are compared. A nested region written inside its
+/// own wrapper is checked there; a lexical `continue` written anywhere else is
+/// checked where it is written (`emitContinueStatement` refuses one that would
+/// bind to a wrapper that does not reach its target), so a captured continue
+/// still sends the function to the flat layout.
 pub fn regionHasLoopBoundaryContinueNotTo(region: *const Region, stop: ir.BlockId) bool {
     for (region.nodes) |node| {
         if (nodeHasLoopBoundaryContinueNotTo(node, stop, region.continue_target)) return true;
@@ -821,10 +865,12 @@ test "a loop-boundary exit continue that a wrapper stopping at another block wou
     const exit = ir.BlockId.fromIndex(26);
 
     // An infinite loop whose body (stopping at the header) leaves through a shared side exit at `join`:
-    // if <8> then <9>; if <10> then <continue the loop> else <14>; <loop boundary 15> end else <23> end. The loop
+    // if <8> then <9>; if <10> then <leave for the header> else <14>; <loop boundary 15> end else <23> end. The loop
     // boundary's body region stops at the header, the holding arm's continue target, so its writer ends the body arm
-    // with a continue; its side arm escapes to `join`, the holding arm's stop, so that arm is written inside a transfer
-    // wrapper that stops at `join`, and a lexical continue there would bind to the wrapper.
+    // with a continue; its side arm escapes to `join`, the holding arm's own stop, from the arm's last node, so that
+    // escape only falls through to the arm's end. The sibling arm's escape to the header gives the outer then-arm a
+    // free target, so that arm is written inside a transfer wrapper that stops at `join`, and a lexical continue under
+    // it would bind to that wrapper.
     var boundary_body_nodes = [_]Node{ .{ .block = ir.BlockId.fromIndex(20) }, .{ .block = ir.BlockId.fromIndex(21) } };
     var boundary_body = Region{ .nodes = &boundary_body_nodes, .stop = header, .loop_exit = exit, .continue_target = header };
     var side_nodes = [_]Node{.{ .block = ir.BlockId.fromIndex(16) }};
@@ -840,17 +886,17 @@ test "a loop-boundary exit continue that a wrapper stopping at another block wou
         } },
     };
     var boundary_arm = Region{ .nodes = &boundary_arm_nodes, .stop = join, .loop_exit = exit, .continue_target = header };
-    var continue_nodes = [_]Node{ .{ .block = ir.BlockId.fromIndex(11) }, .{ .block = ir.BlockId.fromIndex(12) } };
-    var continue_arm = Region{
-        .nodes = &continue_nodes,
+    var escape_nodes = [_]Node{ .{ .block = ir.BlockId.fromIndex(11) }, .{ .block = ir.BlockId.fromIndex(12) } };
+    var escape_arm = Region{
+        .nodes = &escape_nodes,
         .stop = join,
         .loop_exit = exit,
         .continue_target = header,
-        .continue_projection = .{ .target = header, .edge = null },
+        .escape_projection = .{ .target = header, .edge = null },
     };
     var then_nodes = [_]Node{
         .{ .block = ir.BlockId.fromIndex(9) },
-        .{ .branch = .{ .block = ir.BlockId.fromIndex(10), .then_region = &continue_arm, .else_region = &boundary_arm, .join = null } },
+        .{ .branch = .{ .block = ir.BlockId.fromIndex(10), .then_region = &escape_arm, .else_region = &boundary_arm, .join = null } },
     };
     var then_arm = Region{ .nodes = &then_nodes, .stop = join, .loop_exit = exit, .continue_target = header };
     var else_nodes = [_]Node{.{ .block = ir.BlockId.fromIndex(23) }};
@@ -878,17 +924,16 @@ test "a loop-boundary exit continue that a wrapper stopping at another block wou
     var root = Region{ .nodes = &root_nodes, .stop = null, .loop_exit = null };
     const boundary = &boundary_arm_nodes[1].loop_boundary;
 
-    // Before the marking no region counts the continue, and the refusal at a wrapper reports the boundary both at the
-    // loop body's wrapper and at the holding arm's.
-    try std.testing.expect(!regionOwnsEscape(&body));
-    try std.testing.expect(regionHasLoopBoundaryContinueNotTo(&body, header));
+    // Before the marking the loop body owns the sibling arm's escape to its stop. The refusal at a wrapper compares the
+    // wrapped region's own loop boundaries only: the loop body holds none, the holding arm reports its own.
+    try std.testing.expect(regionOwnsEscape(&body));
+    try std.testing.expectEqual(false, regionHasLoopBoundaryContinueNotTo(&body, header));
     try std.testing.expect(regionHasLoopBoundaryContinueNotTo(&boundary_arm, join));
 
     try markFlaggedContinues(allocator, &root);
     try std.testing.expect(boundary.continue_via_flag);
-    // Counting the mark gives the outer then-arm a free target, so it is written inside a wrapper that stops at
-    // `join`, which would capture the sibling arm's lexical continue: the fixed point carries that one by flag too.
-    try std.testing.expect(continue_arm.continue_projection.?.via_flag);
+    // Counting the mark gives the holding arm and the outer then-arm the header as a free target: both are written
+    // inside wrappers that stop at `join` and forward the flag, and the loop body's wrapper consumes it.
     try std.testing.expect(regionOwnsEscape(&body));
     try std.testing.expect(regionHasNestedEscapeTo(&body, header));
     const boundary_arm_targets = try regionFreeTargetsAlloc(allocator, &boundary_arm);
@@ -976,10 +1021,183 @@ test "a loop-boundary exit continue under a wrapper that stops at the loop heade
     defer allocator.free(boundary_arm_targets);
     try std.testing.expectEqual(@as(usize, 0), boundary_arm_targets.len);
     try std.testing.expect(!regionOwnsEscape(&body));
-    // The refusal at the loop body's wrapper still compares the boundary with its holding arm's own stop, not with the
-    // wrapper's, so it reports this lexical continue although the continue reaches the header: the function is
-    // written in the flat layout, as before.
-    try std.testing.expect(regionHasLoopBoundaryContinueNotTo(&body, header));
+    // The refusal at the loop body's wrapper compares the body's own loop boundaries only, so it does not report this
+    // lexical continue, which reaches the header: the function stays structured. A continue that a wrapper would
+    // capture is still refused where it is written (`emitContinueStatement`).
+    try std.testing.expectEqual(false, regionHasLoopBoundaryContinueNotTo(&body, header));
+}
+
+test "a side escape that falls through to its holder's end leaves the loop-boundary exit continue lexical" {
+    const allocator = std.testing.allocator;
+    const header = ir.BlockId.fromIndex(7);
+    const join = ir.BlockId.fromIndex(19);
+    const exit = ir.BlockId.fromIndex(21);
+
+    // An infinite loop whose body (stopping at the header) leaves through a shared side exit at `join`:
+    // if <8> then <9>; <loop boundary 10> else <18> end. The loop boundary is the holding arm's last node; its body
+    // region stops at the header, the holding arm's continue target, so its writer ends the body arm with a continue;
+    // its side arm escapes to `join`, the holding arm's own stop, where the side region stops, and nothing else in the
+    // arm leaves by `join`, so the escape only falls through to the arm's end and the arm needs no wrapper for it.
+    var boundary_body_nodes = [_]Node{ .{ .block = ir.BlockId.fromIndex(15) }, .{ .block = ir.BlockId.fromIndex(16) } };
+    var boundary_body = Region{ .nodes = &boundary_body_nodes, .stop = header, .loop_exit = exit, .continue_target = header };
+    var side_nodes = [_]Node{.{ .block = ir.BlockId.fromIndex(23) }};
+    var side_region = Region{ .nodes = &side_nodes, .stop = join, .loop_exit = null };
+    var holder_nodes = [_]Node{
+        .{ .block = ir.BlockId.fromIndex(9) },
+        .{ .loop_boundary = .{
+            .block = ir.BlockId.fromIndex(10),
+            .body_edge = .{ .target = ir.BlockId.fromIndex(15) },
+            .body_region = &boundary_body,
+            .boundary = .{ .side_escape = .{ .entry_edge = .{ .target = ir.BlockId.fromIndex(11) }, .region = &side_region, .target = join } },
+            .body_on_true = false,
+        } },
+    };
+    var holder = Region{ .nodes = &holder_nodes, .stop = join, .loop_exit = exit, .continue_target = header };
+    var else_nodes = [_]Node{.{ .block = ir.BlockId.fromIndex(18) }};
+    var else_arm = Region{ .nodes = &else_nodes, .stop = join, .loop_exit = exit, .continue_target = header };
+    var body_nodes = [_]Node{
+        .{ .block = header },
+        .{ .branch = .{ .block = ir.BlockId.fromIndex(8), .then_region = &holder, .else_region = &else_arm, .join = join } },
+    };
+    var body = Region{
+        .nodes = &body_nodes,
+        .stop = header,
+        .loop_exit = exit,
+        .continue_target = header,
+        .escape_projection = .{ .target = join, .edge = null },
+    };
+    var shared_nodes = [_]Node{.{ .block = join }};
+    var shared_region = Region{ .nodes = &shared_nodes, .stop = exit, .loop_exit = null };
+    var shared_entries = [_]SharedSideEntry{.{ .entry = join, .region = &shared_region }};
+    var root_nodes = [_]Node{.{ .infinite_loop = .{
+        .header = header,
+        .body_region = &body,
+        .exit = exit,
+        .shared_side_exit = .{ .entries = &shared_entries },
+    } }};
+    var root = Region{ .nodes = &root_nodes, .stop = null, .loop_exit = null };
+    const boundary = &holder_nodes[1].loop_boundary;
+
+    // The planner and the escape census still see the holding arm reach its stop by an escape, which its own stop
+    // captures.
+    try std.testing.expect(regionOwnsEscape(&holder));
+    const holder_targets = try regionFreeTargetsAlloc(allocator, &holder);
+    defer allocator.free(holder_targets);
+    try std.testing.expectEqual(@as(usize, 0), holder_targets.len);
+
+    // No wrapper of its own around the holding arm: the body exit continue binds to the loop body's wrapper, which
+    // stops at the header, so nothing is marked and the loop body owns no escape to the header.
+    try markFlaggedContinues(allocator, &root);
+    try std.testing.expectEqual(false, boundary.continue_via_flag);
+    try std.testing.expect(!regionOwnsEscape(&body));
+    try std.testing.expect(!regionHasNestedEscapeTo(&body, header));
+    const body_targets = try regionFreeTargetsAlloc(allocator, &body);
+    defer allocator.free(body_targets);
+    try std.testing.expectEqualSlices(ir.BlockId, &.{join}, body_targets);
+    const root_targets = try regionFreeTargetsAlloc(allocator, &root);
+    defer allocator.free(root_targets);
+    try std.testing.expectEqual(@as(usize, 0), root_targets.len);
+    // The refusal at a wrapper compares the wrapped region's own loop boundaries only: the loop body holds none, so
+    // its wrapper does not refuse. The holding arm's own comparison reports the lexical continue, but the arm is
+    // written without a wrapper.
+    try std.testing.expectEqual(false, regionHasLoopBoundaryContinueNotTo(&body, header));
+    try std.testing.expect(regionHasLoopBoundaryContinueNotTo(&holder, join));
+}
+
+test "a side escape falls through to its holder's end only when nothing else leaves by the holder's stop" {
+    const allocator = std.testing.allocator;
+    const header = ir.BlockId.fromIndex(7);
+    const join = ir.BlockId.fromIndex(19);
+    const exit = ir.BlockId.fromIndex(21);
+    const outside = ir.BlockId.fromIndex(22);
+
+    // The holding arm of the previous test: its last node is a loop boundary whose side escape targets the arm's own
+    // stop, where the side region stops, and nothing else in the arm leaves by that stop. The arm owns that escape,
+    // and the writer leaves it out and needs no wrapper for it.
+    var boundary_body_nodes = [_]Node{ .{ .block = ir.BlockId.fromIndex(15) }, .{ .block = ir.BlockId.fromIndex(16) } };
+    var boundary_body = Region{ .nodes = &boundary_body_nodes, .stop = header, .loop_exit = exit, .continue_target = header };
+    var side_nodes = [_]Node{.{ .block = ir.BlockId.fromIndex(23) }};
+    var side_region = Region{ .nodes = &side_nodes, .stop = join, .loop_exit = null };
+    var holder_nodes = [_]Node{
+        .{ .block = ir.BlockId.fromIndex(9) },
+        .{ .loop_boundary = .{
+            .block = ir.BlockId.fromIndex(10),
+            .body_edge = .{ .target = ir.BlockId.fromIndex(15) },
+            .body_region = &boundary_body,
+            .boundary = .{ .side_escape = .{ .entry_edge = .{ .target = ir.BlockId.fromIndex(11) }, .region = &side_region, .target = join } },
+            .body_on_true = false,
+        } },
+    };
+    var holder = Region{ .nodes = &holder_nodes, .stop = join, .loop_exit = exit, .continue_target = header };
+    try std.testing.expect(regionOwnsEscape(&holder));
+    try std.testing.expect(regionSideEscapeFallsThrough(&holder));
+    try std.testing.expect(!regionWritesOwnedEscape(&holder));
+
+    // One variant per clause, each restored after its check. In each the stop's flag gets a reader or another writer,
+    // so the arm keeps its wrapper and its side arm keeps the flag and the `break`.
+    // The arm continues at its own stop: the consumer after its wrapper reads the flag.
+    holder.continue_target = join;
+    try std.testing.expect(!regionSideEscapeFallsThrough(&holder));
+    try std.testing.expect(regionWritesOwnedEscape(&holder));
+    holder.continue_target = header;
+    // A projection is written after the loop boundary.
+    holder.escape_projection = .{ .target = exit, .edge = null };
+    try std.testing.expect(!regionSideEscapeFallsThrough(&holder));
+    try std.testing.expect(regionWritesOwnedEscape(&holder));
+    holder.escape_projection = null;
+    holder.terminal_projection = .{ .terminal = outside, .edge = null };
+    try std.testing.expect(!regionSideEscapeFallsThrough(&holder));
+    try std.testing.expect(regionWritesOwnedEscape(&holder));
+    holder.terminal_projection = null;
+    holder.continue_projection = .{ .target = header, .edge = null };
+    try std.testing.expect(!regionSideEscapeFallsThrough(&holder));
+    try std.testing.expect(regionWritesOwnedEscape(&holder));
+    holder.continue_projection = null;
+    // A loop-boundary exit to the stop: the stop's flag is the one the loop that owns the exit reads.
+    var exit_body = Region{ .nodes = &.{}, .stop = null, .loop_exit = join };
+    holder_nodes[0] = .{ .loop_boundary = .{
+        .block = ir.BlockId.fromIndex(9),
+        .body_edge = .{ .target = ir.BlockId.fromIndex(12) },
+        .body_region = &exit_body,
+        .boundary = .{ .exit = .{ .target = join } },
+        .body_on_true = true,
+    } };
+    try std.testing.expect(regionHasLoopBoundaryExitTo(&holder, join));
+    try std.testing.expect(!regionSideEscapeFallsThrough(&holder));
+    try std.testing.expect(regionWritesOwnedEscape(&holder));
+    // Another node escapes to the stop: its `break` needs the wrapper.
+    var leave_nodes = [_]Node{.{ .block = ir.BlockId.fromIndex(12) }};
+    var leave_arm = Region{
+        .nodes = &leave_nodes,
+        .stop = ir.BlockId.fromIndex(13),
+        .loop_exit = exit,
+        .continue_target = header,
+        .escape_projection = .{ .target = join, .edge = null },
+    };
+    var stay_arm = Region{ .nodes = &.{}, .stop = ir.BlockId.fromIndex(13), .loop_exit = exit, .continue_target = header };
+    holder_nodes[0] = .{ .branch = .{ .block = ir.BlockId.fromIndex(9), .then_region = &leave_arm, .else_region = &stay_arm, .join = ir.BlockId.fromIndex(13) } };
+    try std.testing.expect(!regionSideEscapeFallsThrough(&holder));
+    try std.testing.expect(regionWritesOwnedEscape(&holder));
+    holder_nodes[0] = .{ .block = ir.BlockId.fromIndex(9) };
+    // The loop boundary's body region escapes to the stop.
+    boundary_body.escape_projection = .{ .target = join, .edge = null };
+    try std.testing.expect(!regionSideEscapeFallsThrough(&holder));
+    try std.testing.expect(regionWritesOwnedEscape(&holder));
+    boundary_body.escape_projection = null;
+    // The side escape targets another block: it leaves past the arm's end as a free target, and the arm owns none.
+    holder_nodes[1].loop_boundary.boundary.side_escape.target = outside;
+    side_region.stop = outside;
+    try std.testing.expect(!regionSideEscapeFallsThrough(&holder));
+    try std.testing.expect(!regionOwnsEscape(&holder));
+    try std.testing.expect(!regionWritesOwnedEscape(&holder));
+    const outside_targets = try regionFreeTargetsAlloc(allocator, &holder);
+    defer allocator.free(outside_targets);
+    try std.testing.expectEqualSlices(ir.BlockId, &.{outside}, outside_targets);
+    holder_nodes[1].loop_boundary.boundary.side_escape.target = join;
+    side_region.stop = join;
+
+    try std.testing.expect(regionSideEscapeFallsThrough(&holder));
+    try std.testing.expect(!regionWritesOwnedEscape(&holder));
 }
 
 test "loop-boundary exit targets are tracked separately from free targets" {
@@ -17127,42 +17345,15 @@ fn sharedSideExitHasLoopBoundaryExitTo(side_exit: SharedSideExit, target: ir.Blo
 }
 
 fn nodeHasLoopBoundaryContinueNotTo(node: Node, region_stop: ir.BlockId, region_continue_target: ?ir.BlockId) bool {
-    return switch (node) {
-        .block, .loop_control, .loop_terminal => false,
-        .branch => |branch| nestedRegionHasLoopBoundaryContinueNotTo(branch.then_region) or
-            nestedRegionHasLoopBoundaryContinueNotTo(branch.else_region),
-        .loop, .latch_loop => false,
-        .infinite_loop => |loop| loop.shared_side_exit != null and
-            sharedSideExitHasLoopBoundaryContinueNotTo(loop.shared_side_exit.?),
-        .loop_boundary => |control| blk: {
-            // A body exit continue carried by flag (`markFlaggedContinues`) is written as the flag and a `break`.
-            if (control.body_region.stop) |body| {
-                if (!control.continue_via_flag and body != region_stop) {
-                    if (region_continue_target) |continue_target| {
-                        if (body == continue_target) break :blk true;
-                    }
-                }
-            }
-            if (nestedRegionHasLoopBoundaryContinueNotTo(control.body_region)) break :blk true;
-            break :blk switch (control.boundary) {
-                .side_exit => |side| nestedRegionHasLoopBoundaryContinueNotTo(side.region),
-                .side_escape => |side| nestedRegionHasLoopBoundaryContinueNotTo(side.region),
-                .exit, .escape, .terminal, .shared_exit => false,
-            };
-        },
+    const control = switch (node) {
+        .loop_boundary => |value| value,
+        else => return false,
     };
-}
-
-fn nestedRegionHasLoopBoundaryContinueNotTo(region: *const Region) bool {
-    const stop = region.stop orelse return false;
-    return regionHasLoopBoundaryContinueNotTo(region, stop);
-}
-
-fn sharedSideExitHasLoopBoundaryContinueNotTo(side_exit: SharedSideExit) bool {
-    for (side_exit.entries) |entry| {
-        if (nestedRegionHasLoopBoundaryContinueNotTo(entry.region)) return true;
-    }
-    return false;
+    // A body exit continue carried by flag (`markFlaggedContinues`) is written as the flag and a `break`.
+    if (control.continue_via_flag) return false;
+    const body = control.body_region.stop orelse return false;
+    const continue_target = region_continue_target orelse return false;
+    return body != region_stop and body == continue_target;
 }
 
 fn nodeHasUnflaggedLoopExitBreak(program: *const ir.Program, node: Node) bool {
