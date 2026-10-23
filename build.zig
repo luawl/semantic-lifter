@@ -1429,6 +1429,14 @@ pub fn build(b: *std.Build) void {
         "luau/fixtures/wide_integral_number_source.luau",
         "source-frontend-wide-integral-number",
     );
+    const source_frontend_exact_number_literal_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/exact_number_literal_source.luau",
+        "source-frontend-exact-number-literal",
+    );
     const source_frontend_target_resolution_conformance = addLuauSourceManifestProofConformance(
         b,
         exe,
@@ -1780,6 +1788,7 @@ pub fn build(b: *std.Build) void {
     source_frontend_double_rounding_comparison_conformance.addTo(conformance_step);
     source_frontend_double_rounding_comparison_in_range_conformance.addTo(conformance_step);
     source_frontend_wide_integral_number_conformance.addTo(conformance_step);
+    source_frontend_exact_number_literal_conformance.addTo(conformance_step);
     source_frontend_target_resolution_conformance.addTo(conformance_step);
     source_frontend_opaque_result_target_conformance.addTo(conformance_step);
     source_frontend_nonintrinsic_target_origin_conformance.addTo(conformance_step);
@@ -2098,6 +2107,18 @@ pub fn build(b: *std.Build) void {
     run_ast_admission_tests.addFileInput(b.path("luau/target_proof_bundle.luau"));
     run_ast_admission_tests.addFileInput(b.path("luau/lifter_ir.luau"));
     run_ast_admission_tests.addFileInput(b.path("luau/json_codec.luau"));
+    const run_parser_number_transport_tests = b.addSystemCommand(&.{ luneExe(b), "run" });
+    run_parser_number_transport_tests.addFileArg(b.path("luau/parser_number_transport_test.luau"));
+    run_parser_number_transport_tests.addFileInput(b.path("luau/ast_admission.luau"));
+    run_parser_number_transport_tests.addFileInput(b.path("luau/ast_expression_scalar.luau"));
+    run_parser_number_transport_tests.addFileInput(b.path("luau/ast_expression_slots.luau"));
+    run_parser_number_transport_tests.addFileInput(b.path("luau/ast_lexical_scope.luau"));
+    run_parser_number_transport_tests.addFileInput(b.path("luau/ast_local_binding.luau"));
+    run_parser_number_transport_tests.addFileInput(b.path("luau/ast_local_identity.luau"));
+    run_parser_number_transport_tests.addFileInput(b.path("luau/ast_runtime_context.luau"));
+    run_parser_number_transport_tests.addFileInput(b.path("luau/ast_statement_slots.luau"));
+    run_parser_number_transport_tests.addFileInput(b.path("luau/invocation_frame.luau"));
+    run_parser_number_transport_tests.addFileInput(b.path("luau/target_origin_expression_matcher.luau"));
     const run_temporal_target_identity_tests = b.addSystemCommand(&.{ luneExe(b), "run" });
     run_temporal_target_identity_tests.addFileArg(b.path("luau/temporal_target_identity_test.luau"));
     addTemporalTestInputs(b, run_temporal_target_identity_tests);
@@ -2193,6 +2214,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_recovery_manifest_tests.step);
     test_step.dependOn(&run_target_proof_bundle_tests.step);
     test_step.dependOn(&run_ast_admission_tests.step);
+    test_step.dependOn(&run_parser_number_transport_tests.step);
     test_step.dependOn(&run_temporal_target_identity_tests.step);
     test_step.dependOn(&run_direct_closure_return_tests.step);
     test_step.dependOn(&run_fixed_vararg_return_tests.step);

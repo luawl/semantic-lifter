@@ -1209,6 +1209,28 @@ function SourceRuntimeOracle.run(caseName: string, source: string, exported: any
 		for index, value in expected do
 			assert(observed[index] == value, `wide integral number {index} changed its value`)
 		end
+	elseif caseName == "source-frontend-exact-number-literal" then
+		local expected = {
+			8.98846567431158e307,
+			4.4942328371557898e307,
+			0.000001,
+			1e-9,
+			1e-12,
+			1.602176634e-19,
+			1.7976931348623157e308,
+			0.1,
+			1e-320,
+			1e23,
+		}
+		local values = exported()
+		assert(type(values) == "table" and #values == #expected, "the number literal list changed its length")
+		local changed = {}
+		for index, value in expected do
+			if string.pack(">d", values[index]) ~= string.pack(">d", value) then
+				table.insert(changed, tostring(index))
+			end
+		end
+		assert(#changed == 0, `number literals changed their bits at entries {table.concat(changed, ",")}`)
 	else
 		return false
 	end

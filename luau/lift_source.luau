@@ -122,7 +122,9 @@ if recoveryManifestPath ~= nil then
 		fs.readFile(recoveryManifestPath),
 		recoveryManifestPath,
 		function(bytes: string): any
-			return serde.decode("json", bytes)
+			return AstAdmission.decodeManifestBytes(bytes, function(marked: string): any
+				return serde.decode("json", marked)
+			end)
 		end,
 		proofBundleInput
 	)

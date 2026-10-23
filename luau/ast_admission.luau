@@ -91,6 +91,19 @@ end
 
 local signedBytePrefix = string.char(0xef, 0xbf, 0xbf) .. "ff"
 
+-- luau-ast writes a number literal as the "%.17g" text of the parser's double, which names that double exactly, and a
+-- recovery manifest writes the number of a literal key as JSON text. Lune's serde.decode("json") can read such a text
+-- one or two units in the last place away, so each one crosses the decoder as the JSON string "#<text>" and is read
+-- back with tonumber, which rounds correctly.
+local parserNumberLiteral = '("type":"AstExprConstantNumber","location":"[^"]*","value":)(%d[%d%.eE+%-]*)'
+local manifestNumberField = '("number"%s*:%s*)(%-?%d[%d%.eE+%-]*)'
+
+local function markedNumber(text: string, label: string): number
+	local exact = tonumber(string.match(text, "^#(%-?%d[%d%.eE+%-]*)$") or "")
+	assert(exact ~= nil, `{label} text is not a decimal number`)
+	return exact
+end
+
 local function recoverParserString(value: string): string
 	return string.gsub(value, signedBytePrefix .. "(%x%x)", function(hexByte: string): string
 		local byte = tonumber(hexByte, 16)
@@ -121,7 +134,13 @@ local function recoverParserStrings(value: any): any
 			entryCount += 1
 			assert(entryCount <= AstAdmission.defaultLimits.max_entries, "decoded parser AST exceeds the entry limit")
 			if type(child) == "string" then
-				record[key] = recoverParserString(child)
+				if key == "value" and record.type == "AstExprConstantNumber" and string.sub(child, 1, 1) == "#" then
+					record[key] = markedNumber(child, "parser number literal")
+				else
+					record[key] = recoverParserString(child)
+				end
+			elseif type(child) == "number" and key == "value" and record.type == "AstExprConstantNumber" then
+				error("parser number literal did not use exact text transport", 0)
 			elseif type(child) == "table" then
 				table.insert(stack, child :: Record)
 			end
@@ -131,7 +150,36 @@ local function recoverParserStrings(value: any): any
 end
 
 function AstAdmission.decodeParserBytes(value: any, label: string, decode: (string) -> any): any
-	return recoverParserStrings(AstAdmission.decodeBytes(value, label, AstAdmission.maxParserBytes, decode))
+	local bytes = AstAdmission.expectParserBytes(value, label)
+	return recoverParserStrings(decode((string.gsub(bytes, parserNumberLiteral, '%1"#%2"'))))
+end
+
+-- A recovery manifest names the number of a literal key in a field named number, its only field of that name; the
+-- manifest is decoded with each such number read from its text. Every text the transport marks is read back and
+-- nothing else is, so a field named number that holds a string beginning with # is refused.
+function AstAdmission.decodeManifestBytes(bytes: string, decode: (string) -> any): any
+	local marked, markedCount = string.gsub(bytes, manifestNumberField, '%1"#%2"')
+	local decoded = decode(marked)
+	local readCount = 0
+	local stack: { any } = { decoded }
+	while #stack > 0 do
+		local item = table.remove(stack)
+		if type(item) == "table" then
+			local record = item :: Record
+			for key, child in record do
+				if key == "number" and type(child) == "string" and string.sub(child, 1, 1) == "#" then
+					record[key] = markedNumber(child, "recovery manifest number")
+					readCount += 1
+				elseif key == "number" and type(child) == "number" then
+					error("recovery manifest number did not use exact text transport", 0)
+				elseif type(child) == "table" then
+					table.insert(stack, child)
+				end
+			end
+		end
+	end
+	assert(readCount == markedCount, "recovery manifest holds a number text that the exact transport did not mark")
+	return decoded
 end
 
 local function resourceProblem(node: Record, detail: string): Problem
