@@ -142,6 +142,12 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "semantic_lifter", .module = module }},
         }),
     });
+    // Readable validation and emission walk nested regions recursively, and a Debug build's frames are several times
+    // a release build's: on the default 16 MiB main-thread stack a Debug build overflowed on a chain of about 150
+    // nested transfer wrappers. 128 MiB covers more than twice the nesting the syntax-depth budget admits in every
+    // build mode; the module tests, which validate such chains, get the same stack.
+    const main_thread_stack_size = 128 * 1024 * 1024;
+    exe.stack_size = main_thread_stack_size;
     b.installArtifact(exe);
 
     const proof_attest = b.addExecutable(.{
@@ -1543,6 +1549,7 @@ pub fn build(b: *std.Build) void {
     const register_budget_oracle = addRegisterBudgetOracle(b);
     const dispatcher_local_budget_conformance = addDispatcherLocalBudgetConformance(b, exe, z3_enabled, z3_bin);
     const dispatcher_generic_budget_conformance = addDispatcherGenericBudgetConformance(b, exe, z3_enabled, z3_bin);
+    const native_loop_register_conformance = addNativeLoopRegisterConformance(b, exe, z3_enabled, z3_bin);
     const compile_check_positive = b.addRunArtifact(exe);
     if (z3_enabled) compile_check_positive.addPathDir(b.pathFromRoot(z3_bin));
     compile_check_positive.addArg("emit-luau");
@@ -1633,6 +1640,7 @@ pub fn build(b: *std.Build) void {
     conformance_step.dependOn(&register_budget_oracle.step);
     dispatcher_local_budget_conformance.addTo(conformance_step);
     dispatcher_generic_budget_conformance.addTo(conformance_step);
+    native_loop_register_conformance.addTo(conformance_step);
     conformance_step.dependOn(&compile_check_positive.step);
     conformance_step.dependOn(&compile_check_rejection.step);
     conformance_step.dependOn(&compile_check_preserved_output.step);
@@ -1804,6 +1812,7 @@ pub fn build(b: *std.Build) void {
     const module_tests = b.addTest(.{
         .root_module = module,
     });
+    module_tests.stack_size = main_thread_stack_size;
     const run_module_tests = b.addRunArtifact(module_tests);
     if (z3_enabled) run_module_tests.addPathDir(b.pathFromRoot(z3_bin));
     const structure_projection_tests = b.addTest(.{
@@ -2695,6 +2704,117 @@ fn addGenericBudgetBoundary(
     compile.addFileArg(emitted);
     compile.expectExitCode(0);
     return &compile.step;
+}
+
+// Author-written chains at the edge of the readable certificates (luau/native_loop_register_conformance.luau):
+// nested native loops and nested one-shot native loops whose `for` frames and completion locals fill the
+// 255-register frame, and an escape chain whose transfer wrappers fill the syntax budget. At the refused depth the
+// readable admission reports the diagnostic; one level shallower (200 arms for the escape chain) the chain is
+// admitted, emitted and compiled at the pinned compiler's default options, the options of the checked emission.
+// The two one-shot chains are also emitted in direct locals, without value storage, where their header parameters
+// are still aliases that no local counts: at the refused depth that emission is refused with the diagnostic (the
+// emitter writes no output, so the output argument is an empty seed file); one level shallower it is compiled.
+const NativeLoopRegisterConformance = struct {
+    steps: [16]*std.Build.Step,
+
+    fn addTo(self: NativeLoopRegisterConformance, step: *std.Build.Step) void {
+        for (self.steps) |checked| step.dependOn(checked);
+    }
+};
+
+fn addNativeLoopRegisterConformance(
+    b: *std.Build,
+    exe: *std.Build.Step.Compile,
+    z3_enabled: bool,
+    z3_bin: []const u8,
+) NativeLoopRegisterConformance {
+    const Arm = struct { shape: []const u8, refused: []const u8, admitted: []const u8, diagnostic: []const u8, direct_locals: bool = false };
+    const arms = [_]Arm{
+        .{ .shape = "frame_chain", .refused = "83", .admitted = "82", .diagnostic = "unsupported_readable_temporary_register_pressure" },
+        .{ .shape = "generic_chain", .refused = "50", .admitted = "49", .diagnostic = "unsupported_readable_temporary_register_pressure" },
+        .{ .shape = "completion_chain", .refused = "62", .admitted = "61", .diagnostic = "unsupported_readable_temporary_register_pressure" },
+        .{ .shape = "acyclic_chain", .refused = "83", .admitted = "82", .diagnostic = "unsupported_readable_temporary_register_pressure", .direct_locals = true },
+        .{ .shape = "acyclic_generic_chain", .refused = "50", .admitted = "49", .diagnostic = "unsupported_readable_temporary_register_pressure", .direct_locals = true },
+        .{ .shape = "escape_chain", .refused = "300", .admitted = "200", .diagnostic = "unsupported_readable_syntax_depth" },
+    };
+    var result: NativeLoopRegisterConformance = undefined;
+    var next: usize = 0;
+    for (arms) |arm| {
+        const refused_ir = addNativeLoopRegisterResolvedIr(b, exe, z3_enabled, z3_bin, arm.shape, arm.refused);
+        const admitted_ir = addNativeLoopRegisterResolvedIr(b, exe, z3_enabled, z3_bin, arm.shape, arm.admitted);
+
+        const refusal = b.addRunArtifact(exe);
+        if (z3_enabled) refusal.addPathDir(b.pathFromRoot(z3_bin));
+        refusal.addArg("expect-diagnostic");
+        refusal.addFileArg(refused_ir);
+        refusal.addArgs(&.{ "readable-luau", arm.diagnostic });
+        refusal.expectExitCode(0);
+        result.steps[next] = &refusal.step;
+
+        const emit = b.addRunArtifact(exe);
+        if (z3_enabled) emit.addPathDir(b.pathFromRoot(z3_bin));
+        emit.addArg("emit-readable-luau-strategy");
+        emit.addFileArg(admitted_ir);
+        const emitted = emit.addOutputFileArg(b.fmt("native-loop-register-{s}-{s}.automatic.luau", .{ arm.shape, arm.admitted }));
+        emit.addArgs(&.{ "standard-luau", "automatic" });
+        emit.expectExitCode(0);
+        const compile = b.addSystemCommand(&.{ luauCompileExe(b), "--null" });
+        compile.addFileArg(emitted);
+        compile.expectExitCode(0);
+        result.steps[next + 1] = &compile.step;
+        next += 2;
+        if (!arm.direct_locals) continue;
+
+        const direct_refusal = b.addRunArtifact(exe);
+        if (z3_enabled) direct_refusal.addPathDir(b.pathFromRoot(z3_bin));
+        direct_refusal.addArg("emit-readable-luau-strategy");
+        direct_refusal.addFileArg(refused_ir);
+        const seed_files = b.addWriteFiles();
+        direct_refusal.addFileArg(seed_files.add(b.fmt("native-loop-register-{s}-{s}.direct-locals.luau", .{ arm.shape, arm.refused }), ""));
+        direct_refusal.addArgs(&.{ "direct-locals-luau", "automatic" });
+        direct_refusal.expectExitCode(1);
+        direct_refusal.expectStdErrMatch(b.fmt("diagnostic={s} entity=1\n", .{arm.diagnostic}));
+        result.steps[next] = &direct_refusal.step;
+
+        const direct_emit = b.addRunArtifact(exe);
+        if (z3_enabled) direct_emit.addPathDir(b.pathFromRoot(z3_bin));
+        direct_emit.addArg("emit-readable-luau-strategy");
+        direct_emit.addFileArg(admitted_ir);
+        const direct_emitted = direct_emit.addOutputFileArg(b.fmt("native-loop-register-{s}-{s}.direct-locals.luau", .{ arm.shape, arm.admitted }));
+        direct_emit.addArgs(&.{ "direct-locals-luau", "automatic" });
+        direct_emit.expectExitCode(0);
+        const direct_compile = b.addSystemCommand(&.{ luauCompileExe(b), "--null" });
+        direct_compile.addFileArg(direct_emitted);
+        direct_compile.expectExitCode(0);
+        result.steps[next + 1] = &direct_compile.step;
+        next += 2;
+    }
+    std.debug.assert(next == result.steps.len);
+    return result;
+}
+
+fn addNativeLoopRegisterResolvedIr(
+    b: *std.Build,
+    exe: *std.Build.Step.Compile,
+    z3_enabled: bool,
+    z3_bin: []const u8,
+    shape: []const u8,
+    depth: []const u8,
+) std.Build.LazyPath {
+    const name = b.fmt("native-loop-register-{s}-{s}", .{ shape, depth });
+    const fixture_command = b.addSystemCommand(&.{ luneExe(b), "run" });
+    fixture_command.addFileArg(b.path("luau/native_loop_register_conformance.luau"));
+    fixture_command.addFileInput(b.path("luau/lifter_ir.luau"));
+    fixture_command.addFileInput(b.path("luau/json_codec.luau"));
+    const fixture_json = fixture_command.addOutputFileArg(b.fmt("{s}.lifter-ir.json", .{name}));
+    fixture_command.addArgs(&.{ shape, depth });
+    const resolve = b.addRunArtifact(exe);
+    if (z3_enabled) resolve.addPathDir(b.pathFromRoot(z3_bin));
+    resolve.addArg("resolve-ir");
+    resolve.addFileArg(fixture_json);
+    const resolved = resolve.addOutputFileArg(b.fmt("{s}.resolved.lifter-ir.json", .{name}));
+    resolve.addArg(if (z3_enabled) "z3" else "internal");
+    return resolved;
 }
 
 // A fixture's resolved IR emitted under the forced dispatcher (flat layout),

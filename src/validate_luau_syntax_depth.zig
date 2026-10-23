@@ -350,7 +350,10 @@ const Recorder = struct {
                 group_count += 1;
             }
         }
-        const escape_depth = saturatingAdd(parent_depth, @intFromBool(structured_escape.regionOwnsEscape(value)));
+        // The emitter writes a region inside a transfer wrapper (`repeat ... until true`, one statement level) when it
+        // owns an escape or has a free target (`emitRegionWithPredeclaredBlock`).
+        const wrapped = structured_escape.regionOwnsEscape(value) or try structured_escape.regionNeedsTransferWrapper(self.plan.allocator, value);
+        const escape_depth = saturatingAdd(parent_depth, @intFromBool(wrapped));
         const depth = saturatingAdd(escape_depth, @intFromBool(group_count > 1));
         self.note(depth);
         for (value.nodes) |structured_node| try self.visitNode(structured_node, depth);

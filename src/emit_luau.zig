@@ -2294,9 +2294,7 @@ fn emitNumericForLoop(
     const results = numeric.transition.results;
     if (results.len != 4) return error.UnsupportedControlFlow;
 
-    const completion_flag: ?[]const u8 = if (!break_after_body) blk: {
-        const edge = exit_edge orelse break :blk null;
-        if (!loopExitTransferWritesParameters(program, emission_plan, scopes, edge)) break :blk null;
+    const completion_flag: ?[]const u8 = if (nativeIterationDeclaresCompletion(program, emission_plan, scopes, exit_edge, break_after_body)) blk: {
         const header = body_region.stop orelse return error.UnsupportedControlFlow;
         break :blk try nativeIterationCompletionFlagNameAlloc(allocator, program, emission_plan, header);
     } else null;
@@ -2556,9 +2554,7 @@ fn emitGenericForLoop(
     const results = generic.transition.results;
     if (results.len < 4 or results.len != @as(usize, generic.operation.variable_count) + 3) return error.UnsupportedControlFlow;
 
-    const completion_flag: ?[]const u8 = if (!break_after_body) blk: {
-        const edge = exit_edge orelse break :blk null;
-        if (!loopExitTransferWritesParameters(program, emission_plan, scopes, edge)) break :blk null;
+    const completion_flag: ?[]const u8 = if (nativeIterationDeclaresCompletion(program, emission_plan, scopes, exit_edge, break_after_body)) blk: {
         const header = body_region.stop orelse return error.UnsupportedControlFlow;
         break :blk try nativeIterationCompletionFlagNameAlloc(allocator, program, emission_plan, header);
     } else null;
@@ -2652,6 +2648,106 @@ fn loopExitTransferWritesParameters(
         if (!emission_plan.dead.isValueAlias(parameter)) return true;
     }
     return false;
+}
+
+/// Whether a native `for` declares `__lifter_native_iteration_complete_<header>` before it: a loop whose exhaustion
+/// edge writes a parameter, never a `for` that runs its body once. The two native writers and the register
+/// certificate ask this one predicate.
+pub fn nativeIterationDeclaresCompletion(
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    scopes: *const emission_scope.Plan,
+    exit_edge: ?ir.Edge,
+    break_after_body: bool,
+) bool {
+    if (break_after_body) return false;
+    const edge = exit_edge orelse return false;
+    return loopExitTransferWritesParameters(program, emission_plan, scopes, edge);
+}
+
+/// The native `for` the readable writer emits for a structure node: the registers its frame holds beside its loop
+/// variables, whether it declares a completion local, and the region written inside it (`null`: the body is the
+/// terminal block of a loop boundary, written in the node's own scope).
+pub const NativeFor = struct {
+    header: ir.BlockId,
+    hidden_registers: usize,
+    completion: bool,
+    body: ?*const structure.Region,
+};
+
+/// The native `for` `region.nodes[node_index]` is written as, if any: a `.loop` node through `emitLoop`, a `.branch`
+/// node through `emitAcyclicNativeIteration` and a `.loop_boundary` node through `emitLoopBoundaryNativeIteration`,
+/// each under the activation and the match its writer asks for. A semantic-normalized numeric loop is written as
+/// `while true do` and holds no `for` frame.
+pub fn nativeForAt(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    scopes: *const emission_scope.Plan,
+    region: *const structure.Region,
+    node_index: usize,
+) std.mem.Allocator.Error!?NativeFor {
+    switch (region.nodes[node_index]) {
+        .loop => |loop_plan| {
+            if (!scopes.nativeIterationConsumesParameters(loop_plan.header)) return null;
+            const protocol = (try iteration_protocol.matchLoop(allocator, program, loop_plan)) orelse return null;
+            if (nativeProtocolIsSemanticNormalized(protocol)) return null;
+            return .{
+                .header = loop_plan.header,
+                .hidden_registers = nativeForHiddenRegisters(protocol),
+                .completion = nativeIterationDeclaresCompletion(program, emission_plan, scopes, loop_plan.exit_edge, false),
+                .body = loop_plan.body_region,
+            };
+        },
+        .branch => |branch_plan| {
+            if (!scopes.nativeIterationConsumesParameters(branch_plan.block)) return null;
+            const acyclic = (try iteration_protocol.matchAcyclicBranch(allocator, program, branch_plan)) orelse return null;
+            if (nativeProtocolIsSemanticNormalized(acyclic.protocol)) return null;
+            return .{
+                .header = branch_plan.block,
+                .hidden_registers = nativeForHiddenRegisters(acyclic.protocol),
+                .completion = false,
+                .body = acyclic.body_region,
+            };
+        },
+        .loop_boundary => |control| {
+            if (!scopes.nativeIterationConsumesParameters(control.block)) return null;
+            const acyclic = (try iteration_protocol.matchAcyclicLoopBoundary(allocator, program, control)) orelse return null;
+            const body: ?*const structure.Region = switch (control.boundary) {
+                // The writer opens this `for` itself and writes the terminal block inside it.
+                .terminal => null,
+                .side_exit => |side_exit| blk: {
+                    if (nativeProtocolIsSemanticNormalized(acyclic.protocol)) return null;
+                    break :blk side_exit.region;
+                },
+                else => return null,
+            };
+            return .{
+                .header = control.block,
+                .hidden_registers = nativeForHiddenRegisters(acyclic.protocol),
+                .completion = false,
+                .body = body,
+            };
+        },
+        else => return null,
+    }
+}
+
+/// The registers a native `for` frame holds beside its loop variables in the pinned compiler: a numeric `for` its
+/// limit and step (the index is the loop variable), a generic `for` its generator, state and control and at least two
+/// variable slots.
+fn nativeForHiddenRegisters(protocol: iteration_protocol.Match) usize {
+    return switch (protocol) {
+        .numeric => 2,
+        .generic => |generic| 3 + @max(generic.body_parameters.len, 2) - generic.body_parameters.len,
+    };
+}
+
+fn nativeProtocolIsSemanticNormalized(protocol: iteration_protocol.Match) bool {
+    return switch (protocol) {
+        .numeric => |numeric| numeric.operation.mode == .semantic_normalized,
+        .generic => false,
+    };
 }
 
 fn nativeIterationCompletionFlagNameAlloc(

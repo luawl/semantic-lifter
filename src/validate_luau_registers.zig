@@ -166,7 +166,7 @@ fn validatePrepared(
             @intFromBool(emission.names.functionUsesValueStorage(program, function)),
         );
         const base = try functionRegisterBase(allocator, function_base, storage_locals, structured.root);
-        const pressure = try maximumPressure(allocator, program, readable, &emission, &scopes, function, base);
+        const pressure = try maximumPressure(allocator, program, readable, &emission, &scopes, function, base, structured.root);
         // The dispatcher (arbitrary-CFG) layout declares a flat set of locals at
         // the function root that `maximumPressure` undercounts: it scores only
         // materialized (scoped) bindings and omits both the never-materialized
@@ -417,6 +417,7 @@ fn maximumPressure(
     scopes: *const emission_scope.Plan,
     function: ir.Function,
     base: usize,
+    root: *const structure.Region,
 ) std.mem.Allocator.Error!Pressure {
     const locals = try allocator.alloc(usize, scopes.pressureSlotCount());
     defer allocator.free(locals);
@@ -439,6 +440,11 @@ fn maximumPressure(
     const temporaries = try allocator.alloc(usize, scopes.pressureSlotCount());
     defer allocator.free(temporaries);
     @memset(temporaries, 0);
+    // The registers a native `for` holds that no value scope counts (`addNativeForFootprints`): summed along the host
+    // chain as the locals are, and added to the total only.
+    const frames = try allocator.alloc(usize, scopes.pressureSlotCount());
+    defer allocator.free(frames);
+    @memset(frames, 0);
 
     for (program.values) |value| {
         if (value.function != function.id) continue;
@@ -508,6 +514,8 @@ fn maximumPressure(
         }
     }
 
+    if (!root.arbitrary_cfg) try addNativeForFootprints(allocator, program, emission, scopes, root, locals, frames, temporaries);
+
     var maximum_locals = base;
     var maximum_total = base;
     var peak_host: emission_scope.ScopeId = emission_scope.invalid_scope;
@@ -525,9 +533,11 @@ fn maximumPressure(
         var pack_total: usize = 0;
         var place_total: usize = 0;
         var branch_total: usize = 0;
+        var frame_total: usize = 0;
         var current: ?emission_scope.ScopeId = host;
         while (current) |physical| {
             local_total = saturatingAdd(local_total, locals[physical]);
+            frame_total = saturatingAdd(frame_total, frames[physical]);
             value_total = saturatingAdd(value_total, value_locals[physical]);
             pack_total = saturatingAdd(pack_total, pack_locals[physical]);
             place_total = saturatingAdd(place_total, place_locals[physical]);
@@ -545,7 +555,7 @@ fn maximumPressure(
             peak_closures = closure_locals[host];
             peak_temporaries = temporaries[host];
         }
-        maximum_total = @max(maximum_total, saturatingAdd(local_total, @max(closure_locals[host], temporaries[host])));
+        maximum_total = @max(maximum_total, saturatingAdd(saturatingAdd(local_total, frame_total), @max(closure_locals[host], temporaries[host])));
     }
     if (maximum_locals > luau_runtime.max_local_registers or maximum_total > luau_runtime.max_registers) {
         if (stage_trace.enabled) std.debug.print("register_pressure_detail function={} host={} base={} values={} packs={} places={} branches={} closures={} temporaries={} locals={} total={}\n", .{
@@ -563,6 +573,79 @@ fn maximumPressure(
         });
     }
     return .{ .locals = maximum_locals, .total = maximum_total };
+}
+
+/// Registers a native `for` holds that no value scope counts (`emit_luau.nativeForAt`): its frame registers beside its
+/// loop variables, from the `for` statement to its `end`, and its completion local, from its declaration before the
+/// `for` to the end of the enclosing block, where the completion locals of sibling loops are live together. The loop
+/// variables are counted as values. No line declares the header's parameters, but each one that has a value scope and
+/// no value storage is counted as a local of the block the `for` is written in or of a block around it, so it covers
+/// one of these registers: under value storage none does, nor does an aliased parameter of a one-shot header.
+fn addNativeForFootprints(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission: *const emission_planning.Plan,
+    scopes: *const emission_scope.Plan,
+    region: *const structure.Region,
+    locals: []usize,
+    frames: []usize,
+    temporaries: []usize,
+) std.mem.Allocator.Error!void {
+    for (region.nodes, 0..) |*node, index| {
+        if (try emit_luau.nativeForAt(allocator, program, emission, scopes, region, index)) |native| {
+            var covered: usize = 0;
+            for (program.blocks[native.header.index()].parameters) |parameter| {
+                if (!emission.names.valueUsesStorage(parameter) and scopes.valueScope(parameter) != null) covered += 1;
+            }
+            const completion: usize = @intFromBool(native.completion);
+            const completion_uncovered = completion -| covered;
+            const frame_uncovered = (native.hidden_registers + completion) -| (covered + completion_uncovered);
+            if (scopes.nodeScope(node)) |scope| {
+                // The completion local is declared in the block the `for` is written in, and the `for` statement holds
+                // its frame there.
+                addAtScope(locals, scopes, scope, completion_uncovered);
+                addTemporaryAtScope(temporaries, scopes, scope, frame_uncovered);
+                // A terminal loop boundary's body is written in the node's own scope.
+                if (native.body == null) addAtScope(frames, scopes, scope, frame_uncovered);
+            }
+            if (native.body) |body| {
+                // Every physical block the body's nodes are written in (its container groups) holds the frame.
+                var previous: emission_scope.ScopeId = emission_scope.invalid_scope;
+                for (body.nodes) |*body_node| {
+                    const container = scopes.nodeContainerScope(body_node) orelse continue;
+                    const host = scopes.physicalHost(container) orelse continue;
+                    if (host == previous or host >= frames.len) continue;
+                    previous = host;
+                    frames[host] = saturatingAdd(frames[host], frame_uncovered);
+                }
+            }
+        }
+        switch (node.*) {
+            .block, .loop_control, .loop_terminal => {},
+            .branch => |branch| {
+                try addNativeForFootprints(allocator, program, emission, scopes, branch.then_region, locals, frames, temporaries);
+                try addNativeForFootprints(allocator, program, emission, scopes, branch.else_region, locals, frames, temporaries);
+            },
+            .loop => |loop| try addNativeForFootprints(allocator, program, emission, scopes, loop.body_region, locals, frames, temporaries),
+            .latch_loop => |loop| try addNativeForFootprints(allocator, program, emission, scopes, loop.body_region, locals, frames, temporaries),
+            .infinite_loop => |loop| {
+                try addNativeForFootprints(allocator, program, emission, scopes, loop.body_region, locals, frames, temporaries);
+                if (loop.shared_side_exit) |side_exit| {
+                    for (side_exit.entries) |entry| {
+                        try addNativeForFootprints(allocator, program, emission, scopes, entry.region, locals, frames, temporaries);
+                    }
+                }
+            },
+            .loop_boundary => |control| {
+                try addNativeForFootprints(allocator, program, emission, scopes, control.body_region, locals, frames, temporaries);
+                switch (control.boundary) {
+                    .side_exit => |side_exit| try addNativeForFootprints(allocator, program, emission, scopes, side_exit.region, locals, frames, temporaries),
+                    .side_escape => |side_escape| try addNativeForFootprints(allocator, program, emission, scopes, side_escape.region, locals, frames, temporaries),
+                    else => {},
+                }
+            },
+        }
+    }
 }
 
 fn closureRenderedScope(
@@ -1033,7 +1116,414 @@ test "automatic register certificate covers the function-scope escape flags of n
         @intFromBool(emission.names.functionUsesValueStorage(&program, function)),
     );
     const base = try functionRegisterBase(allocator, function.parameters.len, storage_locals, structured.root);
-    const pressure = try maximumPressure(allocator, &program, &readable, &emission, &scopes, function, base);
+    const pressure = try maximumPressure(allocator, &program, &readable, &emission, &scopes, function, base, structured.root);
     // The certified total must cover the emitted peak.
     try std.testing.expectEqual(@as(usize, 11), pressure.total);
+}
+
+/// The workers of the native-loop register tests: worker(f, observe, marker, first, last, stride), function 1,
+/// returned by the chunk; every loop runs over first, last and stride.
+const NativeLoopShape = enum {
+    /// Nested native numeric loops whose exhaustion edges pass no value.
+    numeric_chain,
+    /// The same loops, each exhaustion edge passing the outer value to an exit-block parameter that the exit block
+    /// observes, so each loop declares a completion local before its `for`.
+    numeric_completion_chain,
+    /// Nested one-name native generic loops whose exhaustion edges pass no value.
+    generic_chain,
+    /// The generic loops with completion locals.
+    generic_completion_chain,
+    /// Two native numeric loops with completion locals per level, one after the other in one block: a side loop,
+    /// then the loop whose body holds the next level.
+    completion_tower,
+    /// Nested one-shot native numeric loops (no latch): each header is entered by a jump from the outer level's body,
+    /// so its four parameters are aliases, and each body joins the header's exit target.
+    one_shot_chain,
+};
+
+/// Appends IR entities in creation order, as the LifterIR builder does, so the worker of a shape the native-loop
+/// conformance builder also writes gets the same ids.
+const NativeLoopBuilder = struct {
+    allocator: std.mem.Allocator,
+    evidence: []const ir.EvidenceId,
+    blocks: []ir.Block,
+    instructions: []ir.Instruction,
+    values: []ir.Value,
+    block_count: usize = 0,
+    instruction_count: usize = 0,
+    value_count: usize = 0,
+
+    fn block(self: *NativeLoopBuilder, function: ir.FunctionId) ir.BlockId {
+        const id = ir.BlockId.fromIndex(self.block_count);
+        self.blocks[self.block_count] = .{ .id = id, .function = function, .terminator = .unreachable_block, .evidence = self.evidence };
+        self.block_count += 1;
+        return id;
+    }
+
+    fn value(self: *NativeLoopBuilder, function: ir.FunctionId, value_type: ir.ValueType, origin: ir.ValueOrigin) ir.ValueId {
+        const id = ir.ValueId.fromIndex(self.value_count);
+        self.values[self.value_count] = .{ .id = id, .function = function, .type = value_type, .origin = origin };
+        self.value_count += 1;
+        return id;
+    }
+
+    fn parameters(self: *NativeLoopBuilder, block_id: ir.BlockId, types: []const ir.ValueType) std.mem.Allocator.Error![]const ir.ValueId {
+        const ids = try self.allocator.alloc(ir.ValueId, types.len);
+        const function = self.blocks[block_id.index()].function;
+        for (types, 0..) |value_type, index| {
+            ids[index] = self.value(function, value_type, .{ .block_parameter = .{ .block = block_id, .index = @intCast(index) } });
+        }
+        self.blocks[block_id.index()].parameters = ids;
+        return ids;
+    }
+
+    fn instruction(
+        self: *NativeLoopBuilder,
+        block_id: ir.BlockId,
+        operation: ir.Operation,
+        result_types: []const ir.ValueType,
+        effects: ir.EffectSummary,
+    ) std.mem.Allocator.Error![]const ir.ValueId {
+        const id = ir.InstructionId.fromIndex(self.instruction_count);
+        self.instruction_count += 1;
+        const target = &self.blocks[block_id.index()];
+        const results = try self.allocator.alloc(ir.ValueId, result_types.len);
+        for (result_types, 0..) |value_type, index| {
+            results[index] = self.value(target.function, value_type, .{ .instruction_result = .{ .instruction = id, .index = @intCast(index) } });
+        }
+        self.instructions[id.index()] = .{ .id = id, .block = block_id, .operation = operation, .results = results, .effects = effects, .evidence = self.evidence };
+        const listed = try self.allocator.alloc(ir.InstructionId, target.instructions.len + 1);
+        @memcpy(listed[0..target.instructions.len], target.instructions);
+        listed[target.instructions.len] = id;
+        target.instructions = listed;
+        return results;
+    }
+
+    /// `callee(arguments)` with `result_count` dynamic results (0 or 1).
+    fn call(self: *NativeLoopBuilder, block_id: ir.BlockId, callee: ir.ValueId, arguments: []const ir.ValueId, result_count: u16) std.mem.Allocator.Error![]const ir.ValueId {
+        const operation: ir.Operation = .{ .call = .{
+            .callee = callee,
+            .arguments = try self.allocator.dupe(ir.ValueId, arguments),
+            .result_arity = .{ .fixed = result_count },
+        } };
+        const result_types: []const ir.ValueType = if (result_count == 0) &.{} else &.{.dynamic};
+        return self.instruction(block_id, operation, result_types, .dynamic_call);
+    }
+
+    fn jump(self: *NativeLoopBuilder, source: ir.BlockId, target: ir.BlockId, arguments: []const ir.ValueId) std.mem.Allocator.Error!void {
+        self.blocks[source.index()].terminator = .{ .jump = .{ .target = target, .arguments = try self.allocator.dupe(ir.ValueId, arguments) } };
+    }
+
+    fn branch(
+        self: *NativeLoopBuilder,
+        source: ir.BlockId,
+        condition: ir.ValueId,
+        then_target: ir.BlockId,
+        then_arguments: []const ir.ValueId,
+        else_target: ir.BlockId,
+        else_arguments: []const ir.ValueId,
+    ) std.mem.Allocator.Error!void {
+        self.blocks[source.index()].terminator = .{ .branch = .{
+            .condition = condition,
+            .then_edge = .{ .target = then_target, .arguments = try self.allocator.dupe(ir.ValueId, then_arguments) },
+            .else_edge = .{ .target = else_target, .arguments = try self.allocator.dupe(ir.ValueId, else_arguments) },
+        } };
+    }
+};
+
+/// One native loop level: the header block (four parameters and the transition), the body block with the loop
+/// variable, and the transition's results (the first decides between the body and the exit).
+const NativeLoopHeader = struct {
+    header: ir.BlockId,
+    body: ir.BlockId,
+    index: ir.ValueId,
+    results: []const ir.ValueId,
+};
+
+const NativeLoopWorker = struct {
+    builder: *NativeLoopBuilder,
+    shape: NativeLoopShape,
+    depth: usize,
+    worker: ir.FunctionId,
+    observe: ir.ValueId,
+    first: ir.ValueId,
+    last: ir.ValueId,
+    stride: ir.ValueId,
+    initial_transition: ir.ValueId,
+    later_transition: ?ir.ValueId,
+
+    fn header(self: *const NativeLoopWorker, generic: bool) std.mem.Allocator.Error!NativeLoopHeader {
+        const builder = self.builder;
+        const header_block = builder.block(self.worker);
+        const state_type: ir.ValueType = if (generic) .dynamic else .number;
+        const state = try builder.parameters(header_block, &.{ state_type, state_type, state_type, .boolean });
+        const body = builder.block(self.worker);
+        const index = (try builder.parameters(body, &.{state_type}))[0];
+        const results = if (generic)
+            try builder.instruction(header_block, .{ .generic_for_next = .{
+                .iterator = state[0],
+                .state = state[1],
+                .control = state[2],
+                .initial = state[3],
+                .variable_count = 1,
+            } }, &.{ .boolean, .dynamic, .dynamic, .dynamic }, .generic_for_next)
+        else
+            try builder.instruction(header_block, .{ .numeric_for_next = .{
+                .control = state[0],
+                .limit = state[1],
+                .step = state[2],
+                .initial = state[3],
+            } }, &.{ .boolean, .number, .number, .number }, .numeric_for_next);
+        return .{ .header = header_block, .body = body, .index = index, .results = results };
+    }
+
+    /// The latch of a native loop passes the transition's state back to the header.
+    fn latch(self: *const NativeLoopWorker, loop: NativeLoopHeader, generic: bool) std.mem.Allocator.Error!ir.BlockId {
+        const builder = self.builder;
+        const latch_block = builder.block(self.worker);
+        if (generic) {
+            try builder.jump(latch_block, loop.header, &.{ loop.results[1], loop.results[2], loop.results[3], self.later_transition.? });
+        } else {
+            try builder.jump(latch_block, loop.header, &.{ loop.results[3], loop.results[1], loop.results[2], self.later_transition.? });
+        }
+        return latch_block;
+    }
+
+    /// Level k of a chain: one native loop entered from `preheader`, whose body holds level k + 1, and whose exit
+    /// block jumps to `after`.
+    fn chainLevel(self: *const NativeLoopWorker, k: usize, preheader: ir.BlockId, after: ir.BlockId, outer: ir.ValueId) std.mem.Allocator.Error!void {
+        const builder = self.builder;
+        const generic = self.shape == .generic_chain or self.shape == .generic_completion_chain;
+        const completion = self.shape == .numeric_completion_chain or self.shape == .generic_completion_chain;
+        const hold_exit = builder.block(self.worker);
+        const exit_marker: ?ir.ValueId = if (completion) (try builder.parameters(hold_exit, &.{.dynamic}))[0] else null;
+        const loop = try self.header(generic);
+        try builder.jump(preheader, loop.header, &.{ self.first, self.last, self.stride, self.initial_transition });
+        const exit_arguments: []const ir.ValueId = if (completion) &.{outer} else &.{};
+        try builder.branch(loop.header, loop.results[0], loop.body, &.{loop.results[3]}, hold_exit, exit_arguments);
+        const latch_block = try self.latch(loop, generic);
+        if (k < self.depth) {
+            try self.chainLevel(k + 1, loop.body, latch_block, loop.index);
+        } else {
+            _ = try builder.call(loop.body, self.observe, &.{loop.index}, 0);
+            try builder.jump(loop.body, latch_block, &.{});
+        }
+        if (exit_marker) |marker| _ = try builder.call(hold_exit, self.observe, &.{marker}, 0);
+        try builder.jump(hold_exit, after, &.{});
+    }
+
+    /// Level k of the tower: a side loop over the level, then the loop whose body holds level k + 1, each passing the
+    /// outer value to its exit block's parameter.
+    fn towerLevel(self: *const NativeLoopWorker, k: usize, preheader: ir.BlockId, after: ir.BlockId, outer: ir.ValueId) std.mem.Allocator.Error!void {
+        const builder = self.builder;
+        const side_exit = builder.block(self.worker);
+        const side_marker = (try builder.parameters(side_exit, &.{.dynamic}))[0];
+        const side = try self.header(false);
+        try builder.jump(preheader, side.header, &.{ self.first, self.last, self.stride, self.initial_transition });
+        try builder.branch(side.header, side.results[0], side.body, &.{side.results[3]}, side_exit, &.{outer});
+        const side_latch = try self.latch(side, false);
+        _ = try builder.call(side.body, self.observe, &.{side.index}, 0);
+        try builder.jump(side.body, side_latch, &.{});
+        _ = try builder.call(side_exit, self.observe, &.{side_marker}, 0);
+        const hold_exit = builder.block(self.worker);
+        const hold_marker = (try builder.parameters(hold_exit, &.{.dynamic}))[0];
+        const hold = try self.header(false);
+        try builder.jump(side_exit, hold.header, &.{ self.first, self.last, self.stride, self.initial_transition });
+        try builder.branch(hold.header, hold.results[0], hold.body, &.{hold.results[3]}, hold_exit, &.{outer});
+        const hold_latch = try self.latch(hold, false);
+        if (k < self.depth) {
+            try self.towerLevel(k + 1, hold.body, hold_latch, hold.index);
+        } else {
+            _ = try builder.call(hold.body, self.observe, &.{hold.index}, 0);
+            try builder.jump(hold.body, hold_latch, &.{});
+        }
+        _ = try builder.call(hold_exit, self.observe, &.{hold_marker}, 0);
+        try builder.jump(hold_exit, after, &.{});
+    }
+
+    /// Level k of the one-shot chain: a header entered by a jump from `preheader` that leaves to `join`; its body
+    /// enters level k + 1, whose own join jumps to `join`.
+    fn oneShotLevel(self: *const NativeLoopWorker, k: usize, preheader: ir.BlockId, join: ir.BlockId) std.mem.Allocator.Error!void {
+        const builder = self.builder;
+        const loop = try self.header(false);
+        try builder.jump(preheader, loop.header, &.{ self.first, self.last, self.stride, self.initial_transition });
+        try builder.branch(loop.header, loop.results[0], loop.body, &.{loop.results[3]}, join, &.{});
+        if (k < self.depth) {
+            const inner_join = builder.block(self.worker);
+            try self.oneShotLevel(k + 1, loop.body, inner_join);
+            try builder.jump(inner_join, join, &.{});
+        } else {
+            _ = try builder.call(loop.body, self.observe, &.{loop.index}, 0);
+            try builder.jump(loop.body, join, &.{});
+        }
+    }
+};
+
+fn nativeLoopProgram(allocator: std.mem.Allocator, shape: NativeLoopShape, depth: usize) std.mem.Allocator.Error!ir.Program {
+    const capacity = 32 * depth + 32;
+    var builder: NativeLoopBuilder = .{
+        .allocator = allocator,
+        .evidence = try allocator.dupe(ir.EvidenceId, &.{ir.EvidenceId.fromIndex(0)}),
+        .blocks = try allocator.alloc(ir.Block, capacity),
+        .instructions = try allocator.alloc(ir.Instruction, capacity),
+        .values = try allocator.alloc(ir.Value, capacity),
+    };
+    const chunk = ir.FunctionId.fromIndex(0);
+    const worker = ir.FunctionId.fromIndex(1);
+    const chunk_entry = builder.block(chunk);
+    const f = builder.value(worker, .function, .{ .parameter = 0 });
+    const observe = builder.value(worker, .function, .{ .parameter = 1 });
+    const marker = builder.value(worker, .dynamic, .{ .parameter = 2 });
+    const first = builder.value(worker, .number, .{ .parameter = 3 });
+    const last = builder.value(worker, .number, .{ .parameter = 4 });
+    const stride = builder.value(worker, .number, .{ .parameter = 5 });
+    const entry = builder.block(worker);
+
+    const initial_transition = (try builder.instruction(entry, .{ .constant = .{ .boolean = true } }, &.{.boolean}, .pure))[0];
+    const later_transition: ?ir.ValueId = if (shape == .one_shot_chain)
+        null
+    else
+        (try builder.instruction(entry, .{ .constant = .{ .boolean = false } }, &.{.boolean}, .pure))[0];
+    const seed = (try builder.call(entry, f, &.{marker}, 1))[0];
+    const loops: NativeLoopWorker = .{
+        .builder = &builder,
+        .shape = shape,
+        .depth = depth,
+        .worker = worker,
+        .observe = observe,
+        .first = first,
+        .last = last,
+        .stride = stride,
+        .initial_transition = initial_transition,
+        .later_transition = later_transition,
+    };
+    if (shape == .one_shot_chain) _ = try builder.call(entry, observe, &.{seed}, 0);
+    const done = builder.block(worker);
+    switch (shape) {
+        .numeric_chain, .numeric_completion_chain, .generic_chain, .generic_completion_chain => try loops.chainLevel(1, entry, done, seed),
+        .completion_tower => try loops.towerLevel(1, entry, done, seed),
+        .one_shot_chain => try loops.oneShotLevel(1, entry, done),
+    }
+    builder.blocks[done.index()].terminator = .{ .return_values = try allocator.dupe(ir.ValueId, &.{marker}) };
+
+    const exported = try builder.instruction(chunk_entry, .{ .function_ref = worker }, &.{.function}, .pure);
+    builder.blocks[chunk_entry.index()].terminator = .{ .return_values = exported };
+    const block_ids = try allocator.alloc(ir.BlockId, builder.block_count);
+    for (block_ids, 0..) |*block_id, index| block_id.* = ir.BlockId.fromIndex(index);
+    const functions = try allocator.dupe(ir.Function, &.{
+        .{ .id = chunk, .blocks = block_ids[0..1], .entry_block = chunk_entry, .evidence = builder.evidence },
+        .{
+            .id = worker,
+            .parameters = try allocator.dupe(ir.ValueId, &.{ f, observe, marker, first, last, stride }),
+            .blocks = block_ids[1..],
+            .entry_block = entry,
+            .evidence = builder.evidence,
+        },
+    });
+    const evidence = try allocator.dupe(ir.Evidence, &.{.{
+        .id = ir.EvidenceId.fromIndex(0),
+        .kind = .dynamic_fixture,
+        .locator = "fixture:nested-native-loops",
+    }});
+    return .{
+        .program_id = "nested-native-loops",
+        .entry_function = chunk,
+        .functions = functions,
+        .blocks = builder.blocks[0..builder.block_count],
+        .instructions = builder.instructions[0..builder.instruction_count],
+        .values = builder.values[0..builder.value_count],
+        .evidence = evidence,
+    };
+}
+
+/// The register certificate of `nativeLoopProgram`'s worker on the per-function path of `validatePrepared`, as the
+/// nested_repeat test runs it.
+fn nativeLoopPressure(shape: NativeLoopShape, depth: usize, target: luau_runtime.Target) !Pressure {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const built = try nativeLoopProgram(arena.allocator(), shape, depth);
+    const program = try lexical_transfer.prepareInArena(arena.allocator(), &built);
+    var readable = try readable_scope.Scope.init(allocator, &program);
+    defer readable.deinit();
+    var emission = try emission_planning.Plan.init(allocator, &program, target);
+    defer emission.deinit();
+    const function = program.functions[1];
+    var analysis = try cfg.Analysis.init(allocator, &program, function);
+    defer analysis.deinit();
+    var structured = try structure.Plan.initWithArbitraryFallback(allocator, &analysis);
+    defer structured.deinit();
+    var scopes = try emission_scope.Plan.init(
+        allocator,
+        &program,
+        function,
+        &analysis,
+        &structured,
+        &emission.packs,
+        &emission.dead,
+        &emission.place_writes,
+        &emission.place_reads,
+        &emission.fused_values,
+        &emission.closure_stores,
+    );
+    defer scopes.deinit();
+    if (!structured.root.arbitrary_cfg) {
+        branch_expression.markDeclarations(&program, &emission, &scopes, structured.root, true);
+    }
+    const storage_locals = saturatingAdd(
+        @intFromBool(emission.names.functionUsesStorage(function)),
+        @intFromBool(emission.names.functionUsesValueStorage(&program, function)),
+    );
+    const base = try functionRegisterBase(allocator, function.parameters.len, storage_locals, structured.root);
+    return maximumPressure(allocator, &program, &readable, &emission, &scopes, function, base, structured.root);
+}
+
+test "nested native loops count their for frames and completion locals under value storage" {
+    // Fourteen levels hold more than 120 candidate values, so the worker keeps its values in storage: the header
+    // parameters are storage values, and the certificate counts the six parameters, the storage table and one loop
+    // variable per level (21 locals) whatever each loop holds. A native numeric `for` also holds its limit and step,
+    // a one-name generic `for` its generator, state, control and a second variable slot, and a loop whose exit edge
+    // writes a parameter declares a completion local before its `for`, live to the end of the enclosing block. Each
+    // total equals the pinned compiler's register count for the emitted text (51, 65, 79 and 93).
+    var pressure = try nativeLoopPressure(.numeric_chain, 14, .standard_luau);
+    try std.testing.expectEqual(@as(usize, 21), pressure.locals);
+    try std.testing.expectEqual(@as(usize, 51), pressure.total);
+    pressure = try nativeLoopPressure(.numeric_completion_chain, 14, .standard_luau);
+    try std.testing.expectEqual(@as(usize, 35), pressure.locals);
+    try std.testing.expectEqual(@as(usize, 65), pressure.total);
+    pressure = try nativeLoopPressure(.generic_chain, 14, .standard_luau);
+    try std.testing.expectEqual(@as(usize, 21), pressure.locals);
+    try std.testing.expectEqual(@as(usize, 79), pressure.total);
+    pressure = try nativeLoopPressure(.generic_completion_chain, 14, .standard_luau);
+    try std.testing.expectEqual(@as(usize, 35), pressure.locals);
+    try std.testing.expectEqual(@as(usize, 93), pressure.total);
+    // Two loops per level declare their completion locals in one block, so both are live at once: 7 + 14 loop
+    // variables + 14 completion locals. The compiler needs 44 registers; the certificate also counts each side loop's
+    // variable through its whole block, after its loop has ended.
+    pressure = try nativeLoopPressure(.completion_tower, 7, .standard_luau);
+    try std.testing.expectEqual(@as(usize, 35), pressure.locals);
+    try std.testing.expectEqual(@as(usize, 51), pressure.total);
+}
+
+test "a one-name generic loop with a completion local needs one register beyond its header parameters" {
+    // In direct locals each loop's four header parameters are counted locals although no line declares them (the
+    // `for` holds the loop state). They cover a numeric loop's limit, step and completion local, but a one-name
+    // generic loop with a completion local needs five registers beyond its loop variable: one more per level. The
+    // compiler needs 79 registers for the generic chain and 59 for the numeric one.
+    var pressure = try nativeLoopPressure(.generic_completion_chain, 10, .direct_locals_luau);
+    try std.testing.expectEqual(@as(usize, 69), pressure.locals);
+    try std.testing.expectEqual(@as(usize, 81), pressure.total);
+    pressure = try nativeLoopPressure(.numeric_completion_chain, 10, .direct_locals_luau);
+    try std.testing.expectEqual(@as(usize, 69), pressure.locals);
+    try std.testing.expectEqual(@as(usize, 71), pressure.total);
+}
+
+test "nested one-shot native loops count their for frames when the header parameters are aliases" {
+    // Each one-shot header is entered by a jump, so its four parameters are aliases of the jump's arguments and get
+    // no value scope: the certificate counts the six parameters, the initial-transition constant and one loop
+    // variable per level (17 locals), and nothing covers the limit and step each `for` holds, with or without value
+    // storage. The compiler needs 38 registers.
+    const pressure = try nativeLoopPressure(.one_shot_chain, 10, .direct_locals_luau);
+    try std.testing.expectEqual(@as(usize, 17), pressure.locals);
+    try std.testing.expectEqual(@as(usize, 39), pressure.total);
 }
