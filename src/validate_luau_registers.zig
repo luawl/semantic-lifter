@@ -10,6 +10,7 @@ const emission_scope = @import("emit_luau_scope.zig");
 const lexical = @import("emit_luau_lexical.zig");
 const lexical_transfer = @import("lexical_transfer.zig");
 const luau_runtime = @import("luau_runtime.zig");
+const luau_syntax = @import("luau_syntax.zig");
 const readable_scope = @import("readable_scope.zig");
 const structure = @import("structure.zig");
 const structured_escape = @import("structured_escape.zig");
@@ -701,12 +702,8 @@ fn emittedOperationTemporaryFrameSize(
         else => {},
     }
     const raw = switch (instruction.operation) {
-        .make_table_literal => |constructor| registerAtomicTableConstructorFrame(
-            program,
-            emission,
-            scopes,
-            constructor,
-        ) orelse operationTemporaryFrameSize(instruction.operation).?,
+        // A constructor's frame holds its tail pack as written (`emittedConstructorFrame`).
+        .make_table_literal => |constructor| return emittedConstructorFrame(program, emission, scopes, instruction, constructor),
         else => operationTemporaryFrameSize(instruction.operation) orelse return null,
     };
     const pack_id = switch (instruction.operation) {
@@ -715,7 +712,6 @@ fn emittedOperationTemporaryFrameSize(
         .protected_call => |call| call.argument_pack,
         .coroutine_resume => |call| call.argument_pack,
         .coroutine_yield => |call| call.argument_pack,
-        .make_table_literal => |constructor| constructor.tail_pack,
         .table_set_pack => |operation| operation.pack,
         else => null,
     } orelse return raw;
@@ -723,50 +719,554 @@ fn emittedOperationTemporaryFrameSize(
     return raw - 1 + width;
 }
 
-fn registerAtomicTableConstructorFrame(
+/// The frame of a table constructor, from its table register up, as the emitter writes it (`plannedTableConstructor`,
+/// `emitTableConstructorInstruction`) and luau-compile builds it (`ItemPricing.constructorFrame`), its tail pack
+/// included; a statement `__lifter_value_storage[k] = { ... }` also holds the key `k` in a register under the table.
+/// A constructor with an item whose written form `ItemPricing` does not price keeps the per-field charge.
+fn emittedConstructorFrame(
     program: *const ir.Program,
     emission: *const emission_planning.Plan,
     scopes: *const emission_scope.Plan,
+    instruction: ir.Instruction,
     constructor: ir.TableConstructor,
-) ?usize {
-    if (constructor.tail_pack != null) return null;
-    var list_count: usize = 0;
-    var has_keyed = false;
-    for (constructor.fields) |field| switch (field) {
-        .list => |value| {
-            if (!emittedScalarIsRegisterAtomic(program, emission, scopes, value)) return null;
-            list_count = saturatingAdd(list_count, 1);
-        },
-        .keyed => |keyed| {
-            if (!emittedScalarIsRegisterAtomic(program, emission, scopes, keyed.key) or
-                !emittedScalarIsRegisterAtomic(program, emission, scopes, keyed.value)) return null;
-            has_keyed = true;
-        },
-    };
-    const keyed_frame: usize = if (has_keyed) 2 else 0;
-    return saturatingAdd(1, @max(list_count, keyed_frame));
+) usize {
+    const pricing: ItemPricing = .{ .program = program, .emission = emission, .scopes = scopes };
+    const frame = pricing.constructorFrame(instruction.id, constructor, 0) orelse
+        perFieldConstructorFrame(program, emission, instruction.id, constructor);
+    const stored_statement = instruction.results.len == 1 and
+        !emission.fused_values.contains(instruction.id) and
+        emission.place_writes.consumerForProducer(instruction.id) == null and
+        emission.names.valueUsesStorage(instruction.results[0]);
+    return saturatingAdd(frame, @intFromBool(stored_statement));
 }
 
-fn emittedScalarIsRegisterAtomic(
+/// The charge of a constructor whose items are not priced as built: the table, one register per field, the tail pack at
+/// its written width, and at least the three registers a constructor with a keyed field takes.
+fn perFieldConstructorFrame(
+    program: *const ir.Program,
+    emission: *const emission_planning.Plan,
+    consumer: ir.InstructionId,
+    constructor: ir.TableConstructor,
+) usize {
+    var frame = saturatingAdd(1, constructor.fields.len);
+    if (constructor.tail_pack) |pack_id| frame = saturatingAdd(frame, emittedPackWidth(program, emission, consumer, pack_id));
+    for (constructor.fields) |field| switch (field) {
+        .keyed => return @max(frame, 3),
+        .list => {},
+    };
+    return frame;
+}
+
+/// `unpack(name, 1, rawget(name, 0))`, the expansion of a stored pack: the captured unpack, the name, `1`, then the
+/// nested call of the captured rawget in the fourth register.
+const stored_pack_need: usize = 6;
+
+/// An upvalue indexed by a key, `u[k]`: the upvalue, the key and the result.
+const indexed_upvalue_need: usize = 3;
+
+/// How luau-compile builds a written expression into its target register (a constructor's batch slot, a call's frame
+/// slot, an operand register), every literal priced as at -O0, where it takes a register, `-5` is a unary minus and
+/// `(0 / 0)` a division.
+const Written = struct {
+    /// Registers from the target up, the target included.
+    need: usize,
+    /// A local register of this function written by name: an operand that takes no register of its own.
+    register: bool = false,
+    /// Written as a call, or handing its target to one (`(f(x))`, `(f(x)).k`, `x or f()`): below the register top it is
+    /// built above the top and moved down.
+    relocates: bool = false,
+    /// Written as an unparenthesized call: as the last item of a constructor it takes every result, built at its slot.
+    multret: bool = false,
+    /// Written as a literal: from -O1 luau-compile reads it as a constant operand of `and` and `or` (`ANDK`, `ORK`).
+    constant: bool = false,
+};
+
+/// The registers an operand takes when luau-compile evaluates it for an instruction that reads registers: none for a
+/// local register.
+fn autoNeed(written: Written) usize {
+    return if (written.register) 0 else written.need;
+}
+
+/// The register an evaluated left operand holds while the right one is evaluated: none for a local register.
+fn heldRegister(written: Written) usize {
+    return @intFromBool(!written.register);
+}
+
+/// The registers an operand that is not the last of a concatenation takes above the register top: built in its
+/// register, its own register is below the top; built as a call, it is all above.
+fn aboveTop(written: Written) usize {
+    return if (written.relocates) written.need else written.need -| 1;
+}
+
+/// The register top of an array item, counted from the first register above the table: built at its batch slot (the
+/// slot returns to 0 when a batch of `reserve` items is stored), or, for the last item below slot `reserve - 1` that is
+/// not an unparenthesized call, above the reserve.
+fn listItemTop(reserve: usize, slot: *usize, written: Written, last: bool) usize {
+    if (slot.* == reserve) slot.* = 0;
+    const at = slot.*;
+    slot.* += 1;
+    if (!last or written.multret or at + 1 == reserve) return saturatingAdd(at, written.need);
+    return saturatingAdd(reserve, if (written.relocates) written.need else written.need -| 1);
+}
+
+/// A literal at -O0: one register; a negative number is a unary minus over its magnitude, and `(0 / 0)`, `(1 / 0)` or
+/// `(-1 / 0)` a division of two constants.
+fn literalNeed(literal_value: ir.Literal) usize {
+    return switch (literal_value) {
+        .special_number => 3,
+        .integer => |text| if (text.len != 0 and text[0] == '-') 2 else 1,
+        .number => |number| if (std.math.signbit(number)) 2 else 1,
+        .nil_value, .boolean, .string => 1,
+    };
+}
+
+/// A tail pack as written: one multi-value item (`...`, `select(k, ...)`, a stored pack's expansion or the invocation
+/// that produces the pack), or the values of a `pack_values`, written as array items.
+const Tail = struct {
+    single: ?Written = null,
+    items: []const ir.ValueId = &.{},
+
+    fn count(self: Tail) usize {
+        return @as(usize, @intFromBool(self.single != null)) + self.items.len;
+    }
+};
+
+/// Prices the items of a constructor as `valueUseContext` and `fusedInstructionExpression` write them. Null for a form it
+/// does not price: a value a branch composition may write in its place (`c and x`, `if c then x else y`), a producer
+/// role or operation the renderer refuses, or an expression deeper than `max_fused_expression_operations`.
+const ItemPricing = struct {
     program: *const ir.Program,
     emission: *const emission_planning.Plan,
     scopes: *const emission_scope.Plan,
-    value_id: ir.ValueId,
-) bool {
-    const resolved = emission.dead.resolveValue(value_id);
-    if (resolved.index() >= program.values.len) return false;
-    if (scopes.valueHasStableLexicalBinding(resolved)) return true;
-    const origin = switch (program.values[resolved.index()].origin) {
-        .instruction_result => |origin| origin,
-        else => return false,
-    };
-    if (origin.index != 0 or origin.instruction.index() >= program.instructions.len or
-        (!emission.dead.isInlined(origin.instruction) and !emission.fused_values.contains(origin.instruction))) return false;
-    return switch (program.instructions[origin.instruction.index()].operation) {
-        .constant, .function_ref => true,
-        else => false,
-    };
-}
+
+    /// Registers a constructor holds from its table register up. luau-compile reserves R = min(16, L) registers above the
+    /// table for its L array items (the written items of a tail included) before the first item and keeps them to the
+    /// end. An array item before the last is built at its batch slot with the register top just above it; the slot
+    /// returns to 0 when a batch of R is stored and at every keyed field, which is built above the whole reserve. The
+    /// last array item is built at its slot when it is an unparenthesized call or `...` or sits at slot R - 1; otherwise
+    /// what it needs above its slot sits above the reserve, one register more when it is built as a call.
+    fn constructorFrame(self: ItemPricing, consumer: ir.InstructionId, constructor: ir.TableConstructor, depth: usize) ?usize {
+        if (depth >= luau_runtime.max_fused_expression_operations) return null;
+        const tail: Tail = if (constructor.tail_pack) |pack_id| self.tailItems(consumer, pack_id, depth) orelse return null else .{};
+        var list_count: usize = tail.count();
+        for (constructor.fields) |field| list_count += @intFromBool(field == .list);
+        const item_count = constructor.fields.len + tail.count();
+        if (item_count == 0) return 1;
+        const reserve: usize = @min(16, list_count);
+        var peak: usize = reserve;
+        var slot: usize = 0;
+        for (constructor.fields, 0..) |field, index| {
+            const last = index + 1 == item_count;
+            switch (field) {
+                .keyed => |keyed| {
+                    slot = 0;
+                    peak = @max(peak, saturatingAdd(reserve, self.keyedNeed(keyed.key, keyed.value, depth) orelse return null));
+                },
+                .list => |item| peak = @max(peak, listItemTop(reserve, &slot, self.writtenValue(item, depth) orelse return null, last)),
+            }
+        }
+        if (tail.single) |written| peak = @max(peak, listItemTop(reserve, &slot, written, true));
+        for (tail.items, 0..) |item, index| {
+            const last = index + 1 == tail.items.len;
+            peak = @max(peak, listItemTop(reserve, &slot, self.writtenValue(item, depth) orelse return null, last));
+        }
+        return saturatingAdd(1, peak);
+    }
+
+    /// A keyed field above the reserve: `name = v` (the name a constant register) or `[k] = v`, the key held while the
+    /// value is evaluated; a register key or value takes none.
+    fn keyedNeed(self: ItemPricing, key_id: ir.ValueId, value_id: ir.ValueId, depth: usize) ?usize {
+        const key: Written = if (self.identifierKey(key_id)) .{ .need = 1 } else self.writtenValue(key_id, depth) orelse return null;
+        const field_value = self.writtenValue(value_id, depth) orelse return null;
+        return @max(autoNeed(key), saturatingAdd(heldRegister(key), autoNeed(field_value)));
+    }
+
+    /// A pack as `plannedPackExpression` and `plannedArguments` write it.
+    fn tailItems(self: ItemPricing, consumer: ir.InstructionId, pack_id: ir.ValuePackId, depth: usize) ?Tail {
+        if (pack_id.index() >= self.program.value_packs.len) return null;
+        switch (self.program.value_packs[pack_id.index()].origin) {
+            .varargs => |owner| return .{ .single = .{ .need = self.varargNeed(owner, pack_id) orelse return null, .multret = true } },
+            .instruction_result => |producer_id| {
+                if (producer_id.index() >= self.program.instructions.len) return null;
+                const producer = self.program.instructions[producer_id.index()];
+                switch (producer.operation) {
+                    .pack_values => |items| {
+                        if (items.len == 0 or !self.emission.packs.packValuesServesInstruction(producer_id, consumer)) return null;
+                        return .{ .items = items };
+                    },
+                    else => {},
+                }
+                if (self.emission.packs.storedPackServesInstruction(producer_id, consumer)) {
+                    return .{ .single = .{ .need = stored_pack_need, .multret = true } };
+                }
+                switch (self.emission.packs.role(producer_id)) {
+                    .fused_invocation_producer => |target| if (target == consumer) {
+                        return .{ .single = .{ .need = self.invocationNeed(producer, depth + 1) orelse return null, .multret = true } };
+                    },
+                    else => {},
+                }
+                return null;
+            },
+        }
+    }
+
+    /// `...`, or `select(k, ...)` in the entry function after its fixed parameters and external bindings
+    /// (`directVarargPackExpression`).
+    fn varargNeed(self: ItemPricing, owner: ir.FunctionId, pack_id: ir.ValuePackId) ?usize {
+        if (owner.index() >= self.program.functions.len) return null;
+        const function = self.program.functions[owner.index()];
+        const vararg_pack = function.vararg_pack orelse return null;
+        if (!function.is_variadic or vararg_pack != pack_id) return null;
+        if (owner == self.program.entry_function and function.parameters.len + self.program.external_bindings.len != 0) return 3;
+        return 1;
+    }
+
+    /// A value as `valueUseContext` writes it: the producer it is fused into or inlined as, a fused place read, or a
+    /// name: a local register, `__lifter_value_storage[k]` or an upvalue.
+    fn writtenValue(self: ItemPricing, value_id: ir.ValueId, depth: usize) ?Written {
+        if (depth >= luau_runtime.max_fused_expression_operations) return null;
+        const resolved = self.emission.dead.resolveValue(value_id);
+        if (resolved.index() >= self.program.values.len) return null;
+        if (self.scopes.valueDeclaredAtSyntheticSite(resolved)) return null;
+        const item = self.program.values[resolved.index()];
+        switch (item.origin) {
+            .instruction_result => |origin| if (origin.index == 0 and origin.instruction.index() < self.program.instructions.len) {
+                const producer = self.program.instructions[origin.instruction.index()];
+                if (self.emission.fused_values.contains(producer.id)) return self.writtenProducer(producer, depth + 1);
+                if (self.emission.place_reads.contains(producer.id)) return switch (producer.operation) {
+                    .place_read => |place_id| self.placeReadWritten(place_id),
+                    else => null,
+                };
+                if (self.emission.dead.isInlined(producer.id)) return self.writtenOperation(producer.operation, depth + 1);
+            },
+            .capture => |capture_id| return self.capturedWritten(capture_id),
+            .parameter, .block_parameter => {},
+        }
+        if (item.function != self.scopes.function.id) return null;
+        if (self.emission.names.valueUsesStorage(resolved)) return .{ .need = 2 };
+        return .{ .need = 1, .register = true };
+    }
+
+    /// A captured value: the entry function's bindings are its own locals; elsewhere an upvalue, written by name, or as
+    /// `__lifter_value_storage[k]` of an enclosing function, read through that table's upvalue.
+    fn capturedWritten(self: ItemPricing, capture_id: ir.CaptureId) Written {
+        const function = self.scopes.function;
+        if (function.id == self.program.entry_function) return .{ .need = 1, .register = true };
+        const position = for (function.captures, 0..) |candidate, index| {
+            if (candidate == capture_id) break index;
+        } else return .{ .need = indexed_upvalue_need };
+        for (self.program.instructions) |instruction| switch (instruction.operation) {
+            .make_closure => |closure| if (closure.function == function.id) {
+                if (position >= closure.bindings.len) return .{ .need = indexed_upvalue_need };
+                switch (closure.bindings[position]) {
+                    .value => |source| if (source.index() >= self.program.values.len or
+                        self.emission.names.valueUsesStorage(source) or
+                        self.program.values[source.index()].origin == .capture) return .{ .need = indexed_upvalue_need },
+                    .place => return .{ .need = indexed_upvalue_need },
+                }
+            },
+            else => {},
+        };
+        return .{ .need = 1 };
+    }
+
+    /// A fused place read as `emitRead` writes it: a local's name or `__lifter_place_storage[k]`; a captured place or a
+    /// per-execution cell may be an upvalue, a box `holder[1]` or `rawget(binding, 1)`.
+    fn placeReadWritten(self: ItemPricing, place_id: ir.PlaceId) ?Written {
+        if (place_id.index() >= self.program.places.len) return null;
+        const place = self.program.places[place_id.index()];
+        if (place.origin == .capture or place.function != self.scopes.function.id or
+            self.scopes.arbitraryPlaceNeedsPerExecutionCell(place_id))
+        {
+            return .{ .need = indexed_upvalue_need, .relocates = true };
+        }
+        if (self.emission.names.placeUsesStorage(place_id)) return .{ .need = 2 };
+        return .{ .need = 1, .register = true };
+    }
+
+    /// A producer fused into its consumer (`fusedInstructionExpression`): an invocation is written in parentheses
+    /// where its adjustment is kept, so it is built as a call; a constructor is built in its target.
+    fn writtenProducer(self: ItemPricing, producer: ir.Instruction, depth: usize) ?Written {
+        switch (self.emission.packs.role(producer.id)) {
+            .fused_adjustment => |invocation_id| {
+                if (invocation_id.index() >= self.program.instructions.len) return null;
+                const invocation = self.program.instructions[invocation_id.index()];
+                return .{ .need = self.invocationNeed(invocation, depth) orelse return null, .relocates = true };
+            },
+            .ordinary => {},
+            else => return null,
+        }
+        return switch (producer.operation) {
+            .call, .namecall, .protected_call, .coroutine_create, .coroutine_resume, .coroutine_yield => .{
+                .need = self.invocationNeed(producer, depth) orelse return null,
+                .relocates = true,
+            },
+            .make_table_literal => |inner| .{ .need = self.constructorFrame(producer.id, inner, depth) orelse return null },
+            else => self.writtenOperation(producer.operation, depth),
+        };
+    }
+
+    /// An inlined producer, or a fused one written as its expression (`expressionWithContext`).
+    fn writtenOperation(self: ItemPricing, operation: ir.Operation, depth: usize) ?Written {
+        return switch (operation) {
+            .constant => |literal_value| .{ .need = literalNeed(literal_value), .constant = true },
+            .function_ref, .make_table => .{ .need = 1 },
+            .copy => |source| self.writtenValue(source, depth),
+            .unary => |unary_operation| self.unaryWritten(unary_operation, depth),
+            .binary => |binary_operation| self.binaryWritten(binary_operation, depth),
+            .table_get => |get| self.tableGetWritten(get, depth),
+            .environment_get => |get| self.environmentGetWritten(get, depth),
+            .string_interpolate => |interpolation| self.interpolationWritten(interpolation, depth),
+            else => null,
+        };
+    }
+
+    fn unaryWritten(self: ItemPricing, operation: ir.Unary, depth: usize) ?Written {
+        const operand = self.writtenValue(operation.operand, depth) orelse return null;
+        // bnot(x): the captured bit32.bnot, then its argument
+        if (operation.operator == .bit_not) return .{ .need = @max(2, saturatingAdd(1, operand.need)), .relocates = true, .multret = true };
+        return .{ .need = saturatingAdd(1, autoNeed(operand)) };
+    }
+
+    fn binaryWritten(self: ItemPricing, operation: ir.Binary, depth: usize) ?Written {
+        if (luau_runtime.bit32Capability(operation.operator) != null) {
+            const call_left = self.writtenValue(operation.left, depth) orelse return null;
+            const call_right = self.writtenValue(operation.right, depth) orelse return null;
+            // cap(l, r): the captured bit32 function, then its two arguments
+            const call_need = @max(3, @max(saturatingAdd(1, call_left.need), saturatingAdd(2, call_right.need)));
+            const is_shift = operation.operator == .shift_left or operation.operator == .shift_right;
+            if (!is_shift) {
+                if (operation.shift_behavior != null) return null;
+                return .{ .need = call_need, .relocates = true, .multret = true };
+            }
+            return switch (operation.shift_behavior orelse return null) {
+                .luau_bit32 => .{ .need = call_need, .relocates = true, .multret = true },
+                // (if r >= 32 then 0 else cap(l, r)): the test holds r and a register for 32, then either arm
+                .zero_saturating => .{
+                    .need = @max(call_need, saturatingAdd(1, @max(autoNeed(call_right), saturatingAdd(heldRegister(call_right), 1)))),
+                    .relocates = true,
+                },
+            };
+        }
+        const left = self.writtenValue(operation.left, depth) orelse return null;
+        if (operation.operator == .concat) return self.concatenationWritten(left, operation.right, depth);
+        const right = self.writtenValue(operation.right, depth) orelse return null;
+        return switch (operation.operator) {
+            // luau-compile evaluates the left operand above the target when it is not a comparison or a logical operation
+            // and the right operand is a register, and from -O1 also when the right operand is a constant (`ANDK`, `ORK`),
+            // which -O0 evaluates into the target: such an operation takes the larger of the two forms. Otherwise each
+            // operand is evaluated into the target.
+            .logical_and, .logical_or => if (!self.writtenAsTest(operation.left) and right.register)
+                .{ .need = saturatingAdd(1, autoNeed(left)) }
+            else if (!self.writtenAsTest(operation.left) and right.constant)
+                .{
+                    .need = @max(@max(left.need, right.need), saturatingAdd(1, autoNeed(left))),
+                    .relocates = left.relocates or right.relocates,
+                }
+            else
+                .{ .need = @max(left.need, right.need), .relocates = left.relocates or right.relocates },
+            else => .{ .need = saturatingAdd(1, @max(autoNeed(left), saturatingAdd(heldRegister(left), autoNeed(right)))) },
+        };
+    }
+
+    /// `o_0 .. o_1 .. ... .. o_(n-1)`: luau-compile evaluates the operands along the right spine of concatenations,
+    /// written without parentheses, into n consecutive registers above the target; a parenthesized left concatenation is
+    /// one operand.
+    fn concatenationWritten(self: ItemPricing, first: Written, right_id: ir.ValueId, depth: usize) ?Written {
+        var count: usize = 1;
+        var above = aboveTop(first);
+        var right = right_id;
+        var level = depth;
+        while (self.inlineConcatenation(right)) |next| {
+            level += 1;
+            if (level >= luau_runtime.max_fused_expression_operations) return null;
+            above = @max(above, aboveTop(self.writtenValue(next.left, level) orelse return null));
+            count += 1;
+            right = next.right;
+        }
+        const last = self.writtenValue(right, level) orelse return null;
+        count += 1;
+        return .{ .need = @max(@max(saturatingAdd(1, count), saturatingAdd(count, last.need)), saturatingAdd(saturatingAdd(1, count), above)) };
+    }
+
+    /// The concatenation a value is written as inline, its copies followed: the next link of a right spine.
+    fn inlineConcatenation(self: ItemPricing, value_id: ir.ValueId) ?ir.Binary {
+        var current = value_id;
+        var remaining = luau_runtime.max_fused_expression_operations;
+        while (remaining != 0) : (remaining -= 1) {
+            const producer = self.inlineProducer(current) orelse return null;
+            switch (producer.operation) {
+                .binary => |operation| return if (operation.operator == .concat) operation else null,
+                .copy => |source| current = source,
+                else => return null,
+            }
+        }
+        return null;
+    }
+
+    /// Whether a value is written inline as a comparison or a logical operation, the conditions luau-compile tests
+    /// without a register for the left operand of `and` and `or`.
+    fn writtenAsTest(self: ItemPricing, value_id: ir.ValueId) bool {
+        var current = value_id;
+        var remaining = luau_runtime.max_fused_expression_operations;
+        while (remaining != 0) : (remaining -= 1) {
+            const producer = self.inlineProducer(current) orelse return false;
+            switch (producer.operation) {
+                .binary => |operation| return switch (operation.operator) {
+                    .equal, .not_equal, .less, .less_equal, .greater, .greater_equal, .logical_and, .logical_or => true,
+                    else => false,
+                },
+                .copy => |source| current = source,
+                else => return false,
+            }
+        }
+        return false;
+    }
+
+    /// The producer a value is written as inline: fused with the ordinary role, or inlined.
+    fn inlineProducer(self: ItemPricing, value_id: ir.ValueId) ?ir.Instruction {
+        const resolved = self.emission.dead.resolveValue(value_id);
+        if (resolved.index() >= self.program.values.len or self.scopes.valueDeclaredAtSyntheticSite(resolved)) return null;
+        const origin = switch (self.program.values[resolved.index()].origin) {
+            .instruction_result => |origin| origin,
+            else => return null,
+        };
+        if (origin.index != 0 or origin.instruction.index() >= self.program.instructions.len) return null;
+        const producer = self.program.instructions[origin.instruction.index()];
+        if (self.emission.fused_values.contains(producer.id)) return if (self.emission.packs.role(producer.id) == .ordinary) producer else null;
+        if (self.emission.place_reads.contains(producer.id) or !self.emission.dead.isInlined(producer.id)) return null;
+        return producer;
+    }
+
+    fn tableGetWritten(self: ItemPricing, operation: ir.TableGet, depth: usize) ?Written {
+        const object = self.writtenValue(operation.table, depth) orelse return null;
+        switch (operation.mode) {
+            // rawget(t, k): the captured rawget, then its two arguments
+            .raw => {
+                const raw_key = self.writtenValue(operation.key, depth) orelse return null;
+                return .{ .need = @max(3, @max(saturatingAdd(1, object.need), saturatingAdd(2, raw_key.need))), .relocates = true, .multret = true };
+            },
+            .semantic => {
+                // `object.name`: the object's registers, then the field in the target
+                if (self.identifierKey(operation.key)) return .{
+                    .need = if (object.register) 1 else object.need,
+                    .relocates = !object.register and object.relocates,
+                };
+                // `object[key]`: the object held while the key is evaluated
+                const key = self.writtenValue(operation.key, depth) orelse return null;
+                return .{ .need = saturatingAdd(1, @max(autoNeed(object), saturatingAdd(heldRegister(object), autoNeed(key)))) };
+            },
+        }
+    }
+
+    fn environmentGetWritten(self: ItemPricing, operation: ir.EnvironmentGet, depth: usize) ?Written {
+        switch (operation.target) {
+            // a global, or getfenv()["name"] for a name that is not an identifier
+            .ambient => {
+                if (operation.mode == .raw) return null;
+                return .{ .need = if (luau_syntax.isIdentifier(operation.name)) 1 else 3 };
+            },
+            .value => |environment| {
+                const object = self.writtenValue(environment, depth) orelse return null;
+                if (operation.mode == .raw) return .{ .need = @max(3, saturatingAdd(1, object.need)), .relocates = true, .multret = true };
+                if (luau_syntax.isIdentifier(operation.name)) return .{
+                    .need = if (object.register) 1 else object.need,
+                    .relocates = !object.register and object.relocates,
+                };
+                // `object["name"]`: the name constant in a register
+                return .{ .need = saturatingAdd(1, @max(autoNeed(object), saturatingAdd(heldRegister(object), 1))) };
+            },
+        }
+    }
+
+    /// fmt("...", v1, ..., vn): the captured string.format, the format string, then the values.
+    fn interpolationWritten(self: ItemPricing, operation: ir.StringInterpolation, depth: usize) ?Written {
+        if (operation.segments.len != operation.values.len + 1) return null;
+        var need = saturatingAdd(2, operation.values.len);
+        for (operation.values, 0..) |item, index| {
+            const written = self.writtenValue(item, depth) orelse return null;
+            need = @max(need, saturatingAdd(saturatingAdd(2, index), written.need));
+        }
+        return .{ .need = need, .relocates = true, .multret = true };
+    }
+
+    /// A call's frame (`plannedInvocation`): slot k holds operand k, the callee first (the runtime capture for pcall,
+    /// xpcall and the coroutine library), each built with the register top just above it, then the argument pack.
+    fn invocationNeed(self: ItemPricing, producer: ir.Instruction, depth: usize) ?usize {
+        var need = operationTemporaryFrameSize(producer.operation) orelse return null;
+        switch (producer.operation) {
+            .call => |operation| {
+                need = @max(need, (self.writtenValue(operation.callee, depth) orelse return null).need);
+                need = @max(need, self.argumentsNeed(producer.id, operation.arguments, operation.argument_pack, 1, depth) orelse return null);
+            },
+            .namecall => |operation| {
+                need = @max(need, autoNeed(self.writtenValue(operation.receiver, depth) orelse return null));
+                need = @max(need, self.argumentsNeed(producer.id, operation.arguments, operation.argument_pack, 2, depth) orelse return null);
+            },
+            .protected_call => |operation| {
+                need = @max(need, saturatingAdd(1, (self.writtenValue(operation.callee, depth) orelse return null).need));
+                var first: usize = 2;
+                if (operation.error_handler) |handler| {
+                    need = @max(need, saturatingAdd(2, (self.writtenValue(handler, depth) orelse return null).need));
+                    first = 3;
+                }
+                need = @max(need, self.argumentsNeed(producer.id, operation.arguments, operation.argument_pack, first, depth) orelse return null);
+            },
+            .coroutine_create => |operation| need = @max(need, saturatingAdd(1, (self.writtenValue(operation.callee, depth) orelse return null).need)),
+            .coroutine_resume => |operation| {
+                need = @max(need, saturatingAdd(1, (self.writtenValue(operation.thread, depth) orelse return null).need));
+                need = @max(need, self.argumentsNeed(producer.id, operation.arguments, operation.argument_pack, 2, depth) orelse return null);
+            },
+            .coroutine_yield => |operation| need = @max(need, self.argumentsNeed(producer.id, operation.arguments, operation.argument_pack, 1, depth) orelse return null),
+            else => return null,
+        }
+        return need;
+    }
+
+    /// Arguments from frame slot `first` on, then the argument pack as `plannedArguments` writes it.
+    fn argumentsNeed(
+        self: ItemPricing,
+        consumer: ir.InstructionId,
+        arguments: []const ir.ValueId,
+        argument_pack: ?ir.ValuePackId,
+        first: usize,
+        depth: usize,
+    ) ?usize {
+        var need: usize = 0;
+        for (arguments, 0..) |argument, index| {
+            const written = self.writtenValue(argument, depth) orelse return null;
+            need = @max(need, saturatingAdd(first + index, written.need));
+        }
+        const pack_id = argument_pack orelse return need;
+        const tail = self.tailItems(consumer, pack_id, depth) orelse return null;
+        const slot = first + arguments.len;
+        if (tail.single) |written| return @max(need, saturatingAdd(slot, written.need));
+        for (tail.items, 0..) |item, index| {
+            const written = self.writtenValue(item, depth) orelse return null;
+            need = @max(need, saturatingAdd(slot + index, written.need));
+        }
+        return need;
+    }
+
+    /// Whether a key is written as a name (`semanticConstructorKey`, `semanticValueIndexSuffix`): a string constant that
+    /// is an identifier.
+    fn identifierKey(self: ItemPricing, key_id: ir.ValueId) bool {
+        const resolved = self.emission.dead.resolveValue(key_id);
+        if (resolved.index() >= self.program.values.len) return false;
+        const origin = switch (self.program.values[resolved.index()].origin) {
+            .instruction_result => |origin| origin,
+            else => return false,
+        };
+        if (origin.index != 0 or origin.instruction.index() >= self.program.instructions.len) return false;
+        return switch (self.program.instructions[origin.instruction.index()].operation) {
+            .constant => |literal_value| switch (literal_value) {
+                .string => |name| luau_syntax.isIdentifier(name),
+                else => false,
+            },
+            else => false,
+        };
+    }
+};
 
 fn emittedPackWidth(
     program: *const ir.Program,

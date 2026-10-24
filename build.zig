@@ -1501,6 +1501,31 @@ pub fn build(b: *std.Build) void {
         "luau/fixtures/exact_number_literal_source.luau",
         "source-frontend-exact-number-literal",
     );
+    // Constructors with many array items, each in the standard target and in direct locals: luau-compile stores array
+    // items in batches of 16 above the table register, so 253, 254, 300 and 1000 items take the same registers.
+    const many_item_sources = [_][2][]const u8{
+        .{ "luau/fixtures/many_array_items_253_source.luau", "source-frontend-many-array-items-253" },
+        .{ "luau/fixtures/many_array_items_254_source.luau", "source-frontend-many-array-items-254" },
+        .{ "luau/fixtures/many_array_items_300_source.luau", "source-frontend-many-array-items-300" },
+        .{ "luau/fixtures/many_array_items_1000_source.luau", "source-frontend-many-array-items-1000" },
+        .{ "luau/fixtures/many_number_items_300_source.luau", "source-frontend-many-number-items-300" },
+        .{ "luau/fixtures/many_array_items_in_function_300_source.luau", "source-frontend-many-array-items-in-function-300" },
+        .{ "luau/fixtures/many_computed_items_300_source.luau", "source-frontend-many-computed-items-300" },
+    };
+    var many_item_conformance: [2 * many_item_sources.len]FixtureConformance = undefined;
+    for (many_item_sources, 0..) |many_item_source, many_item_index| {
+        many_item_conformance[2 * many_item_index] = addLuauSourceConformance(b, exe, z3_enabled, z3_bin, many_item_source[0], many_item_source[1]);
+        many_item_conformance[2 * many_item_index + 1] = addLuauSourceConformanceForTarget(
+            b,
+            exe,
+            z3_enabled,
+            z3_bin,
+            many_item_source[0],
+            b.fmt("{s}-direct-locals", .{many_item_source[1]}),
+            "direct-locals-luau",
+        );
+    }
+    const nested_constructor_last_item_conformance = addNestedConstructorLastItemConformance(b, exe, z3_enabled, z3_bin);
     const source_frontend_target_resolution_conformance = addLuauSourceManifestProofConformance(
         b,
         exe,
@@ -1915,6 +1940,8 @@ pub fn build(b: *std.Build) void {
     source_frontend_double_rounding_comparison_in_range_conformance.addTo(conformance_step);
     source_frontend_wide_integral_number_conformance.addTo(conformance_step);
     source_frontend_exact_number_literal_conformance.addTo(conformance_step);
+    for (many_item_conformance) |many_item| many_item.addTo(conformance_step);
+    for (nested_constructor_last_item_conformance) |checked| conformance_step.dependOn(checked);
     source_frontend_target_resolution_conformance.addTo(conformance_step);
     source_frontend_opaque_result_target_conformance.addTo(conformance_step);
     source_frontend_nonintrinsic_target_origin_conformance.addTo(conformance_step);
@@ -3014,6 +3041,45 @@ fn addAutomaticRuntimeConformance(
     runtime_automatic.expectExitCode(0);
     runtime_automatic.step.dependOn(&compile_automatic.step);
     return &runtime_automatic.step;
+}
+
+// A constructor whose last array item, a nested chain of constructors, sits below the last slot of its batch:
+// luau-compile builds the chain above the whole batch, 255 registers from the table register up. Written in direct
+// locals the text keeps the source's registers and compiles; in the standard target the value storage table is one
+// more local under the table, and the readable admission refuses it for temporary register pressure.
+fn addNestedConstructorLastItemConformance(
+    b: *std.Build,
+    exe: *std.Build.Step.Compile,
+    z3_enabled: bool,
+    z3_bin: []const u8,
+) [2]*std.Build.Step {
+    const name = "source-frontend-nested-constructor-last-item";
+    const fixture_json = addLuauSourceIr(b, "luau/fixtures/nested_constructor_last_item_source.luau", null, name);
+    const resolve = b.addRunArtifact(exe);
+    if (z3_enabled) resolve.addPathDir(b.pathFromRoot(z3_bin));
+    resolve.addArg("resolve-ir");
+    resolve.addFileArg(fixture_json);
+    const resolved = resolve.addOutputFileArg(name ++ ".resolved.lifter-ir.json");
+    resolve.addArg(if (z3_enabled) "z3" else "internal");
+
+    const refusal = b.addRunArtifact(exe);
+    if (z3_enabled) refusal.addPathDir(b.pathFromRoot(z3_bin));
+    refusal.addArg("expect-diagnostic");
+    refusal.addFileArg(resolved);
+    refusal.addArgs(&.{ "readable-luau", "unsupported_readable_temporary_register_pressure" });
+    refusal.expectExitCode(0);
+
+    const emit = b.addRunArtifact(exe);
+    if (z3_enabled) emit.addPathDir(b.pathFromRoot(z3_bin));
+    emit.addArg("emit-readable-luau-strategy");
+    emit.addFileArg(resolved);
+    const emitted = emit.addOutputFileArg(name ++ ".direct-locals.luau");
+    emit.addArgs(&.{ "direct-locals-luau", "automatic" });
+    emit.expectExitCode(0);
+    const compile = b.addSystemCommand(&.{ luauCompileExe(b), "--null" });
+    compile.addFileArg(emitted);
+    compile.expectExitCode(0);
+    return .{ &refusal.step, &compile.step };
 }
 
 // An emission that must be refused with a typed line, in the dispatcher-budget refusal form

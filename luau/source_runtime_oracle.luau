@@ -1325,6 +1325,48 @@ function SourceRuntimeOracle.run(caseName: string, source: string, exported: any
 			end
 		end
 		assert(mismatches == 0, `{caseName}: {mismatches} of {rows} rows differ from the source; first {first}`)
+	elseif
+		caseName == "source-frontend-many-array-items-253"
+		or caseName == "source-frontend-many-array-items-253-direct-locals"
+	then
+		assert(exported(1) == "s0" and exported(253) == "s252" and exported(254) == nil, "a constructor with 253 array items changed its items")
+	elseif
+		caseName == "source-frontend-many-array-items-254"
+		or caseName == "source-frontend-many-array-items-254-direct-locals"
+	then
+		assert(exported(1) == "s0" and exported(254) == "s253" and exported(255) == nil, "a constructor with 254 array items changed its items")
+	elseif
+		caseName == "source-frontend-many-array-items-300"
+		or caseName == "source-frontend-many-array-items-300-direct-locals"
+		or caseName == "source-frontend-many-array-items-in-function-300"
+		or caseName == "source-frontend-many-array-items-in-function-300-direct-locals"
+	then
+		assert(
+			exported(1) == "s0" and exported(254) == "s253" and exported(300) == "s299" and exported(301) == nil,
+			"a constructor with 300 array items changed its items"
+		)
+	elseif
+		caseName == "source-frontend-many-array-items-1000"
+		or caseName == "source-frontend-many-array-items-1000-direct-locals"
+	then
+		assert(
+			exported(1) == "s0" and exported(254) == "s253" and exported(1000) == "s999" and exported(1001) == nil,
+			"a constructor with 1000 array items changed its items"
+		)
+	elseif
+		caseName == "source-frontend-many-number-items-300"
+		or caseName == "source-frontend-many-number-items-300-direct-locals"
+	then
+		assert(exported(1) == 0 and exported(254) == 253 and exported(300) == 299, "a constructor with 300 number items changed its items")
+	elseif
+		caseName == "source-frontend-many-computed-items-300"
+		or caseName == "source-frontend-many-computed-items-300-direct-locals"
+	then
+		local items = exported(5)
+		assert(
+			type(items) == "table" and #items == 300 and items[1] == 5 and items[254] == 258 and items[300] == 304,
+			"a constructor with 300 computed items changed its items"
+		)
 	else
 		return false
 	end
