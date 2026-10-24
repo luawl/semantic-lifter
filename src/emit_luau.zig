@@ -947,10 +947,27 @@ fn emitRegionWithPredeclaredBlock(
     predeclared_block: ?ir.BlockId,
 ) (EmitError || std.mem.Allocator.Error)!void {
     // A side escape that falls through to this region's end needs no wrapper
-    // (`structure.regionSideEscapeFallsThrough`).
-    if (!structured_escape.regionWritesOwnedEscape(region) and
-        !try structured_escape.regionNeedsTransferWrapper(allocator, region))
-    {
+    // (`structure.regionSideEscapeFallsThrough`), and neither does a region whose wrapper would only forward escape
+    // flags (`structure.Region.forwards_through`).
+    if (!try structured_escape.regionIsWrapped(allocator, region)) {
+        if (region.forwards_through and try structured_escape.regionNeedsTransferWrapper(allocator, region)) {
+            // Written without its wrapper: each `break` its text leaves by now leaves the statement around it, which the
+            // wrapper's propagation would have left for the same flag. The binder writes no statement.
+            const forwarded_binder: ContinueBinder = .{ .kind = .forwarded, .stop = region.stop, .parent = emission_plan.state.continue_binder };
+            emission_plan.state.continue_binder = &forwarded_binder;
+            defer emission_plan.state.continue_binder = forwarded_binder.parent;
+            return emitRegionBodyWithPredeclaredBlock(
+                output,
+                allocator,
+                program,
+                emission_plan,
+                scopes,
+                region,
+                region_indent,
+                place_aliases,
+                predeclared_block,
+            );
+        }
         return emitRegionBodyWithPredeclaredBlock(
             output,
             allocator,
@@ -977,7 +994,10 @@ fn emitRegionWithPredeclaredBlock(
 
     const has_predeclared_stop_flag = (predeclared_block != null and predeclared_block.? == target) or
         structured_escape.regionHasLoopBoundaryExitTo(region, target);
-    if (!has_predeclared_stop_flag) {
+    // The stop's flag is declared only where this region's own text sets it: after the region only the consumer of a
+    // region that continues at its stop reads it, which needs such a set, and a side arm that sets it after its side
+    // region writes that region with the side target predeclared.
+    if (!has_predeclared_stop_flag and structured_escape.regionWritesOwnedEscape(region)) {
         try emitEscapeFlagDeclaration(output, allocator, program, emission_plan, target, region_indent);
     }
     try output.appendSlice(allocator, region_indent);
@@ -1170,6 +1190,7 @@ fn emitRegionBodyWithPredeclaredBlock(
                                     place_aliases,
                                     projection.nonlocal,
                                 );
+                                if (projection.nonlocal) try emitForwardedSetBreak(output, allocator, emission_plan, indent);
                                 continue;
                             }
                         }
@@ -1413,6 +1434,7 @@ fn emitRegionBodyWithPredeclaredBlock(
                 }
                 if (loop_plan.exit_is_escape) {
                     try emitEscapeFlagSet(output, allocator, program, emission_plan, loop_plan.exit_edge.target, indent);
+                    if (node_index + 1 == region.nodes.len) try emitForwardedSetBreak(output, allocator, emission_plan, indent);
                 }
             },
             .latch_loop => |loop_plan| {
@@ -1422,6 +1444,7 @@ fn emitRegionBodyWithPredeclaredBlock(
                 }
                 if (loop_plan.exit_is_escape) {
                     try emitEscapeFlagSet(output, allocator, program, emission_plan, loop_plan.exit, indent);
+                    if (node_index + 1 == region.nodes.len) try emitForwardedSetBreak(output, allocator, emission_plan, indent);
                 }
             },
             .infinite_loop => |loop_plan| {
@@ -1431,6 +1454,7 @@ fn emitRegionBodyWithPredeclaredBlock(
                 }
                 if (loop_plan.exit_is_escape) {
                     try emitEscapeFlagSet(output, allocator, program, emission_plan, loop_plan.exit.?, indent);
+                    if (node_index + 1 == region.nodes.len) try emitForwardedSetBreak(output, allocator, emission_plan, indent);
                 }
             },
             .loop_control => |control| try emitLoopControl(
@@ -1479,6 +1503,7 @@ fn emitRegionBodyWithPredeclaredBlock(
                     // continue past every wrapper to the loop.
                     _ = try loop_continue_projection.validateEntry(program, region.continue_projection.?.target, projection.target_edge);
                     try emitEscapeFlagSet(output, allocator, program, emission_plan, region.continue_projection.?.target, indent);
+                    try emitForwardedSetBreak(output, allocator, emission_plan, indent);
                 } else {
                     try emitProjectedContinueAfterTransferredEdge(
                         output,
@@ -1501,6 +1526,7 @@ fn emitRegionBodyWithPredeclaredBlock(
                     try emitContinueStatement(output, allocator, emission_plan, projection.target, indent);
                 } else {
                     try emitEscapeFlagSet(output, allocator, program, emission_plan, projection.target, indent);
+                    try emitForwardedSetBreak(output, allocator, emission_plan, indent);
                 }
             }
         }
@@ -1777,8 +1803,9 @@ fn emitBranchArmImpl(
 /// The `break` after the escape flag of a continue an empty branch arm carries by flag: the arm is written in its
 /// holding region's `if` with no wrapper of its own, so the `break` must leave a transfer wrapper, whose
 /// propagation carries the flag on. A loop boundary's body exit continue carried by flag, written in its holding
-/// region's text, takes the same `break`. Anywhere else the function is refused, and emitFunctionBody writes it in
-/// the flat layout.
+/// region's text, takes the same `break`. Under a region written without its forwarding wrapper (`.forwarded`) the
+/// `break` leaves the statement around that region, which the wrapper's propagation would have left for the flag.
+/// Anywhere else the function is refused, and emitFunctionBody writes it in the flat layout.
 fn emitEmptyArmFlagBreak(
     output: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
@@ -1786,7 +1813,29 @@ fn emitEmptyArmFlagBreak(
     indent: []const u8,
 ) (EmitError || std.mem.Allocator.Error)!void {
     const innermost = emission_plan.state.continue_binder orelse return error.UnsupportedControlFlow;
-    if (innermost.kind != .wrapper) return error.UnsupportedControlFlow;
+    switch (innermost.kind) {
+        .wrapper => {},
+        // A region written without its forwarding wrapper: the `break` leaves the statement around it, which that
+        // wrapper's propagation would have left for this flag.
+        .forwarded => if (writtenBinder(innermost) == null) return error.UnsupportedControlFlow,
+        .loop, .one_shot => return error.UnsupportedControlFlow,
+    }
+    try emitBreakStatement(output, allocator, indent);
+}
+
+/// The `break` after an escape flag set that ends a region written without its forwarding wrapper (a `.forwarded`
+/// binder innermost): that wrapper's end would have reached its propagation, which leaves the statement around the
+/// region for this flag, so the `break` leaves that statement directly. Inside a wrapper the set falls to its
+/// `until true`, and nothing is written.
+fn emitForwardedSetBreak(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    emission_plan: *const EmissionPlan,
+    indent: []const u8,
+) (EmitError || std.mem.Allocator.Error)!void {
+    const innermost = emission_plan.state.continue_binder orelse return;
+    if (innermost.kind != .forwarded) return;
+    if (writtenBinder(innermost) == null) return error.UnsupportedControlFlow;
     try emitBreakStatement(output, allocator, indent);
 }
 
@@ -3411,7 +3460,7 @@ fn writesStopConsumer(binder: ?*const ContinueBinder, stop: ir.BlockId) bool {
     var outer = binder;
     while (outer) |statement| : (outer = statement.parent) {
         switch (statement.kind) {
-            .wrapper => continue,
+            .wrapper, .forwarded => continue,
             .loop => return sameBlock(statement.header, stop) or sameBlock(statement.stop, stop),
             .one_shot => return true,
         }
@@ -3573,23 +3622,35 @@ fn emitProjectedContinueAfterTransferredEdge(
 /// Whether a lexical `continue` written under `binder`, the innermost Luau loop statement, reaches `target`: the
 /// binder is a loop whose header or body stop is `target`, or a transfer wrapper whose stop is `target` (leaving a
 /// wrapper reaches its stop) or is the body stop of the innermost loop around it, whose header is `target`. A `for`
-/// that runs its body once binds no `continue`, and neither does the absence of a loop statement.
+/// that runs its body once binds no `continue`, and neither does the absence of a loop statement. A region written
+/// without its forwarding wrapper (`.forwarded`) writes no statement: the walk looks past it.
 fn continueBindsTo(binder: ?*const ContinueBinder, target: ir.BlockId) bool {
-    const innermost = binder orelse return false;
+    const innermost = writtenBinder(binder) orelse return false;
     switch (innermost.kind) {
+        .forwarded => unreachable,
         .loop => return sameBlock(innermost.header, target) or sameBlock(innermost.stop, target),
         .one_shot => return false,
         .wrapper => {
             if (sameBlock(innermost.stop, target)) return true;
             var outer = innermost.parent;
             while (outer) |enclosing| : (outer = enclosing.parent) {
-                if (enclosing.kind == .wrapper) continue;
+                if (enclosing.kind == .wrapper or enclosing.kind == .forwarded) continue;
                 return enclosing.kind == .loop and sameBlock(enclosing.header, target) and
                     enclosing.stop != null and sameBlock(innermost.stop, enclosing.stop.?);
             }
             return false;
         },
     }
+}
+
+/// The innermost binder that writes a Luau statement: `binder` past every region written without its forwarding
+/// wrapper (`.forwarded`), which writes none.
+fn writtenBinder(binder: ?*const ContinueBinder) ?*const ContinueBinder {
+    var current = binder;
+    while (current) |statement| : (current = statement.parent) {
+        if (statement.kind != .forwarded) return statement;
+    }
+    return null;
 }
 
 fn sameBlock(block: ?ir.BlockId, target: ir.BlockId) bool {
@@ -3821,6 +3882,7 @@ fn emitLoopBoundaryBodyImpl(
     if (try validateEmptyBoundaryContinue(program, control.body_region, control.body_edge)) |transfer| {
         if (transfer.nonlocal) {
             try emitEscapeFlagSet(output, allocator, program, emission_plan, transfer.target, indent);
+            try emitForwardedSetBreak(output, allocator, emission_plan, indent);
         } else {
             try emitNativeIterationCompletionSetForTarget(output, allocator, emission_plan, transfer.target, indent);
             try emitContinueStatement(output, allocator, emission_plan, transfer.target, indent);
@@ -4715,12 +4777,219 @@ test "a side region declares no flag of the side target its arm sets after it" {
         sets_after.items,
     );
 
-    // A side escape that falls through to the holding region's end sets nothing after the region, whose wrapper keeps
-    // its own declaration.
+    // A side escape that falls through to the holding region's end sets nothing after the region, and the region's
+    // wrapper declares no flag of that name either: nothing in its text sets it.
     var falls_through: std.ArrayList(u8) = .empty;
     defer falls_through.deinit(allocator);
     try emitLoopBoundaryArmImpl(&falls_through, allocator, &program, &plan, &scopes, boundary, true, "    ", &.{});
-    try std.testing.expectEqualStrings("    local __lifter_escape_2 = false\n" ++ wrapped_side_region, falls_through.items);
+    try std.testing.expectEqualStrings(wrapped_side_region, falls_through.items);
+}
+
+test "a region whose wrapper would only forward a flag is written without it, and a wrapper declares no flag nothing sets" {
+    const allocator = std.testing.allocator;
+    const function_id = ir.FunctionId.fromIndex(0);
+    const header = ir.BlockId.fromIndex(0);
+    const join = ir.BlockId.fromIndex(1);
+    const exit = ir.BlockId.fromIndex(2);
+    const function_blocks = [_]ir.BlockId{ header, join, exit };
+    const blocks = [_]ir.Block{
+        .{ .id = header, .function = function_id, .terminator = .{ .jump = .{ .target = join } } },
+        .{ .id = join, .function = function_id, .terminator = .{ .jump = .{ .target = exit } } },
+        .{ .id = exit, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const functions = [_]ir.Function{.{ .id = function_id, .blocks = &function_blocks, .entry_block = header }};
+    const program: ir.Program = .{
+        .program_id = "forwarding-wrapper",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &.{},
+    };
+    var plan = try EmissionPlan.init(allocator, &program, .standard_luau);
+    defer plan.deinit();
+    var analysis = try cfg.Analysis.init(allocator, &program, functions[0]);
+    defer analysis.deinit();
+    var structured = try structure.Plan.initWithArbitraryFallback(allocator, &analysis);
+    defer structured.deinit();
+    var scopes = try emission_scope.Plan.init(
+        allocator,
+        &program,
+        functions[0],
+        &analysis,
+        &structured,
+        &plan.packs,
+        &plan.dead,
+        &plan.place_writes,
+        &plan.place_reads,
+        &plan.fused_values,
+        &plan.closure_stores,
+    );
+    defer scopes.deinit();
+    const loop: ContinueBinder = .{ .kind = .loop, .header = header, .stop = header };
+    plan.state.continue_binder = &loop;
+    defer plan.state.continue_binder = null;
+
+    // An empty arm that leaves the loop for its exit (an escape projection to a free target): its wrapper's propagation
+    // would only break the loop for that flag, so the arm is written without it and its `break` leaves the loop.
+    var arm = structure.Region{
+        .nodes = &.{},
+        .stop = join,
+        .loop_exit = exit,
+        .continue_target = header,
+        .escape_projection = .{ .target = exit, .edge = null },
+    };
+    try std.testing.expectEqual(@as(usize, 1), try structure.markForwardingRegions(allocator, &program, &arm));
+    try std.testing.expect(arm.forwards_through);
+    var forwarded: std.ArrayList(u8) = .empty;
+    defer forwarded.deinit(allocator);
+    try emitRegion(&forwarded, allocator, &program, &plan, &scopes, &arm, "    ", &.{});
+    try std.testing.expectEqualStrings(
+        "    __lifter_escape_2 = true\n" ++
+            "    do\n" ++
+            "      break\n" ++
+            "    end\n",
+        forwarded.items,
+    );
+    try std.testing.expectEqual(@as(?*const ContinueBinder, &loop), plan.state.continue_binder);
+
+    // Kept, the wrapper declares no flag of its stop: nothing in its text sets it.
+    arm.forwards_through = false;
+    var wrapped: std.ArrayList(u8) = .empty;
+    defer wrapped.deinit(allocator);
+    try emitRegion(&wrapped, allocator, &program, &plan, &scopes, &arm, "    ", &.{});
+    try std.testing.expectEqualStrings(
+        "    repeat\n" ++
+            "      __lifter_escape_2 = true\n" ++
+            "      do\n" ++
+            "        break\n" ++
+            "      end\n" ++
+            "    until true\n" ++
+            "    if __lifter_escape_2 then\n" ++
+            "      break\n" ++
+            "    end\n",
+        wrapped.items,
+    );
+}
+
+test "a region written without its forwarding wrapper writes no statement a break or a continue binds to" {
+    const allocator = std.testing.allocator;
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const header = ir.BlockId.fromIndex(1);
+    const join = ir.BlockId.fromIndex(2);
+    const forwarder = ir.BlockId.fromIndex(3);
+
+    const loop: ContinueBinder = .{ .kind = .loop, .header = header, .stop = header };
+    const forwarded_in_loop: ContinueBinder = .{ .kind = .forwarded, .stop = join, .parent = &loop };
+    const wrapper: ContinueBinder = .{ .kind = .wrapper, .stop = join, .parent = &loop };
+    const forwarded_in_wrapper: ContinueBinder = .{ .kind = .forwarded, .stop = join, .parent = &wrapper };
+    const forwarded_alone: ContinueBinder = .{ .kind = .forwarded, .stop = join };
+    // A continue binds past it: under a loop as under the loop, under a wrapper as under the wrapper, and nowhere when
+    // nothing is around it.
+    try std.testing.expect(continueBindsTo(&forwarded_in_loop, header));
+    try std.testing.expect(!continueBindsTo(&forwarded_in_loop, join));
+    try std.testing.expect(continueBindsTo(&forwarded_in_wrapper, join));
+    try std.testing.expect(!continueBindsTo(&forwarded_in_wrapper, header));
+    try std.testing.expect(!continueBindsTo(&forwarded_alone, header));
+    // A wrapper's outer walk looks past it to the loop: a wrapper that stops at the loop body's stop, a block that
+    // forwards to the header, reaches the loop's next pass.
+    const forwarded_loop: ContinueBinder = .{ .kind = .loop, .header = header, .stop = forwarder };
+    const forwarded_in_forwarded_loop: ContinueBinder = .{ .kind = .forwarded, .stop = join, .parent = &forwarded_loop };
+    const stops_at_forwarder: ContinueBinder = .{ .kind = .wrapper, .stop = forwarder, .parent = &forwarded_in_forwarded_loop };
+    try std.testing.expect(continueBindsTo(&stops_at_forwarder, header));
+    // The stop consumer looks past it as well.
+    try std.testing.expect(writesStopConsumer(&forwarded_in_loop, header));
+    try std.testing.expect(!writesStopConsumer(&forwarded_in_loop, join));
+    try std.testing.expect(writesStopConsumer(&forwarded_in_wrapper, join));
+
+    const function_blocks = [_]ir.BlockId{ entry, header, join, forwarder };
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .jump = .{ .target = header } } },
+        .{ .id = header, .function = function_id, .terminator = .{ .jump = .{ .target = join } } },
+        .{ .id = join, .function = function_id, .terminator = .{ .jump = .{ .target = forwarder } } },
+        .{ .id = forwarder, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const functions = [_]ir.Function{.{ .id = function_id, .blocks = &function_blocks, .entry_block = entry }};
+    const program: ir.Program = .{
+        .program_id = "forwarded-binder",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &.{},
+    };
+    var plan = try EmissionPlan.init(allocator, &program, .standard_luau);
+    defer plan.deinit();
+    defer plan.state.continue_binder = null;
+    var analysis = try cfg.Analysis.init(allocator, &program, functions[0]);
+    defer analysis.deinit();
+    var structured = try structure.Plan.initWithArbitraryFallback(allocator, &analysis);
+    defer structured.deinit();
+    var scopes = try emission_scope.Plan.init(
+        allocator,
+        &program,
+        functions[0],
+        &analysis,
+        &structured,
+        &plan.packs,
+        &plan.dead,
+        &plan.place_writes,
+        &plan.place_reads,
+        &plan.fused_values,
+        &plan.closure_stores,
+    );
+    defer scopes.deinit();
+    const break_lines = "    do\n      break\n    end\n";
+
+    // An empty arm's continue carried by flag takes its `break` under such a region: the `break` leaves the statement
+    // around it. With nothing around it, or under a loop, it is refused as before.
+    var arm_breaks: std.ArrayList(u8) = .empty;
+    defer arm_breaks.deinit(allocator);
+    plan.state.continue_binder = &forwarded_in_loop;
+    try emitEmptyArmFlagBreak(&arm_breaks, allocator, &plan, "    ");
+    try std.testing.expectEqualStrings(break_lines, arm_breaks.items);
+    plan.state.continue_binder = &forwarded_alone;
+    try std.testing.expectError(error.UnsupportedControlFlow, emitEmptyArmFlagBreak(&arm_breaks, allocator, &plan, "    "));
+    plan.state.continue_binder = &loop;
+    try std.testing.expectError(error.UnsupportedControlFlow, emitEmptyArmFlagBreak(&arm_breaks, allocator, &plan, "    "));
+
+    // A flag set that ends such a region takes a `break`; inside a wrapper it falls to `until true`.
+    var set_breaks: std.ArrayList(u8) = .empty;
+    defer set_breaks.deinit(allocator);
+    plan.state.continue_binder = &forwarded_in_wrapper;
+    try emitForwardedSetBreak(&set_breaks, allocator, &plan, "    ");
+    plan.state.continue_binder = &wrapper;
+    try emitForwardedSetBreak(&set_breaks, allocator, &plan, "    ");
+    try std.testing.expectEqualStrings(break_lines, set_breaks.items);
+    plan.state.continue_binder = &forwarded_alone;
+    try std.testing.expectError(error.UnsupportedControlFlow, emitForwardedSetBreak(&set_breaks, allocator, &plan, "    "));
+
+    // An empty loop-boundary body whose continue is carried by flag ends the region that holds it.
+    var empty_body = structure.Region{
+        .nodes = &.{},
+        .stop = entry,
+        .loop_exit = null,
+        .continue_target = entry,
+        .continue_projection = .{ .target = header, .edge = null },
+    };
+    const control: structure.LoopBoundaryControl = .{
+        .block = entry,
+        .body_edge = .{ .target = header },
+        .body_region = &empty_body,
+        .boundary = .{ .exit = .{ .target = entry } },
+        .body_on_true = true,
+    };
+    var forwarded_body: std.ArrayList(u8) = .empty;
+    defer forwarded_body.deinit(allocator);
+    plan.state.continue_binder = &forwarded_in_loop;
+    try emitLoopBoundaryBodyImpl(&forwarded_body, allocator, &program, &plan, &scopes, control, .parent_stop, null, "    ", &.{});
+    try std.testing.expectEqualStrings("    __lifter_escape_1 = true\n" ++ break_lines, forwarded_body.items);
+    var wrapped_body: std.ArrayList(u8) = .empty;
+    defer wrapped_body.deinit(allocator);
+    plan.state.continue_binder = &wrapper;
+    try emitLoopBoundaryBodyImpl(&wrapped_body, allocator, &program, &plan, &scopes, control, .parent_stop, null, "    ", &.{});
+    try std.testing.expectEqualStrings("    __lifter_escape_1 = true\n", wrapped_body.items);
 }
 
 test "a loop that owns its exit declares that exit's flag and counts it in the register budget" {

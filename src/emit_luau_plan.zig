@@ -22,14 +22,16 @@ pub const NativeIterationCompletion = struct {
 /// The innermost Luau loop statement around the text being written, which a lexical `continue` binds to: a
 /// transfer wrapper (`repeat ... until true`), whose end reaches its `stop`; a loop, whose next pass starts at its
 /// `header` (`stop` is its body region's stop: the header, or a block that forwards to it); or a `for` written to
-/// run its body once, which binds no `continue`. `parent` is the statement around it.
+/// run its body once, which binds no `continue`. `parent` is the statement around it. A region written without the
+/// transfer wrapper that would only forward its flags pushes a `forwarded` binder, which writes no statement: a
+/// `continue` or `break` written under it binds to the statement around it.
 pub const ContinueBinder = struct {
     kind: Kind,
     header: ?ir.BlockId = null,
     stop: ?ir.BlockId = null,
     parent: ?*const ContinueBinder = null,
 
-    pub const Kind = enum { wrapper, loop, one_shot };
+    pub const Kind = enum { wrapper, loop, one_shot, forwarded };
 };
 
 pub const EmitState = struct {

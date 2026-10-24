@@ -14,6 +14,10 @@ pub fn regionSideEscapeFallsThrough(region: *const structure.Region) bool {
     return structure.regionSideEscapeFallsThrough(region);
 }
 
+pub fn regionIsWrapped(allocator: std.mem.Allocator, region: *const structure.Region) std.mem.Allocator.Error!bool {
+    return structure.regionIsWrapped(allocator, region);
+}
+
 pub fn regionHasNestedEscapeTo(region: *const structure.Region, target: ir.BlockId) bool {
     return structure.regionHasNestedEscapeTo(region, target);
 }

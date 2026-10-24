@@ -1971,6 +1971,20 @@ pub fn build(b: *std.Build) void {
     conformance_step.dependOn(wrapped_continue_dispatcher);
     conformance_step.dependOn(&wrapped_local_continue_layout.step);
     conformance_step.dependOn(&wrapped_continue_layout.step);
+    // The structured texts of the arms whose regions are wrapped for a free target: no transfer wrapper only forwards
+    // escape flags to the propagation after it, and no wrapper declares a stop flag that nothing sets or reads.
+    const transfer_wrapper_audit = b.addSystemCommand(&.{ luneExe(b), "run" });
+    transfer_wrapper_audit.addFileArg(b.path("luau/transfer_wrapper_audit.luau"));
+    transfer_wrapper_audit.addFileArg(luau_iteration_escape_join_exit_conformance.generated_luau);
+    transfer_wrapper_audit.addFileArg(luau_iteration_header_entry_conformance.generated_luau);
+    transfer_wrapper_audit.addFileArg(luau_iteration_continue_completion_conformance.generated_luau);
+    transfer_wrapper_audit.addFileArg(luau_iteration_boundary_body_continue_conformance.generated_luau);
+    transfer_wrapper_audit.addFileArg(source_frontend_wrapped_local_continue_conformance.generated_luau);
+    transfer_wrapper_audit.addFileArg(luau_wrapped_continue_conformance.generated_luau);
+    transfer_wrapper_audit.addFileArg(luau_loop_owned_exit_flag_conformance.generated_luau);
+    transfer_wrapper_audit.addFileArg(luau_iteration_header_forwarder_conformance.generated_luau);
+    transfer_wrapper_audit.addFileArg(source_frontend_always_break_transfer_iteration_conformance.generated_luau);
+    conformance_step.dependOn(&transfer_wrapper_audit.step);
     luau_loop_owned_exit_flag_conformance.addTo(conformance_step);
     conformance_step.dependOn(loop_owned_exit_flag_dispatcher);
     source_frontend_loop_exit_flag_reentry_conformance.addTo(conformance_step);
