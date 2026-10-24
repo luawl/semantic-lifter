@@ -104,3 +104,59 @@ end
 
 local markedAccepted = pcall(AstAdmission.decodeManifestBytes, '{"literal": {"number": "#7"}}', decodeJson)
 assert(not markedAccepted, "a manifest number given as a string beginning with # was read as a number")
+
+-- A number literal that overflows a double, which Luau reads as math.huge, reaches luau-ast's output as the bare token
+-- Infinity, which is not JSON; a negative one is a unary minus over such a literal. These are luau-ast's documents for
+-- return 1e999, for local x = -1e999 return x, for a return of 2 followed by 308 zeros and for a return of the largest
+-- finite double. Each literal is admitted and decodes to the double tonumber reads from its source text, the negated
+-- one under its unary minus, and the largest finite literal stays finite.
+local function decodeOverflowingLiteral(document: string, source: string): any
+	local admitted, decoded = pcall(AstAdmission.decodeParserBytes, document, source, decodeJson)
+	assert(admitted, `the number literal of {source} was not admitted: {decoded}`)
+	return decoded
+end
+
+local function assertLiteralBits(value: number, text: string)
+	local expected = bits(tonumber(text) :: number)
+	assert(bits(value) == expected, `the number literal {text} decoded to {bits(value)}, not {expected}`)
+end
+
+local returned = decodeOverflowingLiteral(
+	'{"root":{"type":"AstStatBlock","location":"0,0 - 1,0","hasEnd":true,"body":[{"type":"AstStatReturn",'
+		.. '"location":"0,0 - 0,12","list":[{"type":"AstExprConstantNumber","location":"0,7 - 0,12","value":Infinity}]}]},'
+		.. '"commentLocations":[]}',
+	"return 1e999"
+)
+assertLiteralBits(returned.root.body[1].list[1].value, "1e999")
+
+local negated = decodeOverflowingLiteral(
+	'{"root":{"type":"AstStatBlock","location":"0,0 - 1,0","hasEnd":true,"body":[{"type":"AstStatLocal",'
+		.. '"location":"0,0 - 0,16","vars":[{"luauType":null,"name":"x","isConst":false,"type":"AstLocal",'
+		.. '"location":"0,6 - 0,7"}],"values":[{"type":"AstExprUnary","location":"0,10 - 0,16","op":"Minus",'
+		.. '"expr":{"type":"AstExprConstantNumber","location":"0,11 - 0,16","value":Infinity}}]},{"type":"AstStatReturn",'
+		.. '"location":"0,17 - 0,25","list":[{"type":"AstExprLocal","location":"0,24 - 0,25","local":{"luauType":null,'
+		.. '"name":"x","isConst":false,"type":"AstLocal","location":"0,6 - 0,7"}}]}]},"commentLocations":[]}',
+	"local x = -1e999 return x"
+)
+local negation = negated.root.body[1].values[1]
+assert(negation.type == "AstExprUnary" and negation.op == "Minus", "the negated number literal is not a unary minus")
+assertLiteralBits(-negation.expr.value, "-1e999")
+
+local overflowingInteger = "2" .. string.rep("0", 308)
+local integer = decodeOverflowingLiteral(
+	'{"root":{"type":"AstStatBlock","location":"0,0 - 1,0","hasEnd":true,"body":[{"type":"AstStatReturn",'
+		.. '"location":"0,0 - 0,316","list":[{"type":"AstExprConstantNumber","location":"0,7 - 0,316","value":Infinity}]}]},'
+		.. '"commentLocations":[]}',
+	"a return of 2 followed by 308 zeros"
+)
+assertLiteralBits(integer.root.body[1].list[1].value, overflowingInteger)
+
+local largest = decodeOverflowingLiteral(
+	'{"root":{"type":"AstStatBlock","location":"0,0 - 1,0","hasEnd":true,"body":[{"type":"AstStatReturn",'
+		.. '"location":"0,0 - 0,29","list":[{"type":"AstExprConstantNumber","location":"0,7 - 0,29",'
+		.. '"value":1.7976931348623157e+308}]}]},"commentLocations":[]}',
+	"return 1.7976931348623157e308"
+)
+local largestValue = largest.root.body[1].list[1].value
+assertLiteralBits(largestValue, "1.7976931348623157e308")
+assert(largestValue < math.huge, "the largest finite number literal decoded as infinity")

@@ -96,6 +96,10 @@ local signedBytePrefix = string.char(0xef, 0xbf, 0xbf) .. "ff"
 -- one or two units in the last place away, so each one crosses the decoder as the JSON string "#<text>" and is read
 -- back with tonumber, which rounds correctly.
 local parserNumberLiteral = '("type":"AstExprConstantNumber","location":"[^"]*","value":)(%d[%d%.eE+%-]*)'
+-- luau-ast writes a number literal that overflows a double, such as 1e999, which Luau reads as math.huge, as the bare
+-- token Infinity, which is not JSON. Such a value crosses the decoder as the marked decimal text 1e999, which tonumber
+-- reads back as math.huge; the pattern for the token runs only on a document that holds the token.
+local parserInfiniteLiteral = '("type":"AstExprConstantNumber","location":"[^"]*","value":)Infinity}'
 local manifestNumberField = '("number"%s*:%s*)(%-?%d[%d%.eE+%-]*)'
 
 local function markedNumber(text: string, label: string): number
@@ -151,7 +155,11 @@ end
 
 function AstAdmission.decodeParserBytes(value: any, label: string, decode: (string) -> any): any
 	local bytes = AstAdmission.expectParserBytes(value, label)
-	return recoverParserStrings(decode((string.gsub(bytes, parserNumberLiteral, '%1"#%2"'))))
+	local marked = string.gsub(bytes, parserNumberLiteral, '%1"#%2"')
+	if string.find(marked, '"value":Infinity}', 1, true) ~= nil then
+		marked = string.gsub(marked, parserInfiniteLiteral, '%1"#1e999"}')
+	end
+	return recoverParserStrings(decode(marked))
 end
 
 -- A recovery manifest names the number of a literal key in a field named number, its only field of that name; the
