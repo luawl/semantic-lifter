@@ -143,7 +143,7 @@ pub fn preserveAdmittedWithExactControlAlloc(
         var normalized_any = false;
         for (affected_functions, 0..) |affected, function_index| {
             if (!affected) continue;
-            const normalized = try irreducible_normalize.normalizeFunctionWithScratchInArena(
+            const normalized = try irreducible_normalize.normalizeAdmittedFunctionWithScratchInArena(
                 allocator,
                 backing_allocator,
                 &current,
@@ -691,7 +691,7 @@ fn resolveAdmittedAlloc(
         current.edge_rewrites = rewrites.items;
         const blocks_before_final = current.blocks.len;
         const rewrites_before_final = current.edge_rewrites.len;
-        const final_normalized = try irreducible_normalize.normalizeWithScratchInArena(
+        const final_normalized = try irreducible_normalize.normalizeAdmittedWithScratchInArena(
             allocator,
             backing_allocator,
             &current,

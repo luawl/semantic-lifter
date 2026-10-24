@@ -1221,6 +1221,27 @@ elseif caseName == "irreducible-iteration-convergence" then
 	end
 	runGeneric(false)
 	runGeneric(true)
+elseif
+	caseName == "source-frontend-feedback-decline-iteration-join"
+	or caseName == "source-frontend-feedback-decline-iteration-join-direct-locals"
+then
+	-- A numeric for loop whose if leaves the loop into two never-ending branches when i equals a or b. Only inputs
+	-- that return are called: no i in 1..n equals a or b, so the loop adds 1..n.
+	local calls = { { 6, 100, 200, 21 }, { 3, 0, 0, 6 }, { 1, 7, 9, 1 }, { 0, 1, 2, 0 }, { 5, 6, 7, 15 }, { 4, -1, 5, 10 } }
+	for _, call in calls do
+		assert(
+			exported(call[1], call[2], call[3]) == call[4],
+			`the loop with two never-ending branches returned the wrong sum for n = {call[1]}`
+		)
+	end
+elseif
+	caseName == "source-frontend-feedback-decline-iteration-join-min"
+	or caseName == "source-frontend-feedback-decline-iteration-join-min-direct-locals"
+then
+	-- The smaller program returns 0 when neither branch is taken or when the loop does not run.
+	assert(exported(3, false, false) == 0, "the loop with both branches off changed its result")
+	assert(exported(0, true, true) == 0, "the loop entered a branch with no iteration")
+	assert(exported(5, nil, nil) == 0, "the loop with nil branch values changed its result")
 elseif SourceRuntimeOracle.run(caseName, source, exported) then
 	-- Checked by the focused source-runtime oracle.
 else

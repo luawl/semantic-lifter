@@ -1695,6 +1695,58 @@ pub fn build(b: *std.Build) void {
     nested_reresolve_audit.addFileArg(nested_reresolve_third_ir);
     nested_reresolve_audit.addFileArg(nested_reresolve_renormalized_ir);
     const conformance_step = b.step("conformance", "Validate, emit, and compile Zig- and Luau-built generic fixtures");
+    // Author-written IR fixtures in which the structure feedback
+    // cannot make function 0 plannable. emit-luau declines that function, writes it flat and emits on both targets;
+    // the control, whose functions all plan, keeps an empty stderr. resolve-ir and the decline audit pin the
+    // per-function scope on the published IR.
+    const feedback_decline_fixtures = [_]struct { path: []const u8, name: []const u8, stderr_match: ?[]const u8 }{
+        .{ .path = "luau/fixtures/feedback_decline_or_arm_place.lifter-ir.json", .name = "feedback-decline-or-arm-place", .stderr_match = "normalize decline phase=feedback-unsplittable-collision function=0 " },
+        .{ .path = "luau/fixtures/feedback_decline_exitless_place.lifter-ir.json", .name = "feedback-decline-exitless-place", .stderr_match = "normalize decline phase=feedback-unsplittable-collision function=0 " },
+        .{ .path = "luau/fixtures/feedback_decline_exitless_local.lifter-ir.json", .name = "feedback-decline-exitless-local", .stderr_match = "normalize decline phase=feedback-clone-limit function=0 " },
+        .{ .path = "luau/fixtures/feedback_decline_worker_place.lifter-ir.json", .name = "feedback-decline-worker-place", .stderr_match = "normalize decline phase=feedback-unsplittable-collision function=0 " },
+        .{ .path = "luau/fixtures/feedback_decline_worker_local.lifter-ir.json", .name = "feedback-decline-worker-local", .stderr_match = "normalize decline phase=feedback-clone-limit function=0 " },
+        .{ .path = "luau/fixtures/feedback_decline_worker_ok.lifter-ir.json", .name = "feedback-decline-worker-ok", .stderr_match = null },
+    };
+    for (feedback_decline_fixtures) |fixture| {
+        addFeedbackDeclineConformance(b, exe, z3_enabled, z3_bin, trace_normalize_phases, conformance_step, b.path(fixture.path), fixture.name, "standard-luau", fixture.stderr_match);
+        addFeedbackDeclineConformance(b, exe, z3_enabled, z3_bin, trace_normalize_phases, conformance_step, b.path(fixture.path), b.fmt("{s}-direct-locals", .{fixture.name}), "direct-locals-luau", fixture.stderr_match);
+    }
+    const feedback_decline_control_ir = addFeedbackDeclineResolve(b, exe, z3_enabled, z3_bin, "luau/fixtures/feedback_decline_worker_ok.lifter-ir.json", "feedback-decline-worker-ok");
+    const feedback_decline_audited = [_]struct { path: []const u8, name: []const u8 }{
+        .{ .path = "luau/fixtures/feedback_decline_worker_place.lifter-ir.json", .name = "feedback-decline-worker-place" },
+        .{ .path = "luau/fixtures/feedback_decline_worker_local.lifter-ir.json", .name = "feedback-decline-worker-local" },
+        .{ .path = "luau/fixtures/feedback_decline_worker_ok.lifter-ir.json", .name = "feedback-decline-worker-ok" },
+    };
+    for (feedback_decline_audited) |fixture| {
+        const resolved_ir = if (std.mem.eql(u8, fixture.name, "feedback-decline-worker-ok"))
+            feedback_decline_control_ir
+        else
+            addFeedbackDeclineResolve(b, exe, z3_enabled, z3_bin, fixture.path, fixture.name);
+        const decline_audit = b.addSystemCommand(&.{ luneExe(b), "run" });
+        decline_audit.addFileArg(b.path("luau/feedback_decline_audit.luau"));
+        decline_audit.addArg(fixture.name);
+        decline_audit.addFileArg(b.path(fixture.path));
+        decline_audit.addFileArg(resolved_ir);
+        decline_audit.addFileArg(feedback_decline_control_ir);
+        conformance_step.dependOn(&decline_audit.step);
+    }
+    // Author-written source programs: a numeric for loop whose if leaves the loop into two never-ending branches, one
+    // of them holding its own inner for loop. The structure feedback finds no alternative split for the loop's
+    // function, so emit-luau declines it and writes it flat. Each program lifts, resolves, validates, emits and runs on
+    // both targets (the runtime oracle calls only inputs that return), and emit-luau on the lifted IR prints the
+    // decline line.
+    const feedback_decline_sources = [_]struct { path: []const u8, name: []const u8 }{
+        .{ .path = "luau/fixtures/feedback_decline_iteration_join_source.luau", .name = "feedback-decline-iteration-join" },
+        .{ .path = "luau/fixtures/feedback_decline_iteration_join_min_source.luau", .name = "feedback-decline-iteration-join-min" },
+    };
+    for (feedback_decline_sources) |fixture| {
+        const standard = addLuauSourceConformanceForTarget(b, exe, z3_enabled, z3_bin, fixture.path, b.fmt("source-frontend-{s}", .{fixture.name}), "standard-luau");
+        standard.addTo(conformance_step);
+        addFeedbackDeclineConformance(b, exe, z3_enabled, z3_bin, trace_normalize_phases, conformance_step, standard.input_ir, fixture.name, "standard-luau", "normalize decline phase=feedback-no-alternative function=1 ");
+        const direct = addLuauSourceConformanceForTarget(b, exe, z3_enabled, z3_bin, fixture.path, b.fmt("source-frontend-{s}-direct-locals", .{fixture.name}), "direct-locals-luau");
+        direct.addTo(conformance_step);
+        addFeedbackDeclineConformance(b, exe, z3_enabled, z3_bin, trace_normalize_phases, conformance_step, direct.input_ir, b.fmt("{s}-direct-locals", .{fixture.name}), "direct-locals-luau", "normalize decline phase=feedback-no-alternative function=1 ");
+    }
     conformance_step.dependOn(&register_budget_oracle.step);
     dispatcher_local_budget_conformance.addTo(conformance_step);
     dispatcher_generic_budget_conformance.addTo(conformance_step);
@@ -3221,6 +3273,55 @@ fn addLuauSourceConformanceForTarget(
         .resolved_ir = resolved_json,
         .generated_luau = emitted_luau,
     };
+}
+
+// emit-luau on an author-written IR, a fixture or a lifted source, for a named target.
+// The checked emission compiles the output, so exit 0 means it emits and compiles. A declining fixture prints its
+// decline line (once per resolve pass); the control, whose functions all plan, keeps an empty stderr.
+fn addFeedbackDeclineConformance(
+    b: *std.Build,
+    exe: *std.Build.Step.Compile,
+    z3_enabled: bool,
+    z3_bin: []const u8,
+    trace_normalize_phases: bool,
+    conformance_step: *std.Build.Step,
+    fixture_ir: std.Build.LazyPath,
+    fixture_name: []const u8,
+    target_name: []const u8,
+    stderr_match: ?[]const u8,
+) void {
+    const emit_command = b.addRunArtifact(exe);
+    if (z3_enabled) emit_command.addPathDir(b.pathFromRoot(z3_bin));
+    emit_command.addArg("emit-luau");
+    emit_command.addFileArg(fixture_ir);
+    _ = emit_command.addOutputFileArg(b.fmt("{s}.generated.luau", .{fixture_name}));
+    emit_command.addArg(target_name);
+    emit_command.addFileArg(.{ .cwd_relative = luauCompileExe(b) });
+    if (stderr_match) |line| {
+        emit_command.expectStdErrMatch(line);
+    } else if (!trace_normalize_phases) {
+        emit_command.expectStdErrEqual("");
+    }
+    emit_command.expectExitCode(0);
+    conformance_step.dependOn(&emit_command.step);
+}
+
+// resolve-ir on an author-written IR fixture; the resolved IR is the decline audit's input.
+fn addFeedbackDeclineResolve(
+    b: *std.Build,
+    exe: *std.Build.Step.Compile,
+    z3_enabled: bool,
+    z3_bin: []const u8,
+    fixture_path: []const u8,
+    fixture_name: []const u8,
+) std.Build.LazyPath {
+    const resolve_command = b.addRunArtifact(exe);
+    if (z3_enabled) resolve_command.addPathDir(b.pathFromRoot(z3_bin));
+    resolve_command.addArg("resolve-ir");
+    resolve_command.addFileArg(b.path(fixture_path));
+    const resolved_json = resolve_command.addOutputFileArg(b.fmt("{s}.resolved.lifter-ir.json", .{fixture_name}));
+    resolve_command.addArg(if (z3_enabled) "z3" else "internal");
+    return resolved_json;
 }
 
 fn addSerializedCompileConformanceWithEngine(

@@ -25,6 +25,13 @@ pub const NormalizeOptions = struct {
     // resumed pass must not pay for those already-proven scans again.
     skip_initial_phases: bool = false,
     initial_resume_seed: ?ResumeSeed = null,
+    // Admitted resolution sets this. A function the
+    // structure feedback cannot make plannable (an unsplittable collision, splits past
+    // the clone budget, a deferred search past its rejected-edge budget, or a retried
+    // collision with no alternative split) is restored to its feedback-start state and
+    // left to the emitter's per-function arbitrary-CFG fallback, and the feedback reruns
+    // without it. normalize-ir keeps the failure.
+    decline_unsplittable_functions: bool = false,
 };
 
 const trace_normalize_phases = build_options.trace_normalize_phases;
@@ -1067,6 +1074,23 @@ pub fn normalizeFunctionWithScratchInArena(
     return normalizeImpl(allocator, scratch_allocator, source, true, function_index, .{});
 }
 
+pub fn normalizeAdmittedWithScratchInArena(
+    allocator: std.mem.Allocator,
+    scratch_allocator: std.mem.Allocator,
+    source: *const ir.Program,
+) NormalizeError!Result {
+    return normalizeImpl(allocator, scratch_allocator, source, true, null, .{ .decline_unsplittable_functions = true });
+}
+
+pub fn normalizeAdmittedFunctionWithScratchInArena(
+    allocator: std.mem.Allocator,
+    scratch_allocator: std.mem.Allocator,
+    source: *const ir.Program,
+    function_index: usize,
+) NormalizeError!Result {
+    return normalizeImpl(allocator, scratch_allocator, source, true, function_index, .{ .decline_unsplittable_functions = true });
+}
+
 pub fn normalizeFunctionWithScratchInArenaBudget(
     allocator: std.mem.Allocator,
     scratch_allocator: std.mem.Allocator,
@@ -1131,15 +1155,28 @@ pub fn normalizeControlWithScratchInArena(
     return normalizeImpl(allocator, scratch_allocator, source, false, null, .{});
 }
 
-// Remove only semantically transparent forwarding blocks before control
-// restructuring.  Keep the blocks and record each edge substitution so the
-// admitted history remains replayable and auditable.
+// The collapse with no declined function. The Phase 0 collapse and the collapse tests
+// call it; the feedback's post-split collapse calls collapseTransparentForwardingBlocksExcept with the declined set.
 fn collapseTransparentForwardingBlocks(
     allocator: std.mem.Allocator,
     program: *ir.Program,
     blocks: *std.ArrayList(ir.Block),
     rewrites: *std.ArrayList(ir.CfgEdgeRewrite),
     only_function: ?usize,
+) NormalizeError!usize {
+    return collapseTransparentForwardingBlocksExcept(allocator, program, blocks, rewrites, only_function, null);
+}
+
+// Remove only semantically transparent forwarding blocks before control
+// restructuring.  Keep the blocks and record each edge substitution so the
+// admitted history remains replayable and auditable.
+fn collapseTransparentForwardingBlocksExcept(
+    allocator: std.mem.Allocator,
+    program: *ir.Program,
+    blocks: *std.ArrayList(ir.Block),
+    rewrites: *std.ArrayList(ir.CfgEdgeRewrite),
+    only_function: ?usize,
+    declined: ?[]const bool,
 ) NormalizeError!usize {
     const selected_function = if (only_function) |function_index|
         if (function_index < program.functions.len) program.functions[function_index].id else return 0
@@ -1157,6 +1194,8 @@ fn collapseTransparentForwardingBlocks(
         @memset(reachable, false);
         for (program.functions, 0..) |function, function_index| {
             if (only_function) |selected_index| if (function_index != selected_index) continue;
+            // A declined function keeps its feedback-start blocks: none is marked reachable, so none is collapsed or retargeted.
+            if (declined) |set| if (set[function_index]) continue;
             var analysis = cfg.Analysis.init(allocator, program, function) catch |err| switch (err) {
                 error.InvalidCfg => continue,
                 error.OutOfMemory => return error.OutOfMemory,
@@ -1566,6 +1605,88 @@ fn compoundShortCircuitSplitAlloc(
     };
 }
 
+// The per-function decline of admitted resolution
+// (NormalizeOptions.decline_unsplittable_functions). The structure feedback writes
+// only block terminators and function block lists in place and only appends to the
+// other lists, the fact applyPlan's rollback rests on, so copies of the blocks and
+// functions, four lengths, the result and the structural clone count taken at the
+// feedback start restore it.
+const FeedbackDecline = struct {
+    declined: []bool,
+    unsplittable: []bool,
+    start_blocks: []ir.Block,
+    start_functions: []ir.Function,
+    start_instruction_count: usize,
+    start_value_count: usize,
+    start_pack_count: usize,
+    start_rewrite_count: usize,
+    start_result: Result,
+    start_structural_cloned_blocks: usize,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        blocks: []const ir.Block,
+        functions: []const ir.Function,
+        instruction_count: usize,
+        value_count: usize,
+        pack_count: usize,
+        rewrite_count: usize,
+        result: Result,
+        structural_cloned_blocks: usize,
+    ) std.mem.Allocator.Error!FeedbackDecline {
+        const declined = try allocator.alloc(bool, functions.len);
+        errdefer allocator.free(declined);
+        @memset(declined, false);
+        const unsplittable = try allocator.alloc(bool, functions.len);
+        errdefer allocator.free(unsplittable);
+        @memset(unsplittable, false);
+        const start_blocks = try allocator.dupe(ir.Block, blocks);
+        errdefer allocator.free(start_blocks);
+        const start_functions = try allocator.dupe(ir.Function, functions);
+        return .{
+            .declined = declined,
+            .unsplittable = unsplittable,
+            .start_blocks = start_blocks,
+            .start_functions = start_functions,
+            .start_instruction_count = instruction_count,
+            .start_value_count = value_count,
+            .start_pack_count = pack_count,
+            .start_rewrite_count = rewrite_count,
+            .start_result = result,
+            .start_structural_cloned_blocks = structural_cloned_blocks,
+        };
+    }
+
+    fn deinit(self: FeedbackDecline, allocator: std.mem.Allocator) void {
+        allocator.free(self.declined);
+        allocator.free(self.unsplittable);
+        allocator.free(self.start_blocks);
+        allocator.free(self.start_functions);
+    }
+
+    fn restore(
+        self: FeedbackDecline,
+        blocks: *std.ArrayList(ir.Block),
+        functions: *std.ArrayList(ir.Function),
+        instructions: *std.ArrayList(ir.Instruction),
+        values: *std.ArrayList(ir.Value),
+        packs: *std.ArrayList(ir.ValuePack),
+        rewrites: *std.ArrayList(ir.CfgEdgeRewrite),
+        result: *Result,
+        structural_cloned_blocks: *usize,
+    ) void {
+        blocks.shrinkRetainingCapacity(self.start_blocks.len);
+        @memcpy(blocks.items, self.start_blocks);
+        @memcpy(functions.items, self.start_functions);
+        instructions.shrinkRetainingCapacity(self.start_instruction_count);
+        values.shrinkRetainingCapacity(self.start_value_count);
+        packs.shrinkRetainingCapacity(self.start_pack_count);
+        rewrites.shrinkRetainingCapacity(self.start_rewrite_count);
+        result.* = self.start_result;
+        structural_cloned_blocks.* = self.start_structural_cloned_blocks;
+    }
+};
+
 fn normalizeImpl(
     allocator: std.mem.Allocator,
     scratch_allocator: std.mem.Allocator,
@@ -1756,9 +1877,28 @@ fn normalizeImpl(
         var feedback_arena = std.heap.ArenaAllocator.init(scratch_allocator);
         defer feedback_arena.deinit();
         const feedback_allocator = feedback_arena.allocator();
+        // With the option, a function the feedback cannot
+        // make plannable is declined (restored and then skipped) and the feedback restarts.
+        const decline: ?FeedbackDecline = if (options.decline_unsplittable_functions)
+            try FeedbackDecline.init(
+                scratch_allocator,
+                blocks.items,
+                functions.items,
+                instructions.items.len,
+                values.items.len,
+                packs.items.len,
+                rewrites.items.len,
+                result,
+                structural_cloned_blocks,
+            )
+        else
+            null;
+        defer if (decline) |state| state.deinit(scratch_allocator);
+        var restart_feedback = false;
         iteration = 0;
         const feedback_iteration_limit = options.feedback_iteration_limit orelse iteration_limit;
-        while (iteration < feedback_iteration_limit) : (iteration += 1) {
+        while (iteration < feedback_iteration_limit) : (iteration = if (restart_feedback) 0 else iteration + 1) {
+            restart_feedback = false;
             // A failed structure probe owns substantial temporary CFG and
             // replay state. Reclaim it at the iteration boundary instead of
             // retaining every failed plan until the whole function exits.
@@ -1775,6 +1915,7 @@ fn normalizeImpl(
             var selected_context: ?structure.CollisionContext = null;
             var unvisited_plan: ?SplitPlan = null;
             var found_collision = false;
+            if (decline) |state| @memset(state.unsplittable, false);
             var seeded_fallback = false;
 
             // A targeted feedback iteration does not mutate the program
@@ -1982,6 +2123,7 @@ fn normalizeImpl(
             if (selected == null) {
                 for (result.program.functions, 0..) |function, function_index| {
                     if (only_function) |selected_function| if (function_index != selected_function) continue;
+                    if (decline) |state| if (state.declined[function_index]) continue;
                     const graph_start = normalizePhaseNow();
                     var graph = cfg.Analysis.init(feedback_allocator, &result.program, function) catch |err| switch (err) {
                         error.InvalidCfg => continue,
@@ -2091,6 +2233,7 @@ fn normalizeImpl(
                             }
                             if (!collisionCanSplit(obstruction.reason)) continue;
                             found_collision = true;
+                            if (decline) |state| state.unsplittable[function_index] = true;
                             if (obstruction.owner_context) |owner| {
                                 traceNormalize("feedback_collision_owner_context start={} stop={?} loop_exit={?} continue_target={?} parameter_arguments={any}\n", .{
                                     owner.start.index(),
@@ -2362,12 +2505,29 @@ fn normalizeImpl(
             }
             var overlap = if (selected) |value| value else {
                 if (found_collision) {
+                    if (decline) |state| {
+                        var declined_now: usize = 0;
+                        for (state.unsplittable, 0..) |is_unsplittable, declined_index| {
+                            if (!is_unsplittable or state.declined[declined_index]) continue;
+                            state.declined[declined_index] = true;
+                            declined_now += 1;
+                            std.debug.print("normalize decline phase=feedback-unsplittable-collision function={} iteration={} blocks={} structural_clones={} rewrites={} arms={}\n", .{ declined_index, iteration, blocks.items.len, structural_cloned_blocks, rewrites.items.len, collision_arms.items.len });
+                        }
+                        if (declined_now != 0) {
+                            state.restore(&blocks, &functions, &instructions, &values, &packs, &rewrites, &result, &structural_cloned_blocks);
+                            collision_arms.clearRetainingCapacity();
+                            collision_seed = if (options.initial_resume_seed) |seed| collisionSeedFromResumeSeed(seed) else null;
+                            restart_feedback = true;
+                            continue;
+                        }
+                    }
                     std.debug.print("normalize failure phase=feedback-unsplittable-collision iteration={} blocks={} structural_clones={} rewrites={} arms={}\n", .{ iteration, blocks.items.len, structural_cloned_blocks, rewrites.items.len, collision_arms.items.len });
                     return error.NormalizationInvariantFailed;
                 }
                 break;
             };
             defer overlap.deinit();
+            const collision_function_index = overlap.function_index;
             traceNormalize("feedback_selected function={} entry={} branch={} join={} closure={any} incoming={any}\n", .{
                 overlap.function_index,
                 overlap.entry.index(),
@@ -2550,6 +2710,7 @@ fn normalizeImpl(
                 var alternative_context = selected_context;
                 var alternative_seedable = true;
                 var authenticated_boundary_alternative = false;
+                var deferred_exhausted = false;
                 if (alternative == null) {
                     if (try findPredecessorCollisionSplitAllocWithAnalysisAndReplayContext(
                         feedback_allocator,
@@ -2746,6 +2907,8 @@ fn normalizeImpl(
                         collision_arms.items,
                         only_function,
                         collision_projection_context,
+                        if (decline) |state| state.declined else null,
+                        if (decline != null) &deferred_exhausted else null,
                     )) |deferred_alternative| {
                         alternative = try freshCollisionAlternativeWithAnalysis(
                             &result.program,
@@ -2774,8 +2937,32 @@ fn normalizeImpl(
                         }
                     }
                 }
+                if (deferred_exhausted) {
+                    if (decline) |state| {
+                        if (!state.declined[collision_function_index]) {
+                            state.declined[collision_function_index] = true;
+                            std.debug.print("normalize decline phase=feedback-deferred-rejected-edges function={} iteration={} blocks={} structural_clones={} rewrites={} arms={}\n", .{ collision_function_index, iteration, blocks.items.len, structural_cloned_blocks, rewrites.items.len, collision_arms.items.len });
+                            state.restore(&blocks, &functions, &instructions, &values, &packs, &rewrites, &result, &structural_cloned_blocks);
+                            collision_arms.clearRetainingCapacity();
+                            collision_seed = if (options.initial_resume_seed) |seed| collisionSeedFromResumeSeed(seed) else null;
+                            restart_feedback = true;
+                            continue;
+                        }
+                    }
+                }
                 collision_seedable = alternative_seedable;
                 const chosen_alternative = alternative orelse {
+                    if (decline) |state| {
+                        if (!state.declined[collision_function_index]) {
+                            state.declined[collision_function_index] = true;
+                            std.debug.print("normalize decline phase=feedback-no-alternative function={} iteration={} source={} target={} blocks={} structural_clones={} rewrites={} arms={}\n", .{ collision_function_index, iteration, collision_arm.source.index(), collision_arm.target.index(), blocks.items.len, structural_cloned_blocks, rewrites.items.len, collision_arms.items.len });
+                            state.restore(&blocks, &functions, &instructions, &values, &packs, &rewrites, &result, &structural_cloned_blocks);
+                            collision_arms.clearRetainingCapacity();
+                            collision_seed = if (options.initial_resume_seed) |seed| collisionSeedFromResumeSeed(seed) else null;
+                            restart_feedback = true;
+                            continue;
+                        }
+                    }
                     std.debug.print("normalize failure phase=feedback-no-alternative iteration={} source={} target={} blocks={} structural_clones={} rewrites={} arms={}\n", .{ iteration, collision_arm.source.index(), collision_arm.target.index(), blocks.items.len, structural_cloned_blocks, rewrites.items.len, collision_arms.items.len });
                     if (stage_trace.enabled) {
                         if (previous_collision_arm) |owner_arm| {
@@ -2936,6 +3123,17 @@ fn normalizeImpl(
             structural_cloned_blocks = std.math.add(usize, structural_cloned_blocks, overlap.closure.len) catch
                 return error.NormalizationInvariantFailed;
             if (structural_cloned_blocks > structural_clone_limit) {
+                if (decline) |state| {
+                    if (!state.declined[collision_function_index]) {
+                        state.declined[collision_function_index] = true;
+                        std.debug.print("normalize decline phase=feedback-clone-limit function={} iteration={} blocks={} structural_clones={} limit={} rewrites={} arms={}\n", .{ collision_function_index, iteration, blocks.items.len, structural_cloned_blocks, structural_clone_limit, rewrites.items.len, collision_arms.items.len });
+                        state.restore(&blocks, &functions, &instructions, &values, &packs, &rewrites, &result, &structural_cloned_blocks);
+                        collision_arms.clearRetainingCapacity();
+                        collision_seed = if (options.initial_resume_seed) |seed| collisionSeedFromResumeSeed(seed) else null;
+                        restart_feedback = true;
+                        continue;
+                    }
+                }
                 std.debug.print("normalize failure phase=feedback-clone-limit iteration={} blocks={} structural_clones={} limit={} rewrites={} arms={}\n", .{ iteration, blocks.items.len, structural_cloned_blocks, structural_clone_limit, rewrites.items.len, collision_arms.items.len });
                 return error.NormalizationInvariantFailed;
             }
@@ -2977,12 +3175,13 @@ fn normalizeImpl(
                 blocks.items.len,
                 rewrites.items.len,
             });
-            const forwarded = try collapseTransparentForwardingBlocks(
+            const forwarded = try collapseTransparentForwardingBlocksExcept(
                 allocator,
                 &result.program,
                 &blocks,
                 &rewrites,
                 only_function,
+                if (decline) |state| state.declined else null,
             );
             if (forwarded != 0) traceNormalize("normalize_phase transparent_forwarding_after_apply iteration={} blocks={} rewrites={} collapsed={}\\n", .{
                 iteration,
@@ -9889,6 +10088,8 @@ fn findDeferredCollisionSplitAlloc(
     prior_arms: []const CollisionArm,
     only_function: ?usize,
     projection_context: *structural_overlap.ReplayProjectionContext,
+    declined: ?[]const bool,
+    exhausted: ?*bool,
 ) NormalizeError!?DeferredCollisionAlternative {
     if (deferred.source.index() >= program.blocks.len) return null;
     const blocks = try allocator.dupe(ir.Block, program.blocks);
@@ -9899,6 +10100,7 @@ fn findDeferredCollisionSplitAlloc(
     planning.blocks = blocks;
     for (planning.functions, 0..) |function, function_index| {
         if (only_function) |selected_function| if (function_index != selected_function) continue;
+        if (declined) |set| if (set[function_index]) continue;
         var rejected_edges: usize = 0;
         while (true) {
             var graph = cfg.Analysis.init(allocator, &planning, function) catch |err| switch (err) {
@@ -9975,6 +10177,10 @@ fn findDeferredCollisionSplitAlloc(
                     if (!maskPlanningArm(blocks, rejected)) break;
                     rejected_edges += 1;
                     if (rejected_edges > function.blocks.len * 2 + 1) {
+                        if (exhausted) |flag| {
+                            flag.* = true;
+                            return null;
+                        }
                         return error.NormalizationInvariantFailed;
                     }
                 },
@@ -12200,4 +12406,446 @@ test "mixed region plan retains only eligible secondary entries" {
     defer plan.deinit();
     try std.testing.expectEqual(@as(usize, 1), plan.secondary_count);
     try std.testing.expectEqual(eligible, plan.secondaries[0].block);
+}
+
+const DeclineTestPlace = enum { instruction, local };
+const DeclineTestSecond = enum { none, worker, or_arm };
+
+fn declineTestProgram(allocator: std.mem.Allocator, place: DeclineTestPlace, b4_returns: bool, second: DeclineTestSecond) std.mem.Allocator.Error!ir.Program {
+    const f0 = ir.FunctionId.fromIndex(0);
+    const f1 = ir.FunctionId.fromIndex(1);
+    const ev_refs = try allocator.dupe(ir.EvidenceId, &.{ir.EvidenceId.fromIndex(0)});
+
+    var values = @as(std.ArrayList(ir.Value), .empty);
+    var instructions = @as(std.ArrayList(ir.Instruction), .empty);
+    var blocks = @as(std.ArrayList(ir.Block), .empty);
+    var places = @as(std.ArrayList(ir.Place), .empty);
+    var functions = @as(std.ArrayList(ir.Function), .empty);
+
+    // Function 0: the solver-free twin of trigger 2, header carrying a second unread parameter.
+    try values.append(allocator, .{ .id = ir.ValueId.fromIndex(0), .function = f0, .type = .{ .kind = .string, .bit_width = 0, .signed = false }, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(0), .index = 0 } } });
+    try values.append(allocator, .{ .id = ir.ValueId.fromIndex(1), .function = f0, .type = .{ .kind = .number, .bit_width = 64, .signed = false }, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(2), .index = 0 } } });
+    try values.append(allocator, .{ .id = ir.ValueId.fromIndex(2), .function = f0, .type = .{ .kind = .dynamic, .bit_width = 0, .signed = false }, .origin = .{ .block_parameter = .{ .block = ir.BlockId.fromIndex(1), .index = 0 } } });
+    try values.append(allocator, .{ .id = ir.ValueId.fromIndex(3), .function = f0, .type = .{ .kind = .number, .bit_width = 64, .signed = false }, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(3), .index = 0 } } });
+    try values.append(allocator, .{ .id = ir.ValueId.fromIndex(4), .function = f0, .type = .{ .kind = .number, .bit_width = 64, .signed = false }, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(4), .index = 0 } } });
+    try values.append(allocator, .{ .id = ir.ValueId.fromIndex(5), .function = f0, .type = .{ .kind = .boolean, .bit_width = 0, .signed = false }, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(5), .index = 0 } } });
+    try values.append(allocator, .{ .id = ir.ValueId.fromIndex(6), .function = f0, .type = .{ .kind = .dynamic, .bit_width = 0, .signed = false }, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(6), .index = 0 } } });
+    try values.append(allocator, .{ .id = ir.ValueId.fromIndex(7), .function = f0, .type = .{ .kind = .boolean, .bit_width = 0, .signed = false }, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(7), .index = 0 } } });
+    try values.append(allocator, .{ .id = ir.ValueId.fromIndex(8), .function = f0, .type = .{ .kind = .boolean, .bit_width = 0, .signed = false }, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(8), .index = 0 } } });
+    try values.append(allocator, .{ .id = ir.ValueId.fromIndex(9), .function = f0, .type = .{ .kind = .boolean, .bit_width = 0, .signed = false }, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(9), .index = 0 } } });
+    try instructions.append(allocator, .{ .id = ir.InstructionId.fromIndex(0), .block = ir.BlockId.fromIndex(0), .operation = .{ .constant = .{ .string = "on" } }, .results = try allocator.dupe(ir.ValueId, &.{ir.ValueId.fromIndex(0)}), .effects = .{ .precision = .exact, .reads_memory = false, .writes_memory = false, .may_throw = false, .may_yield = false, .invokes_unknown_code = false }, .evidence = ev_refs });
+    try instructions.append(allocator, .{ .id = ir.InstructionId.fromIndex(1), .block = ir.BlockId.fromIndex(0), .operation = .{ .place_write = .{ .place = ir.PlaceId.fromIndex(0), .value = ir.ValueId.fromIndex(0) } }, .results = &.{}, .effects = .{ .precision = .exact, .reads_memory = false, .writes_memory = true, .may_throw = false, .may_yield = false, .invokes_unknown_code = false }, .evidence = ev_refs });
+    try instructions.append(allocator, .{ .id = ir.InstructionId.fromIndex(2), .block = ir.BlockId.fromIndex(0), .operation = .{ .constant = .{ .number = -1 } }, .results = try allocator.dupe(ir.ValueId, &.{ir.ValueId.fromIndex(1)}), .effects = .{ .precision = .exact, .reads_memory = false, .writes_memory = false, .may_throw = false, .may_yield = false, .invokes_unknown_code = false }, .evidence = ev_refs });
+    try instructions.append(allocator, .{ .id = ir.InstructionId.fromIndex(3), .block = ir.BlockId.fromIndex(1), .operation = .{ .constant = .{ .number = 0 } }, .results = try allocator.dupe(ir.ValueId, &.{ir.ValueId.fromIndex(3)}), .effects = .{ .precision = .exact, .reads_memory = false, .writes_memory = false, .may_throw = false, .may_yield = false, .invokes_unknown_code = false }, .evidence = ev_refs });
+    try instructions.append(allocator, .{ .id = ir.InstructionId.fromIndex(4), .block = ir.BlockId.fromIndex(2), .operation = .{ .constant = .{ .number = 7 } }, .results = try allocator.dupe(ir.ValueId, &.{ir.ValueId.fromIndex(4)}), .effects = .{ .precision = .exact, .reads_memory = false, .writes_memory = false, .may_throw = false, .may_yield = false, .invokes_unknown_code = false }, .evidence = ev_refs });
+    try instructions.append(allocator, .{ .id = ir.InstructionId.fromIndex(5), .block = ir.BlockId.fromIndex(2), .operation = .{ .binary = .{ .operator = .equal, .left = ir.ValueId.fromIndex(3), .right = ir.ValueId.fromIndex(4) } }, .results = try allocator.dupe(ir.ValueId, &.{ir.ValueId.fromIndex(5)}), .effects = .{ .precision = .conservative, .reads_memory = true, .writes_memory = true, .may_throw = true, .may_yield = true, .invokes_unknown_code = true }, .evidence = ev_refs });
+    try instructions.append(allocator, .{ .id = ir.InstructionId.fromIndex(6), .block = ir.BlockId.fromIndex(5), .operation = .{ .place_read = ir.PlaceId.fromIndex(0) }, .results = try allocator.dupe(ir.ValueId, &.{ir.ValueId.fromIndex(6)}), .effects = .{ .precision = .exact, .reads_memory = true, .writes_memory = false, .may_throw = false, .may_yield = false, .invokes_unknown_code = false }, .evidence = ev_refs });
+    try instructions.append(allocator, .{ .id = ir.InstructionId.fromIndex(7), .block = ir.BlockId.fromIndex(5), .operation = .{ .constant = .{ .boolean = true } }, .results = try allocator.dupe(ir.ValueId, &.{ir.ValueId.fromIndex(7)}), .effects = .{ .precision = .exact, .reads_memory = false, .writes_memory = false, .may_throw = false, .may_yield = false, .invokes_unknown_code = false }, .evidence = ev_refs });
+    try instructions.append(allocator, .{ .id = ir.InstructionId.fromIndex(8), .block = ir.BlockId.fromIndex(5), .operation = .{ .binary = .{ .operator = .equal, .left = ir.ValueId.fromIndex(6), .right = ir.ValueId.fromIndex(7) } }, .results = try allocator.dupe(ir.ValueId, &.{ir.ValueId.fromIndex(8)}), .effects = .{ .precision = .conservative, .reads_memory = true, .writes_memory = true, .may_throw = true, .may_yield = true, .invokes_unknown_code = true }, .evidence = ev_refs });
+    try instructions.append(allocator, .{ .id = ir.InstructionId.fromIndex(9), .block = ir.BlockId.fromIndex(6), .operation = .{ .constant = .{ .boolean = true } }, .results = try allocator.dupe(ir.ValueId, &.{ir.ValueId.fromIndex(9)}), .effects = .{ .precision = .exact, .reads_memory = false, .writes_memory = false, .may_throw = false, .may_yield = false, .invokes_unknown_code = false }, .evidence = ev_refs });
+    switch (second) {
+        .none => {},
+        .worker => {
+            try values.append(allocator, .{ .id = ir.ValueId.fromIndex(10), .function = f1, .type = .{ .kind = .boolean, .bit_width = 0, .signed = false }, .origin = .{ .parameter = 0 } });
+            try values.append(allocator, .{ .id = ir.ValueId.fromIndex(11), .function = f1, .type = .{ .kind = .boolean, .bit_width = 0, .signed = false }, .origin = .{ .parameter = 1 } });
+            try values.append(allocator, .{ .id = ir.ValueId.fromIndex(12), .function = f1, .type = .{ .kind = .boolean, .bit_width = 0, .signed = false }, .origin = .{ .parameter = 2 } });
+        },
+        .or_arm => {
+            try values.append(allocator, .{ .id = ir.ValueId.fromIndex(10), .function = f1, .type = .{ .kind = .number, .bit_width = 64, .signed = false }, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(10), .index = 0 } } });
+            try values.append(allocator, .{ .id = ir.ValueId.fromIndex(11), .function = f1, .type = .{ .kind = .number, .bit_width = 64, .signed = false }, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(11), .index = 0 } } });
+            try values.append(allocator, .{ .id = ir.ValueId.fromIndex(12), .function = f1, .type = .{ .kind = .number, .bit_width = 64, .signed = false }, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(12), .index = 0 } } });
+            try values.append(allocator, .{ .id = ir.ValueId.fromIndex(13), .function = f1, .type = .{ .kind = .boolean, .bit_width = 0, .signed = false }, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(13), .index = 0 } } });
+            try values.append(allocator, .{ .id = ir.ValueId.fromIndex(14), .function = f1, .type = .{ .kind = .dynamic, .bit_width = 0, .signed = false }, .origin = .{ .block_parameter = .{ .block = ir.BlockId.fromIndex(9), .index = 0 } } });
+            try values.append(allocator, .{ .id = ir.ValueId.fromIndex(15), .function = f1, .type = .{ .kind = .dynamic, .bit_width = 0, .signed = false }, .origin = .{ .block_parameter = .{ .block = ir.BlockId.fromIndex(9), .index = 1 } } });
+            try values.append(allocator, .{ .id = ir.ValueId.fromIndex(16), .function = f1, .type = .{ .kind = .dynamic, .bit_width = 0, .signed = false }, .origin = .{ .block_parameter = .{ .block = ir.BlockId.fromIndex(9), .index = 2 } } });
+            try values.append(allocator, .{ .id = ir.ValueId.fromIndex(17), .function = f1, .type = .{ .kind = .boolean, .bit_width = 0, .signed = false }, .origin = .{ .block_parameter = .{ .block = ir.BlockId.fromIndex(9), .index = 3 } } });
+            try values.append(allocator, .{ .id = ir.ValueId.fromIndex(18), .function = f1, .type = .{ .kind = .boolean, .bit_width = 0, .signed = false }, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(14), .index = 0 } } });
+            try values.append(allocator, .{ .id = ir.ValueId.fromIndex(19), .function = f1, .type = .{ .kind = .number, .bit_width = 64, .signed = false }, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(14), .index = 1 } } });
+            try values.append(allocator, .{ .id = ir.ValueId.fromIndex(20), .function = f1, .type = .{ .kind = .number, .bit_width = 64, .signed = false }, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(14), .index = 2 } } });
+            try values.append(allocator, .{ .id = ir.ValueId.fromIndex(21), .function = f1, .type = .{ .kind = .number, .bit_width = 64, .signed = false }, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(14), .index = 3 } } });
+            try values.append(allocator, .{ .id = ir.ValueId.fromIndex(22), .function = f1, .type = .{ .kind = .number, .bit_width = 64, .signed = false }, .origin = .{ .block_parameter = .{ .block = ir.BlockId.fromIndex(11), .index = 0 } } });
+            try values.append(allocator, .{ .id = ir.ValueId.fromIndex(23), .function = f1, .type = .{ .kind = .number, .bit_width = 64, .signed = false }, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(15), .index = 0 } } });
+            try values.append(allocator, .{ .id = ir.ValueId.fromIndex(24), .function = f1, .type = .{ .kind = .boolean, .bit_width = 0, .signed = false }, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(16), .index = 0 } } });
+            try values.append(allocator, .{ .id = ir.ValueId.fromIndex(25), .function = f1, .type = .{ .kind = .number, .bit_width = 64, .signed = false }, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(17), .index = 0 } } });
+            try values.append(allocator, .{ .id = ir.ValueId.fromIndex(26), .function = f1, .type = .{ .kind = .boolean, .bit_width = 0, .signed = false }, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(18), .index = 0 } } });
+            try values.append(allocator, .{ .id = ir.ValueId.fromIndex(27), .function = f1, .type = .{ .kind = .boolean, .bit_width = 0, .signed = false }, .origin = .{ .block_parameter = .{ .block = ir.BlockId.fromIndex(13), .index = 0 } } });
+            try values.append(allocator, .{ .id = ir.ValueId.fromIndex(28), .function = f1, .type = .{ .kind = .boolean, .bit_width = 0, .signed = false }, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(20), .index = 0 } } });
+            try values.append(allocator, .{ .id = ir.ValueId.fromIndex(29), .function = f1, .type = .{ .kind = .number, .bit_width = 64, .signed = false }, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(21), .index = 0 } } });
+            try instructions.append(allocator, .{ .id = ir.InstructionId.fromIndex(10), .block = ir.BlockId.fromIndex(8), .operation = .{ .constant = .{ .number = 1 } }, .results = try allocator.dupe(ir.ValueId, &.{ir.ValueId.fromIndex(10)}), .effects = .{ .precision = .exact, .reads_memory = false, .writes_memory = false, .may_throw = false, .may_yield = false, .invokes_unknown_code = false }, .evidence = ev_refs });
+            try instructions.append(allocator, .{ .id = ir.InstructionId.fromIndex(11), .block = ir.BlockId.fromIndex(8), .operation = .{ .constant = .{ .number = 3 } }, .results = try allocator.dupe(ir.ValueId, &.{ir.ValueId.fromIndex(11)}), .effects = .{ .precision = .exact, .reads_memory = false, .writes_memory = false, .may_throw = false, .may_yield = false, .invokes_unknown_code = false }, .evidence = ev_refs });
+            try instructions.append(allocator, .{ .id = ir.InstructionId.fromIndex(12), .block = ir.BlockId.fromIndex(8), .operation = .{ .constant = .{ .number = 1 } }, .results = try allocator.dupe(ir.ValueId, &.{ir.ValueId.fromIndex(12)}), .effects = .{ .precision = .exact, .reads_memory = false, .writes_memory = false, .may_throw = false, .may_yield = false, .invokes_unknown_code = false }, .evidence = ev_refs });
+            try instructions.append(allocator, .{ .id = ir.InstructionId.fromIndex(13), .block = ir.BlockId.fromIndex(8), .operation = .{ .constant = .{ .boolean = true } }, .results = try allocator.dupe(ir.ValueId, &.{ir.ValueId.fromIndex(13)}), .effects = .{ .precision = .exact, .reads_memory = false, .writes_memory = false, .may_throw = false, .may_yield = false, .invokes_unknown_code = false }, .evidence = ev_refs });
+            try instructions.append(allocator, .{ .id = ir.InstructionId.fromIndex(14), .block = ir.BlockId.fromIndex(9), .operation = .{ .numeric_for_next = .{ .control = ir.ValueId.fromIndex(14), .limit = ir.ValueId.fromIndex(15), .step = ir.ValueId.fromIndex(16), .initial = ir.ValueId.fromIndex(17) } }, .results = try allocator.dupe(ir.ValueId, &.{ ir.ValueId.fromIndex(18), ir.ValueId.fromIndex(19), ir.ValueId.fromIndex(20), ir.ValueId.fromIndex(21) }), .effects = .{ .precision = .exact, .reads_memory = false, .writes_memory = false, .may_throw = true, .may_yield = false, .invokes_unknown_code = false }, .evidence = ev_refs });
+            try instructions.append(allocator, .{ .id = ir.InstructionId.fromIndex(15), .block = ir.BlockId.fromIndex(11), .operation = .{ .constant = .{ .number = 2 } }, .results = try allocator.dupe(ir.ValueId, &.{ir.ValueId.fromIndex(23)}), .effects = .{ .precision = .exact, .reads_memory = false, .writes_memory = false, .may_throw = false, .may_yield = false, .invokes_unknown_code = false }, .evidence = ev_refs });
+            try instructions.append(allocator, .{ .id = ir.InstructionId.fromIndex(16), .block = ir.BlockId.fromIndex(11), .operation = .{ .binary = .{ .operator = .greater_equal, .left = ir.ValueId.fromIndex(22), .right = ir.ValueId.fromIndex(23) } }, .results = try allocator.dupe(ir.ValueId, &.{ir.ValueId.fromIndex(24)}), .effects = .{ .precision = .conservative, .reads_memory = true, .writes_memory = true, .may_throw = true, .may_yield = true, .invokes_unknown_code = true }, .evidence = ev_refs });
+            try instructions.append(allocator, .{ .id = ir.InstructionId.fromIndex(17), .block = ir.BlockId.fromIndex(12), .operation = .{ .constant = .{ .number = 2 } }, .results = try allocator.dupe(ir.ValueId, &.{ir.ValueId.fromIndex(25)}), .effects = .{ .precision = .exact, .reads_memory = false, .writes_memory = false, .may_throw = false, .may_yield = false, .invokes_unknown_code = false }, .evidence = ev_refs });
+            try instructions.append(allocator, .{ .id = ir.InstructionId.fromIndex(18), .block = ir.BlockId.fromIndex(12), .operation = .{ .binary = .{ .operator = .less_equal, .left = ir.ValueId.fromIndex(22), .right = ir.ValueId.fromIndex(25) } }, .results = try allocator.dupe(ir.ValueId, &.{ir.ValueId.fromIndex(26)}), .effects = .{ .precision = .conservative, .reads_memory = true, .writes_memory = true, .may_throw = true, .may_yield = true, .invokes_unknown_code = true }, .evidence = ev_refs });
+            try instructions.append(allocator, .{ .id = ir.InstructionId.fromIndex(19), .block = ir.BlockId.fromIndex(14), .operation = .{ .place_write = .{ .place = ir.PlaceId.fromIndex(1), .value = ir.ValueId.fromIndex(22) } }, .results = &.{}, .effects = .{ .precision = .exact, .reads_memory = false, .writes_memory = true, .may_throw = false, .may_yield = false, .invokes_unknown_code = false }, .evidence = ev_refs });
+            try instructions.append(allocator, .{ .id = ir.InstructionId.fromIndex(20), .block = ir.BlockId.fromIndex(14), .operation = .{ .constant = .{ .boolean = false } }, .results = try allocator.dupe(ir.ValueId, &.{ir.ValueId.fromIndex(28)}), .effects = .{ .precision = .exact, .reads_memory = false, .writes_memory = false, .may_throw = false, .may_yield = false, .invokes_unknown_code = false }, .evidence = ev_refs });
+            try instructions.append(allocator, .{ .id = ir.InstructionId.fromIndex(21), .block = ir.BlockId.fromIndex(15), .operation = .{ .constant = .{ .number = 122 } }, .results = try allocator.dupe(ir.ValueId, &.{ir.ValueId.fromIndex(29)}), .effects = .{ .precision = .exact, .reads_memory = false, .writes_memory = false, .may_throw = false, .may_yield = false, .invokes_unknown_code = false }, .evidence = ev_refs });
+        },
+    }
+
+    // The header's second parameter: unread, always equal to the preheader value, so behaviour is unchanged.
+    const w = ir.ValueId.fromIndex(values.items.len);
+    try values.append(allocator, .{ .id = w, .function = f0, .type = .{ .kind = .dynamic, .bit_width = 0, .signed = false }, .origin = .{ .block_parameter = .{ .block = ir.BlockId.fromIndex(1), .index = 1 } } });
+
+    const place_origin: ir.PlaceOrigin = switch (place) {
+        .instruction => .{ .instruction = ir.InstructionId.fromIndex(1) },
+        .local => .{ .local = 0 },
+    };
+    try places.append(allocator, .{ .id = ir.PlaceId.fromIndex(0), .function = f0, .name_hint = "flag", .origin = place_origin, .evidence = ev_refs });
+
+    try blocks.append(allocator, .{ .id = ir.BlockId.fromIndex(0), .function = f0, .parameters = &.{}, .instructions = try allocator.dupe(ir.InstructionId, &.{ ir.InstructionId.fromIndex(0), ir.InstructionId.fromIndex(1), ir.InstructionId.fromIndex(2) }), .terminator = .{ .jump = .{ .target = ir.BlockId.fromIndex(1), .arguments = try allocator.dupe(ir.ValueId, &.{ ir.ValueId.fromIndex(1), ir.ValueId.fromIndex(1) }) } }, .evidence = ev_refs });
+    try blocks.append(allocator, .{ .id = ir.BlockId.fromIndex(1), .function = f0, .parameters = try allocator.dupe(ir.ValueId, &.{ ir.ValueId.fromIndex(2), w }), .instructions = try allocator.dupe(ir.InstructionId, &.{ir.InstructionId.fromIndex(3)}), .terminator = .{ .jump = .{ .target = ir.BlockId.fromIndex(2), .arguments = &.{} } }, .evidence = ev_refs });
+    try blocks.append(allocator, .{ .id = ir.BlockId.fromIndex(2), .function = f0, .parameters = &.{}, .instructions = try allocator.dupe(ir.InstructionId, &.{ ir.InstructionId.fromIndex(4), ir.InstructionId.fromIndex(5) }), .terminator = .{ .branch = .{ .condition = ir.ValueId.fromIndex(5), .then_edge = .{ .target = ir.BlockId.fromIndex(5), .arguments = &.{} }, .else_edge = .{ .target = ir.BlockId.fromIndex(4), .arguments = &.{} } } }, .evidence = ev_refs });
+    try blocks.append(allocator, .{ .id = ir.BlockId.fromIndex(3), .function = f0, .parameters = &.{}, .instructions = &.{}, .terminator = .{ .jump = .{ .target = ir.BlockId.fromIndex(1), .arguments = try allocator.dupe(ir.ValueId, &.{ ir.ValueId.fromIndex(3), ir.ValueId.fromIndex(1) }) } }, .evidence = ev_refs });
+    try blocks.append(allocator, .{ .id = ir.BlockId.fromIndex(4), .function = f0, .parameters = &.{}, .instructions = &.{}, .terminator = if (b4_returns) ir.Terminator{ .return_values = &.{} } else ir.Terminator{ .jump = .{ .target = ir.BlockId.fromIndex(4), .arguments = &.{} } }, .evidence = ev_refs });
+    try blocks.append(allocator, .{ .id = ir.BlockId.fromIndex(5), .function = f0, .parameters = &.{}, .instructions = try allocator.dupe(ir.InstructionId, &.{ ir.InstructionId.fromIndex(6), ir.InstructionId.fromIndex(7), ir.InstructionId.fromIndex(8) }), .terminator = .{ .branch = .{ .condition = ir.ValueId.fromIndex(8), .then_edge = .{ .target = ir.BlockId.fromIndex(3), .arguments = &.{} }, .else_edge = .{ .target = ir.BlockId.fromIndex(6), .arguments = &.{} } } }, .evidence = ev_refs });
+    try blocks.append(allocator, .{ .id = ir.BlockId.fromIndex(6), .function = f0, .parameters = &.{}, .instructions = try allocator.dupe(ir.InstructionId, &.{ir.InstructionId.fromIndex(9)}), .terminator = .{ .jump = .{ .target = ir.BlockId.fromIndex(6), .arguments = &.{} } }, .evidence = ev_refs });
+    try blocks.append(allocator, .{ .id = ir.BlockId.fromIndex(7), .function = f0, .parameters = &.{}, .instructions = &.{}, .terminator = .{ .jump = .{ .target = ir.BlockId.fromIndex(0), .arguments = &.{} } }, .evidence = ev_refs });
+
+    switch (second) {
+        .none => {},
+        .worker => {
+            try blocks.append(allocator, .{ .id = ir.BlockId.fromIndex(8), .function = f1, .parameters = &.{}, .instructions = &.{}, .terminator = .{ .jump = .{ .target = ir.BlockId.fromIndex(9), .arguments = &.{} } }, .evidence = ev_refs });
+            try blocks.append(allocator, .{ .id = ir.BlockId.fromIndex(9), .function = f1, .parameters = &.{}, .instructions = &.{}, .terminator = .{ .branch = .{ .condition = ir.ValueId.fromIndex(12), .then_edge = .{ .target = ir.BlockId.fromIndex(10), .arguments = &.{} }, .else_edge = .{ .target = ir.BlockId.fromIndex(15), .arguments = &.{} } } }, .evidence = ev_refs });
+            try blocks.append(allocator, .{ .id = ir.BlockId.fromIndex(10), .function = f1, .parameters = &.{}, .instructions = &.{}, .terminator = .{ .branch = .{ .condition = ir.ValueId.fromIndex(10), .then_edge = .{ .target = ir.BlockId.fromIndex(12), .arguments = &.{} }, .else_edge = .{ .target = ir.BlockId.fromIndex(11), .arguments = &.{} } } }, .evidence = ev_refs });
+            try blocks.append(allocator, .{ .id = ir.BlockId.fromIndex(11), .function = f1, .parameters = &.{}, .instructions = &.{}, .terminator = .{ .jump = .{ .target = ir.BlockId.fromIndex(11), .arguments = &.{} } }, .evidence = ev_refs });
+            try blocks.append(allocator, .{ .id = ir.BlockId.fromIndex(12), .function = f1, .parameters = &.{}, .instructions = &.{}, .terminator = .{ .branch = .{ .condition = ir.ValueId.fromIndex(11), .then_edge = .{ .target = ir.BlockId.fromIndex(14), .arguments = &.{} }, .else_edge = .{ .target = ir.BlockId.fromIndex(13), .arguments = &.{} } } }, .evidence = ev_refs });
+            try blocks.append(allocator, .{ .id = ir.BlockId.fromIndex(13), .function = f1, .parameters = &.{}, .instructions = &.{}, .terminator = .{ .jump = .{ .target = ir.BlockId.fromIndex(13), .arguments = &.{} } }, .evidence = ev_refs });
+            try blocks.append(allocator, .{ .id = ir.BlockId.fromIndex(14), .function = f1, .parameters = &.{}, .instructions = &.{}, .terminator = .{ .jump = .{ .target = ir.BlockId.fromIndex(9), .arguments = &.{} } }, .evidence = ev_refs });
+            try blocks.append(allocator, .{ .id = ir.BlockId.fromIndex(15), .function = f1, .parameters = &.{}, .instructions = &.{}, .terminator = .{ .return_values = &.{} }, .evidence = ev_refs });
+        },
+        .or_arm => {
+            try blocks.append(allocator, .{ .id = ir.BlockId.fromIndex(8), .function = f1, .parameters = &.{}, .instructions = try allocator.dupe(ir.InstructionId, &.{ ir.InstructionId.fromIndex(10), ir.InstructionId.fromIndex(11), ir.InstructionId.fromIndex(12), ir.InstructionId.fromIndex(13) }), .terminator = .{ .jump = .{ .target = ir.BlockId.fromIndex(9), .arguments = try allocator.dupe(ir.ValueId, &.{ ir.ValueId.fromIndex(10), ir.ValueId.fromIndex(11), ir.ValueId.fromIndex(12), ir.ValueId.fromIndex(13) }) } }, .evidence = ev_refs });
+            try blocks.append(allocator, .{ .id = ir.BlockId.fromIndex(9), .function = f1, .parameters = try allocator.dupe(ir.ValueId, &.{ ir.ValueId.fromIndex(14), ir.ValueId.fromIndex(15), ir.ValueId.fromIndex(16), ir.ValueId.fromIndex(17) }), .instructions = try allocator.dupe(ir.InstructionId, &.{ir.InstructionId.fromIndex(14)}), .terminator = .{ .branch = .{ .condition = ir.ValueId.fromIndex(18), .then_edge = .{ .target = ir.BlockId.fromIndex(11), .arguments = try allocator.dupe(ir.ValueId, &.{ir.ValueId.fromIndex(21)}) }, .else_edge = .{ .target = ir.BlockId.fromIndex(10), .arguments = &.{} } } }, .evidence = ev_refs });
+            try blocks.append(allocator, .{ .id = ir.BlockId.fromIndex(10), .function = f1, .parameters = &.{}, .instructions = &.{}, .terminator = .{ .return_values = &.{} }, .evidence = ev_refs });
+            try blocks.append(allocator, .{ .id = ir.BlockId.fromIndex(11), .function = f1, .parameters = try allocator.dupe(ir.ValueId, &.{ir.ValueId.fromIndex(22)}), .instructions = try allocator.dupe(ir.InstructionId, &.{ ir.InstructionId.fromIndex(15), ir.InstructionId.fromIndex(16) }), .terminator = .{ .branch = .{ .condition = ir.ValueId.fromIndex(24), .then_edge = .{ .target = ir.BlockId.fromIndex(12), .arguments = &.{} }, .else_edge = .{ .target = ir.BlockId.fromIndex(15), .arguments = &.{} } } }, .evidence = ev_refs });
+            try blocks.append(allocator, .{ .id = ir.BlockId.fromIndex(12), .function = f1, .parameters = &.{}, .instructions = try allocator.dupe(ir.InstructionId, &.{ ir.InstructionId.fromIndex(17), ir.InstructionId.fromIndex(18) }), .terminator = .{ .jump = .{ .target = ir.BlockId.fromIndex(13), .arguments = try allocator.dupe(ir.ValueId, &.{ir.ValueId.fromIndex(26)}) } }, .evidence = ev_refs });
+            try blocks.append(allocator, .{ .id = ir.BlockId.fromIndex(13), .function = f1, .parameters = try allocator.dupe(ir.ValueId, &.{ir.ValueId.fromIndex(27)}), .instructions = &.{}, .terminator = .{ .branch = .{ .condition = ir.ValueId.fromIndex(27), .then_edge = .{ .target = ir.BlockId.fromIndex(14), .arguments = &.{} }, .else_edge = .{ .target = ir.BlockId.fromIndex(15), .arguments = &.{} } } }, .evidence = ev_refs });
+            try blocks.append(allocator, .{ .id = ir.BlockId.fromIndex(14), .function = f1, .parameters = &.{}, .instructions = try allocator.dupe(ir.InstructionId, &.{ ir.InstructionId.fromIndex(19), ir.InstructionId.fromIndex(20) }), .terminator = .{ .jump = .{ .target = ir.BlockId.fromIndex(9), .arguments = try allocator.dupe(ir.ValueId, &.{ ir.ValueId.fromIndex(21), ir.ValueId.fromIndex(19), ir.ValueId.fromIndex(20), ir.ValueId.fromIndex(28) }) } }, .evidence = ev_refs });
+            try blocks.append(allocator, .{ .id = ir.BlockId.fromIndex(15), .function = f1, .parameters = &.{}, .instructions = try allocator.dupe(ir.InstructionId, &.{ir.InstructionId.fromIndex(21)}), .terminator = .{ .jump = .{ .target = ir.BlockId.fromIndex(14), .arguments = &.{} } }, .evidence = ev_refs });
+            try places.append(allocator, .{ .id = ir.PlaceId.fromIndex(1), .function = f1, .name_hint = "last", .origin = .{ .local = 0 }, .evidence = ev_refs });
+        },
+    }
+
+    try functions.append(allocator, .{ .id = f0, .name_hint = "module", .local_places = try allocator.dupe(ir.PlaceId, &.{ir.PlaceId.fromIndex(0)}), .blocks = try allocator.dupe(ir.BlockId, &.{ ir.BlockId.fromIndex(0), ir.BlockId.fromIndex(1), ir.BlockId.fromIndex(2), ir.BlockId.fromIndex(3), ir.BlockId.fromIndex(4), ir.BlockId.fromIndex(5), ir.BlockId.fromIndex(6), ir.BlockId.fromIndex(7) }), .entry_block = ir.BlockId.fromIndex(7), .evidence = ev_refs });
+    switch (second) {
+        .none => {},
+        .worker => {
+            try functions.append(allocator, .{ .id = f1, .name_hint = "worker", .lexical_parent = f0, .parameters = try allocator.dupe(ir.ValueId, &.{ ir.ValueId.fromIndex(10), ir.ValueId.fromIndex(11), ir.ValueId.fromIndex(12) }), .blocks = try allocator.dupe(ir.BlockId, &.{ ir.BlockId.fromIndex(8), ir.BlockId.fromIndex(9), ir.BlockId.fromIndex(10), ir.BlockId.fromIndex(11), ir.BlockId.fromIndex(12), ir.BlockId.fromIndex(13), ir.BlockId.fromIndex(14), ir.BlockId.fromIndex(15) }), .entry_block = ir.BlockId.fromIndex(8), .evidence = ev_refs });
+        },
+        .or_arm => {
+            try functions.append(allocator, .{ .id = f1, .name_hint = "arm", .lexical_parent = f0, .local_places = try allocator.dupe(ir.PlaceId, &.{ir.PlaceId.fromIndex(1)}), .blocks = try allocator.dupe(ir.BlockId, &.{ ir.BlockId.fromIndex(8), ir.BlockId.fromIndex(9), ir.BlockId.fromIndex(10), ir.BlockId.fromIndex(11), ir.BlockId.fromIndex(12), ir.BlockId.fromIndex(13), ir.BlockId.fromIndex(14), ir.BlockId.fromIndex(15) }), .entry_block = ir.BlockId.fromIndex(8), .evidence = ev_refs });
+        },
+    }
+
+    const evidence = try allocator.dupe(ir.Evidence, &.{.{ .id = ir.EvidenceId.fromIndex(0), .kind = .dynamic_fixture, .locator = "fixture:feedback-decline-program" }});
+    return ir.Program{
+        .program_id = "feedback-decline-program",
+        .entry_function = f0,
+        .functions = try functions.toOwnedSlice(allocator),
+        .blocks = try blocks.toOwnedSlice(allocator),
+        .instructions = try instructions.toOwnedSlice(allocator),
+        .values = try values.toOwnedSlice(allocator),
+        .places = try places.toOwnedSlice(allocator),
+        .evidence = evidence,
+    };
+}
+
+fn twoNeverEndingBranchesTestProgram(allocator: std.mem.Allocator) std.mem.Allocator.Error!ir.Program {
+    const f0 = ir.FunctionId.fromIndex(0);
+    const f1 = ir.FunctionId.fromIndex(1);
+    const ev_refs = try allocator.dupe(ir.EvidenceId, &.{ir.EvidenceId.fromIndex(0)});
+
+    var values = @as(std.ArrayList(ir.Value), .empty);
+    var instructions = @as(std.ArrayList(ir.Instruction), .empty);
+    var blocks = @as(std.ArrayList(ir.Block), .empty);
+    var functions = @as(std.ArrayList(ir.Function), .empty);
+
+    // Function 0: one block that returns nothing (the closure and vararg pack of the checkpoint dropped).
+    try blocks.append(allocator, .{ .id = ir.BlockId.fromIndex(0), .function = f0, .parameters = &.{}, .instructions = &.{}, .terminator = .{ .return_values = &.{} }, .evidence = ev_refs });
+    try functions.append(allocator, .{ .id = f0, .blocks = try allocator.dupe(ir.BlockId, &.{ir.BlockId.fromIndex(0)}), .entry_block = ir.BlockId.fromIndex(0), .evidence = ev_refs });
+
+    // Function 1: the checkpoint's closure after the exact prepass turned both headers into jumps.
+    try values.append(allocator, .{ .id = ir.ValueId.fromIndex(0), .function = f1, .type = .{ .kind = .dynamic, .bit_width = 0, .signed = false }, .origin = .{ .parameter = 0 } });
+    try values.append(allocator, .{ .id = ir.ValueId.fromIndex(1), .function = f1, .type = .{ .kind = .dynamic, .bit_width = 0, .signed = false }, .origin = .{ .parameter = 1 } });
+    try values.append(allocator, .{ .id = ir.ValueId.fromIndex(2), .function = f1, .type = .{ .kind = .dynamic, .bit_width = 0, .signed = false }, .origin = .{ .parameter = 2 } });
+    try values.append(allocator, .{ .id = ir.ValueId.fromIndex(3), .function = f1, .type = .{ .kind = .integer, .bit_width = 64, .signed = true }, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(0), .index = 0 } } });
+    try values.append(allocator, .{ .id = ir.ValueId.fromIndex(4), .function = f1, .type = .{ .kind = .integer, .bit_width = 64, .signed = true }, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(1), .index = 0 } } });
+    try values.append(allocator, .{ .id = ir.ValueId.fromIndex(5), .function = f1, .type = .{ .kind = .boolean, .bit_width = 0, .signed = false }, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(2), .index = 0 } } });
+    try values.append(allocator, .{ .id = ir.ValueId.fromIndex(6), .function = f1, .type = .{ .kind = .boolean, .bit_width = 0, .signed = false }, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(3), .index = 0 } } });
+    try values.append(allocator, .{ .id = ir.ValueId.fromIndex(7), .function = f1, .type = .{ .kind = .dynamic, .bit_width = 0, .signed = false }, .origin = .{ .block_parameter = .{ .block = ir.BlockId.fromIndex(2), .index = 0 } } });
+    try values.append(allocator, .{ .id = ir.ValueId.fromIndex(8), .function = f1, .type = .{ .kind = .dynamic, .bit_width = 0, .signed = false }, .origin = .{ .block_parameter = .{ .block = ir.BlockId.fromIndex(2), .index = 1 } } });
+    try values.append(allocator, .{ .id = ir.ValueId.fromIndex(9), .function = f1, .type = .{ .kind = .dynamic, .bit_width = 0, .signed = false }, .origin = .{ .block_parameter = .{ .block = ir.BlockId.fromIndex(2), .index = 2 } } });
+    try values.append(allocator, .{ .id = ir.ValueId.fromIndex(10), .function = f1, .type = .{ .kind = .boolean, .bit_width = 0, .signed = false }, .origin = .{ .block_parameter = .{ .block = ir.BlockId.fromIndex(2), .index = 3 } } });
+    try values.append(allocator, .{ .id = ir.ValueId.fromIndex(11), .function = f1, .type = .{ .kind = .number, .bit_width = 64, .signed = false }, .origin = .{ .block_parameter = .{ .block = ir.BlockId.fromIndex(3), .index = 0 } } });
+    try values.append(allocator, .{ .id = ir.ValueId.fromIndex(12), .function = f1, .type = .{ .kind = .boolean, .bit_width = 0, .signed = false }, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(4), .index = 0 } } });
+    try values.append(allocator, .{ .id = ir.ValueId.fromIndex(13), .function = f1, .type = .{ .kind = .number, .bit_width = 64, .signed = false }, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(4), .index = 1 } } });
+    try values.append(allocator, .{ .id = ir.ValueId.fromIndex(14), .function = f1, .type = .{ .kind = .number, .bit_width = 64, .signed = false }, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(4), .index = 2 } } });
+    try values.append(allocator, .{ .id = ir.ValueId.fromIndex(15), .function = f1, .type = .{ .kind = .number, .bit_width = 64, .signed = false }, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(4), .index = 3 } } });
+    try values.append(allocator, .{ .id = ir.ValueId.fromIndex(16), .function = f1, .type = .{ .kind = .boolean, .bit_width = 0, .signed = false }, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(5), .index = 0 } } });
+    try values.append(allocator, .{ .id = ir.ValueId.fromIndex(17), .function = f1, .type = .{ .kind = .integer, .bit_width = 64, .signed = true }, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(6), .index = 0 } } });
+    try values.append(allocator, .{ .id = ir.ValueId.fromIndex(18), .function = f1, .type = .{ .kind = .integer, .bit_width = 64, .signed = true }, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(7), .index = 0 } } });
+    try values.append(allocator, .{ .id = ir.ValueId.fromIndex(19), .function = f1, .type = .{ .kind = .integer, .bit_width = 64, .signed = true }, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(8), .index = 0 } } });
+    try values.append(allocator, .{ .id = ir.ValueId.fromIndex(20), .function = f1, .type = .{ .kind = .boolean, .bit_width = 0, .signed = false }, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(9), .index = 0 } } });
+    try values.append(allocator, .{ .id = ir.ValueId.fromIndex(21), .function = f1, .type = .{ .kind = .boolean, .bit_width = 0, .signed = false }, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(10), .index = 0 } } });
+    try values.append(allocator, .{ .id = ir.ValueId.fromIndex(22), .function = f1, .type = .{ .kind = .dynamic, .bit_width = 0, .signed = false }, .origin = .{ .block_parameter = .{ .block = ir.BlockId.fromIndex(10), .index = 0 } } });
+    try values.append(allocator, .{ .id = ir.ValueId.fromIndex(23), .function = f1, .type = .{ .kind = .dynamic, .bit_width = 0, .signed = false }, .origin = .{ .block_parameter = .{ .block = ir.BlockId.fromIndex(10), .index = 1 } } });
+    try values.append(allocator, .{ .id = ir.ValueId.fromIndex(24), .function = f1, .type = .{ .kind = .dynamic, .bit_width = 0, .signed = false }, .origin = .{ .block_parameter = .{ .block = ir.BlockId.fromIndex(10), .index = 2 } } });
+    try values.append(allocator, .{ .id = ir.ValueId.fromIndex(25), .function = f1, .type = .{ .kind = .boolean, .bit_width = 0, .signed = false }, .origin = .{ .block_parameter = .{ .block = ir.BlockId.fromIndex(10), .index = 3 } } });
+    try values.append(allocator, .{ .id = ir.ValueId.fromIndex(26), .function = f1, .type = .{ .kind = .number, .bit_width = 64, .signed = false }, .origin = .{ .block_parameter = .{ .block = ir.BlockId.fromIndex(11), .index = 0 } } });
+    try values.append(allocator, .{ .id = ir.ValueId.fromIndex(27), .function = f1, .type = .{ .kind = .boolean, .bit_width = 0, .signed = false }, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(11), .index = 0 } } });
+    try values.append(allocator, .{ .id = ir.ValueId.fromIndex(28), .function = f1, .type = .{ .kind = .number, .bit_width = 64, .signed = false }, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(11), .index = 1 } } });
+    try values.append(allocator, .{ .id = ir.ValueId.fromIndex(29), .function = f1, .type = .{ .kind = .number, .bit_width = 64, .signed = false }, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(11), .index = 2 } } });
+    try values.append(allocator, .{ .id = ir.ValueId.fromIndex(30), .function = f1, .type = .{ .kind = .number, .bit_width = 64, .signed = false }, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(11), .index = 3 } } });
+    try values.append(allocator, .{ .id = ir.ValueId.fromIndex(31), .function = f1, .type = .{ .kind = .boolean, .bit_width = 0, .signed = false }, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(12), .index = 0 } } });
+    try values.append(allocator, .{ .id = ir.ValueId.fromIndex(32), .function = f1, .type = .{ .kind = .integer, .bit_width = 64, .signed = true }, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(13), .index = 0 } } });
+    try instructions.append(allocator, .{ .id = ir.InstructionId.fromIndex(0), .block = ir.BlockId.fromIndex(1), .operation = .{ .constant = .{ .integer = "1" } }, .results = try allocator.dupe(ir.ValueId, &.{ir.ValueId.fromIndex(3)}), .effects = .{ .precision = .exact, .reads_memory = false, .writes_memory = false, .may_throw = false, .may_yield = false, .invokes_unknown_code = false }, .evidence = ev_refs });
+    try instructions.append(allocator, .{ .id = ir.InstructionId.fromIndex(1), .block = ir.BlockId.fromIndex(1), .operation = .{ .constant = .{ .integer = "1" } }, .results = try allocator.dupe(ir.ValueId, &.{ir.ValueId.fromIndex(4)}), .effects = .{ .precision = .exact, .reads_memory = false, .writes_memory = false, .may_throw = false, .may_yield = false, .invokes_unknown_code = false }, .evidence = ev_refs });
+    try instructions.append(allocator, .{ .id = ir.InstructionId.fromIndex(2), .block = ir.BlockId.fromIndex(1), .operation = .{ .constant = .{ .boolean = true } }, .results = try allocator.dupe(ir.ValueId, &.{ir.ValueId.fromIndex(5)}), .effects = .{ .precision = .exact, .reads_memory = false, .writes_memory = false, .may_throw = false, .may_yield = false, .invokes_unknown_code = false }, .evidence = ev_refs });
+    try instructions.append(allocator, .{ .id = ir.InstructionId.fromIndex(3), .block = ir.BlockId.fromIndex(1), .operation = .{ .constant = .{ .boolean = false } }, .results = try allocator.dupe(ir.ValueId, &.{ir.ValueId.fromIndex(6)}), .effects = .{ .precision = .exact, .reads_memory = false, .writes_memory = false, .may_throw = false, .may_yield = false, .invokes_unknown_code = false }, .evidence = ev_refs });
+    try instructions.append(allocator, .{ .id = ir.InstructionId.fromIndex(4), .block = ir.BlockId.fromIndex(2), .operation = .{ .numeric_for_next = .{ .control = ir.ValueId.fromIndex(7), .limit = ir.ValueId.fromIndex(8), .step = ir.ValueId.fromIndex(9), .initial = ir.ValueId.fromIndex(10) } }, .results = try allocator.dupe(ir.ValueId, &.{ ir.ValueId.fromIndex(12), ir.ValueId.fromIndex(13), ir.ValueId.fromIndex(14), ir.ValueId.fromIndex(15) }), .effects = .{ .precision = .exact, .reads_memory = false, .writes_memory = false, .may_throw = true, .may_yield = false, .invokes_unknown_code = false }, .evidence = ev_refs });
+    try instructions.append(allocator, .{ .id = ir.InstructionId.fromIndex(5), .block = ir.BlockId.fromIndex(7), .operation = .{ .constant = .{ .boolean = true } }, .results = try allocator.dupe(ir.ValueId, &.{ir.ValueId.fromIndex(16)}), .effects = .{ .precision = .exact, .reads_memory = false, .writes_memory = false, .may_throw = false, .may_yield = false, .invokes_unknown_code = false }, .evidence = ev_refs });
+    try instructions.append(allocator, .{ .id = ir.InstructionId.fromIndex(6), .block = ir.BlockId.fromIndex(8), .operation = .{ .constant = .{ .integer = "1" } }, .results = try allocator.dupe(ir.ValueId, &.{ir.ValueId.fromIndex(17)}), .effects = .{ .precision = .exact, .reads_memory = false, .writes_memory = false, .may_throw = false, .may_yield = false, .invokes_unknown_code = false }, .evidence = ev_refs });
+    try instructions.append(allocator, .{ .id = ir.InstructionId.fromIndex(7), .block = ir.BlockId.fromIndex(8), .operation = .{ .constant = .{ .integer = "3" } }, .results = try allocator.dupe(ir.ValueId, &.{ir.ValueId.fromIndex(18)}), .effects = .{ .precision = .exact, .reads_memory = false, .writes_memory = false, .may_throw = false, .may_yield = false, .invokes_unknown_code = false }, .evidence = ev_refs });
+    try instructions.append(allocator, .{ .id = ir.InstructionId.fromIndex(8), .block = ir.BlockId.fromIndex(8), .operation = .{ .constant = .{ .integer = "1" } }, .results = try allocator.dupe(ir.ValueId, &.{ir.ValueId.fromIndex(19)}), .effects = .{ .precision = .exact, .reads_memory = false, .writes_memory = false, .may_throw = false, .may_yield = false, .invokes_unknown_code = false }, .evidence = ev_refs });
+    try instructions.append(allocator, .{ .id = ir.InstructionId.fromIndex(9), .block = ir.BlockId.fromIndex(8), .operation = .{ .constant = .{ .boolean = true } }, .results = try allocator.dupe(ir.ValueId, &.{ir.ValueId.fromIndex(20)}), .effects = .{ .precision = .exact, .reads_memory = false, .writes_memory = false, .may_throw = false, .may_yield = false, .invokes_unknown_code = false }, .evidence = ev_refs });
+    try instructions.append(allocator, .{ .id = ir.InstructionId.fromIndex(10), .block = ir.BlockId.fromIndex(8), .operation = .{ .constant = .{ .boolean = false } }, .results = try allocator.dupe(ir.ValueId, &.{ir.ValueId.fromIndex(21)}), .effects = .{ .precision = .exact, .reads_memory = false, .writes_memory = false, .may_throw = false, .may_yield = false, .invokes_unknown_code = false }, .evidence = ev_refs });
+    try instructions.append(allocator, .{ .id = ir.InstructionId.fromIndex(11), .block = ir.BlockId.fromIndex(10), .operation = .{ .numeric_for_next = .{ .control = ir.ValueId.fromIndex(22), .limit = ir.ValueId.fromIndex(23), .step = ir.ValueId.fromIndex(24), .initial = ir.ValueId.fromIndex(25) } }, .results = try allocator.dupe(ir.ValueId, &.{ ir.ValueId.fromIndex(27), ir.ValueId.fromIndex(28), ir.ValueId.fromIndex(29), ir.ValueId.fromIndex(30) }), .effects = .{ .precision = .exact, .reads_memory = false, .writes_memory = false, .may_throw = true, .may_yield = false, .invokes_unknown_code = false }, .evidence = ev_refs });
+    try instructions.append(allocator, .{ .id = ir.InstructionId.fromIndex(12), .block = ir.BlockId.fromIndex(15), .operation = .{ .constant = .{ .boolean = true } }, .results = try allocator.dupe(ir.ValueId, &.{ir.ValueId.fromIndex(31)}), .effects = .{ .precision = .exact, .reads_memory = false, .writes_memory = false, .may_throw = false, .may_yield = false, .invokes_unknown_code = false }, .evidence = ev_refs });
+    try instructions.append(allocator, .{ .id = ir.InstructionId.fromIndex(13), .block = ir.BlockId.fromIndex(4), .operation = .{ .constant = .{ .integer = "0" } }, .results = try allocator.dupe(ir.ValueId, &.{ir.ValueId.fromIndex(32)}), .effects = .{ .precision = .exact, .reads_memory = false, .writes_memory = false, .may_throw = false, .may_yield = false, .invokes_unknown_code = false }, .evidence = ev_refs });
+    try blocks.append(allocator, .{ .id = ir.BlockId.fromIndex(1), .function = f1, .parameters = &.{}, .instructions = try allocator.dupe(ir.InstructionId, &.{ ir.InstructionId.fromIndex(0), ir.InstructionId.fromIndex(1), ir.InstructionId.fromIndex(2), ir.InstructionId.fromIndex(3) }), .terminator = .{ .jump = .{ .target = ir.BlockId.fromIndex(2), .arguments = try allocator.dupe(ir.ValueId, &.{ ir.ValueId.fromIndex(3), ir.ValueId.fromIndex(0), ir.ValueId.fromIndex(4), ir.ValueId.fromIndex(5) }) } }, .evidence = ev_refs });
+    try blocks.append(allocator, .{ .id = ir.BlockId.fromIndex(2), .function = f1, .parameters = try allocator.dupe(ir.ValueId, &.{ ir.ValueId.fromIndex(7), ir.ValueId.fromIndex(8), ir.ValueId.fromIndex(9), ir.ValueId.fromIndex(10) }), .instructions = try allocator.dupe(ir.InstructionId, &.{ir.InstructionId.fromIndex(4)}), .terminator = .{ .branch = .{ .condition = ir.ValueId.fromIndex(12), .then_edge = .{ .target = ir.BlockId.fromIndex(3), .arguments = try allocator.dupe(ir.ValueId, &.{ir.ValueId.fromIndex(15)}) }, .else_edge = .{ .target = ir.BlockId.fromIndex(4), .arguments = &.{} } } }, .evidence = ev_refs });
+    try blocks.append(allocator, .{ .id = ir.BlockId.fromIndex(3), .function = f1, .parameters = try allocator.dupe(ir.ValueId, &.{ir.ValueId.fromIndex(11)}), .instructions = &.{}, .terminator = .{ .branch = .{ .condition = ir.ValueId.fromIndex(1), .then_edge = .{ .target = ir.BlockId.fromIndex(5), .arguments = &.{} }, .else_edge = .{ .target = ir.BlockId.fromIndex(6), .arguments = &.{} } } }, .evidence = ev_refs });
+    try blocks.append(allocator, .{ .id = ir.BlockId.fromIndex(4), .function = f1, .parameters = &.{}, .instructions = try allocator.dupe(ir.InstructionId, &.{ir.InstructionId.fromIndex(13)}), .terminator = .{ .return_values = try allocator.dupe(ir.ValueId, &.{ir.ValueId.fromIndex(32)}) }, .evidence = ev_refs });
+    try blocks.append(allocator, .{ .id = ir.BlockId.fromIndex(5), .function = f1, .parameters = &.{}, .instructions = &.{}, .terminator = .{ .jump = .{ .target = ir.BlockId.fromIndex(7), .arguments = &.{} } }, .evidence = ev_refs });
+    try blocks.append(allocator, .{ .id = ir.BlockId.fromIndex(6), .function = f1, .parameters = &.{}, .instructions = &.{}, .terminator = .{ .branch = .{ .condition = ir.ValueId.fromIndex(2), .then_edge = .{ .target = ir.BlockId.fromIndex(13), .arguments = &.{} }, .else_edge = .{ .target = ir.BlockId.fromIndex(14), .arguments = &.{} } } }, .evidence = ev_refs });
+    try blocks.append(allocator, .{ .id = ir.BlockId.fromIndex(7), .function = f1, .parameters = &.{}, .instructions = try allocator.dupe(ir.InstructionId, &.{ir.InstructionId.fromIndex(5)}), .terminator = .{ .jump = .{ .target = ir.BlockId.fromIndex(8), .arguments = &.{} } }, .evidence = ev_refs });
+    try blocks.append(allocator, .{ .id = ir.BlockId.fromIndex(8), .function = f1, .parameters = &.{}, .instructions = try allocator.dupe(ir.InstructionId, &.{ ir.InstructionId.fromIndex(6), ir.InstructionId.fromIndex(7), ir.InstructionId.fromIndex(8), ir.InstructionId.fromIndex(9), ir.InstructionId.fromIndex(10) }), .terminator = .{ .jump = .{ .target = ir.BlockId.fromIndex(10), .arguments = try allocator.dupe(ir.ValueId, &.{ ir.ValueId.fromIndex(17), ir.ValueId.fromIndex(18), ir.ValueId.fromIndex(19), ir.ValueId.fromIndex(20) }) } }, .evidence = ev_refs });
+    try blocks.append(allocator, .{ .id = ir.BlockId.fromIndex(9), .function = f1, .parameters = &.{}, .instructions = &.{}, .terminator = .{ .jump = .{ .target = ir.BlockId.fromIndex(19), .arguments = &.{} } }, .evidence = ev_refs });
+    try blocks.append(allocator, .{ .id = ir.BlockId.fromIndex(10), .function = f1, .parameters = try allocator.dupe(ir.ValueId, &.{ ir.ValueId.fromIndex(22), ir.ValueId.fromIndex(23), ir.ValueId.fromIndex(24), ir.ValueId.fromIndex(25) }), .instructions = try allocator.dupe(ir.InstructionId, &.{ir.InstructionId.fromIndex(11)}), .terminator = .{ .branch = .{ .condition = ir.ValueId.fromIndex(27), .then_edge = .{ .target = ir.BlockId.fromIndex(11), .arguments = try allocator.dupe(ir.ValueId, &.{ir.ValueId.fromIndex(30)}) }, .else_edge = .{ .target = ir.BlockId.fromIndex(12), .arguments = &.{} } } }, .evidence = ev_refs });
+    try blocks.append(allocator, .{ .id = ir.BlockId.fromIndex(11), .function = f1, .parameters = try allocator.dupe(ir.ValueId, &.{ir.ValueId.fromIndex(26)}), .instructions = &.{}, .terminator = .{ .jump = .{ .target = ir.BlockId.fromIndex(10), .arguments = try allocator.dupe(ir.ValueId, &.{ ir.ValueId.fromIndex(30), ir.ValueId.fromIndex(28), ir.ValueId.fromIndex(29), ir.ValueId.fromIndex(21) }) } }, .evidence = ev_refs });
+    try blocks.append(allocator, .{ .id = ir.BlockId.fromIndex(12), .function = f1, .parameters = &.{}, .instructions = &.{}, .terminator = .{ .jump = .{ .target = ir.BlockId.fromIndex(7), .arguments = &.{} } }, .evidence = ev_refs });
+    try blocks.append(allocator, .{ .id = ir.BlockId.fromIndex(13), .function = f1, .parameters = &.{}, .instructions = &.{}, .terminator = .{ .jump = .{ .target = ir.BlockId.fromIndex(15), .arguments = &.{} } }, .evidence = ev_refs });
+    try blocks.append(allocator, .{ .id = ir.BlockId.fromIndex(14), .function = f1, .parameters = &.{}, .instructions = &.{}, .terminator = .{ .jump = .{ .target = ir.BlockId.fromIndex(18), .arguments = &.{} } }, .evidence = ev_refs });
+    try blocks.append(allocator, .{ .id = ir.BlockId.fromIndex(15), .function = f1, .parameters = &.{}, .instructions = try allocator.dupe(ir.InstructionId, &.{ir.InstructionId.fromIndex(12)}), .terminator = .{ .jump = .{ .target = ir.BlockId.fromIndex(16), .arguments = &.{} } }, .evidence = ev_refs });
+    try blocks.append(allocator, .{ .id = ir.BlockId.fromIndex(16), .function = f1, .parameters = &.{}, .instructions = &.{}, .terminator = .{ .jump = .{ .target = ir.BlockId.fromIndex(15), .arguments = &.{} } }, .evidence = ev_refs });
+    try blocks.append(allocator, .{ .id = ir.BlockId.fromIndex(17), .function = f1, .parameters = &.{}, .instructions = &.{}, .terminator = .{ .jump = .{ .target = ir.BlockId.fromIndex(18), .arguments = &.{} } }, .evidence = ev_refs });
+    try blocks.append(allocator, .{ .id = ir.BlockId.fromIndex(18), .function = f1, .parameters = &.{}, .instructions = &.{}, .terminator = .{ .jump = .{ .target = ir.BlockId.fromIndex(19), .arguments = &.{} } }, .evidence = ev_refs });
+    try blocks.append(allocator, .{ .id = ir.BlockId.fromIndex(19), .function = f1, .parameters = &.{}, .instructions = &.{}, .terminator = .{ .jump = .{ .target = ir.BlockId.fromIndex(2), .arguments = try allocator.dupe(ir.ValueId, &.{ ir.ValueId.fromIndex(15), ir.ValueId.fromIndex(13), ir.ValueId.fromIndex(14), ir.ValueId.fromIndex(6) }) } }, .evidence = ev_refs });
+    try functions.append(allocator, .{ .id = f1, .parameters = try allocator.dupe(ir.ValueId, &.{ ir.ValueId.fromIndex(0), ir.ValueId.fromIndex(1), ir.ValueId.fromIndex(2) }), .blocks = try allocator.dupe(ir.BlockId, &.{ ir.BlockId.fromIndex(1), ir.BlockId.fromIndex(2), ir.BlockId.fromIndex(3), ir.BlockId.fromIndex(4), ir.BlockId.fromIndex(5), ir.BlockId.fromIndex(6), ir.BlockId.fromIndex(7), ir.BlockId.fromIndex(8), ir.BlockId.fromIndex(9), ir.BlockId.fromIndex(10), ir.BlockId.fromIndex(11), ir.BlockId.fromIndex(12), ir.BlockId.fromIndex(13), ir.BlockId.fromIndex(14), ir.BlockId.fromIndex(15), ir.BlockId.fromIndex(16), ir.BlockId.fromIndex(17), ir.BlockId.fromIndex(18), ir.BlockId.fromIndex(19) }), .entry_block = ir.BlockId.fromIndex(1), .evidence = ev_refs });
+
+    const evidence = try allocator.dupe(ir.Evidence, &.{.{ .id = ir.EvidenceId.fromIndex(0), .kind = .dynamic_fixture, .locator = "fixture:for-loop-two-never-ending-branches" }});
+    return ir.Program{
+        .program_id = "for-loop-two-never-ending-branches",
+        .entry_function = f0,
+        .functions = try functions.toOwnedSlice(allocator),
+        .blocks = try blocks.toOwnedSlice(allocator),
+        .instructions = try instructions.toOwnedSlice(allocator),
+        .values = try values.toOwnedSlice(allocator),
+        .evidence = evidence,
+    };
+}
+
+test "plain normalization keeps the typed failure of a function the feedback cannot make plannable" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const cases = [_]struct { place: DeclineTestPlace, second: DeclineTestSecond }{
+        .{ .place = .instruction, .second = .none },
+        .{ .place = .local, .second = .none },
+        .{ .place = .instruction, .second = .worker },
+        .{ .place = .local, .second = .worker },
+        .{ .place = .instruction, .second = .or_arm },
+        .{ .place = .local, .second = .or_arm },
+    };
+    for (cases) |case| {
+        const program = try declineTestProgram(allocator, case.place, false, case.second);
+        try std.testing.expectError(error.NormalizationInvariantFailed, normalizeInArena(allocator, &program));
+    }
+    const control = try declineTestProgram(allocator, .local, true, .worker);
+    const normalized = try normalizeInArena(allocator, &control);
+    const control_f0 = control.functions[0];
+    const normalized_f0 = normalized.program.functions[0];
+    try std.testing.expectEqualSlices(ir.BlockId, control_f0.blocks, normalized_f0.blocks);
+    for (control_f0.blocks) |block_id| {
+        const before = control.blocks[block_id.index()].terminator;
+        const after = normalized.program.blocks[block_id.index()].terminator;
+        try std.testing.expectEqual(std.meta.activeTag(before), std.meta.activeTag(after));
+    }
+}
+
+test "plain normalization keeps the typed failure of a for loop with two never-ending branches" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const program = try twoNeverEndingBranchesTestProgram(allocator);
+    try std.testing.expectError(error.NormalizationInvariantFailed, normalizeInArena(allocator, &program));
+}
+
+fn declineTerminatorMatches(expected: ir.Terminator, actual: ir.Terminator) !void {
+    try std.testing.expectEqual(std.meta.activeTag(expected), std.meta.activeTag(actual));
+    switch (expected) {
+        .jump => |edge| {
+            try std.testing.expectEqual(edge.target, actual.jump.target);
+            try std.testing.expectEqualSlices(ir.ValueId, edge.arguments, actual.jump.arguments);
+        },
+        .branch => |branch| {
+            try std.testing.expectEqual(branch.condition, actual.branch.condition);
+            try std.testing.expectEqual(branch.then_edge.target, actual.branch.then_edge.target);
+            try std.testing.expectEqualSlices(ir.ValueId, branch.then_edge.arguments, actual.branch.then_edge.arguments);
+            try std.testing.expectEqual(branch.else_edge.target, actual.branch.else_edge.target);
+            try std.testing.expectEqualSlices(ir.ValueId, branch.else_edge.arguments, actual.branch.else_edge.arguments);
+        },
+        .return_values => |values| {
+            try std.testing.expectEqualSlices(ir.ValueId, values, actual.return_values);
+        },
+        else => {},
+    }
+}
+
+fn expectFunctionBlocksPreserved(input: *const ir.Program, result: *const ir.Program, function_index: usize) !void {
+    const input_function = input.functions[function_index];
+    const result_function = result.functions[function_index];
+    try std.testing.expectEqualSlices(ir.BlockId, input_function.blocks, result_function.blocks);
+    for (input_function.blocks) |block_id| {
+        try declineTerminatorMatches(input.blocks[block_id.index()].terminator, result.blocks[block_id.index()].terminator);
+    }
+}
+
+fn expectNoRewriteFromFunctionZero(input: *const ir.Program, result: *const ir.Program) !void {
+    const function_zero_blocks = input.functions[0].blocks;
+    for (result.edge_rewrites) |rewrite| {
+        for (function_zero_blocks) |block_id| {
+            try std.testing.expect(rewrite.source != block_id);
+        }
+    }
+}
+
+fn expectRewritesEqual(expected: []const ir.CfgEdgeRewrite, actual: []const ir.CfgEdgeRewrite) !void {
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |left, right| {
+        try std.testing.expectEqual(left.rule, right.rule);
+        try std.testing.expectEqual(left.source, right.source);
+        try std.testing.expectEqual(left.kind, right.kind);
+        try std.testing.expectEqual(left.from.target, right.from.target);
+        try std.testing.expectEqualSlices(ir.ValueId, left.from.arguments, right.from.arguments);
+        try std.testing.expectEqual(left.to.target, right.to.target);
+        try std.testing.expectEqualSlices(ir.ValueId, left.to.arguments, right.to.arguments);
+        try std.testing.expectEqual(left.node_split_group, right.node_split_group);
+    }
+}
+
+fn expectSingleFunctionDeclined(place: DeclineTestPlace) !void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const work = arena.allocator();
+    const program = try declineTestProgram(work, place, false, .none);
+    const whole = try normalizeAdmittedWithScratchInArena(work, work, &program);
+    try std.testing.expectEqual(@as(usize, 8), whole.program.blocks.len);
+    try std.testing.expectEqual(@as(usize, 0), whole.program.edge_rewrites.len);
+    try std.testing.expectEqual(@as(usize, 0), whole.cloned_blocks);
+    try expectFunctionBlocksPreserved(&program, &whole.program, 0);
+    const targeted = try normalizeAdmittedFunctionWithScratchInArena(work, work, &program, 0);
+    try std.testing.expectEqual(@as(usize, 8), targeted.program.blocks.len);
+    try std.testing.expectEqual(@as(usize, 0), targeted.program.edge_rewrites.len);
+    try std.testing.expectEqual(@as(usize, 0), targeted.cloned_blocks);
+    try expectFunctionBlocksPreserved(&program, &targeted.program, 0);
+}
+
+fn expectDeclinedBesideHealthyWorker(place: DeclineTestPlace) !void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const work = arena.allocator();
+    const declining = try declineTestProgram(work, place, false, .worker);
+    const control = try declineTestProgram(work, .local, true, .worker);
+    const declined = try normalizeAdmittedWithScratchInArena(work, work, &declining);
+    const healthy = try normalizeInArena(work, &control);
+    try expectFunctionBlocksPreserved(&declining, &declined.program, 0);
+    try expectNoRewriteFromFunctionZero(&declining, &declined.program);
+    try std.testing.expectEqual(healthy.program.blocks.len, declined.program.blocks.len);
+    try std.testing.expectEqualSlices(ir.BlockId, healthy.program.functions[1].blocks, declined.program.functions[1].blocks);
+    try expectRewritesEqual(healthy.program.edge_rewrites, declined.program.edge_rewrites);
+}
+
+fn expectDeclinedKeepsArmSplit(place: DeclineTestPlace) !void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const work = arena.allocator();
+    const program = try declineTestProgram(work, place, false, .or_arm);
+    const result = try normalizeAdmittedWithScratchInArena(work, work, &program);
+    try expectFunctionBlocksPreserved(&program, &result.program, 0);
+    try expectNoRewriteFromFunctionZero(&program, &result.program);
+    try std.testing.expectEqual(@as(usize, 17), result.program.blocks.len);
+    try std.testing.expectEqualSlices(ir.BlockId, &.{
+        ir.BlockId.fromIndex(8),  ir.BlockId.fromIndex(9),  ir.BlockId.fromIndex(10),
+        ir.BlockId.fromIndex(11), ir.BlockId.fromIndex(12), ir.BlockId.fromIndex(13),
+        ir.BlockId.fromIndex(14), ir.BlockId.fromIndex(15), ir.BlockId.fromIndex(16),
+    }, result.program.functions[1].blocks);
+    try std.testing.expectEqual(@as(usize, 1), result.program.edge_rewrites.len);
+    const rewrite = result.program.edge_rewrites[0];
+    try std.testing.expectEqual(ir.EdgeRewriteRule.node_split, rewrite.rule);
+    try std.testing.expectEqual(ir.BlockId.fromIndex(13), rewrite.source);
+    try std.testing.expectEqual(ir.CfgEdgeKind.branch_else, rewrite.kind);
+    try std.testing.expectEqual(ir.BlockId.fromIndex(15), rewrite.from.target);
+    try std.testing.expectEqual(@as(usize, 0), rewrite.from.arguments.len);
+    try std.testing.expectEqual(ir.BlockId.fromIndex(16), rewrite.to.target);
+    try std.testing.expectEqual(@as(usize, 0), rewrite.to.arguments.len);
+}
+
+test "admitted normalization declines an unsplittable function and restores it" {
+    try expectSingleFunctionDeclined(.instruction);
+}
+
+test "admitted normalization declines a function whose splits pass the clone budget and restores it" {
+    try expectSingleFunctionDeclined(.local);
+}
+
+test "a declined unsplittable function leaves the function beside it as plain normalization publishes it" {
+    try expectDeclinedBesideHealthyWorker(.instruction);
+}
+
+test "a function declined at the clone budget leaves the function beside it as plain normalization publishes it" {
+    try expectDeclinedBesideHealthyWorker(.local);
+}
+
+test "a declined unsplittable function keeps the feedback split of the function beside it" {
+    try expectDeclinedKeepsArmSplit(.instruction);
+}
+
+test "a function declined at the clone budget keeps the feedback split of the function beside it" {
+    try expectDeclinedKeepsArmSplit(.local);
+}
+
+test "admitted normalization equals plain normalization when no function declines" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const work = arena.allocator();
+    const program = try declineTestProgram(work, .local, true, .worker);
+    const plain = try normalizeInArena(work, &program);
+    const admitted = try normalizeAdmittedWithScratchInArena(work, work, &program);
+    try std.testing.expectEqual(plain.program.blocks.len, admitted.program.blocks.len);
+    try std.testing.expectEqual(plain.cloned_blocks, admitted.cloned_blocks);
+    for (plain.program.functions, admitted.program.functions) |plain_function, admitted_function| {
+        try std.testing.expectEqualSlices(ir.BlockId, plain_function.blocks, admitted_function.blocks);
+    }
+    try expectRewritesEqual(plain.program.edge_rewrites, admitted.program.edge_rewrites);
+}
+
+test "admitted normalization declines a for loop with two never-ending branches and keeps its function unchanged" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const work = arena.allocator();
+    const program = try twoNeverEndingBranchesTestProgram(work);
+    const result = normalizeAdmittedWithScratchInArena(work, work, &program) catch |err| {
+        std.debug.print("admitted normalization of the for loop with two never-ending branches failed: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    try std.testing.expectEqual(@as(usize, 20), result.program.blocks.len);
+    try std.testing.expectEqual(@as(usize, 0), result.program.edge_rewrites.len);
+    try std.testing.expectEqual(@as(usize, 0), result.cloned_blocks);
+    try expectFunctionBlocksPreserved(&program, &result.program, 1);
+    try expectFunctionBlocksPreserved(&program, &result.program, 0);
 }
