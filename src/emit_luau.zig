@@ -4768,6 +4768,46 @@ test "a loop that owns its exit declares that exit's flag and counts it in the r
     try std.testing.expectEqual(@as(usize, 0), structured_escape.maxOwnedDepth(&root));
 }
 
+test "a loop whose body leaves it by a loop-boundary exit declares that exit's flag on every pass" {
+    const header = ir.BlockId.fromIndex(1);
+    const exit = ir.BlockId.fromIndex(2);
+    const decision = ir.BlockId.fromIndex(3);
+    const body_block = ir.BlockId.fromIndex(4);
+    // An infinite loop whose body ends with a loop boundary: its body arm continues the loop and its exit arm leaves
+    // for the loop's exit, setting that exit's flag. Nothing in the body escapes to the exit.
+    var boundary_body_nodes = [_]structure.Node{.{ .block = body_block }};
+    var boundary_body = structure.Region{ .nodes = &boundary_body_nodes, .stop = header, .loop_exit = exit, .continue_target = header };
+    var body_nodes = [_]structure.Node{
+        .{ .block = header },
+        .{ .loop_boundary = .{
+            .block = decision,
+            .body_edge = .{ .target = body_block },
+            .body_region = &boundary_body,
+            .boundary = .{ .exit = .{ .target = exit } },
+            .body_on_true = true,
+        } },
+    };
+    var body = structure.Region{ .nodes = &body_nodes, .stop = header, .loop_exit = exit, .continue_target = header };
+    var root_nodes = [_]structure.Node{
+        .{ .infinite_loop = .{ .header = header, .body_region = &body, .exit = exit } },
+        .{ .block = exit },
+    };
+    var root = structure.Region{ .nodes = &root_nodes, .stop = null, .loop_exit = null };
+    // The loop declares the flag at the top of every pass, so an entry of the loop that an enclosing loop makes again
+    // starts with the flag false; the flag lives through the loop's body, one flag in the register budget.
+    try std.testing.expectEqual(@as(?ir.BlockId, exit), structured_escape.loopOwnedExitFlag(&root, root_nodes[0]));
+    try std.testing.expectEqual(@as(usize, 1), structured_escape.maxOwnedDepth(&root));
+    // A holding region whose stop is the exit declares no flag the loop-boundary exit below it shares, so the loop
+    // still declares it.
+    root.stop = exit;
+    try std.testing.expectEqual(@as(?ir.BlockId, exit), structured_escape.loopOwnedExitFlag(&root, root_nodes[0]));
+    try std.testing.expectEqual(@as(usize, 1), structured_escape.maxOwnedDepth(&root));
+    root.stop = null;
+    // A loop whose exit is itself an escape owns no exit.
+    root_nodes[0].infinite_loop.exit_is_escape = true;
+    try std.testing.expectEqual(@as(?ir.BlockId, null), structured_escape.loopOwnedExitFlag(&root, root_nodes[0]));
+}
+
 test "wrapped region exposes only its owning loop continuation" {
     const stop = ir.BlockId.fromIndex(31);
     const other = ir.BlockId.fromIndex(32);

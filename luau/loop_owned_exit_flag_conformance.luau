@@ -24,7 +24,17 @@
 --   side_escape_free_target: step("entry") while step("Z") do while true do step("H") while step("I") do
 --     if step("B") then if step("L") then <next pass of the middle loop> end <leave the middle loop> end
 --     step("C") end step("E") <leave the middle loop> end end return "done"
--- The chunk returns the eight workers in this order.
+-- The ninth and tenth are worker(step) again: an inner loop whose `break` is a loop-boundary exit carried by its
+-- exit's escape flag (its body is written inside a transfer wrapper for a nested `continue`), entered again by an
+-- outer loop, so the flag must start false on every entry of the inner loop:
+--   exit_reentered: while step("H0") do while step("I") do if step("A") then if step("B") then step("K")
+--     <next pass of the inner loop> end end if step("X") then <leave the inner loop> end step("C") end step("E")
+--     end return "done"
+--   exit_to_infinite_header: the same inner loop last in the body of an outer infinite loop, so its exit is the
+--     outer loop's header and the stop of the region that holds it: while true do step("H") while step("I") do
+--     if step("A") then if step("B") then step("K") <next pass of the inner loop> end end
+--     if step("X") then <leave the inner loop> end step("C") end end
+-- The chunk returns the ten workers in this order.
 local fs = require("@lune/fs")
 local process = require("@lune/process")
 local LifterIR = require("./lifter_ir")
@@ -115,6 +125,26 @@ local SHAPES = {
 		{ name = "middle_left", steps = { { "note", "E" } }, exit = { "jump", "outer_header" } },
 		{ name = "done", steps = {}, exit = { "return", "done" } },
 	},
+	exit_reentered = {
+		{ name = "outer_header", steps = { { "decide", "H0" } }, exit = { "branch", "inner_header", "done" } },
+		{ name = "inner_header", steps = { { "decide", "I" } }, exit = { "branch", "a_test", "left" } },
+		{ name = "a_test", steps = { { "decide", "A" } }, exit = { "branch", "b_test", "boundary" } },
+		{ name = "b_test", steps = { { "decide", "B" } }, exit = { "branch", "cont", "boundary" } },
+		{ name = "cont", steps = { { "note", "K" } }, exit = { "jump", "inner_header" } },
+		{ name = "boundary", steps = { { "decide", "X" } }, exit = { "branch", "left", "tail" } },
+		{ name = "tail", steps = { { "note", "C" } }, exit = { "jump", "inner_header" } },
+		{ name = "left", steps = { { "note", "E" } }, exit = { "jump", "outer_header" } },
+		{ name = "done", steps = {}, exit = { "return", "done" } },
+	},
+	exit_to_infinite_header = {
+		{ name = "outer_header", steps = { { "note", "H" } }, exit = { "jump", "inner_header" } },
+		{ name = "inner_header", steps = { { "decide", "I" } }, exit = { "branch", "a_test", "outer_header" } },
+		{ name = "a_test", steps = { { "decide", "A" } }, exit = { "branch", "b_test", "boundary" } },
+		{ name = "b_test", steps = { { "decide", "B" } }, exit = { "branch", "cont", "boundary" } },
+		{ name = "cont", steps = { { "note", "K" } }, exit = { "jump", "inner_header" } },
+		{ name = "boundary", steps = { { "decide", "X" } }, exit = { "branch", "outer_header", "tail" } },
+		{ name = "tail", steps = { { "note", "C" } }, exit = { "jump", "inner_header" } },
+	},
 }
 
 -- The order in which each step shape's blocks receive their steps and terminators.
@@ -145,6 +175,18 @@ local FILL_ORDER = {
 		"middle_left",
 		"done",
 	},
+	exit_reentered = {
+		"outer_header",
+		"inner_header",
+		"a_test",
+		"b_test",
+		"cont",
+		"boundary",
+		"tail",
+		"left",
+		"done",
+	},
+	exit_to_infinite_header = { "outer_header", "inner_header", "a_test", "b_test", "cont", "boundary", "tail" },
 }
 
 local function addStepWorker(shape)
@@ -267,6 +309,8 @@ for _, kind in { "numeric", "generic", "semantic" } do
 	export(addNativeWorker(kind))
 end
 export(addStepWorker("side_escape_free_target"))
+export(addStepWorker("exit_reentered"))
+export(addStepWorker("exit_to_infinite_header"))
 builder:finalizeBlock(chunkBlock, LifterIR.Terminator.returnValues(exports))
 builder:finalizeFunction(chunk)
 

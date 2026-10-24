@@ -677,10 +677,13 @@ pub fn regionHasNestedEscapeTo(region: *const Region, target: ir.BlockId) bool {
 /// The escape census lets a loop own its exit: `collectLoopFreeTargets` puts an exit that is not itself an escape
 /// in the capture chain of the body, so an escape to it from the body (a nested loop that leaves through it, a
 /// loop-boundary escape or side escape to it, or a projection of a region in the body) is no free target above the
-/// loop and no transfer wrapper's stop. The region that holds the loop declares the flag before its wrapper when its
-/// stop is the exit. Otherwise every read and write of the flag lies inside the loop, and the loop declares it at
-/// the top of every pass, so a loop that runs again starts with the flag false; a function-scope declaration of the
-/// same flag (for a loop-boundary exit to the same block) is shadowed inside the loop.
+/// loop and no transfer wrapper's stop. A loop-boundary exit to the exit, at any depth of the body, sets the exit's
+/// flag, and every read of that flag lies inside the loop; no wrapper of the holding region declares a flag that a
+/// loop-boundary exit below it sets, so the loop owns the flag whatever the holding region's stop. Otherwise the
+/// region that holds the loop declares the flag before its wrapper when its stop is the exit, and else every read
+/// and write of the flag lies inside the loop. The loop declares an owned flag at the top of every pass, so a loop
+/// that runs again, or that an enclosing loop enters again, starts with the flag false; the function-scope
+/// declaration of a loop-boundary exit's flag is shadowed inside the loop.
 pub fn loopOwnedExitFlag(holding_region: *const Region, node: Node) ?ir.BlockId {
     const owned: struct { exit: ir.BlockId, body: *const Region } = switch (node) {
         .loop => |loop| if (loop.exit_is_escape) return null else .{ .exit = loop.exit_edge.target, .body = loop.body_region },
@@ -688,6 +691,7 @@ pub fn loopOwnedExitFlag(holding_region: *const Region, node: Node) ?ir.BlockId 
         .infinite_loop => |loop| if (loop.exit_is_escape) return null else .{ .exit = loop.exit orelse return null, .body = loop.body_region },
         else => return null,
     };
+    if (regionHasLoopBoundaryExitTo(owned.body, owned.exit)) return owned.exit;
     if (holding_region.stop != null and holding_region.stop.? == owned.exit) return null;
     if (!regionEscapesTo(owned.body, owned.exit)) return null;
     return owned.exit;

@@ -1118,7 +1118,8 @@ test "automatic register certificate covers the function-scope escape flags of n
     const base = try functionRegisterBase(allocator, function.parameters.len, storage_locals, structured.root);
     const pressure = try maximumPressure(allocator, &program, &readable, &emission, &scopes, function, base, structured.root);
     // The certified total must cover the emitted peak.
-    try std.testing.expectEqual(@as(usize, 11), pressure.total);
+    // Both loops also declare their owned exits' flags at the top of each pass, and maxOwnedDepth counts them.
+    try std.testing.expectEqual(@as(usize, 13), pressure.total);
 }
 
 /// The workers of the native-loop register tests: worker(f, observe, marker, first, last, stride), function 1,

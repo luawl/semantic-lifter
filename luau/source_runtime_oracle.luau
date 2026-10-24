@@ -1231,6 +1231,100 @@ function SourceRuntimeOracle.run(caseName: string, source: string, exported: any
 			end
 		end
 		assert(#changed == 0, `number literals changed their bits at entries {table.concat(changed, ",")}`)
+	elseif
+		caseName == "source-frontend-loop-exit-flag-reentry"
+		or caseName == "source-frontend-loop-exit-flag-reentry-direct-locals"
+		or caseName == "source-frontend-loop-exit-flag-reentry-mid-pass"
+		or caseName == "source-frontend-loop-exit-flag-reentry-mid-pass-direct-locals"
+	then
+		-- The worker against a copy of its source function over 24 rows (n 0..5, m 0..3): the result and the order of
+		-- observe's arguments must match. The inner loop's `break` is carried by its exit's escape flag and the outer
+		-- loop enters the inner loop again on every pass, so a flag one pass left set would end the next pass's inner
+		-- loop after its first pass or, in the mid-pass shape, part way through it. A run that makes more than 400
+		-- observe calls stops with the error "call cap".
+		local function reentry(n: number, m: number, _marker: any, _f: any, _g: any, observe: any): any
+			local total = 0
+			for pass = 1, m do
+				local acc = 0
+				for i = 1, n do
+					if i > 1 then
+						if i > pass + 1 then
+							continue
+						end
+					end
+					acc += 1
+					observe(i)
+					if acc > 1 then
+						break
+					end
+				end
+				total = total * 10 + acc
+			end
+			return total
+		end
+		local function reentryMidPass(n: number, m: number, _marker: any, _f: any, _g: any, observe: any): any
+			local total = 0
+			for _ = 1, 2 do
+				local acc = 0
+				for i = 1, n do
+					if i > 1 then
+						if i > 2 then
+							continue
+						end
+					end
+					if i > 0 then
+						if i > m then
+							if acc > 5 then
+								continue
+							end
+						end
+						acc += 1
+						if acc > 1 then
+							break
+						end
+						acc += 10
+						observe(10 * i)
+					end
+					acc += 100
+					observe(100 * i)
+				end
+				total = total * 1000 + acc
+			end
+			return total
+		end
+		local reference = if string.find(caseName, "mid-pass", 1, true) ~= nil then reentryMidPass else reentry
+		local function runRow(worker: any, n: number, m: number): string
+			local log: { string } = {}
+			local function observe(value: number)
+				if #log >= 400 then
+					error("call cap", 0)
+				end
+				table.insert(log, tostring(value))
+			end
+			local ok, result = pcall(worker, n, m, "marker", function()
+				return false
+			end, function()
+				return false
+			end, observe)
+			local outcome = if ok then "ok:" .. tostring(result) else "err:" .. string.gsub(tostring(result), "^.-:%d+: ", "")
+			return outcome .. " [" .. table.concat(log, ",") .. "]"
+		end
+		local rows, mismatches = 0, 0
+		local first = ""
+		for n = 0, 5 do
+			for m = 0, 3 do
+				local expected = runRow(reference, n, m)
+				local actual = runRow(exported, n, m)
+				rows += 1
+				if expected ~= actual then
+					mismatches += 1
+					if first == "" then
+						first = `n={n} m={m} expected={expected} got={actual}`
+					end
+				end
+			end
+		end
+		assert(mismatches == 0, `{caseName}: {mismatches} of {rows} rows differ from the source; first {first}`)
 	else
 		return false
 	end

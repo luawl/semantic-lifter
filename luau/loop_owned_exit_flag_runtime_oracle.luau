@@ -7,7 +7,9 @@
 -- script that runs out raises, which bounds every loop. One row is also checked against its trace written out: the
 -- third worker's second entry to its middle loop must not see the flag its first entry left set. The eighth worker
 -- leaves its inner loop by a loop boundary's side escape, whose side arm sets the flag of the exit the middle loop
--- owns after the side region: that set must reach the flag the middle loop reads.
+-- owns after the side region: that set must reach the flag the middle loop reads. The ninth and tenth leave an
+-- inner loop that an outer loop enters again by a loop-boundary exit carried by its escape flag: a flag one entry
+-- left set must not end the next entry's first pass.
 -- A passing case prints nothing. A failing case prints one line per failing worker, `<case> <worker> rows=<R>
 -- mismatches=<M> trapped=<T>` with the first differing row, a line for the written-out row when it differs, and
 -- fails one assertion that counts the failed workers.
@@ -149,6 +151,43 @@ local function sideEscapeFreeTarget(step: (string) -> any): any
 	return "done"
 end
 
+local function exitReentered(step: (string) -> any): any
+	while step("H0") do
+		while step("I") do
+			if step("A") then
+				if step("B") then
+					step("K")
+					continue
+				end
+			end
+			if step("X") then
+				break
+			end
+			step("C")
+		end
+		step("E")
+	end
+	return "done"
+end
+
+local function exitToInfiniteHeader(step: (string) -> any): any
+	while true do
+		step("H")
+		while step("I") do
+			if step("A") then
+				if step("B") then
+					step("K")
+					continue
+				end
+			end
+			if step("X") then
+				break
+			end
+			step("C")
+		end
+	end
+end
+
 -- The native loops run index over 1, 2, 3.
 local function ownedExitFor(step: (string) -> any): any
 	for index = 1, 3 do
@@ -195,6 +234,8 @@ local WORKERS: { WorkerEntry } = {
 	{ name = "owned_exit_generic_for", reference = ownedExitFor, invoke = genericInvoke },
 	{ name = "owned_exit_semantic_for", reference = ownedExitFor, invoke = semanticInvoke },
 	{ name = "side_escape_free_target", reference = sideEscapeFreeTarget, invoke = stepInvoke },
+	{ name = "exit_reentered", reference = exitReentered, invoke = stepInvoke },
+	{ name = "exit_to_infinite_header", reference = exitToInfiniteHeader, invoke = stepInvoke },
 }
 
 local function scriptText(bits: { boolean }): string

@@ -489,6 +489,64 @@ pub fn build(b: *std.Build) void {
         "loop-owned-exit-flag",
         luau_loop_owned_exit_flag_conformance.resolved_ir,
     );
+    const source_frontend_loop_exit_flag_reentry_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/loop_exit_flag_reentry_source.luau",
+        "source-frontend-loop-exit-flag-reentry",
+    );
+    const source_frontend_loop_exit_flag_reentry_direct_locals_conformance = addLuauSourceConformanceForTarget(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/loop_exit_flag_reentry_source.luau",
+        "source-frontend-loop-exit-flag-reentry-direct-locals",
+        "direct-locals-luau",
+    );
+    const loop_exit_flag_reentry_dispatcher = addDispatcherRuntimeConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "source-frontend-loop-exit-flag-reentry",
+        source_frontend_loop_exit_flag_reentry_conformance.resolved_ir,
+    );
+    const source_frontend_loop_exit_flag_reentry_mid_pass_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/loop_exit_flag_reentry_mid_pass_source.luau",
+        "source-frontend-loop-exit-flag-reentry-mid-pass",
+    );
+    const source_frontend_loop_exit_flag_reentry_mid_pass_direct_locals_conformance = addLuauSourceConformanceForTarget(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/loop_exit_flag_reentry_mid_pass_source.luau",
+        "source-frontend-loop-exit-flag-reentry-mid-pass-direct-locals",
+        "direct-locals-luau",
+    );
+    const loop_exit_flag_reentry_mid_pass_dispatcher = addDispatcherRuntimeConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "source-frontend-loop-exit-flag-reentry-mid-pass",
+        source_frontend_loop_exit_flag_reentry_mid_pass_conformance.resolved_ir,
+    );
+    const loop_exit_flag_reentry_layout = b.addSystemCommand(&.{ luneExe(b), "run" });
+    loop_exit_flag_reentry_layout.addFileArg(b.path("luau/structured_layout_oracle.luau"));
+    loop_exit_flag_reentry_layout.addArg("source-frontend-loop-exit-flag-reentry");
+    loop_exit_flag_reentry_layout.addFileArg(source_frontend_loop_exit_flag_reentry_conformance.generated_luau);
+    const loop_exit_flag_reentry_mid_pass_layout = b.addSystemCommand(&.{ luneExe(b), "run" });
+    loop_exit_flag_reentry_mid_pass_layout.addFileArg(b.path("luau/structured_layout_oracle.luau"));
+    loop_exit_flag_reentry_mid_pass_layout.addArg("source-frontend-loop-exit-flag-reentry-mid-pass");
+    loop_exit_flag_reentry_mid_pass_layout.addFileArg(source_frontend_loop_exit_flag_reentry_mid_pass_conformance.generated_luau);
     const luau_iteration_header_forwarder_conformance = addLuauFixtureConformance(
         b,
         exe,
@@ -1692,6 +1750,14 @@ pub fn build(b: *std.Build) void {
     conformance_step.dependOn(&wrapped_continue_layout.step);
     luau_loop_owned_exit_flag_conformance.addTo(conformance_step);
     conformance_step.dependOn(loop_owned_exit_flag_dispatcher);
+    source_frontend_loop_exit_flag_reentry_conformance.addTo(conformance_step);
+    source_frontend_loop_exit_flag_reentry_direct_locals_conformance.addTo(conformance_step);
+    conformance_step.dependOn(loop_exit_flag_reentry_dispatcher);
+    conformance_step.dependOn(&loop_exit_flag_reentry_layout.step);
+    source_frontend_loop_exit_flag_reentry_mid_pass_conformance.addTo(conformance_step);
+    source_frontend_loop_exit_flag_reentry_mid_pass_direct_locals_conformance.addTo(conformance_step);
+    conformance_step.dependOn(loop_exit_flag_reentry_mid_pass_dispatcher);
+    conformance_step.dependOn(&loop_exit_flag_reentry_mid_pass_layout.step);
     luau_iteration_header_forwarder_conformance.addTo(conformance_step);
     conformance_step.dependOn(iteration_header_forwarder_dispatcher);
     luau_open_pack_projection_conformance.addTo(conformance_step);
