@@ -1720,6 +1720,152 @@ pub fn build(b: *std.Build) void {
     nested_reresolve_audit.addFileArg(nested_reresolve_third_ir);
     nested_reresolve_audit.addFileArg(nested_reresolve_renormalized_ir);
     const conformance_step = b.step("conformance", "Validate, emit, and compile Zig- and Luau-built generic fixtures");
+    // Author-written programs whose latch carries
+    // values of its own loop (a header instruction or parameter, a mid block, the edge source), and their controls.
+    // specializeForwardingJump forwards the authenticated latch through the dominator-path rule, so emit-luau writes
+    // each forwarded function structured on both targets; the controls keep their structure class, the two refusals
+    // keep their lines, the Phase-0 runs pin the post-split collapse's self-target guard, and the resolved mid twin
+    // pins the published forwarding record.
+    const latch_forward_fixtures = [_]struct { path: []const u8, name: []const u8, audit: []const u8 }{
+        .{ .path = "luau/fixtures/latch_forward_t2y_place.lifter-ir.json", .name = "latch-forward-t2y-place", .audit = "class=structured-no-dispatcher" },
+        .{ .path = "luau/fixtures/latch_forward_t2x.lifter-ir.json", .name = "latch-forward-t2x", .audit = "class=structured-no-dispatcher" },
+        .{ .path = "luau/fixtures/latch_forward_t2.lifter-ir.json", .name = "latch-forward-t2", .audit = "class=structured-no-dispatcher" },
+        .{ .path = "luau/fixtures/latch_forward_wp.lifter-ir.json", .name = "latch-forward-wp", .audit = "class=structured-no-dispatcher" },
+        .{ .path = "luau/fixtures/latch_forward_wl.lifter-ir.json", .name = "latch-forward-wl", .audit = "class=structured-no-dispatcher" },
+        .{ .path = "luau/fixtures/latch_forward_t2x_body1.lifter-ir.json", .name = "latch-forward-t2x-body1", .audit = "class=structured-no-dispatcher" },
+        .{ .path = "luau/fixtures/latch_forward_t2x_body4.lifter-ir.json", .name = "latch-forward-t2x-body4", .audit = "class=structured-no-dispatcher" },
+        .{ .path = "luau/fixtures/latch_forward_t2x_hang4x2.lifter-ir.json", .name = "latch-forward-t2x-hang4x2", .audit = "class=structured-no-dispatcher" },
+        .{ .path = "luau/fixtures/latch_forward_t2x_hang6x2.lifter-ir.json", .name = "latch-forward-t2x-hang6x2", .audit = "class=structured-no-dispatcher" },
+        .{ .path = "luau/fixtures/latch_forward_t2x_pre2.lifter-ir.json", .name = "latch-forward-t2x-pre2", .audit = "class=structured-no-dispatcher" },
+        .{ .path = "luau/fixtures/latch_forward_t2x_pre8.lifter-ir.json", .name = "latch-forward-t2x-pre8", .audit = "class=structured-no-dispatcher" },
+        .{ .path = "luau/fixtures/latch_forward_t2x_three.lifter-ir.json", .name = "latch-forward-t2x-three", .audit = "class=structured-no-dispatcher" },
+        .{ .path = "luau/fixtures/latch_forward_t2y_body1.lifter-ir.json", .name = "latch-forward-t2y-body1", .audit = "class=structured-no-dispatcher" },
+        .{ .path = "luau/fixtures/latch_forward_t2y_body4.lifter-ir.json", .name = "latch-forward-t2y-body4", .audit = "class=structured-no-dispatcher" },
+        .{ .path = "luau/fixtures/latch_forward_t2y_hang4x2.lifter-ir.json", .name = "latch-forward-t2y-hang4x2", .audit = "class=structured-no-dispatcher" },
+        .{ .path = "luau/fixtures/latch_forward_t2y_hang6x2.lifter-ir.json", .name = "latch-forward-t2y-hang6x2", .audit = "class=structured-no-dispatcher" },
+        .{ .path = "luau/fixtures/latch_forward_t2y_pre2.lifter-ir.json", .name = "latch-forward-t2y-pre2", .audit = "class=structured-no-dispatcher" },
+        .{ .path = "luau/fixtures/latch_forward_t2y_pre8.lifter-ir.json", .name = "latch-forward-t2y-pre8", .audit = "class=structured-no-dispatcher" },
+        .{ .path = "luau/fixtures/latch_forward_t2y_three.lifter-ir.json", .name = "latch-forward-t2y-three", .audit = "class=structured-no-dispatcher" },
+        .{ .path = "luau/fixtures/latch_forward_t2y_place_mid.lifter-ir.json", .name = "latch-forward-t2y-place-mid", .audit = "class=structured-no-dispatcher" },
+        .{ .path = "luau/fixtures/latch_forward_t2x_mid.lifter-ir.json", .name = "latch-forward-t2x-mid", .audit = "class=structured-no-dispatcher" },
+        .{ .path = "luau/fixtures/latch_forward_wp_mid.lifter-ir.json", .name = "latch-forward-wp-mid", .audit = "class=structured-no-dispatcher" },
+        .{ .path = "luau/fixtures/latch_forward_wl_mid.lifter-ir.json", .name = "latch-forward-wl-mid", .audit = "class=structured-no-dispatcher" },
+        .{ .path = "luau/fixtures/latch_forward_t2y_place_bodyarg.lifter-ir.json", .name = "latch-forward-t2y-place-bodyarg", .audit = "class=structured-no-dispatcher" },
+        .{ .path = "luau/fixtures/latch_forward_t2x_bodyarg.lifter-ir.json", .name = "latch-forward-t2x-bodyarg", .audit = "class=structured-no-dispatcher" },
+        .{ .path = "luau/fixtures/latch_forward_control_noparam.lifter-ir.json", .name = "latch-forward-control-noparam", .audit = "class=structured-no-dispatcher" },
+        .{ .path = "luau/fixtures/latch_forward_control_wok.lifter-ir.json", .name = "latch-forward-control-wok", .audit = "class=structured-no-dispatcher" },
+        .{ .path = "luau/fixtures/latch_forward_control_wok_mid.lifter-ir.json", .name = "latch-forward-control-wok-mid", .audit = "class=structured-no-dispatcher" },
+        .{ .path = "luau/fixtures/latch_forward_control_cycle2_param.lifter-ir.json", .name = "latch-forward-control-cycle2-param", .audit = "class=structured-no-dispatcher" },
+        .{ .path = "luau/fixtures/latch_forward_control_presolved.lifter-ir.json", .name = "latch-forward-control-presolved", .audit = "class=dispatcher-present" },
+        .{ .path = "luau/fixtures/latch_forward_control_presolved_place.lifter-ir.json", .name = "latch-forward-control-presolved-place", .audit = "class=dispatcher-present" },
+    };
+    for (latch_forward_fixtures) |fixture| {
+        addLatchForwardConformance(b, exe, z3_enabled, z3_bin, trace_normalize_phases, conformance_step, fixture.path, fixture.name, "standard-luau", fixture.audit);
+        addLatchForwardConformance(b, exe, z3_enabled, z3_bin, trace_normalize_phases, conformance_step, fixture.path, b.fmt("{s}-direct-locals", .{fixture.name}), "direct-locals-luau", fixture.audit);
+    }
+    addLatchForwardConformance(b, exe, z3_enabled, z3_bin, trace_normalize_phases, conformance_step, "luau/fixtures/latch_forward_control_t2x_pre.lifter-ir.json", "latch-forward-control-t2x-pre", "standard-luau", "class=dispatcher-present");
+    const latch_forward_pre_refusal = b.addRunArtifact(exe);
+    if (z3_enabled) latch_forward_pre_refusal.addPathDir(b.pathFromRoot(z3_bin));
+    latch_forward_pre_refusal.addArg("emit-luau");
+    latch_forward_pre_refusal.addFileArg(b.path("luau/fixtures/latch_forward_control_t2y_place_pre.lifter-ir.json"));
+    _ = latch_forward_pre_refusal.addOutputFileArg("latch-forward-control-t2y-place-pre.generated.luau");
+    latch_forward_pre_refusal.addArg("standard-luau");
+    latch_forward_pre_refusal.addFileArg(.{ .cwd_relative = luauCompileExe(b) });
+    latch_forward_pre_refusal.expectStdErrMatch("normalize failure phase=clone-availability function=0 blocks=10 rewrites=2");
+    latch_forward_pre_refusal.expectExitCode(1);
+    conformance_step.dependOn(&latch_forward_pre_refusal.step);
+    const latch_forward_plain_refusal = b.addRunArtifact(exe);
+    if (z3_enabled) latch_forward_plain_refusal.addPathDir(b.pathFromRoot(z3_bin));
+    latch_forward_plain_refusal.addArg("normalize-ir");
+    latch_forward_plain_refusal.addFileArg(b.path("luau/fixtures/latch_forward_control_presolved_place.lifter-ir.json"));
+    _ = latch_forward_plain_refusal.addOutputFileArg("latch-forward-control-presolved-place.normalized.lifter-ir.json");
+    latch_forward_plain_refusal.expectStdErrMatch("normalize failure phase=feedback-unsplittable-collision iteration=0 blocks=8 structural_clones=0 rewrites=0 arms=0");
+    latch_forward_plain_refusal.expectExitCode(1);
+    conformance_step.dependOn(&latch_forward_plain_refusal.step);
+    const latch_forward_phase0 = [_]struct { path: []const u8, name: []const u8 }{
+        .{ .path = "luau/fixtures/latch_forward_control_cycle2_param.lifter-ir.json", .name = "latch-forward-control-cycle2-param" },
+        .{ .path = "luau/fixtures/latch_forward_guard_cycle2_fparam.lifter-ir.json", .name = "latch-forward-guard-cycle2-fparam" },
+    };
+    for (latch_forward_phase0) |fixture| {
+        const phase0 = b.addRunArtifact(exe);
+        if (z3_enabled) phase0.addPathDir(b.pathFromRoot(z3_bin));
+        phase0.addArg("normalize-ir-budget");
+        phase0.addFileArg(b.path(fixture.path));
+        _ = phase0.addOutputFileArg(b.fmt("{s}.phase0.lifter-ir.json", .{fixture.name}));
+        phase0.addArgs(&.{ "1", "0" });
+        if (!trace_normalize_phases) phase0.expectStdErrEqual("");
+        phase0.expectExitCode(0);
+        conformance_step.dependOn(&phase0.step);
+    }
+    const latch_forward_pin_resolve = b.addRunArtifact(exe);
+    if (z3_enabled) latch_forward_pin_resolve.addPathDir(b.pathFromRoot(z3_bin));
+    latch_forward_pin_resolve.addArg("resolve-ir");
+    latch_forward_pin_resolve.addFileArg(b.path("luau/fixtures/latch_forward_t2y_place_mid.lifter-ir.json"));
+    const latch_forward_pin_ir = latch_forward_pin_resolve.addOutputFileArg("latch-forward-t2y-place-mid.resolved.lifter-ir.json");
+    latch_forward_pin_resolve.addArg(if (z3_enabled) "z3" else "internal");
+    latch_forward_pin_resolve.expectExitCode(0);
+    const latch_forward_pin = b.addRunArtifact(exe);
+    latch_forward_pin.addArg("inspect-edge-rewrite");
+    latch_forward_pin.addFileArg(latch_forward_pin_ir);
+    latch_forward_pin.addArg("0");
+    latch_forward_pin.expectStdErrMatch("rewrite=0 source=5 kind=branch_then from=3 to=1 rule=forwarding_jump group=null");
+    latch_forward_pin.expectExitCode(0);
+    conformance_step.dependOn(&latch_forward_pin.step);
+    // The post-split collapse's self-target guard on source-lifted
+    // programs. The frontend lowers the body of an empty-body `while` loop to a forwarder whose source is its own
+    // header, so the collapse of a targeted normalization writes a self-forward today, split or not: Phase 0 runs on
+    // the lifted IR of the two-hang `while` fixture and of a terminating `while step() do end`, and on the resolved IR
+    // of a `while k > 100 do end`, whose edge into the body carries a path constraint the self-forward would orphan.
+    const latch_forward_source_phase0 = [_]struct { path: []const u8, name: []const u8 }{
+        .{ .path = "luau/fixtures/exitless_two_hang_while_source.luau", .name = "latch-forward-guard-two-hang-while" },
+        .{ .path = "luau/fixtures/latch_forward_guard_empty_while_source.luau", .name = "latch-forward-guard-empty-while" },
+    };
+    for (latch_forward_source_phase0) |fixture| {
+        const source_phase0 = b.addRunArtifact(exe);
+        if (z3_enabled) source_phase0.addPathDir(b.pathFromRoot(z3_bin));
+        source_phase0.addArg("normalize-ir-budget");
+        source_phase0.addFileArg(addLuauSourceIr(b, fixture.path, null, fixture.name));
+        _ = source_phase0.addOutputFileArg(b.fmt("{s}.phase0.lifter-ir.json", .{fixture.name}));
+        source_phase0.addArgs(&.{ "1", "0" });
+        if (!trace_normalize_phases) source_phase0.expectStdErrEqual("");
+        source_phase0.expectExitCode(0);
+        conformance_step.dependOn(&source_phase0.step);
+    }
+    const latch_forward_constraint_resolve = b.addRunArtifact(exe);
+    if (z3_enabled) latch_forward_constraint_resolve.addPathDir(b.pathFromRoot(z3_bin));
+    latch_forward_constraint_resolve.addArg("resolve-ir");
+    latch_forward_constraint_resolve.addFileArg(addLuauSourceIr(b, "luau/fixtures/latch_forward_guard_while_constraint_source.luau", null, "latch-forward-guard-while-constraint"));
+    const latch_forward_constraint_ir = latch_forward_constraint_resolve.addOutputFileArg("latch-forward-guard-while-constraint.resolved.lifter-ir.json");
+    latch_forward_constraint_resolve.addArg(if (z3_enabled) "z3" else "internal");
+    latch_forward_constraint_resolve.expectExitCode(0);
+    const latch_forward_constraint_phase0 = b.addRunArtifact(exe);
+    if (z3_enabled) latch_forward_constraint_phase0.addPathDir(b.pathFromRoot(z3_bin));
+    latch_forward_constraint_phase0.addArg("normalize-ir-budget");
+    latch_forward_constraint_phase0.addFileArg(latch_forward_constraint_ir);
+    _ = latch_forward_constraint_phase0.addOutputFileArg("latch-forward-guard-while-constraint.phase0.lifter-ir.json");
+    latch_forward_constraint_phase0.addArgs(&.{ "1", "0" });
+    if (!trace_normalize_phases) latch_forward_constraint_phase0.expectStdErrEqual("");
+    latch_forward_constraint_phase0.expectExitCode(0);
+    conformance_step.dependOn(&latch_forward_constraint_phase0.step);
+    // The same guard on an exact-prepass checkpoint. Resolving the exact branch facts of a source's
+    // `while true do end` turns its header into a jump to the empty body, which jumps back, so Phase 0 of a targeted
+    // normalization would forward the header's edge into the body onto the header itself.
+    const latch_forward_exact_resolve = b.addRunArtifact(exe);
+    if (z3_enabled) latch_forward_exact_resolve.addPathDir(b.pathFromRoot(z3_bin));
+    latch_forward_exact_resolve.addArg("resolve-exact-control-ir");
+    latch_forward_exact_resolve.addFileArg(addLuauSourceIr(b, "luau/fixtures/feedback_decline_iteration_join_min_source.luau", null, "latch-forward-guard-while-true-latch"));
+    const latch_forward_exact_ir = latch_forward_exact_resolve.addOutputFileArg("latch-forward-guard-while-true-latch.exact.lifter-ir.json");
+    latch_forward_exact_resolve.addArg(if (z3_enabled) "z3" else "internal");
+    latch_forward_exact_resolve.expectExitCode(0);
+    const latch_forward_exact_phase0 = b.addRunArtifact(exe);
+    if (z3_enabled) latch_forward_exact_phase0.addPathDir(b.pathFromRoot(z3_bin));
+    latch_forward_exact_phase0.addArg("normalize-ir-budget");
+    latch_forward_exact_phase0.addFileArg(latch_forward_exact_ir);
+    _ = latch_forward_exact_phase0.addOutputFileArg("latch-forward-guard-while-true-latch.phase0.lifter-ir.json");
+    latch_forward_exact_phase0.addArgs(&.{ "1", "0" });
+    if (!trace_normalize_phases) latch_forward_exact_phase0.expectStdErrEqual("");
+    latch_forward_exact_phase0.expectExitCode(0);
+    conformance_step.dependOn(&latch_forward_exact_phase0.step);
     // Author-written IR fixtures in which the structure feedback
     // cannot make function 0 plannable. emit-luau declines that function, writes it flat and emits on both targets;
     // the control, whose functions all plan, keeps an empty stderr. resolve-ir and the decline audit pin the
@@ -3388,6 +3534,37 @@ fn addFeedbackDeclineResolve(
     const resolved_json = resolve_command.addOutputFileArg(b.fmt("{s}.resolved.lifter-ir.json", .{fixture_name}));
     resolve_command.addArg(if (z3_enabled) "z3" else "internal");
     return resolved_json;
+}
+
+// emit-luau on an author-written IR fixture for a
+// named target, exit 0 with an empty stderr (the checked emission compiles the output), then the structure audit with
+// the expected class: `class=structured-no-dispatcher` for a forwarded latch or a control that plans,
+// `class=dispatcher-present` for a control that stays flat.
+fn addLatchForwardConformance(
+    b: *std.Build,
+    exe: *std.Build.Step.Compile,
+    z3_enabled: bool,
+    z3_bin: []const u8,
+    trace_normalize_phases: bool,
+    conformance_step: *std.Build.Step,
+    fixture_path: []const u8,
+    fixture_name: []const u8,
+    target_name: []const u8,
+    audit_class: []const u8,
+) void {
+    const emit_command = b.addRunArtifact(exe);
+    if (z3_enabled) emit_command.addPathDir(b.pathFromRoot(z3_bin));
+    emit_command.addArg("emit-luau");
+    emit_command.addFileArg(b.path(fixture_path));
+    const generated_luau = emit_command.addOutputFileArg(b.fmt("{s}.generated.luau", .{fixture_name}));
+    emit_command.addArg(target_name);
+    emit_command.addFileArg(.{ .cwd_relative = luauCompileExe(b) });
+    if (!trace_normalize_phases) emit_command.expectStdErrEqual("");
+    emit_command.expectExitCode(0);
+    conformance_step.dependOn(&emit_command.step);
+    const audit = addStructureAstAudit(b, fixture_name, generated_luau);
+    audit.expectStdOutMatch(audit_class);
+    conformance_step.dependOn(&audit.step);
 }
 
 fn addSerializedCompileConformanceWithEngine(

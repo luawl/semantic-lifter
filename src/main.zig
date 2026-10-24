@@ -258,11 +258,15 @@ fn writeFile(io: Io, path: []const u8, bytes: []const u8) !void {
     try writeFileWithOptions(io, path, bytes, .{ .truncate = true });
 }
 
+/// `program_allocator` owns the storage of `program` (the arena of the command, or the arena that parsing allocated).
+/// The refresh stores the proof digests it recomputes in the program, so they are allocated there and released with
+/// it; a digest it replaces stays with the owner that allocated it.
 fn prepareNormalizedPublication(
     allocator: std.mem.Allocator,
+    program_allocator: std.mem.Allocator,
     program: *lifter.ir.Program,
 ) !void {
-    try lifter.proof_orchestrator.refreshSerializedProofDigestsAlloc(allocator, program);
+    try lifter.proof_orchestrator.refreshSerializedProofDigestsAlloc(program_allocator, program);
     var report = try lifter.validate.validate(allocator, program, .core);
     defer report.deinit();
     printDiagnostics(allocator, &report, program);
@@ -1127,7 +1131,7 @@ pub fn main(init: std.process.Init) !void {
         defer allocator.free(source);
         var parsed = try lifter.codec.parse(allocator, source);
         defer parsed.deinit();
-        try prepareNormalizedPublication(allocator, &parsed.value);
+        try prepareNormalizedPublication(allocator, parsed.arena.allocator(), &parsed.value);
         const encoded = try lifter.codec.encodeCompactAlloc(allocator, &parsed.value);
         defer allocator.free(encoded);
         try writeFile(io, args[3], encoded);
@@ -1274,7 +1278,7 @@ pub fn main(init: std.process.Init) !void {
                 function_index,
                 feedback_iterations,
             );
-        try prepareNormalizedPublication(allocator, &normalized.program);
+        try prepareNormalizedPublication(allocator, arena_state.allocator(), &normalized.program);
         const encoded = try lifter.codec.encodeCompactAlloc(allocator, &normalized.program);
         defer allocator.free(encoded);
         try writeFile(io, args[3], encoded);
@@ -1321,7 +1325,7 @@ pub fn main(init: std.process.Init) !void {
             feedback_iterations,
             initial_seed,
         );
-        try prepareNormalizedPublication(allocator, &normalized.program);
+        try prepareNormalizedPublication(allocator, arena_state.allocator(), &normalized.program);
         const encoded = try lifter.codec.encodeCompactAlloc(allocator, &normalized.program);
         defer allocator.free(encoded);
         try writeFile(io, args[3], encoded);
@@ -1367,7 +1371,7 @@ pub fn main(init: std.process.Init) !void {
                 allocator,
                 &parsed.value,
             );
-        try prepareNormalizedPublication(allocator, &normalized.program);
+        try prepareNormalizedPublication(allocator, arena_state.allocator(), &normalized.program);
         const encoded = try lifter.codec.encodeAlloc(allocator, &normalized.program);
         defer allocator.free(encoded);
         try writeFile(io, args[3], encoded);
@@ -1428,4 +1432,58 @@ test "diagnostic-only commands are labelled in the usage text" {
     }
     // emit-readable-luau-strategy names its admission refusals as typed diagnostics.
     try std.testing.expect(std.mem.indexOf(u8, usage_text, "no diagnostic lines on refusal") == null);
+}
+
+test "normalized publication keeps refreshed proof digests in the published program's allocator" {
+    // A program read back from its encoding, as the publication commands read one: its certificate holds a framework
+    // digest, which the publication refresh recomputes and stores in the program. std.testing.allocator fails the
+    // test when a recomputed digest is allocated where nothing releases it.
+    const fixture = lifter.fixtures.arithmetic_module;
+    const terms = [_]lifter.ir.SolverTerm{.{
+        .id = lifter.ir.SolverTermId.fromIndex(0),
+        .sort = .{ .kind = .boolean },
+        .operation = .{ .boolean_literal = true },
+    }};
+    const queries = [_]lifter.ir.SolverQuery{.{
+        .id = lifter.ir.QueryId.fromIndex(0),
+        .kind = .prove_true,
+        .goal = lifter.ir.SolverTermId.fromIndex(0),
+    }};
+    const claims = [_]lifter.ir.Claim{.{
+        .id = lifter.ir.ClaimId.fromIndex(0),
+        .subject = .{ .program = {} },
+        .predicate = lifter.ir.SolverTermId.fromIndex(0),
+        .status = .unproven,
+        .required_for_emission = true,
+        .evidence = &.{fixture.proof},
+        .query = lifter.ir.QueryId.fromIndex(0),
+    }};
+    var program = fixture.program;
+    program.solver_terms = &terms;
+    program.queries = &queries;
+    program.claims = &claims;
+
+    var resolved = try lifter.proof_orchestrator.resolveAlloc(
+        std.testing.allocator,
+        &program,
+        lifter.solver_backend.internalFacts(),
+    );
+    defer resolved.deinit();
+    try std.testing.expectEqual(@as(usize, 1), resolved.program.certificates.len);
+    const encoded = try lifter.codec.encodeAlloc(std.testing.allocator, &resolved.program);
+    defer std.testing.allocator.free(encoded);
+
+    var parsed = try lifter.codec.parse(std.testing.allocator, encoded);
+    defer parsed.deinit();
+    const recorded = parsed.value.certificates[0].certificate_digest.?;
+    try std.testing.expect(lifter.proof_digest.isFrameworkDigest(recorded));
+
+    try prepareNormalizedPublication(std.testing.allocator, parsed.arena.allocator(), &parsed.value);
+    const refreshed = parsed.value.certificates[0].certificate_digest.?;
+    try std.testing.expect(refreshed.ptr != recorded.ptr);
+    try std.testing.expectEqualStrings(recorded, refreshed);
+
+    const published = try lifter.codec.encodeCompactAlloc(std.testing.allocator, &parsed.value);
+    defer std.testing.allocator.free(published);
+    try std.testing.expect(std.mem.indexOf(u8, published, refreshed) != null);
 }

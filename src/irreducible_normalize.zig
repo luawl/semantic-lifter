@@ -1247,8 +1247,12 @@ fn collapseTransparentForwardingBlocksExcept(
             if (!try forwardingJumpIsReplayable(allocator, program, candidate.id, outgoing)) continue;
 
             for (blocks.items, 0..) |*source_block, source_index| {
+                // A source that is the candidate's own target would receive the
+                // self-loop `T: jump T(...)`, and edge admission refuses a rewrite whose target is its source
+                // (validate_proofs hasCanonicalRewritePrefix), so that edge keeps its forwarder.
                 if (source_index >= reachable.len or !reachable[source_index] or
-                    source_block.id == candidate.id or source_block.function != candidate.function or
+                    source_block.id == candidate.id or source_block.id == outgoing.target or
+                    source_block.function != candidate.function or
                     (selected_function != null and source_block.function != selected_function.?) or
                     isHistoricalForwardingTarget(rewrites.items, source_block.id))
                 {
@@ -8790,7 +8794,10 @@ fn collapseAuthenticatedTransparentCollisionEdge(
         .jump => |edge| edge,
         .branch, .return_values, .return_pack, .return_expanded, .throw_error, .unreachable_block => return false,
     };
-    if (outgoing.target == candidate.target or
+    // A forwarder whose jump returns to the candidate's own source would record
+    // the self-loop `source: jump source(...)`, which edge admission refuses (validate_proofs
+    // hasCanonicalRewritePrefix); the live edge keeps its forwarder, as the post-split collapse's source loop does.
+    if (outgoing.target == candidate.target or outgoing.target == candidate.source or
         outgoing.target.index() >= blocks.items.len)
     {
         return false;
@@ -12848,4 +12855,390 @@ test "admitted normalization declines a for loop with two never-ending branches 
     try std.testing.expectEqual(@as(usize, 0), result.cloned_blocks);
     try expectFunctionBlocksPreserved(&program, &result.program, 1);
     try expectFunctionBlocksPreserved(&program, &result.program, 0);
+}
+
+test "transparent collapse never writes a forward from a block into itself" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const b0 = ir.BlockId.fromIndex(0);
+    const b1 = ir.BlockId.fromIndex(1);
+    const b2 = ir.BlockId.fromIndex(2);
+    const input = ir.ValueId.fromIndex(0);
+    const p = ir.ValueId.fromIndex(1);
+    const input_arguments = [_]ir.ValueId{input};
+    const blocks = [_]ir.Block{
+        .{ .id = b0, .function = function_id, .terminator = .{ .branch = .{
+            .condition = input,
+            .then_edge = .{ .target = b1, .arguments = input_arguments[0..] },
+            .else_edge = .{ .target = b2 },
+        } } },
+        .{ .id = b1, .function = function_id, .parameters = &.{p}, .terminator = .{ .jump = .{ .target = b2 } } },
+        .{ .id = b2, .function = function_id, .terminator = .{ .jump = .{ .target = b1, .arguments = input_arguments[0..] } } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &.{input},
+        .blocks = &.{ b0, b1, b2 },
+        .entry_block = b0,
+    };
+    const values = [_]ir.Value{
+        .{ .id = input, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = p, .function = function_id, .type = .boolean, .origin = .{ .block_parameter = .{ .block = b1, .index = 0 } } },
+    };
+    const program = ir.Program{
+        .program_id = "transparent-collapse-self-forward",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+    };
+    var block_list: std.ArrayList(ir.Block) = .empty;
+    defer block_list.deinit(std.testing.allocator);
+    try block_list.appendSlice(std.testing.allocator, &blocks);
+    var rewrite_list: std.ArrayList(ir.CfgEdgeRewrite) = .empty;
+    defer rewrite_list.deinit(std.testing.allocator);
+    var working_program = program;
+    working_program.blocks = block_list.items;
+    working_program.edge_rewrites = rewrite_list.items;
+
+    try std.testing.expectEqual(@as(usize, 1), try collapseTransparentForwardingBlocks(
+        std.testing.allocator,
+        &working_program,
+        &block_list,
+        &rewrite_list,
+        0,
+    ));
+    try std.testing.expectEqual(b1, block_list.items[b0.index()].terminator.branch.else_edge.target);
+    try std.testing.expectEqualSlices(ir.ValueId, input_arguments[0..], block_list.items[b0.index()].terminator.branch.else_edge.arguments);
+    try std.testing.expectEqual(b2, block_list.items[b1.index()].terminator.jump.target);
+    try std.testing.expectEqual(@as(usize, 0), block_list.items[b1.index()].terminator.jump.arguments.len);
+    try std.testing.expectEqual(@as(usize, 1), rewrite_list.items.len);
+    try std.testing.expectEqual(ir.EdgeRewriteRule.forwarding_jump, rewrite_list.items[0].rule);
+    try std.testing.expectEqual(b0, rewrite_list.items[0].source);
+    try std.testing.expectEqual(ir.CfgEdgeKind.branch_else, rewrite_list.items[0].kind);
+    try std.testing.expectEqual(b2, rewrite_list.items[0].from.target);
+    try std.testing.expectEqual(b1, rewrite_list.items[0].to.target);
+    for (rewrite_list.items) |rewrite| {
+        try std.testing.expect(rewrite.source != rewrite.to.target);
+    }
+}
+
+test "paired collision replay fold never targets its own source" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const source_root = ir.BlockId.fromIndex(1);
+    const target_root = ir.BlockId.fromIndex(2);
+    const source_clone = ir.BlockId.fromIndex(3);
+    const target_clone = ir.BlockId.fromIndex(4);
+    const input = ir.ValueId.fromIndex(0);
+    const source_parameter = ir.ValueId.fromIndex(1);
+    const target_parameter = ir.ValueId.fromIndex(2);
+    const clone_parameter = ir.ValueId.fromIndex(3);
+    const clone_target_parameter = ir.ValueId.fromIndex(4);
+    const group = ir.NodeSplitGroupId.fromIndex(7);
+    const entry_arguments = [_]ir.ValueId{input};
+    const source_arguments = [_]ir.ValueId{source_parameter};
+    const clone_arguments = [_]ir.ValueId{clone_parameter};
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .jump = .{
+            .target = source_clone,
+            .arguments = entry_arguments[0..],
+        } } },
+        .{ .id = source_root, .function = function_id, .parameters = &.{source_parameter}, .terminator = .{ .jump = .{
+            .target = target_root,
+            .arguments = source_arguments[0..],
+        } } },
+        .{ .id = target_root, .function = function_id, .parameters = &.{target_parameter}, .terminator = .{ .return_values = &.{} } },
+        .{ .id = source_clone, .function = function_id, .parameters = &.{clone_parameter}, .terminator = .{ .jump = .{
+            .target = target_clone,
+            .arguments = clone_arguments[0..],
+        } } },
+        .{ .id = target_clone, .function = function_id, .parameters = &.{clone_target_parameter}, .terminator = .{ .return_values = &.{} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &.{input},
+        .blocks = &.{ entry, source_root, target_root, source_clone, target_clone },
+        .entry_block = entry,
+    };
+    const values = [_]ir.Value{
+        .{ .id = input, .function = function_id, .type = .integer, .origin = .{ .parameter = 0 } },
+        .{ .id = source_parameter, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = source_root, .index = 0 } } },
+        .{ .id = target_parameter, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = target_root, .index = 0 } } },
+        .{ .id = clone_parameter, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = source_clone, .index = 0 } } },
+        .{ .id = clone_target_parameter, .function = function_id, .type = .integer, .origin = .{ .block_parameter = .{ .block = target_clone, .index = 0 } } },
+    };
+    const rewrites = [_]ir.CfgEdgeRewrite{
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(0),
+            .source = entry,
+            .kind = .jump,
+            .from = .{ .target = source_root, .arguments = entry_arguments[0..] },
+            .to = .{ .target = source_clone, .arguments = entry_arguments[0..] },
+            .rule = .node_split,
+            .node_split_group = group,
+        },
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(1),
+            .source = source_clone,
+            .kind = .jump,
+            .from = .{ .target = target_root, .arguments = clone_arguments[0..] },
+            .to = .{ .target = target_clone, .arguments = clone_arguments[0..] },
+            .rule = .node_split,
+            .node_split_group = group,
+        },
+    };
+    var blocks_owned: std.ArrayList(ir.Block) = .empty;
+    defer blocks_owned.deinit(std.testing.allocator);
+    try blocks_owned.appendSlice(std.testing.allocator, &blocks);
+    var rewrites_owned: std.ArrayList(ir.CfgEdgeRewrite) = .empty;
+    defer rewrites_owned.deinit(std.testing.allocator);
+    try rewrites_owned.appendSlice(std.testing.allocator, &rewrites);
+    var program = ir.Program{
+        .program_id = "paired-collision-replay-fold-self-source",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = blocks_owned.items,
+        .instructions = &.{},
+        .values = &values,
+        .edge_rewrites = rewrites_owned.items,
+    };
+    var projection = try structural_overlap.ReplayProjectionContext.init(
+        std.testing.allocator,
+        &program,
+    );
+    defer projection.deinit();
+
+    // (1) The candidate's source is the owner's target, so a fold would record a forward from source_clone into
+    // itself. The lineage walk never reaches an owner whose target is the candidate's source, so the fold is refused.
+    const self_owner: CollisionArm = .{ .source = entry, .kind = .jump, .target = source_clone };
+    const self_candidate: CollisionArm = .{ .source = source_clone, .kind = .jump, .target = target_clone };
+    try std.testing.expect(!try collapsePairedCollisionEdge(
+        std.testing.allocator,
+        &program,
+        &blocks_owned,
+        &rewrites_owned,
+        self_owner,
+        self_candidate,
+        &projection,
+    ));
+    try std.testing.expectEqual(@as(usize, 2), program.edge_rewrites.len);
+    try std.testing.expectEqual(target_clone, program.blocks[source_clone.index()].terminator.jump.target);
+    try std.testing.expectEqualSlices(ir.ValueId, clone_arguments[0..], program.blocks[source_clone.index()].terminator.jump.arguments);
+
+    // (2) The owner-equivalent fold still happens and its record's source differs from its target.
+    const owner: CollisionArm = .{ .source = source_root, .kind = .jump, .target = target_root };
+    const candidate: CollisionArm = .{ .source = source_clone, .kind = .jump, .target = target_clone };
+    try std.testing.expect(try collapsePairedCollisionEdge(
+        std.testing.allocator,
+        &program,
+        &blocks_owned,
+        &rewrites_owned,
+        owner,
+        candidate,
+        &projection,
+    ));
+    defer std.testing.allocator.free(program.edge_rewrites[2].from.arguments);
+    defer std.testing.allocator.free(program.edge_rewrites[2].to.arguments);
+    try std.testing.expectEqual(@as(usize, 3), program.edge_rewrites.len);
+    try std.testing.expectEqual(ir.EdgeRewriteRule.forwarding_jump, program.edge_rewrites[2].rule);
+    try std.testing.expect(program.edge_rewrites[2].source != program.edge_rewrites[2].to.target);
+}
+
+test "authenticated transparent collision forwarding never targets its own source" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const source = ir.BlockId.fromIndex(1);
+    const target = ir.BlockId.fromIndex(2);
+    const target_clone = ir.BlockId.fromIndex(3);
+    const exit = ir.BlockId.fromIndex(4);
+    const group = ir.NodeSplitGroupId.fromIndex(0);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .jump = .{ .target = source } } },
+        .{ .id = source, .function = function_id, .terminator = .{ .jump = .{ .target = target_clone } } },
+        .{ .id = target, .function = function_id, .terminator = .{ .jump = .{ .target = source } } },
+        .{ .id = target_clone, .function = function_id, .terminator = .{ .jump = .{ .target = source } } },
+        .{ .id = exit, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .blocks = &.{ entry, source, target, target_clone, exit },
+        .entry_block = entry,
+    };
+    const rewrites = [_]ir.CfgEdgeRewrite{
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(0),
+            .source = source,
+            .kind = .jump,
+            .from = .{ .target = target },
+            .to = .{ .target = target_clone },
+            .rule = .node_split,
+            .node_split_group = group,
+        },
+    };
+    var blocks_owned: std.ArrayList(ir.Block) = .empty;
+    defer blocks_owned.deinit(std.testing.allocator);
+    try blocks_owned.appendSlice(std.testing.allocator, &blocks);
+    var rewrites_owned: std.ArrayList(ir.CfgEdgeRewrite) = .empty;
+    defer rewrites_owned.deinit(std.testing.allocator);
+    try rewrites_owned.appendSlice(std.testing.allocator, &rewrites);
+    var program = ir.Program{
+        .program_id = "authenticated-transparent-self-source",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = blocks_owned.items,
+        .instructions = &.{},
+        .values = &.{},
+        .edge_rewrites = rewrites_owned.items,
+    };
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, function);
+    defer analysis.deinit();
+    var projection = try structural_overlap.ReplayProjectionContext.init(
+        std.testing.allocator,
+        &program,
+    );
+    defer projection.deinit();
+
+    const owner: CollisionArm = .{ .source = source, .kind = .jump, .target = target };
+    const candidate: CollisionArm = .{ .source = source, .kind = .jump, .target = target_clone };
+    try std.testing.expect(try directTargetBridgeIsAuthenticated(
+        &analysis,
+        owner,
+        candidate,
+        &projection,
+    ));
+    try std.testing.expect(!try collapseAuthenticatedTransparentCollisionEdge(
+        std.testing.allocator,
+        &program,
+        &blocks_owned,
+        &rewrites_owned,
+        &analysis,
+        0,
+        owner,
+        candidate,
+        &projection,
+    ));
+    try std.testing.expectEqual(target_clone, program.blocks[source.index()].terminator.jump.target);
+    try std.testing.expectEqual(@as(usize, 1), program.edge_rewrites.len);
+}
+
+test "transparent collapse keeps an empty loop body whose only source is its own header" {
+    // The source frontend lowers the body of an empty-body `while` loop to a parameterless,
+    // instruction-free block whose only source is the loop header, which is also its target. Forwarding that edge
+    // would record `header: branch c ? header : exit`, a rewrite whose target is its source, which edge admission
+    // refuses (validate_proofs hasCanonicalRewritePrefix), so the edge keeps its forwarder.
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const header = ir.BlockId.fromIndex(1);
+    const body = ir.BlockId.fromIndex(2);
+    const exit = ir.BlockId.fromIndex(3);
+    const condition = ir.ValueId.fromIndex(0);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .jump = .{ .target = header } } },
+        .{ .id = header, .function = function_id, .terminator = .{ .branch = .{
+            .condition = condition,
+            .then_edge = .{ .target = body },
+            .else_edge = .{ .target = exit },
+        } } },
+        .{ .id = body, .function = function_id, .terminator = .{ .jump = .{ .target = header } } },
+        .{ .id = exit, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &.{condition},
+        .blocks = &.{ entry, header, body, exit },
+        .entry_block = entry,
+    };
+    const values = [_]ir.Value{
+        .{ .id = condition, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+    };
+    const program = ir.Program{
+        .program_id = "empty-while-body-forwarder",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+    };
+    var block_list: std.ArrayList(ir.Block) = .empty;
+    defer block_list.deinit(std.testing.allocator);
+    try block_list.appendSlice(std.testing.allocator, &blocks);
+    var rewrite_list: std.ArrayList(ir.CfgEdgeRewrite) = .empty;
+    defer rewrite_list.deinit(std.testing.allocator);
+    var working_program = program;
+    working_program.blocks = block_list.items;
+    working_program.edge_rewrites = rewrite_list.items;
+
+    try std.testing.expectEqual(@as(usize, 0), try collapseTransparentForwardingBlocks(
+        std.testing.allocator,
+        &working_program,
+        &block_list,
+        &rewrite_list,
+        0,
+    ));
+    try std.testing.expectEqual(body, block_list.items[header.index()].terminator.branch.then_edge.target);
+    try std.testing.expectEqual(@as(usize, 0), rewrite_list.items.len);
+}
+
+test "transparent collapse forwards the entry of an empty repeat body and keeps its back edge" {
+    // The empty body of a `repeat ... until` loop has two sources, the
+    // entry and the loop's condition block, which is also its target. The entry edge forwards admissibly; the back
+    // edge would record `latch: branch c ? exit : latch`, a rewrite whose target is its source, so the back edge
+    // keeps its forwarder.
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const body = ir.BlockId.fromIndex(1);
+    const latch = ir.BlockId.fromIndex(2);
+    const exit = ir.BlockId.fromIndex(3);
+    const condition = ir.ValueId.fromIndex(0);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .jump = .{ .target = body } } },
+        .{ .id = body, .function = function_id, .terminator = .{ .jump = .{ .target = latch } } },
+        .{ .id = latch, .function = function_id, .terminator = .{ .branch = .{
+            .condition = condition,
+            .then_edge = .{ .target = exit },
+            .else_edge = .{ .target = body },
+        } } },
+        .{ .id = exit, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &.{condition},
+        .blocks = &.{ entry, body, latch, exit },
+        .entry_block = entry,
+    };
+    const values = [_]ir.Value{
+        .{ .id = condition, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+    };
+    const program = ir.Program{
+        .program_id = "empty-repeat-body-forwarder",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+    };
+    var block_list: std.ArrayList(ir.Block) = .empty;
+    defer block_list.deinit(std.testing.allocator);
+    try block_list.appendSlice(std.testing.allocator, &blocks);
+    var rewrite_list: std.ArrayList(ir.CfgEdgeRewrite) = .empty;
+    defer rewrite_list.deinit(std.testing.allocator);
+    var working_program = program;
+    working_program.blocks = block_list.items;
+    working_program.edge_rewrites = rewrite_list.items;
+
+    try std.testing.expectEqual(@as(usize, 1), try collapseTransparentForwardingBlocks(
+        std.testing.allocator,
+        &working_program,
+        &block_list,
+        &rewrite_list,
+        0,
+    ));
+    try std.testing.expectEqual(latch, block_list.items[entry.index()].terminator.jump.target);
+    try std.testing.expectEqual(body, block_list.items[latch.index()].terminator.branch.else_edge.target);
+    try std.testing.expectEqual(@as(usize, 1), rewrite_list.items.len);
+    try std.testing.expectEqual(entry, rewrite_list.items[0].source);
+    try std.testing.expectEqual(ir.CfgEdgeKind.jump, rewrite_list.items[0].kind);
+    try std.testing.expectEqual(body, rewrite_list.items[0].from.target);
+    try std.testing.expectEqual(latch, rewrite_list.items[0].to.target);
 }

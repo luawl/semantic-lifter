@@ -359,7 +359,9 @@ fn specializeForwardingJump(
         };
         const result = instruction.results[0];
         if (source.index() >= substitutions.len or result.index() >= substitutions.len) return .{ .edge = incoming };
-        substitutions[result.index()] = substitutions[source.index()] orelse return .{ .edge = incoming };
+        substitutions[result.index()] = substitutions[source.index()] orelse
+            (try dominatorPathValue(allocator, program, forwarding, outgoing.target, source)) orelse
+            return .{ .edge = incoming };
     }
     if (outgoing.arguments.len == 0) return .{
         .edge = .{ .target = outgoing.target },
@@ -373,7 +375,11 @@ fn specializeForwardingJump(
             allocator.free(arguments);
             return .{ .edge = incoming };
         }
-        arguments[index] = substitutions[argument.index()] orelse {
+        arguments[index] = substitutions[argument.index()] orelse
+            (dominatorPathValue(allocator, program, forwarding, outgoing.target, argument) catch |err| {
+                allocator.free(arguments);
+                return err;
+            }) orelse {
             allocator.free(arguments);
             return .{ .edge = incoming };
         };
@@ -383,6 +389,78 @@ fn specializeForwardingJump(
         .changed = true,
         .rule = .forwarding_jump,
     };
+}
+
+/// A root the substitution above has no entry for may be forwarded as itself
+/// when its defining block D lies on the dominator path from the forward's target T down to the forwarder F (T
+/// dominates D, D dominates F). Every entry path to a predecessor of F passes D, and D is not re-entered before F's
+/// jump, so the value is defined at the forwarded source and equal to the one F passes. T dom D confines this to a
+/// latch carrying values of its own loop. Dominance is textbook (vacuous for an unreachable block), so the replay on a
+/// published program, where F has no live predecessor, reproduces the application.
+fn dominatorPathValue(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    forwarding: ir.Block,
+    target: ir.BlockId,
+    value_id: ir.ValueId,
+) !?ir.ValueId {
+    if (value_id.index() >= program.values.len) return null;
+    const value = program.values[value_id.index()];
+    if (value.id != value_id or value.function != forwarding.function) return null;
+    const definition = switch (value.origin) {
+        .block_parameter => |origin| origin.block,
+        .instruction_result => |origin| definition: {
+            if (origin.instruction.index() >= program.instructions.len) return null;
+            const instruction = program.instructions[origin.instruction.index()];
+            if (instruction.id != origin.instruction) return null;
+            break :definition instruction.block;
+        },
+        .parameter, .capture => return null,
+    };
+    if (definition == forwarding.id or definition.index() >= program.blocks.len) return null;
+    if (!try blockDominates(allocator, program, forwarding.function, target, definition)) return null;
+    if (!try blockDominates(allocator, program, forwarding.function, definition, forwarding.id)) return null;
+    return value_id;
+}
+
+/// Every path from the function's entry block to `dominated` passes `dominator`; vacuously true when `dominated` is
+/// unreachable, and the entry dominates every block of its function. A depth-first search from the entry that never
+/// enters `dominator`: `dominator` dominates `dominated` exactly when the search does not reach it.
+fn blockDominates(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    function_id: ir.FunctionId,
+    dominator: ir.BlockId,
+    dominated: ir.BlockId,
+) !bool {
+    if (dominator == dominated) return true;
+    if (function_id.index() >= program.functions.len) return false;
+    const function = program.functions[function_id.index()];
+    if (function.id != function_id or function.entry_block.index() >= program.blocks.len) return false;
+    if (function.entry_block == dominator) return true;
+    const visited = try allocator.alloc(bool, program.blocks.len);
+    defer allocator.free(visited);
+    @memset(visited, false);
+    var stack: std.ArrayList(ir.BlockId) = .empty;
+    defer stack.deinit(allocator);
+    visited[function.entry_block.index()] = true;
+    try stack.append(allocator, function.entry_block);
+    while (stack.pop()) |block_id| {
+        if (block_id == dominated) return false;
+        const successors: [2]?ir.BlockId = switch (program.blocks[block_id.index()].terminator) {
+            .jump => |edge| .{ edge.target, null },
+            .branch => |branch| .{ branch.then_edge.target, branch.else_edge.target },
+            else => .{ null, null },
+        };
+        for (successors) |maybe_successor| {
+            const successor = maybe_successor orelse continue;
+            if (successor == dominator or successor.index() >= program.blocks.len or
+                visited[successor.index()] or program.blocks[successor.index()].function != function_id) continue;
+            visited[successor.index()] = true;
+            try stack.append(allocator, successor);
+        }
+    }
+    return true;
 }
 
 fn forwardingValuesAreLocal(
@@ -1863,4 +1941,335 @@ test "forwarding jumps persist replayable copy-chain parameter substitution" {
     const retained_result = try applyProvedBranches(arena.allocator(), &retained);
     try std.testing.expectEqual(@as(usize, 0), retained_result.specialized_edges);
     try std.testing.expectEqual(forwarding_id, retained.blocks[entry_id.index()].terminator.jump.target);
+}
+
+test "forwarding jumps substitute a root defined on the dominator path from the target to the forwarder" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const b0 = ir.BlockId.fromIndex(0);
+    const b1 = ir.BlockId.fromIndex(1);
+    const b2 = ir.BlockId.fromIndex(2);
+    const b3 = ir.BlockId.fromIndex(3);
+    const b4 = ir.BlockId.fromIndex(4);
+    const b5 = ir.BlockId.fromIndex(5);
+    const input = ir.ValueId.fromIndex(0);
+    const carried = ir.ValueId.fromIndex(1);
+    const t = ir.ValueId.fromIndex(2);
+    const m = ir.ValueId.fromIndex(3);
+    const w = ir.ValueId.fromIndex(4);
+    const t_instr = ir.InstructionId.fromIndex(0);
+    const m_instr = ir.InstructionId.fromIndex(1);
+    const w_instr = ir.InstructionId.fromIndex(2);
+    const evidence_id = ir.EvidenceId.fromIndex(0);
+    const input_arguments = [_]ir.ValueId{input};
+    const placeholder_arguments = [_]ir.ValueId{m};
+    const blocks = [_]ir.Block{
+        .{ .id = b0, .function = function_id, .terminator = .{ .jump = .{ .target = b1, .arguments = input_arguments[0..] } } },
+        .{ .id = b1, .function = function_id, .parameters = &.{carried}, .instructions = &.{t_instr}, .terminator = .{ .jump = .{ .target = b2 } } },
+        .{ .id = b2, .function = function_id, .instructions = &.{m_instr}, .terminator = .{ .jump = .{ .target = b3 } } },
+        .{ .id = b3, .function = function_id, .instructions = &.{w_instr}, .terminator = .{ .branch = .{
+            .condition = input,
+            .then_edge = .{ .target = b4 },
+            .else_edge = .{ .target = b5 },
+        } } },
+        .{ .id = b4, .function = function_id, .terminator = .{ .jump = .{ .target = b1, .arguments = placeholder_arguments[0..] } } },
+        .{ .id = b5, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const values = [_]ir.Value{
+        .{ .id = input, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = carried, .function = function_id, .type = .boolean, .origin = .{ .block_parameter = .{ .block = b1, .index = 0 } } },
+        .{ .id = t, .function = function_id, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = t_instr, .index = 0 } } },
+        .{ .id = m, .function = function_id, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = m_instr, .index = 0 } } },
+        .{ .id = w, .function = function_id, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = w_instr, .index = 0 } } },
+    };
+    const instructions = [_]ir.Instruction{
+        .{ .id = t_instr, .block = b1, .operation = .{ .constant = .{ .boolean = false } }, .results = &.{t}, .effects = .pure, .evidence = &.{evidence_id} },
+        .{ .id = m_instr, .block = b2, .operation = .{ .constant = .{ .boolean = true } }, .results = &.{m}, .effects = .pure, .evidence = &.{evidence_id} },
+        .{ .id = w_instr, .block = b3, .operation = .{ .constant = .{ .boolean = true } }, .results = &.{w}, .effects = .pure, .evidence = &.{evidence_id} },
+    };
+    const evidence = [_]ir.Evidence{.{ .id = evidence_id, .kind = .frontend_proof, .locator = "fixture:dominator-path-forwarding" }};
+    const terms = [_]ir.SolverTerm{.{ .id = ir.SolverTermId.fromIndex(0), .sort = .{ .kind = .boolean }, .operation = .{ .value = input } }};
+    const constraints = [_]ir.Constraint{.{
+        .id = ir.ConstraintId.fromIndex(0),
+        .predicate = ir.SolverTermId.fromIndex(0),
+        .evidence = &.{evidence_id},
+        .scope = .{ .edge = .{ .source = b3, .kind = .branch_then, .target = b4 } },
+    }};
+    const base_program: ir.Program = .{
+        .program_id = "dominator-path-forwarding",
+        .entry_function = function_id,
+        .functions = &.{.{ .id = function_id, .parameters = &.{input}, .blocks = &.{ b0, b1, b2, b3, b4, b5 }, .entry_block = b0 }},
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+        .evidence = &evidence,
+        .solver_terms = &terms,
+        .constraints = &constraints,
+    };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const roots = [_]ir.ValueId{ m, t, carried, w };
+    for (roots) |root| {
+        const forward_arguments = try arena.allocator().dupe(ir.ValueId, &.{root});
+        var local_blocks = blocks;
+        local_blocks[b4.index()].terminator.jump.arguments = forward_arguments;
+        var program = base_program;
+        program.blocks = &local_blocks;
+        program.edge_rewrites = &.{};
+        const result = try applyProvedBranches(arena.allocator(), &program);
+        try std.testing.expectEqual(@as(usize, 1), result.specialized_edges);
+        const then_edge = program.blocks[b3.index()].terminator.branch.then_edge;
+        try std.testing.expectEqual(b1, then_edge.target);
+        try std.testing.expectEqualSlices(ir.ValueId, forward_arguments, then_edge.arguments);
+        try std.testing.expectEqual(@as(usize, 1), program.edge_rewrites.len);
+        try std.testing.expectEqual(ir.EdgeRewriteRule.forwarding_jump, program.edge_rewrites[0].rule);
+        try std.testing.expect(program.edge_rewrites[0].certificate == null);
+        try std.testing.expectEqual(b4, program.edge_rewrites[0].from.target);
+        try std.testing.expectEqual(@as(usize, 0), program.edge_rewrites[0].from.arguments.len);
+        try std.testing.expectEqual(b1, program.edge_rewrites[0].to.target);
+        try std.testing.expectEqualSlices(ir.ValueId, forward_arguments, program.edge_rewrites[0].to.arguments);
+
+        var report = try @import("validate.zig").validate(std.testing.allocator, &program, .core);
+        defer report.deinit();
+        try std.testing.expect(report.isClean());
+
+        const replayed = (try replayForwardingJump(arena.allocator(), &program, .{ .target = b4 })) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(b1, replayed.target);
+        try std.testing.expectEqualSlices(ir.ValueId, forward_arguments, replayed.arguments);
+    }
+}
+
+test "forwarding jumps keep refusing a root defined above the target or off its dominator path" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // (a) The root is defined in the preheader b0, which the target b1 does not dominate.
+    {
+        const function_id = ir.FunctionId.fromIndex(0);
+        const b0 = ir.BlockId.fromIndex(0);
+        const b1 = ir.BlockId.fromIndex(1);
+        const b2 = ir.BlockId.fromIndex(2);
+        const b3 = ir.BlockId.fromIndex(3);
+        const b4 = ir.BlockId.fromIndex(4);
+        const b5 = ir.BlockId.fromIndex(5);
+        const input = ir.ValueId.fromIndex(0);
+        const carried = ir.ValueId.fromIndex(1);
+        const pre = ir.ValueId.fromIndex(2);
+        const pre_instr = ir.InstructionId.fromIndex(0);
+        const evidence_id = ir.EvidenceId.fromIndex(0);
+        const input_arguments = [_]ir.ValueId{input};
+        const pre_arguments = [_]ir.ValueId{pre};
+        const blocks = [_]ir.Block{
+            .{ .id = b0, .function = function_id, .instructions = &.{pre_instr}, .terminator = .{ .jump = .{ .target = b1, .arguments = input_arguments[0..] } } },
+            .{ .id = b1, .function = function_id, .parameters = &.{carried}, .terminator = .{ .jump = .{ .target = b2 } } },
+            .{ .id = b2, .function = function_id, .terminator = .{ .jump = .{ .target = b3 } } },
+            .{ .id = b3, .function = function_id, .terminator = .{ .branch = .{
+                .condition = input,
+                .then_edge = .{ .target = b4 },
+                .else_edge = .{ .target = b5 },
+            } } },
+            .{ .id = b4, .function = function_id, .terminator = .{ .jump = .{ .target = b1, .arguments = pre_arguments[0..] } } },
+            .{ .id = b5, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        };
+        const values = [_]ir.Value{
+            .{ .id = input, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+            .{ .id = carried, .function = function_id, .type = .boolean, .origin = .{ .block_parameter = .{ .block = b1, .index = 0 } } },
+            .{ .id = pre, .function = function_id, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = pre_instr, .index = 0 } } },
+        };
+        const instructions = [_]ir.Instruction{
+            .{ .id = pre_instr, .block = b0, .operation = .{ .constant = .{ .boolean = true } }, .results = &.{pre}, .effects = .pure, .evidence = &.{evidence_id} },
+        };
+        const evidence = [_]ir.Evidence{.{ .id = evidence_id, .kind = .frontend_proof, .locator = "fixture:dominator-path-forwarding" }};
+        const terms = [_]ir.SolverTerm{.{ .id = ir.SolverTermId.fromIndex(0), .sort = .{ .kind = .boolean }, .operation = .{ .value = input } }};
+        const constraints = [_]ir.Constraint{.{
+            .id = ir.ConstraintId.fromIndex(0),
+            .predicate = ir.SolverTermId.fromIndex(0),
+            .evidence = &.{evidence_id},
+            .scope = .{ .edge = .{ .source = b3, .kind = .branch_then, .target = b4 } },
+        }};
+        var program: ir.Program = .{
+            .program_id = "dominator-path-preheader-root",
+            .entry_function = function_id,
+            .functions = &.{.{ .id = function_id, .parameters = &.{input}, .blocks = &.{ b0, b1, b2, b3, b4, b5 }, .entry_block = b0 }},
+            .blocks = &blocks,
+            .instructions = &instructions,
+            .values = &values,
+            .evidence = &evidence,
+            .solver_terms = &terms,
+            .constraints = &constraints,
+        };
+        const result = try applyProvedBranches(arena.allocator(), &program);
+        try std.testing.expectEqual(@as(usize, 0), result.specialized_edges);
+        try std.testing.expectEqual(b4, program.blocks[b3.index()].terminator.branch.then_edge.target);
+    }
+
+    // (b) The conformance forward-edge shape: the forward target b3 does not dominate the root's block b1.
+    {
+        const function_id = ir.FunctionId.fromIndex(0);
+        const b0 = ir.BlockId.fromIndex(0);
+        const b1 = ir.BlockId.fromIndex(1);
+        const b2 = ir.BlockId.fromIndex(2);
+        const b3 = ir.BlockId.fromIndex(3);
+        const b4 = ir.BlockId.fromIndex(4);
+        const input = ir.ValueId.fromIndex(0);
+        const v = ir.ValueId.fromIndex(1);
+        const x = ir.ValueId.fromIndex(2);
+        const v_instr = ir.InstructionId.fromIndex(0);
+        const evidence_id = ir.EvidenceId.fromIndex(0);
+        const v_arguments = [_]ir.ValueId{v};
+        const blocks = [_]ir.Block{
+            .{ .id = b0, .function = function_id, .terminator = .{ .branch = .{
+                .condition = input,
+                .then_edge = .{ .target = b1 },
+                .else_edge = .{ .target = b4 },
+            } } },
+            .{ .id = b1, .function = function_id, .instructions = &.{v_instr}, .terminator = .{ .branch = .{
+                .condition = input,
+                .then_edge = .{ .target = b2 },
+                .else_edge = .{ .target = b4 },
+            } } },
+            .{ .id = b2, .function = function_id, .terminator = .{ .jump = .{ .target = b3, .arguments = v_arguments[0..] } } },
+            .{ .id = b3, .function = function_id, .parameters = &.{x}, .terminator = .{ .return_values = &.{x} } },
+            .{ .id = b4, .function = function_id, .terminator = .{ .return_values = &.{input} } },
+        };
+        const values = [_]ir.Value{
+            .{ .id = input, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+            .{ .id = v, .function = function_id, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = v_instr, .index = 0 } } },
+            .{ .id = x, .function = function_id, .type = .boolean, .origin = .{ .block_parameter = .{ .block = b3, .index = 0 } } },
+        };
+        const instructions = [_]ir.Instruction{
+            .{ .id = v_instr, .block = b1, .operation = .{ .constant = .{ .boolean = true } }, .results = &.{v}, .effects = .pure, .evidence = &.{evidence_id} },
+        };
+        const evidence = [_]ir.Evidence{.{ .id = evidence_id, .kind = .frontend_proof, .locator = "fixture:dominator-path-forwarding" }};
+        const terms = [_]ir.SolverTerm{.{ .id = ir.SolverTermId.fromIndex(0), .sort = .{ .kind = .boolean }, .operation = .{ .value = input } }};
+        const constraints = [_]ir.Constraint{.{
+            .id = ir.ConstraintId.fromIndex(0),
+            .predicate = ir.SolverTermId.fromIndex(0),
+            .evidence = &.{evidence_id},
+            .scope = .{ .edge = .{ .source = b1, .kind = .branch_then, .target = b2 } },
+        }};
+        var program: ir.Program = .{
+            .program_id = "dominator-path-forward-edge",
+            .entry_function = function_id,
+            .functions = &.{.{ .id = function_id, .parameters = &.{input}, .blocks = &.{ b0, b1, b2, b3, b4 }, .entry_block = b0 }},
+            .blocks = &blocks,
+            .instructions = &instructions,
+            .values = &values,
+            .evidence = &evidence,
+            .solver_terms = &terms,
+            .constraints = &constraints,
+        };
+        const result = try applyProvedBranches(arena.allocator(), &program);
+        try std.testing.expectEqual(@as(usize, 0), result.specialized_edges);
+        try std.testing.expectEqual(b2, program.blocks[b1.index()].terminator.branch.then_edge.target);
+    }
+}
+
+test "a latch whose target enters it replays a target-defined root" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const b0 = ir.BlockId.fromIndex(0);
+    const b1 = ir.BlockId.fromIndex(1);
+    const b2 = ir.BlockId.fromIndex(2);
+    const input = ir.ValueId.fromIndex(0);
+    const p = ir.ValueId.fromIndex(1);
+    const t = ir.ValueId.fromIndex(2);
+    const t_instr = ir.InstructionId.fromIndex(0);
+    const evidence_id = ir.EvidenceId.fromIndex(0);
+    const input_arguments = [_]ir.ValueId{input};
+    const t_arguments = [_]ir.ValueId{t};
+    const blocks = [_]ir.Block{
+        .{ .id = b0, .function = function_id, .terminator = .{ .jump = .{ .target = b1, .arguments = input_arguments[0..] } } },
+        .{ .id = b1, .function = function_id, .parameters = &.{p}, .instructions = &.{t_instr}, .terminator = .{ .jump = .{ .target = b2 } } },
+        .{ .id = b2, .function = function_id, .terminator = .{ .jump = .{ .target = b1, .arguments = t_arguments[0..] } } },
+    };
+    const values = [_]ir.Value{
+        .{ .id = input, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = p, .function = function_id, .type = .boolean, .origin = .{ .block_parameter = .{ .block = b1, .index = 0 } } },
+        .{ .id = t, .function = function_id, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = t_instr, .index = 0 } } },
+    };
+    const instructions = [_]ir.Instruction{
+        .{ .id = t_instr, .block = b1, .operation = .{ .constant = .{ .boolean = false } }, .results = &.{t}, .effects = .pure, .evidence = &.{evidence_id} },
+    };
+    const evidence = [_]ir.Evidence{.{ .id = evidence_id, .kind = .frontend_proof, .locator = "fixture:dominator-path-forwarding" }};
+    const terms = [_]ir.SolverTerm{.{ .id = ir.SolverTermId.fromIndex(0), .sort = .{ .kind = .boolean }, .operation = .{ .value = input } }};
+    const constraints = [_]ir.Constraint{.{
+        .id = ir.ConstraintId.fromIndex(0),
+        .predicate = ir.SolverTermId.fromIndex(0),
+        .evidence = &.{evidence_id},
+        .scope = .{ .edge = .{ .source = b1, .kind = .jump, .target = b2 } },
+    }};
+    var program: ir.Program = .{
+        .program_id = "dominator-path-target-enters-forwarder",
+        .entry_function = function_id,
+        .functions = &.{.{ .id = function_id, .parameters = &.{input}, .blocks = &.{ b0, b1, b2 }, .entry_block = b0 }},
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+        .evidence = &evidence,
+        .solver_terms = &terms,
+        .constraints = &constraints,
+    };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const replayed = (try replayForwardingJump(arena.allocator(), &program, .{ .target = b2 })) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(b1, replayed.target);
+    try std.testing.expectEqualSlices(ir.ValueId, t_arguments[0..], replayed.arguments);
+
+    const result = try applyProvedBranches(arena.allocator(), &program);
+    try std.testing.expectEqual(@as(usize, 0), result.specialized_edges);
+    try std.testing.expectEqual(b2, program.blocks[b1.index()].terminator.jump.target);
+}
+
+test "forwarding replay accepts a dead forwarder whose root is defined in a dead block" {
+    // This test pins a known over-acceptance (not a defect to fix): the replay recomputes dominance on the program it
+    // reads, so for a dead forwarder whose root's block is also dead it accepts a forward the main pass never makes,
+    // because the main pass scopes to reachable blocks. Soundness is unaffected: a published use is still checked by
+    // validateValueUse, and value equality only needs the defining block to differ from the forwarder.
+    const function_id = ir.FunctionId.fromIndex(0);
+    const b0 = ir.BlockId.fromIndex(0);
+    const b1 = ir.BlockId.fromIndex(1);
+    const b2 = ir.BlockId.fromIndex(2);
+    const b3 = ir.BlockId.fromIndex(3);
+    const input = ir.ValueId.fromIndex(0);
+    const v = ir.ValueId.fromIndex(1);
+    const x = ir.ValueId.fromIndex(2);
+    const v_instr = ir.InstructionId.fromIndex(0);
+    const evidence_id = ir.EvidenceId.fromIndex(0);
+    const v_arguments = [_]ir.ValueId{v};
+    const blocks = [_]ir.Block{
+        .{ .id = b0, .function = function_id, .terminator = .{ .return_values = &.{input} } },
+        .{ .id = b1, .function = function_id, .instructions = &.{v_instr}, .terminator = .{ .jump = .{ .target = b2 } } },
+        .{ .id = b2, .function = function_id, .terminator = .{ .jump = .{ .target = b3, .arguments = v_arguments[0..] } } },
+        .{ .id = b3, .function = function_id, .parameters = &.{x}, .terminator = .{ .return_values = &.{x} } },
+    };
+    const values = [_]ir.Value{
+        .{ .id = input, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = v, .function = function_id, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = v_instr, .index = 0 } } },
+        .{ .id = x, .function = function_id, .type = .boolean, .origin = .{ .block_parameter = .{ .block = b3, .index = 0 } } },
+    };
+    const instructions = [_]ir.Instruction{
+        .{ .id = v_instr, .block = b1, .operation = .{ .constant = .{ .boolean = true } }, .results = &.{v}, .effects = .pure, .evidence = &.{evidence_id} },
+    };
+    const evidence = [_]ir.Evidence{.{ .id = evidence_id, .kind = .frontend_proof, .locator = "fixture:dominator-path-forwarding" }};
+    const terms = [_]ir.SolverTerm{.{ .id = ir.SolverTermId.fromIndex(0), .sort = .{ .kind = .boolean }, .operation = .{ .value = input } }};
+    var program: ir.Program = .{
+        .program_id = "dominator-path-dead-forwarder",
+        .entry_function = function_id,
+        .functions = &.{.{ .id = function_id, .parameters = &.{input}, .blocks = &.{ b0, b1, b2, b3 }, .entry_block = b0 }},
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+        .evidence = &evidence,
+        .solver_terms = &terms,
+    };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const replayed = (try replayForwardingJump(arena.allocator(), &program, .{ .target = b2 })) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(b3, replayed.target);
+    try std.testing.expectEqualSlices(ir.ValueId, v_arguments[0..], replayed.arguments);
 }
