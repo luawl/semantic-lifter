@@ -198,6 +198,40 @@ function SourceRuntimeOracle.run(caseName: string, source: string, exported: any
 			assert(ordinaryCaptures[index]() == index, "source frontend merged repeat-local capture identity")
 		end
 		assert(exported(10) == 5, "source frontend changed repeat break behavior")
+	elseif
+		caseName == "source-frontend-repeat-continue-queue-drain"
+		or caseName == "source-frontend-repeat-continue-queue-drain-parameter-test"
+		or caseName == "source-frontend-repeat-continue-queue-drain-derived-local"
+	then
+		-- A repeat worker that skips queue items equal to the selector: the body local `item` (and `half`, derived from
+		-- it) is read after a nested `if item == selector then skipped += 1 continue end`, so every pass must read its
+		-- own item (rows: selector, budget and the expected sum, skipped count and index).
+		local rows: { { any } } = if caseName == "source-frontend-repeat-continue-queue-drain"
+			then {
+				{ 1, 3, 7, 1, 3 }, { 1, 7, 12, 2, 5 }, { 1, 10, 12, 2, 5 },
+				{ 3, 0, 1, 1, 2 }, { 3, 1, 5, 1, 3 }, { 3, 3, 5, 1, 3 }, { 3, 7, 11, 1, 5 }, { 3, 10, 11, 1, 5 },
+				{ 4, 7, 10, 1, 5 }, { 4, 10, 19, 1, 6 },
+				{ 0, 10, 14, 0, 5 }, { "x", 3, 4, 0, 2 }, { 11, 7, 8, 0, 3 },
+			}
+			elseif caseName == "source-frontend-repeat-continue-queue-drain-parameter-test"
+			then {
+				{ 1, 3, 7, 1, 3 }, { 1, 7, 9, 1, 3 }, { 1, 10, 15, 2, 5 },
+				{ 3, 0, 1, 1, 2 }, { 3, 1, 5, 1, 3 }, { 3, 3, 5, 1, 3 }, { 3, 7, 9, 1, 4 }, { 3, 10, 15, 1, 5 },
+				{ 4, 7, 8, 1, 4 }, { 4, 10, 14, 1, 5 },
+				{ 0, 10, 11, 0, 3 }, { "x", 3, 4, 0, 2 }, { 11, 7, 11, 0, 3 },
+			}
+			else {
+				{ 1, 10, 21, 1, 3 },
+				{ 3, 0, 3, 1, 2 }, { 3, 1, 3, 1, 2 }, { 3, 3, 15, 1, 3 }, { 3, 7, 15, 1, 3 }, { 3, 10, 15, 1, 3 },
+				{ 0, 10, 12, 0, 2 }, { "x", 3, 9, 0, 1 }, { 11, 7, 9, 0, 1 },
+			}
+		for _, row in rows do
+			local sum, skipped, index = exported(row[1], row[2])
+			assert(
+				sum == row[3] and skipped == row[4] and index == row[5],
+				`queue drain ({row[1]}, {row[2]}) returned {sum}, {skipped}, {index}; expected {row[3]}, {row[4]}, {row[5]}`
+			)
+		end
 	elseif caseName == "source-frontend-compound-assignment" then
 		assert(string.find(source, "calls += 1", 1, true) ~= nil, "source frontend did not recover a lexical compound update")
 		assert(string.find(source, "object[call_result] += right()", 1, true) ~= nil, "source frontend did not recover ordered table compound syntax")

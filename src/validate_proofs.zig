@@ -15,6 +15,7 @@ const cfg = @import("cfg.zig");
 const type_validation = @import("validate_types.zig");
 const control_query_plan = @import("control_query_plan.zig");
 const node_split = @import("node_split.zig");
+const clone_availability = @import("clone_availability.zig");
 
 pub fn validate(
     report: *diagnostics.Report,
@@ -152,6 +153,33 @@ fn validateSolver(report: *diagnostics.Report, program: *const ir.Program) !void
             try report.add(.invalid_edge_rewrite, rewrite_index);
         }
     }
+}
+
+/// The first edge rewrite at or after `start` that the checks above refuse, or null. The feedback normalizer runs it
+/// on the rewrites it appended before it returns, so it never hands validation a program validation refuses.
+pub fn firstRefusedEdgeRewrite(allocator: std.mem.Allocator, program: *const ir.Program, start: usize) !?usize {
+    if (start >= program.edge_rewrites.len) return null;
+    var history = try RewriteHistory.init(allocator, program);
+    defer history.deinit();
+    const has_node_split = for (program.edge_rewrites) |rewrite| {
+        if (rewrite.rule == .node_split) break true;
+    } else false;
+    var replay_index: ?node_split.ReplayIndex = if (has_node_split)
+        try node_split.ReplayIndex.init(allocator, program)
+    else
+        null;
+    defer if (replay_index) |*index| index.deinit();
+    for (program.edge_rewrites[start..], start..) |rewrite, rewrite_index| {
+        if (!try validEdgeRewriteWithHistory(
+            allocator,
+            program,
+            rewrite,
+            rewrite_index,
+            &history,
+            if (replay_index) |*index| index else null,
+        )) return rewrite_index;
+    }
+    return null;
 }
 
 fn validConstraintEdgeScope(program: *const ir.Program, constraint: ir.Constraint) bool {
@@ -388,7 +416,57 @@ fn validEdgeRewriteWithHistory(
         }) orelse edge_path.replayedWitnessedBranchEdge(program, rewrite.source, rewrite.kind) orelse return false;
         if (!edge_path.sameEdge(current, rewrite.to)) return false;
     }
+    if (rewrite.rule == .clone_fold and !try cloneFoldRenamedValuesAreDead(allocator, program, rewrite)) return false;
     return true;
+}
+
+// A clone fold runs the owner where the clone ran. The replay mapping proves the clone is the owner's image under its
+// clone family's renaming, not that a renamed value holds the same runtime value on the folded edge: in the program
+// as given, whatever produced it, no renamed value may be live on entry to the owner or be among the arguments the
+// fold passes. A superseded fold is checked too, at its owner: the rewrite that later took its arm, a split of the
+// owner for one, carries the owner's reads. Once later splits have taken every edge into the owner, its reads run only
+// in their copies and the liveness rule holds vacuously at a block the function's entry does not reach, so a fold
+// whose owner the entry does not reach is refused unless its family renames nothing.
+fn cloneFoldRenamedValuesAreDead(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    rewrite: ir.CfgEdgeRewrite,
+) !bool {
+    const group = rewrite.node_split_group orelse return false;
+    var family = (try node_split.replayFamilyPairsForCloneAlloc(
+        allocator,
+        program,
+        rewrite.to.target,
+        rewrite.from.target,
+        group,
+    )) orelse return false;
+    defer family.deinit();
+    // The folded edge reads its arguments before the owner runs, and its source block need not be reachable from the
+    // owner, so no use in a block shows them live: a renamed identity among them is refused wherever it is defined.
+    if (family.source_values.len != family.clone_values.len) return false;
+    for (rewrite.to.arguments) |argument| {
+        for (family.source_values, family.clone_values) |source, clone| {
+            if (source != clone and (argument == source or argument == clone)) return false;
+        }
+    }
+    const owner = program.blocks[rewrite.to.target.index()];
+    if (owner.function.index() >= program.functions.len) return false;
+    var analysis = cfg.Analysis.init(allocator, program, program.functions[owner.function.index()]) catch |err| switch (err) {
+        error.InvalidCfg => return false,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    defer analysis.deinit();
+    if (!analysis.isReachable(rewrite.to.target)) {
+        if (family.source_packs.len != family.clone_packs.len) return false;
+        for (family.source_values, family.clone_values) |source, clone| if (source != clone) return false;
+        for (family.source_packs, family.clone_packs) |source, clone| if (source != clone) return false;
+    }
+    return clone_availability.foldRenamedValuesAreDead(allocator, program, &analysis, rewrite.to.target, .{
+        .source_values = family.source_values,
+        .clone_values = family.clone_values,
+        .source_packs = family.source_packs,
+        .clone_packs = family.clone_packs,
+    });
 }
 
 fn validNodeSplitGroup(program: *const ir.Program, rewrite: ir.CfgEdgeRewrite, rewrite_index: usize) bool {
@@ -712,6 +790,245 @@ test "clone fold replay rejects altered clone semantics" {
     program.blocks = &blocks;
     program.edge_rewrites = &grouped_rewrites;
     try std.testing.expect(validCloneFoldBoundary(&program, grouped_rewrites[2], 2));
+}
+
+// A repeat worker that skips queue items equal to a selector, lifted by the source frontend and resolved: rewrite 22
+// folds edge 25.branch_else from clone 26 back to block 9, which reads value 18, the original loop body's item, where
+// clone 26 read value 67, the cloned body's item. Value 18 is live on entry to block 9, so the fold is refused.
+test "clone fold validation refuses a stored fold whose owner reads a renamed loop value" {
+    const parsed = try std.json.parseFromSlice(ir.Program, std.testing.allocator, @embedFile("testdata/clone_fold_stale_read_resolved.lifter-ir.json"), .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+    var report = try @import("validate.zig").validate(std.testing.allocator, &parsed.value, .core);
+    defer report.deinit();
+    try std.testing.expectEqual(@as(usize, 1), report.diagnostics.items.len);
+    try std.testing.expectEqual(diagnostics.Code.invalid_edge_rewrite, report.diagnostics.items[0].code);
+    try std.testing.expectEqual(@as(?u32, 22), report.diagnostics.items[0].entity_index);
+}
+
+// Group 0 cloned owner block 2 (an empty jump) to 4 and its successor 3 to 5. Clone 5 returns `substitute` where block
+// 3 returns `original`: the clone reads a value in place of its source block's, which the replay mapping admits for a
+// split, while the folded pair 2/4 reads neither. Folding 1.branch_then from clone 4 back to block 2 makes that path
+// return `original`, which is live on entry to block 2, so the fold is refused although its own pair is equal.
+test "clone fold validation names a value a later clone block reads in place of its source block's" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const split_source = ir.BlockId.fromIndex(1);
+    const owner = ir.BlockId.fromIndex(2);
+    const owner_successor = ir.BlockId.fromIndex(3);
+    const clone = ir.BlockId.fromIndex(4);
+    const clone_successor = ir.BlockId.fromIndex(5);
+    const exit = ir.BlockId.fromIndex(6);
+    const condition = ir.ValueId.fromIndex(0);
+    const original = ir.ValueId.fromIndex(1);
+    const substitute = ir.ValueId.fromIndex(2);
+    const original_instruction = ir.InstructionId.fromIndex(0);
+    const substitute_instruction = ir.InstructionId.fromIndex(1);
+    const group = ir.NodeSplitGroupId.fromIndex(0);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .instructions = &.{original_instruction}, .terminator = .{ .jump = .{ .target = split_source } } },
+        .{ .id = split_source, .function = function_id, .instructions = &.{substitute_instruction}, .terminator = .{ .branch = .{
+            .condition = condition,
+            .then_edge = .{ .target = owner },
+            .else_edge = .{ .target = exit },
+        } } },
+        .{ .id = owner, .function = function_id, .terminator = .{ .jump = .{ .target = owner_successor } } },
+        .{ .id = owner_successor, .function = function_id, .terminator = .{ .return_values = &.{original} } },
+        .{ .id = clone, .function = function_id, .terminator = .{ .jump = .{ .target = clone_successor } } },
+        .{ .id = clone_successor, .function = function_id, .terminator = .{ .return_values = &.{substitute} } },
+        .{ .id = exit, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &.{condition},
+        .blocks = &.{ entry, split_source, owner, owner_successor, clone, clone_successor, exit },
+        .entry_block = entry,
+    };
+    const values = [_]ir.Value{
+        .{ .id = condition, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = original, .function = function_id, .type = .integer, .origin = .{ .instruction_result = .{ .instruction = original_instruction, .index = 0 } } },
+        .{ .id = substitute, .function = function_id, .type = .integer, .origin = .{ .instruction_result = .{ .instruction = substitute_instruction, .index = 0 } } },
+    };
+    const instructions = [_]ir.Instruction{
+        .{ .id = original_instruction, .block = entry, .operation = .{ .constant = .{ .integer = "1" } }, .results = &.{original}, .effects = .pure },
+        .{ .id = substitute_instruction, .block = split_source, .operation = .{ .constant = .{ .integer = "2" } }, .results = &.{substitute}, .effects = .pure },
+    };
+    const rewrites = [_]ir.CfgEdgeRewrite{
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(0),
+            .source = split_source,
+            .kind = .branch_then,
+            .from = .{ .target = owner },
+            .to = .{ .target = clone },
+            .rule = .node_split,
+            .node_split_group = group,
+        },
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(1),
+            .source = clone,
+            .kind = .jump,
+            .from = .{ .target = owner_successor },
+            .to = .{ .target = clone_successor },
+            .rule = .node_split,
+            .node_split_group = group,
+        },
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(2),
+            .source = split_source,
+            .kind = .branch_then,
+            .from = .{ .target = clone },
+            .to = .{ .target = owner },
+            .rule = .clone_fold,
+            .node_split_group = group,
+        },
+    };
+    const program = ir.Program{
+        .program_id = "clone-fold-later-clone-block-read",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+        .edge_rewrites = &rewrites,
+    };
+
+    try std.testing.expect(try validEdgeRewrite(std.testing.allocator, &program, rewrites[0], 0));
+    try std.testing.expect(try validEdgeRewrite(std.testing.allocator, &program, rewrites[1], 1));
+    try std.testing.expect(!try validEdgeRewrite(std.testing.allocator, &program, rewrites[2], 2));
+}
+
+// The program with the block that the else edge of `source` targets split into a fresh exact copy: the copy gets fresh
+// instructions and results (an operand the block defines is read from the copy's own result) and joins the block's
+// function, the edge targets the copy, and the node_split record is the root of a group of its own. The block must
+// have no parameters and jump without arguments, as block 9 of the stored resolved program does.
+fn splitElseTargetIntoExactCopy(allocator: std.mem.Allocator, stored: ir.Program, source: ir.BlockId) !ir.Program {
+    try std.testing.expect(stored.blocks[source.index()].terminator == .branch);
+    const edge = stored.blocks[source.index()].terminator.branch.else_edge;
+    const owner = stored.blocks[edge.target.index()];
+    const copy_id = ir.BlockId.fromIndex(stored.blocks.len);
+    try std.testing.expect(owner.parameters.len == 0 and owner.terminator == .jump and owner.terminator.jump.arguments.len == 0);
+
+    var instructions: std.ArrayList(ir.Instruction) = .empty;
+    try instructions.appendSlice(allocator, stored.instructions);
+    var values: std.ArrayList(ir.Value) = .empty;
+    try values.appendSlice(allocator, stored.values);
+    var renamed: std.AutoHashMapUnmanaged(ir.ValueId, ir.ValueId) = .empty;
+    const copy_instructions = try allocator.alloc(ir.InstructionId, owner.instructions.len);
+    for (owner.instructions, copy_instructions) |instruction_id, *copy_instruction| {
+        var instruction = stored.instructions[instruction_id.index()];
+        instruction.id = ir.InstructionId.fromIndex(instructions.items.len);
+        instruction.block = copy_id;
+        switch (instruction.operation) {
+            .place_read => {},
+            .binary => |*binary| {
+                binary.left = renamed.get(binary.left) orelse binary.left;
+                binary.right = renamed.get(binary.right) orelse binary.right;
+            },
+            .place_write => |*write| write.value = renamed.get(write.value) orelse write.value,
+            else => return error.TestUnexpectedResult,
+        }
+        const results = try allocator.alloc(ir.ValueId, instruction.results.len);
+        for (instruction.results, results, 0..) |result, *fresh, result_index| {
+            fresh.* = ir.ValueId.fromIndex(values.items.len);
+            var value = stored.values[result.index()];
+            value.id = fresh.*;
+            value.origin = .{ .instruction_result = .{ .instruction = instruction.id, .index = @intCast(result_index) } };
+            try values.append(allocator, value);
+            try renamed.put(allocator, result, fresh.*);
+        }
+        instruction.results = results;
+        try instructions.append(allocator, instruction);
+        copy_instruction.* = instruction.id;
+    }
+    var blocks: std.ArrayList(ir.Block) = .empty;
+    try blocks.appendSlice(allocator, stored.blocks);
+    var copy = owner;
+    copy.id = copy_id;
+    copy.instructions = copy_instructions;
+    try blocks.append(allocator, copy);
+    blocks.items[source.index()].terminator.branch.else_edge = .{ .target = copy_id, .arguments = edge.arguments };
+    const functions = try allocator.dupe(ir.Function, stored.functions);
+    const function_blocks = try allocator.alloc(ir.BlockId, functions[owner.function.index()].blocks.len + 1);
+    @memcpy(function_blocks[0 .. function_blocks.len - 1], functions[owner.function.index()].blocks);
+    function_blocks[function_blocks.len - 1] = copy_id;
+    functions[owner.function.index()].blocks = function_blocks;
+    var rewrites: std.ArrayList(ir.CfgEdgeRewrite) = .empty;
+    try rewrites.appendSlice(allocator, stored.edge_rewrites);
+    try rewrites.append(allocator, .{
+        .id = ir.EdgeRewriteId.fromIndex(stored.edge_rewrites.len),
+        .source = source,
+        .kind = .branch_else,
+        .from = .{ .target = owner.id, .arguments = edge.arguments },
+        .to = .{ .target = copy_id, .arguments = edge.arguments },
+        .rule = .node_split,
+        .node_split_group = ir.NodeSplitGroupId.fromIndex(stored.edge_rewrites.len),
+    });
+    var program = stored;
+    program.functions = functions;
+    program.blocks = blocks.items;
+    program.instructions = instructions.items;
+    program.values = values.items;
+    program.edge_rewrites = rewrites.items;
+    return program;
+}
+
+// The first test's stored program with its fold superseded: block 31, an exact copy of block 9 that reads value 18 as
+// block 9 does, takes edge 25.branch_else through a node split of block 9 in a group of its own, so rewrite 22 is no
+// longer the arm's last rewrite. The split replays, and block 9 still reads value 18 where clone 26 read value 67, so
+// the superseded fold is refused at its owner as the live one is.
+test "clone fold validation refuses a superseded fold whose owner reads a renamed loop value" {
+    const parsed = try std.json.parseFromSlice(ir.Program, std.testing.allocator, @embedFile("testdata/clone_fold_stale_read_resolved.lifter-ir.json"), .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const stored = parsed.value;
+    const fold = stored.edge_rewrites[22];
+    try std.testing.expect(fold.rule == .clone_fold and fold.source == ir.BlockId.fromIndex(25) and fold.to.target == ir.BlockId.fromIndex(9));
+    try std.testing.expect(stored.blocks[25].terminator == .branch and stored.blocks[25].terminator.branch.else_edge.target == fold.to.target);
+    const program = try splitElseTargetIntoExactCopy(arena.allocator(), stored, fold.source);
+
+    var report = try @import("validate.zig").validate(std.testing.allocator, &program, .core);
+    defer report.deinit();
+    try std.testing.expectEqual(@as(usize, 1), report.diagnostics.items.len);
+    try std.testing.expectEqual(diagnostics.Code.invalid_edge_rewrite, report.diagnostics.items[0].code);
+    try std.testing.expectEqual(@as(?u32, 22), report.diagnostics.items[0].entity_index);
+}
+
+// The third test's program with block 9's other live incoming edge, 5.branch_else (rewrite 1 forwards it past block 8,
+// block 9's remaining predecessor), split the same way into a second exact copy: the function's entry no longer reaches
+// block 9, and value 18 is read only in its copies. The liveness rule holds vacuously at an owner the entry does not
+// reach, so the superseded fold is refused because its owner is unreachable.
+test "clone fold validation refuses a superseded fold whose owner later splits left unreachable" {
+    const parsed = try std.json.parseFromSlice(ir.Program, std.testing.allocator, @embedFile("testdata/clone_fold_stale_read_resolved.lifter-ir.json"), .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const stored = parsed.value;
+    const fold = stored.edge_rewrites[22];
+    try std.testing.expect(fold.rule == .clone_fold and fold.source == ir.BlockId.fromIndex(25) and fold.to.target == ir.BlockId.fromIndex(9));
+    try std.testing.expect(stored.blocks[25].terminator == .branch and stored.blocks[25].terminator.branch.else_edge.target == fold.to.target);
+    const superseded = try splitElseTargetIntoExactCopy(allocator, stored, fold.source);
+    const other_source = ir.BlockId.fromIndex(5);
+    try std.testing.expect(superseded.blocks[other_source.index()].terminator == .branch and superseded.blocks[other_source.index()].terminator.branch.else_edge.target == fold.to.target);
+    const program = try splitElseTargetIntoExactCopy(allocator, superseded, other_source);
+    var analysis = try cfg.Analysis.init(std.testing.allocator, &program, program.functions[program.blocks[fold.to.target.index()].function.index()]);
+    defer analysis.deinit();
+    try std.testing.expect(!analysis.isReachable(fold.to.target));
+
+    var report = try @import("validate.zig").validate(std.testing.allocator, &program, .core);
+    defer report.deinit();
+    try std.testing.expectEqual(@as(usize, 1), report.diagnostics.items.len);
+    try std.testing.expectEqual(diagnostics.Code.invalid_edge_rewrite, report.diagnostics.items[0].code);
+    try std.testing.expectEqual(@as(?u32, 22), report.diagnostics.items[0].entity_index);
 }
 
 fn validateClaimsAndObligations(

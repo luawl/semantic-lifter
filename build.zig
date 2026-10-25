@@ -1042,6 +1042,30 @@ pub fn build(b: *std.Build) void {
         "luau/fixtures/repeat_loop_source.luau",
         "source-frontend-repeat-loop",
     );
+    const source_frontend_repeat_continue_queue_drain_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/repeat_continue_queue_drain_source.luau",
+        "source-frontend-repeat-continue-queue-drain",
+    );
+    const source_frontend_repeat_continue_queue_drain_parameter_test_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/repeat_continue_queue_drain_parameter_test_source.luau",
+        "source-frontend-repeat-continue-queue-drain-parameter-test",
+    );
+    const source_frontend_repeat_continue_queue_drain_derived_local_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/repeat_continue_queue_drain_derived_local_source.luau",
+        "source-frontend-repeat-continue-queue-drain-derived-local",
+    );
     const source_frontend_compound_conformance = addLuauSourceConformance(
         b,
         exe,
@@ -2257,6 +2281,9 @@ pub fn build(b: *std.Build) void {
     source_frontend_method_conformance.addTo(conformance_step);
     source_frontend_recursive_conformance.addTo(conformance_step);
     source_frontend_repeat_conformance.addTo(conformance_step);
+    source_frontend_repeat_continue_queue_drain_conformance.addTo(conformance_step);
+    source_frontend_repeat_continue_queue_drain_parameter_test_conformance.addTo(conformance_step);
+    source_frontend_repeat_continue_queue_drain_derived_local_conformance.addTo(conformance_step);
     conformance_step.dependOn(repeat_loop_dispatcher);
     source_frontend_compound_conformance.addTo(conformance_step);
     source_frontend_if_expression_conformance.addTo(conformance_step);
@@ -2403,6 +2430,7 @@ pub fn build(b: *std.Build) void {
             "failed clone application rolls back graph and rewrite state",
             "transparent empty continuation reuses a different stop",
             "clone fold dominance preflight rolls back an unsafe redirect",
+            "clone fold refuses an owner that reads a renamed loop value",
             "clone-fold resume arm reservation is idempotent",
             "clone-fold reservation does not consume a distinct predecessor",
         },

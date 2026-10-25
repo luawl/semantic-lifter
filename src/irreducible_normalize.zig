@@ -10,6 +10,7 @@ const control_flow = @import("control_flow.zig");
 const iteration_protocol = @import("iteration_protocol.zig");
 const structural_overlap = @import("structural_overlap.zig");
 const clone_availability = @import("clone_availability.zig");
+const validate_proofs = @import("validate_proofs.zig");
 const structure = @import("structure.zig");
 const build_options = @import("build_options");
 const stage_trace = @import("stage_trace.zig");
@@ -1898,11 +1899,52 @@ fn normalizeImpl(
         else
             null;
         defer if (decline) |state| state.deinit(scratch_allocator);
+        // The final-form check below may refuse a clone fold this feedback made; the feedback then re-runs from
+        // here with the fold refused. The admitted entries restore their decline state, the others this one.
+        const refusal_restart: ?FeedbackDecline = if (decline == null)
+            try FeedbackDecline.init(
+                scratch_allocator,
+                blocks.items,
+                functions.items,
+                instructions.items.len,
+                values.items.len,
+                packs.items.len,
+                rewrites.items.len,
+                result,
+                structural_cloned_blocks,
+            )
+        else
+            null;
+        defer if (refusal_restart) |state| state.deinit(scratch_allocator);
+        const feedback_rewrite_start = rewrites.items.len;
+        var refused_folds: std.ArrayList(RefusedCloneFold) = .empty;
+        defer refused_folds.deinit(scratch_allocator);
         var restart_feedback = false;
         iteration = 0;
         const feedback_iteration_limit = options.feedback_iteration_limit orelse iteration_limit;
-        while (iteration < feedback_iteration_limit) : (iteration = if (restart_feedback) 0 else iteration + 1) {
+        // Once a refused clone fold has restarted the feedback, the admitted entries take one more pass at the
+        // iteration limit: it declines the functions whose folds were refused instead of failing.
+        while (iteration < feedback_iteration_limit or (iteration == feedback_iteration_limit and options.feedback_iteration_limit == null and decline != null and refused_folds.items.len != 0)) : (iteration = if (restart_feedback) 0 else iteration + 1) {
             restart_feedback = false;
+            if (iteration == feedback_iteration_limit) {
+                const state = decline.?;
+                var declined_now: usize = 0;
+                for (refused_folds.items) |fold| {
+                    if (state.declined[fold.function]) continue;
+                    state.declined[fold.function] = true;
+                    declined_now += 1;
+                    std.debug.print("normalize decline phase=feedback-iteration-limit function={} iterations={} blocks={} structural_clones={} rewrites={} arms={}\n", .{ fold.function, iteration, blocks.items.len, structural_cloned_blocks, rewrites.items.len, collision_arms.items.len });
+                }
+                if (declined_now == 0) {
+                    std.debug.print("normalize failure phase=feedback-iteration-limit iterations={} blocks={} structural_clones={} rewrites={} arms={}\n", .{ iteration, blocks.items.len, structural_cloned_blocks, rewrites.items.len, collision_arms.items.len });
+                    return error.NormalizationInvariantFailed;
+                }
+                state.restore(&blocks, &functions, &instructions, &values, &packs, &rewrites, &result, &structural_cloned_blocks);
+                collision_arms.clearRetainingCapacity();
+                collision_seed = if (options.initial_resume_seed) |seed| collisionSeedFromResumeSeed(seed) else null;
+                restart_feedback = true;
+                continue;
+            }
             // A failed structure probe owns substantial temporary CFG and
             // replay state. Reclaim it at the iteration boundary instead of
             // retaining every failed plan until the whole function exits.
@@ -2039,6 +2081,7 @@ fn normalizeImpl(
                                 owner,
                                 candidate,
                                 &seed_replay,
+                                refused_folds.items,
                             )) {
                                 traceNormalize("normalize_phase collision_seed_direct_target_fold iteration={} source={} from={} to={}\n", .{
                                     iteration,
@@ -2492,6 +2535,19 @@ fn normalizeImpl(
                     return error.NormalizationInvariantFailed;
                 if (structural_cloned_blocks > structural_clone_limit) {
                     traceUnvisitedPlanCloneLimit(&result.program, plan, structural_cloned_blocks, structural_clone_limit, rewrites.items.len, collision_arms.items.len);
+                    // Once a refused clone fold has restarted the feedback, the admitted entries decline the
+                    // plan's function here, as they do at the clone limit.
+                    if (decline) |state| {
+                        if (refused_folds.items.len != 0 and !state.declined[plan.function_index]) {
+                            state.declined[plan.function_index] = true;
+                            std.debug.print("normalize decline phase=feedback-batch-clone-limit function={} iteration={} blocks={} structural_clones={} limit={} rewrites={} arms={}\n", .{ plan.function_index, iteration, blocks.items.len, structural_cloned_blocks, structural_clone_limit, rewrites.items.len, collision_arms.items.len });
+                            state.restore(&blocks, &functions, &instructions, &values, &packs, &rewrites, &result, &structural_cloned_blocks);
+                            collision_arms.clearRetainingCapacity();
+                            collision_seed = if (options.initial_resume_seed) |seed| collisionSeedFromResumeSeed(seed) else null;
+                            restart_feedback = true;
+                            continue;
+                        }
+                    }
                     std.debug.print("normalize failure phase=feedback-batch-clone-limit iteration={} blocks={} structural_clones={} limit={} rewrites={} arms={}\n", .{ iteration, blocks.items.len, structural_cloned_blocks, structural_clone_limit, rewrites.items.len, collision_arms.items.len });
                     return error.NormalizationInvariantFailed;
                 }
@@ -2526,6 +2582,53 @@ fn normalizeImpl(
                         }
                     }
                     std.debug.print("normalize failure phase=feedback-unsplittable-collision iteration={} blocks={} structural_clones={} rewrites={} arms={}\n", .{ iteration, blocks.items.len, structural_cloned_blocks, rewrites.items.len, collision_arms.items.len });
+                    return error.NormalizationInvariantFailed;
+                }
+                // Before the feedback returns, validation must accept every rewrite it appended, on the final form:
+                // a clone fold whose renamed values a later rewrite made live is refused and the feedback re-runs
+                // without it; another refused rewrite, or more refused folds than the feedback has iterations,
+                // declines its function under the admitted entries and fails plain normalization.
+                if (try validate_proofs.firstRefusedEdgeRewrite(feedback_allocator, &result.program, feedback_rewrite_start)) |refused_index| {
+                    const refused = rewrites.items[refused_index];
+                    const refused_function = blocks.items[refused.source.index()].function.index();
+                    if (refused.rule == .clone_fold and refused.node_split_group != null and
+                        refused_folds.items.len < feedback_iteration_limit)
+                    {
+                        try refused_folds.append(scratch_allocator, .{
+                            .source = refused.source,
+                            .kind = refused.kind,
+                            .from = refused.from.target,
+                            .to = refused.to.target,
+                            .group = refused.node_split_group.?,
+                            .function = refused_function,
+                        });
+                        traceNormalize("normalize_phase feedback_refused_clone_fold iteration={} rewrite={} source={} kind={s} from={} to={} refused={}\n", .{
+                            iteration,
+                            refused_index,
+                            refused.source.index(),
+                            @tagName(refused.kind),
+                            refused.from.target.index(),
+                            refused.to.target.index(),
+                            refused_folds.items.len,
+                        });
+                        (decline orelse refusal_restart.?).restore(&blocks, &functions, &instructions, &values, &packs, &rewrites, &result, &structural_cloned_blocks);
+                        collision_arms.clearRetainingCapacity();
+                        collision_seed = if (options.initial_resume_seed) |seed| collisionSeedFromResumeSeed(seed) else null;
+                        restart_feedback = true;
+                        continue;
+                    }
+                    if (decline) |state| {
+                        if (refused_function < state.declined.len and !state.declined[refused_function]) {
+                            state.declined[refused_function] = true;
+                            std.debug.print("normalize decline phase=feedback-refused-rewrite function={} iteration={} rewrite={} rule={s} blocks={} structural_clones={} rewrites={} arms={}\n", .{ refused_function, iteration, refused_index, @tagName(refused.rule), blocks.items.len, structural_cloned_blocks, rewrites.items.len, collision_arms.items.len });
+                            state.restore(&blocks, &functions, &instructions, &values, &packs, &rewrites, &result, &structural_cloned_blocks);
+                            collision_arms.clearRetainingCapacity();
+                            collision_seed = if (options.initial_resume_seed) |seed| collisionSeedFromResumeSeed(seed) else null;
+                            restart_feedback = true;
+                            continue;
+                        }
+                    }
+                    std.debug.print("normalize failure phase=feedback-refused-rewrite iteration={} rewrite={} rule={s} blocks={} structural_clones={} rewrites={} arms={}\n", .{ iteration, refused_index, @tagName(refused.rule), blocks.items.len, structural_cloned_blocks, rewrites.items.len, collision_arms.items.len });
                     return error.NormalizationInvariantFailed;
                 }
                 break;
@@ -2613,6 +2716,7 @@ fn normalizeImpl(
                         target_owner,
                         collision_arm,
                         collision_projection_context,
+                        refused_folds.items,
                     );
                     if (folded != 0) {
                         traceNormalize("normalize_phase direct_target_parent_chain_fold iteration={} function={} folds={}\n", .{
@@ -2647,6 +2751,7 @@ fn normalizeImpl(
                         historical_owner,
                         collision_arm,
                         collision_projection_context,
+                        refused_folds.items,
                     );
                     if (folded != 0) {
                         traceNormalize("normalize_phase target_lineage_chain_fold iteration={} function={} folds={}\n", .{
@@ -2706,6 +2811,7 @@ fn normalizeImpl(
                     previous,
                     collision_arm,
                     collision_projection_context,
+                    refused_folds.items,
                 )) {
                     collision_seed = null;
                     continue;
@@ -4789,6 +4895,85 @@ fn mapEdgeArgumentsBackwardThroughClone(
     return mapped;
 }
 
+// The pairs a clone fold renames, from its clone family's replay mapping.
+fn familyRenamedPairs(family: *const node_split.ReplayMappings) clone_availability.RenamedPairs {
+    return .{
+        .source_values = family.source_values,
+        .clone_values = family.clone_values,
+        .source_packs = family.source_packs,
+        .clone_packs = family.clone_packs,
+    };
+}
+
+// The clone family pairs of every target lineage step a paired fold walks: the owner target then runs where the
+// candidate's target clone ran, so the renaming of each step must be dead on entry to the owner target.
+const LineageRenamedPairs = struct {
+    source_values: std.ArrayList(ir.ValueId) = .empty,
+    clone_values: std.ArrayList(ir.ValueId) = .empty,
+    source_packs: std.ArrayList(ir.ValuePackId) = .empty,
+    clone_packs: std.ArrayList(ir.ValuePackId) = .empty,
+
+    fn deinit(self: *LineageRenamedPairs, allocator: std.mem.Allocator) void {
+        self.source_values.deinit(allocator);
+        self.clone_values.deinit(allocator);
+        self.source_packs.deinit(allocator);
+        self.clone_packs.deinit(allocator);
+    }
+
+    // False when the step has no replay mapping: no mapping, no fold.
+    fn appendStep(
+        self: *LineageRenamedPairs,
+        allocator: std.mem.Allocator,
+        program: *const ir.Program,
+        source: ir.BlockId,
+        clone: ir.BlockId,
+        group: ir.NodeSplitGroupId,
+    ) NormalizeError!bool {
+        var family = (try node_split.replayFamilyPairsForCloneAlloc(allocator, program, source, clone, group)) orelse return false;
+        defer family.deinit();
+        try self.source_values.appendSlice(allocator, family.source_values);
+        try self.clone_values.appendSlice(allocator, family.clone_values);
+        try self.source_packs.appendSlice(allocator, family.source_packs);
+        try self.clone_packs.appendSlice(allocator, family.clone_packs);
+        return true;
+    }
+
+    fn pairs(self: *const LineageRenamedPairs) clone_availability.RenamedPairs {
+        return .{
+            .source_values = self.source_values.items,
+            .clone_values = self.clone_values.items,
+            .source_packs = self.source_packs.items,
+            .clone_packs = self.clone_packs.items,
+        };
+    }
+};
+
+// A clone fold that validation refused on the final form of its function: the feedback re-runs from its start and
+// the fold sites do not make this fold again, so the iteration that made it takes the split it selected. `function`
+// is the index of the function the fold is in, which the admitted entries decline if the re-run overruns.
+const RefusedCloneFold = struct {
+    source: ir.BlockId,
+    kind: ir.CfgEdgeKind,
+    from: ir.BlockId,
+    to: ir.BlockId,
+    group: ir.NodeSplitGroupId,
+    function: usize,
+};
+
+fn cloneFoldIsRefused(
+    refused: []const RefusedCloneFold,
+    source: ir.BlockId,
+    kind: ir.CfgEdgeKind,
+    from: ir.BlockId,
+    to: ir.BlockId,
+    group: ir.NodeSplitGroupId,
+) bool {
+    for (refused) |fold| {
+        if (fold.source == source and fold.kind == kind and fold.from == from and fold.to == to and fold.group == group) return true;
+    }
+    return false;
+}
+
 // A paired clone can reproduce a collision edge inside the very closure that
 // was cloned to resolve it.  Splitting that edge again is self-replicating:
 // the next clone contains the same edge with fresh block/value ids.  Replay
@@ -4844,6 +5029,8 @@ fn collapsePairedCollisionEdge(
     defer if (projected_owned) allocator.free(projected);
     var owner_projected = try allocator.dupe(ir.ValueId, live.arguments);
     defer allocator.free(owner_projected);
+    var renamed: LineageRenamedPairs = .{};
+    defer renamed.deinit(allocator);
 
     var current_source = candidate.source;
     var current_target = candidate.target;
@@ -4878,6 +5065,7 @@ fn collapsePairedCollisionEdge(
                     )) orelse return false;
                     allocator.free(owner_projected);
                     owner_projected = next_projected;
+                    if (!try renamed.appendStep(allocator, program, target_step.block, current_target, target_step.group)) return false;
                     current_source = source_step.block;
                     current_target = target_step.block;
                     paired_steps += 1;
@@ -4900,6 +5088,7 @@ fn collapsePairedCollisionEdge(
         const next_projected = try allocator.dupe(ir.ValueId, rewrite.from.arguments);
         allocator.free(owner_projected);
         owner_projected = next_projected;
+        if (!try renamed.appendStep(allocator, program, target_step.block, current_target, target_step.group)) return false;
         current_target = target_step.block;
     }
     if (paired_steps == 0 or
@@ -4932,6 +5121,7 @@ fn collapsePairedCollisionEdge(
         reference,
         owner.target,
         projected,
+        renamed.pairs(),
     ))) {
         return false;
     }
@@ -4971,6 +5161,7 @@ fn collapseOwnerComposedCollisionEdge(
     owner: CollisionArm,
     candidate: CollisionArm,
     projection: *structural_overlap.ReplayProjectionContext,
+    refused: []const RefusedCloneFold,
 ) NormalizeError!bool {
     if (!try sameNodeSplitOwnerComposedArmLineageWithReplay(
         program,
@@ -5035,6 +5226,16 @@ fn collapseOwnerComposedCollisionEdge(
         return false;
     }
 
+    if (cloneFoldIsRefused(refused, candidate.source, candidate.kind, candidate.target, owner.target, target_parent.group)) return false;
+    // The owner runs where the clone ran: the clone family's renamed values must be dead on entry to the owner.
+    var renamed = (try node_split.replayFamilyPairsForCloneAlloc(
+        allocator,
+        program,
+        owner.target,
+        candidate.target,
+        target_parent.group,
+    )) orelse return false;
+    defer renamed.deinit();
     const from_arguments = try allocator.dupe(ir.ValueId, live.arguments);
     errdefer allocator.free(from_arguments);
     const to_arguments = try allocator.dupe(ir.ValueId, target_rewrite.from.arguments);
@@ -5048,6 +5249,7 @@ fn collapseOwnerComposedCollisionEdge(
         reference,
         owner.target,
         to_arguments,
+        familyRenamedPairs(&renamed),
     ))) {
         allocator.free(from_arguments);
         allocator.free(to_arguments);
@@ -5189,6 +5391,152 @@ test "paired collision replay fold preserves an available owner-equivalent tuple
     try std.testing.expectEqual(target_clone, program.edge_rewrites[2].from.target);
     try std.testing.expectEqual(target_root, program.edge_rewrites[2].to.target);
     try std.testing.expectEqualSlices(ir.ValueId, clone_arguments[0..], program.edge_rewrites[2].to.arguments);
+}
+
+// A loop whose body (block 1) defines `item` and jumps to its test (block 2), which branches on it; group 0 cloned
+// both (blocks 3 and 4, defining and reading `clone_item`) for the passes after the first, entered from the test's
+// back edge. Forwarding clone 3's jump to block 2 instead of clone 4 would make every later pass test `item`, the
+// first pass's value, where block 4 tested `clone_item`; the dominance preflight passes, since block 1 dominates both.
+test "paired collision replay fold refuses an owner target that reads a renamed loop value" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const body = ir.BlockId.fromIndex(1);
+    const body_test = ir.BlockId.fromIndex(2);
+    const body_clone = ir.BlockId.fromIndex(3);
+    const test_clone = ir.BlockId.fromIndex(4);
+    const exit = ir.BlockId.fromIndex(5);
+    const input = ir.ValueId.fromIndex(0);
+    const item = ir.ValueId.fromIndex(1);
+    const clone_item = ir.ValueId.fromIndex(2);
+    const item_instruction = ir.InstructionId.fromIndex(0);
+    const clone_item_instruction = ir.InstructionId.fromIndex(1);
+    const group = ir.NodeSplitGroupId.fromIndex(0);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .jump = .{ .target = body } } },
+        .{ .id = body, .function = function_id, .instructions = &.{item_instruction}, .terminator = .{ .jump = .{ .target = body_test } } },
+        .{ .id = body_test, .function = function_id, .terminator = .{ .branch = .{
+            .condition = item,
+            .then_edge = .{ .target = body_clone },
+            .else_edge = .{ .target = exit },
+        } } },
+        .{ .id = body_clone, .function = function_id, .instructions = &.{clone_item_instruction}, .terminator = .{ .jump = .{ .target = test_clone } } },
+        .{ .id = test_clone, .function = function_id, .terminator = .{ .branch = .{
+            .condition = clone_item,
+            .then_edge = .{ .target = body_clone },
+            .else_edge = .{ .target = exit },
+        } } },
+        .{ .id = exit, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const function = ir.Function{
+        .id = function_id,
+        .parameters = &.{input},
+        .blocks = &.{ entry, body, body_test, body_clone, test_clone, exit },
+        .entry_block = entry,
+    };
+    const values = [_]ir.Value{
+        .{ .id = input, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = item, .function = function_id, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = item_instruction, .index = 0 } } },
+        .{ .id = clone_item, .function = function_id, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = clone_item_instruction, .index = 0 } } },
+    };
+    const instructions = [_]ir.Instruction{
+        .{ .id = item_instruction, .block = body, .operation = .{ .copy = input }, .results = &.{item}, .effects = .pure },
+        .{ .id = clone_item_instruction, .block = body_clone, .operation = .{ .copy = input }, .results = &.{clone_item}, .effects = .pure },
+    };
+    const rewrites = [_]ir.CfgEdgeRewrite{
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(0),
+            .source = body_test,
+            .kind = .branch_then,
+            .from = .{ .target = body },
+            .to = .{ .target = body_clone },
+            .rule = .node_split,
+            .node_split_group = group,
+        },
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(1),
+            .source = body_clone,
+            .kind = .jump,
+            .from = .{ .target = body_test },
+            .to = .{ .target = test_clone },
+            .rule = .node_split,
+            .node_split_group = group,
+        },
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(2),
+            .source = test_clone,
+            .kind = .branch_then,
+            .from = .{ .target = body },
+            .to = .{ .target = body_clone },
+            .rule = .node_split,
+            .node_split_group = group,
+        },
+    };
+    var blocks_owned: std.ArrayList(ir.Block) = .empty;
+    defer blocks_owned.deinit(std.testing.allocator);
+    try blocks_owned.appendSlice(std.testing.allocator, &blocks);
+    var rewrites_owned: std.ArrayList(ir.CfgEdgeRewrite) = .empty;
+    defer rewrites_owned.deinit(std.testing.allocator);
+    try rewrites_owned.appendSlice(std.testing.allocator, &rewrites);
+    var program = ir.Program{
+        .program_id = "paired-collision-replay-fold-renamed-loop-value",
+        .entry_function = function_id,
+        .functions = &.{function},
+        .blocks = blocks_owned.items,
+        .instructions = &instructions,
+        .values = &values,
+        .edge_rewrites = rewrites_owned.items,
+    };
+    var projection = try structural_overlap.ReplayProjectionContext.init(
+        std.testing.allocator,
+        &program,
+    );
+    defer projection.deinit();
+
+    const owner: CollisionArm = .{ .source = body, .kind = .jump, .target = body_test };
+    const candidate: CollisionArm = .{ .source = body_clone, .kind = .jump, .target = test_clone };
+    try std.testing.expect(sameNodeSplitPairedArmLineageForwardWithReplay(
+        &program,
+        &projection,
+        owner,
+        candidate,
+    ));
+    const folded = try collapsePairedCollisionEdge(
+        std.testing.allocator,
+        &program,
+        &blocks_owned,
+        &rewrites_owned,
+        owner,
+        candidate,
+        &projection,
+    );
+    if (folded) {
+        std.testing.allocator.free(program.edge_rewrites[3].from.arguments);
+        std.testing.allocator.free(program.edge_rewrites[3].to.arguments);
+    }
+    try std.testing.expect(!folded);
+    try std.testing.expectEqual(test_clone, program.blocks[body_clone.index()].terminator.jump.target);
+    try std.testing.expectEqual(@as(usize, 3), program.edge_rewrites.len);
+
+    // The record such a fold writes is a forwarding_jump, which validation admits only for a jump-only block of
+    // exact-pure copies; written here by hand on the folded edge, it is refused at that record.
+    var folded_blocks = blocks;
+    folded_blocks[body_clone.index()].terminator = .{ .jump = .{ .target = body_test } };
+    const folded_rewrites = [_]ir.CfgEdgeRewrite{ rewrites[0], rewrites[1], rewrites[2], .{
+        .id = ir.EdgeRewriteId.fromIndex(3),
+        .source = body_clone,
+        .kind = .jump,
+        .from = .{ .target = test_clone },
+        .to = .{ .target = body_test },
+        .rule = .forwarding_jump,
+    } };
+    var folded_program = program;
+    folded_program.blocks = &folded_blocks;
+    folded_program.edge_rewrites = &folded_rewrites;
+    var report = try @import("validate.zig").validate(std.testing.allocator, &folded_program, .core);
+    defer report.deinit();
+    try std.testing.expectEqual(@as(usize, 1), report.diagnostics.items.len);
+    try std.testing.expectEqual(@import("diagnostics.zig").Code.invalid_edge_rewrite, report.diagnostics.items[0].code);
+    try std.testing.expectEqual(@as(?u32, 3), report.diagnostics.items[0].entity_index);
 }
 
 // A continuation may clone both endpoints of the owner arm through separate
@@ -5418,6 +5766,7 @@ test "owner-composed collision arm replays a complete external tuple" {
         owner,
         candidate,
         &collapsed_projection,
+        &.{},
     ));
     defer std.testing.allocator.free(collapsed_program.edge_rewrites[2].from.arguments);
     defer std.testing.allocator.free(collapsed_program.edge_rewrites[2].to.arguments);
@@ -8386,10 +8735,13 @@ fn directTargetBridgeIsAuthenticated(
 }
 
 // A persisted node-split seed can land on an effectful direct target clone.
-// Re-cloning that block is not a new semantic decision: replayMappingsForClone
-// proves that the clone has the same operations, effects, values, packs, and
-// structural terminator as its owner.  Fold only that exact authenticated
-// boundary back to the owner and retain the forwarding record for replay.
+// Re-cloning that block is not a new semantic decision: replayCloneFold
+// proves that the clone has its owner's operations, effects and structural
+// terminator under the clone family's renaming of values and packs, not that
+// a renamed value holds the same runtime value on the folded edge; the
+// redirect preflight requires every renamed value to be dead on entry to the
+// owner.  Fold only that exact authenticated boundary back to the owner and
+// retain the forwarding record for replay.
 fn collapseAuthenticatedDirectTargetCollisionEdge(
     allocator: std.mem.Allocator,
     program: *ir.Program,
@@ -8399,6 +8751,7 @@ fn collapseAuthenticatedDirectTargetCollisionEdge(
     owner: CollisionArm,
     candidate: CollisionArm,
     projection_context: *structural_overlap.ReplayProjectionContext,
+    refused: []const RefusedCloneFold,
 ) NormalizeError!bool {
     if (!try directTargetBridgeIsAuthenticated(
         analysis,
@@ -8462,14 +8815,16 @@ fn collapseAuthenticatedDirectTargetCollisionEdge(
     defer if (replayed.arguments.len != 0) allocator.free(replayed.arguments);
     if (replayed.target != owner.target) return false;
 
-    var mappings = (try node_split.replayMappingsForCloneAlloc(
+    if (cloneFoldIsRefused(refused, candidate.source, candidate.kind, candidate.target, owner.target, target_parent.group)) return false;
+    // The owner runs where the clone ran: the clone family's renamed values must be dead on entry to the owner.
+    var renamed = (try node_split.replayFamilyPairsForCloneAlloc(
         allocator,
         program,
         owner.target,
         candidate.target,
         target_parent.group,
     )) orelse return false;
-    defer mappings.deinit();
+    defer renamed.deinit();
 
     const projected = (try mapEdgeArgumentsBackwardThroughClone(
         allocator,
@@ -8492,6 +8847,7 @@ fn collapseAuthenticatedDirectTargetCollisionEdge(
         reference,
         owner.target,
         projected,
+        familyRenamedPairs(&renamed),
     ))) return false;
     const from_arguments = try allocator.dupe(ir.ValueId, live.arguments);
     errdefer allocator.free(from_arguments);
@@ -8525,6 +8881,7 @@ fn collapseAuthenticatedTargetLineageChain(
     initial_owner: CollisionArm,
     initial_candidate: CollisionArm,
     projection: *structural_overlap.ReplayProjectionContext,
+    refused: []const RefusedCloneFold,
 ) NormalizeError!usize {
     if (function_index >= program.functions.len) return 0;
 
@@ -8555,6 +8912,7 @@ fn collapseAuthenticatedTargetLineageChain(
             owner,
             candidate,
             projection,
+            refused,
         )) true else try collapseAuthenticatedDirectTargetCollisionEdge(
             allocator,
             program,
@@ -8564,6 +8922,7 @@ fn collapseAuthenticatedTargetLineageChain(
             owner,
             candidate,
             projection,
+            refused,
         );
         if (!folded_here) break;
         folded += 1;
@@ -8689,6 +9048,7 @@ test "persisted direct target chain folds an effectful clone without collision h
         owner_arm,
         candidate_arm,
         &replay,
+        &.{},
     ));
     try std.testing.expectEqual(owner, program.blocks[entry.index()].terminator.branch.then_edge.target);
     try std.testing.expectEqual(@as(usize, 3), program.edge_rewrites.len);
@@ -11676,7 +12036,11 @@ fn redirectEdge(
 // A clone fold changes the live control-flow graph without creating a new
 // block or value.  Recheck availability on the redirected graph before the
 // fold is published; otherwise a valid clone-equivalence proof can still
-// erase the only dominating producer of a later use.
+// erase the only dominating producer of a later use.  A fold also passes the
+// pairs its clone family renames: the owner then reads its own identity of
+// every renamed value where the clone read the clone's, so no renamed value
+// may be live on entry to the owner, even when an older definition of it
+// still dominates the use.
 fn redirectEdgeWithDominancePreflight(
     allocator: std.mem.Allocator,
     program: *ir.Program,
@@ -11686,6 +12050,7 @@ fn redirectEdgeWithDominancePreflight(
     reference: ir.CfgEdgeRef,
     target: ir.BlockId,
     arguments: []const ir.ValueId,
+    renamed: ?clone_availability.RenamedPairs,
 ) NormalizeError!bool {
     const original_terminator = block.terminator;
     if (!redirectEdge(block, reference, target, arguments)) return false;
@@ -11726,6 +12091,24 @@ fn redirectEdgeWithDominancePreflight(
     });
     if (!available) {
         return false;
+    }
+    if (renamed) |pairs| {
+        const dead = try clone_availability.foldRenamedValuesAreDead(
+            allocator,
+            program,
+            &post_redirect_analysis,
+            target,
+            pairs,
+        );
+        traceNormalize("normalize_phase clone_fold_renamed_preflight source={} kind={s} from={} to={} pairs={} dead={}\n", .{
+            reference.source.index(),
+            @tagName(reference.kind),
+            reference.target.index(),
+            target.index(),
+            pairs.source_values.len + pairs.source_packs.len,
+            dead,
+        });
+        if (!dead) return false;
     }
     committed = true;
     return true;
@@ -11789,8 +12172,34 @@ test "clone fold dominance preflight rolls back an unsafe redirect" {
         reference,
         use,
         &.{},
+        null,
     )));
     try std.testing.expectEqual(clone, blocks[source.index()].terminator.jump.target);
+}
+
+// A repeat worker that skips queue items equal to a selector, lifted by the source frontend and normalized for three
+// feedback iterations: block 25, the clone of the selector test, branches to clone 26 (`sum += item`, reading value
+// 67, the cloned loop body's item). Folding that edge back to block 9 would make the clone path add value 18, the
+// original body's item from an earlier pass (worker(1, 3) would return 4, 1, 3 instead of 7, 1, 3).
+test "clone fold refuses an owner that reads a renamed loop value" {
+    const parsed = try std.json.parseFromSlice(ir.Program, std.testing.allocator, @embedFile("testdata/clone_fold_stale_read_rung3.lifter-ir.json"), .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const normalized = try normalizeFunctionWithScratchInArenaResumeBudget(
+        arena.allocator(),
+        std.testing.allocator,
+        &parsed.value,
+        1,
+        1,
+    );
+    for (normalized.program.edge_rewrites[parsed.value.edge_rewrites.len..]) |rewrite| {
+        try std.testing.expect(!(rewrite.rule == .clone_fold and rewrite.to.target == ir.BlockId.fromIndex(9)));
+    }
+    try std.testing.expect(normalized.program.blocks[25].terminator.branch.else_edge.target != ir.BlockId.fromIndex(9));
 }
 
 test "eligible two-entry cycles normalize through authenticated node splitting" {

@@ -384,13 +384,34 @@ pub fn replayMappingsForCloneAlloc(
     clone: ir.BlockId,
     group: ir.NodeSplitGroupId,
 ) std.mem.Allocator.Error!?ReplayMappings {
-    return replayMappingsAlloc(allocator, program, source, clone, group, null);
+    return replayMappingsAlloc(allocator, program, source, clone, group, null, false);
+}
+
+/// The renaming a clone fold relies on, for the fold's liveness check: the fold's replay mapping, the positional
+/// value and pack reads of every other block pair of the clone family, and the definitions and positional reads of
+/// every other node-split clone block of the function, whichever group made it. A cloned block may read a value in
+/// place of its source block's value (a substitute an earlier split made) where the folded pair reads neither, and
+/// another group's split may rename a value the owner's successors read; those pairs are renamed too. The pairs are
+/// not injective and only name renamed identities; null when the fold has no replay mapping or a clone block pair
+/// does not line up position by position.
+pub fn replayFamilyPairsForCloneAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    source: ir.BlockId,
+    clone: ir.BlockId,
+    group: ir.NodeSplitGroupId,
+) std.mem.Allocator.Error!?ReplayMappings {
+    return replayMappingsAlloc(allocator, program, source, clone, group, null, true);
 }
 
 /// Replay an authenticated edge fold from a node-split clone back to its
 /// source block.  Unlike a forwarding jump, the clone may contain real
-/// instructions; the node-split mapping proves that executing the source
-/// block preserves the clone's operations, effects, and terminator.
+/// instructions; the node-split mapping proves that the clone is the source
+/// block's image under the clone family's renaming: the same operations,
+/// effects and terminator, renamed value for renamed value.  It does not
+/// prove that a renamed value holds the same runtime value on the folded
+/// edge; clone_availability.foldRenamedValuesAreDead decides that, in the
+/// normalizer's redirect preflight and in validation.
 pub fn replayCloneFold(
     allocator: std.mem.Allocator,
     program: *const ir.Program,
@@ -464,7 +485,7 @@ pub fn replayMappingsForCloneAllocWithIndex(
     clone: ir.BlockId,
     group: ir.NodeSplitGroupId,
 ) std.mem.Allocator.Error!?ReplayMappings {
-    return replayMappingsAlloc(allocator, program, source, clone, group, index);
+    return replayMappingsAlloc(allocator, program, source, clone, group, index, false);
 }
 
 fn replayAllocWithGroup(
@@ -478,7 +499,7 @@ fn replayAllocWithGroup(
     if (incoming.target.index() >= program.blocks.len or clone_id.index() >= program.blocks.len) return null;
     const source = program.blocks[incoming.target.index()];
     const clone = program.blocks[clone_id.index()];
-    var mappings = try replayMappingsAlloc(allocator, program, source.id, clone.id, group, replay_index) orelse return null;
+    var mappings = try replayMappingsAlloc(allocator, program, source.id, clone.id, group, replay_index, false) orelse return null;
     defer mappings.deinit();
     if (source.id != incoming.target or clone.id != clone_id or source.id == clone.id or
         source.function != clone.function or incoming.arguments.len != source.parameters.len or
@@ -1300,6 +1321,7 @@ fn replayMappingsAlloc(
     current_clone: ir.BlockId,
     group: ?ir.NodeSplitGroupId,
     replay_index: ?*const ReplayIndex,
+    family_reads: bool,
 ) std.mem.Allocator.Error!?ReplayMappings {
     if (current_source.index() >= program.blocks.len or current_clone.index() >= program.blocks.len) return null;
     const source_block = program.blocks[current_source.index()];
@@ -1486,6 +1508,47 @@ fn replayMappingsAlloc(
         &clone_packs,
         if (group) |requested_group| requested_group.index() else 0,
     )) return null;
+    if (family_reads) {
+        // Every other node-split clone block of the function, in any group: a fold's renamed values must be dead
+        // whichever split renamed them. The family's blocks add their reads; the others their definitions too.
+        const visited = try allocator.alloc(bool, program.blocks.len);
+        defer allocator.free(visited);
+        @memset(visited, false);
+        visited[current_clone.index()] = true;
+        for (program.edge_rewrites) |rewrite| {
+            if (rewrite.rule != .node_split or rewrite.to.target == rewrite.from.target or
+                rewrite.to.target.index() >= program.blocks.len or visited[rewrite.to.target.index()]) continue;
+            const clone_id = rewrite.to.target;
+            const source_id = clone_sources[clone_id.index()] orelse continue;
+            if (program.blocks[clone_id.index()].function != source_block.function) continue;
+            visited[clone_id.index()] = true;
+            const in_family = active[clone_id.index()];
+            if (!in_family and !try appendReplayFamilyDefinitionPairs(
+                allocator,
+                program,
+                source_id,
+                clone_id,
+                &source_values,
+                &clone_values,
+                &source_packs,
+                &clone_packs,
+            )) return null;
+            const history_start = if (in_family)
+                if (group) |requested_group| requested_group.index() else 0
+            else if (rewrite.node_split_group) |clone_group| clone_group.index() else 0;
+            if (!try appendReplayFamilyReadPairs(
+                allocator,
+                program,
+                source_id,
+                clone_id,
+                &source_values,
+                &clone_values,
+                &source_packs,
+                &clone_packs,
+                history_start,
+            )) return null;
+        }
+    }
     const owned_source_values = try source_values.toOwnedSlice(allocator);
     errdefer allocator.free(owned_source_values);
     const owned_clone_values = try clone_values.toOwnedSlice(allocator);
@@ -1657,6 +1720,120 @@ fn appendReplayUseMappingsFrom(
     for (source_used_packs.items, clone_used_packs.items) |source_pack, clone_pack| {
         if (!replayPackPairCompatible(program, source_pack, clone_pack) or
             !try appendReplayPackMapping(allocator, source_packs, clone_packs, source_pack, clone_pack)) return false;
+    }
+    return true;
+}
+
+// The parameter, result and pack-result identities of one source/clone block pair outside the clone family whose two
+// sides differ, appended without the injectivity the replay mapping requires: the pairs only name renamed identities
+// for a clone fold's liveness check. False when the two blocks do not line up position by position.
+fn appendReplayFamilyDefinitionPairs(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    source_id: ir.BlockId,
+    clone_id: ir.BlockId,
+    source_values: *std.ArrayList(ir.ValueId),
+    clone_values: *std.ArrayList(ir.ValueId),
+    source_packs: *std.ArrayList(ir.ValuePackId),
+    clone_packs: *std.ArrayList(ir.ValuePackId),
+) std.mem.Allocator.Error!bool {
+    if (source_id.index() >= program.blocks.len or clone_id.index() >= program.blocks.len) return false;
+    const source = program.blocks[source_id.index()];
+    const clone = program.blocks[clone_id.index()];
+    if (source.parameters.len != clone.parameters.len or source.instructions.len != clone.instructions.len) return false;
+    for (source.parameters, clone.parameters) |source_value, clone_value| {
+        if (source_value == clone_value) continue;
+        try source_values.append(allocator, source_value);
+        try clone_values.append(allocator, clone_value);
+    }
+    for (source.instructions, clone.instructions) |source_instruction_id, clone_instruction_id| {
+        if (source_instruction_id.index() >= program.instructions.len or clone_instruction_id.index() >= program.instructions.len) return false;
+        const source_instruction = program.instructions[source_instruction_id.index()];
+        const clone_instruction = program.instructions[clone_instruction_id.index()];
+        if (source_instruction.results.len != clone_instruction.results.len) return false;
+        for (source_instruction.results, clone_instruction.results) |source_value, clone_value| {
+            if (source_value == clone_value) continue;
+            try source_values.append(allocator, source_value);
+            try clone_values.append(allocator, clone_value);
+        }
+        if (source_instruction.pack_result) |source_pack| {
+            const clone_pack = clone_instruction.pack_result orelse return false;
+            if (source_pack == clone_pack) continue;
+            try source_packs.append(allocator, source_pack);
+            try clone_packs.append(allocator, clone_pack);
+        } else if (clone_instruction.pack_result != null) return false;
+    }
+    return true;
+}
+
+// The positional value and pack reads of one source/clone block pair whose two sides differ, appended without the
+// injectivity the replay mapping requires: the pairs only name renamed identities for a clone fold's liveness
+// check. False when the pair does not read position for position.
+fn appendReplayFamilyReadPairs(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    source_id: ir.BlockId,
+    clone_id: ir.BlockId,
+    source_values: *std.ArrayList(ir.ValueId),
+    clone_values: *std.ArrayList(ir.ValueId),
+    source_packs: *std.ArrayList(ir.ValuePackId),
+    clone_packs: *std.ArrayList(ir.ValuePackId),
+    history_start: usize,
+) std.mem.Allocator.Error!bool {
+    if (source_id.index() >= program.blocks.len or clone_id.index() >= program.blocks.len) return false;
+    const source = program.blocks[source_id.index()];
+    const clone = program.blocks[clone_id.index()];
+    if (source.id != source_id or clone.id != clone_id or source.instructions.len != clone.instructions.len) return false;
+
+    var source_reads: std.ArrayList(ir.ValueId) = .empty;
+    defer source_reads.deinit(allocator);
+    var clone_reads: std.ArrayList(ir.ValueId) = .empty;
+    defer clone_reads.deinit(allocator);
+    var source_pack_reads: std.ArrayList(ir.ValuePackId) = .empty;
+    defer source_pack_reads.deinit(allocator);
+    var clone_pack_reads: std.ArrayList(ir.ValuePackId) = .empty;
+    defer clone_pack_reads.deinit(allocator);
+    var out_of_memory = false;
+    var source_collector = UseCollector{
+        .allocator = allocator,
+        .values = &source_reads,
+        .packs = &source_pack_reads,
+        .out_of_memory = &out_of_memory,
+    };
+    var clone_collector = UseCollector{
+        .allocator = allocator,
+        .values = &clone_reads,
+        .packs = &clone_pack_reads,
+        .out_of_memory = &out_of_memory,
+    };
+    for (source.instructions, clone.instructions) |source_instruction_id, clone_instruction_id| {
+        if (source_instruction_id.index() >= program.instructions.len or clone_instruction_id.index() >= program.instructions.len) return false;
+        runtime_uses.visitOperationUses(program.instructions[source_instruction_id.index()].operation, &source_collector);
+        runtime_uses.visitOperationUses(program.instructions[clone_instruction_id.index()].operation, &clone_collector);
+        if (out_of_memory) return error.OutOfMemory;
+        if (source_reads.items.len != clone_reads.items.len or source_pack_reads.items.len != clone_pack_reads.items.len) return false;
+    }
+    const terminators = reverseStructuralTerminatorPair(
+        program,
+        source.id,
+        source.terminator,
+        clone.id,
+        clone.terminator,
+        history_start,
+    );
+    runtime_uses.visitTerminatorUses(terminators.source, &source_collector);
+    runtime_uses.visitTerminatorUses(terminators.clone, &clone_collector);
+    if (out_of_memory) return error.OutOfMemory;
+    if (source_reads.items.len != clone_reads.items.len or source_pack_reads.items.len != clone_pack_reads.items.len) return false;
+    for (source_reads.items, clone_reads.items) |source_value, clone_value| {
+        if (source_value == clone_value) continue;
+        try source_values.append(allocator, source_value);
+        try clone_values.append(allocator, clone_value);
+    }
+    for (source_pack_reads.items, clone_pack_reads.items) |source_pack, clone_pack| {
+        if (source_pack == clone_pack) continue;
+        try source_packs.append(allocator, source_pack);
+        try clone_packs.append(allocator, clone_pack);
     }
     return true;
 }

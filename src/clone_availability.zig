@@ -675,6 +675,135 @@ pub fn functionUsesAreAvailable(
     );
 }
 
+/// The owner-side and clone-side identities a clone fold renames, position by position. A pair whose two sides are
+/// equal renames nothing.
+pub const RenamedPairs = struct {
+    source_values: []const ir.ValueId = &.{},
+    clone_values: []const ir.ValueId = &.{},
+    source_packs: []const ir.ValuePackId = &.{},
+    clone_packs: []const ir.ValuePackId = &.{},
+};
+
+const FoldUseCollector = struct {
+    allocator: std.mem.Allocator,
+    values: *std.ArrayList(ir.ValueId),
+    packs: *std.ArrayList(ir.ValuePackId),
+    out_of_memory: *bool,
+
+    pub fn value(self: *FoldUseCollector, value_id: ir.ValueId) void {
+        self.values.append(self.allocator, value_id) catch {
+            self.out_of_memory.* = true;
+        };
+    }
+
+    pub fn pack(self: *FoldUseCollector, pack_id: ir.ValuePackId) void {
+        self.packs.append(self.allocator, pack_id) catch {
+            self.out_of_memory.* = true;
+        };
+    }
+
+    pub fn place(_: *FoldUseCollector, _: ir.PlaceId) void {}
+};
+
+// Both sides of every pair whose two sides differ: the identities a fold renames.
+fn putRenamedSides(allocator: std.mem.Allocator, set: anytype, sources: anytype, clones: anytype) std.mem.Allocator.Error!void {
+    for (sources, clones) |source, clone| {
+        if (source == clone) continue;
+        try set.put(allocator, source, {});
+        try set.put(allocator, clone, {});
+    }
+}
+
+fn foldValueDefinitionBlock(program: *const ir.Program, value_id: ir.ValueId) ?ir.BlockId {
+    if (value_id.index() >= program.values.len) return null;
+    return switch (program.values[value_id.index()].origin) {
+        .parameter, .capture => null,
+        .block_parameter => |origin| origin.block,
+        .instruction_result => |origin| if (origin.instruction.index() < program.instructions.len)
+            program.instructions[origin.instruction.index()].block
+        else
+            null,
+    };
+}
+
+fn foldPackDefinitionBlock(program: *const ir.Program, pack_id: ir.ValuePackId) ?ir.BlockId {
+    if (pack_id.index() >= program.value_packs.len) return null;
+    return switch (program.value_packs[pack_id.index()].origin) {
+        .varargs => null,
+        .instruction_result => |instruction_id| if (instruction_id.index() < program.instructions.len)
+            program.instructions[instruction_id.index()].block
+        else
+            null,
+    };
+}
+
+/// A clone fold redirects an edge from a node-split clone to the clone's owner block. The replay mapping that
+/// authenticates the fold pairs each owner-side identity with its clone-side identity (the clone is the owner's
+/// image under that renaming). After the redirect the owner side runs where the clone side ran, so it reads the
+/// owner-side identity of every renamed value where the clone read the clone-side one; the two hold the same runtime
+/// value only if neither identity of a renamed pair is live on entry to the owner. A use is live when the owner
+/// reaches its block without passing the value's defining block; a value the owner defines is not. `analysis` is
+/// the function's graph after the redirect.
+pub fn foldRenamedValuesAreDead(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    owner: ir.BlockId,
+    renamed: RenamedPairs,
+) std.mem.Allocator.Error!bool {
+    if (renamed.source_values.len != renamed.clone_values.len or renamed.source_packs.len != renamed.clone_packs.len) return false;
+    var renamed_values: std.AutoHashMapUnmanaged(ir.ValueId, void) = .empty;
+    defer renamed_values.deinit(allocator);
+    try putRenamedSides(allocator, &renamed_values, renamed.source_values, renamed.clone_values);
+    var renamed_packs: std.AutoHashMapUnmanaged(ir.ValuePackId, void) = .empty;
+    defer renamed_packs.deinit(allocator);
+    try putRenamedSides(allocator, &renamed_packs, renamed.source_packs, renamed.clone_packs);
+    var used_values: std.ArrayList(ir.ValueId) = .empty;
+    defer used_values.deinit(allocator);
+    var used_packs: std.ArrayList(ir.ValuePackId) = .empty;
+    defer used_packs.deinit(allocator);
+    var out_of_memory = false;
+    for (analysis.function.blocks) |use_block| {
+        if (use_block.index() >= program.blocks.len or !analysis.isReachable(use_block)) continue;
+        used_values.clearRetainingCapacity();
+        used_packs.clearRetainingCapacity();
+        var collector = FoldUseCollector{
+            .allocator = allocator,
+            .values = &used_values,
+            .packs = &used_packs,
+            .out_of_memory = &out_of_memory,
+        };
+        const block = program.blocks[use_block.index()];
+        for (block.instructions) |instruction_id| {
+            if (instruction_id.index() >= program.instructions.len) return false;
+            runtime_uses.visitOperationUses(program.instructions[instruction_id.index()].operation, &collector);
+        }
+        runtime_uses.visitTerminatorUses(block.terminator, &collector);
+        if (out_of_memory) return error.OutOfMemory;
+        for (used_values.items) |value_id| {
+            if (!renamed_values.contains(value_id)) continue;
+            const definition = foldValueDefinitionBlock(program, value_id) orelse continue;
+            // canReachAvoiding is false when the owner or the use block is the definition block: a value the
+            // owner defines, or one read only after its own block redefines it, is not live on entry.
+            if (try analysis.canReachAvoiding(owner, use_block, definition)) {
+                if (trace_clone_availability) std.debug.print("clone_fold_renamed_live owner={} value={} definition={} use={}\n", .{
+                    owner.index(),
+                    value_id.index(),
+                    definition.index(),
+                    use_block.index(),
+                });
+                return false;
+            }
+        }
+        for (used_packs.items) |pack_id| {
+            if (!renamed_packs.contains(pack_id)) continue;
+            const definition = foldPackDefinitionBlock(program, pack_id) orelse continue;
+            if (try analysis.canReachAvoiding(owner, use_block, definition)) return false;
+        }
+    }
+    return true;
+}
+
 fn valuePairIsCanonical(
     program: *const ir.Program,
     function_id: ir.FunctionId,
