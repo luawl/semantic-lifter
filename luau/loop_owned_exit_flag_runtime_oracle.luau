@@ -9,9 +9,11 @@
 -- leaves its inner loop by a loop boundary's side escape, whose side arm sets the flag of the exit the middle loop
 -- owns after the side region: that set must reach the flag the middle loop reads. The ninth and tenth leave an
 -- inner loop that an outer loop enters again by a loop-boundary exit carried by its escape flag: a flag one entry
--- left set must not end the next entry's first pass.
+-- left set must not end the next entry's first pass. The eleventh leaves its side region by the exit of a loop last
+-- in one of its arms, which continues the middle loop: that arm sets the middle loop's header flag after the loop,
+-- and a second row is checked against its trace written out.
 -- A passing case prints nothing. A failing case prints one line per failing worker, `<case> <worker> rows=<R>
--- mismatches=<M> trapped=<T>` with the first differing row, a line for the written-out row when it differs, and
+-- mismatches=<M> trapped=<T>` with the first differing row, a line for each written-out row that differs, and
 -- fails one assertion that counts the failed workers.
 local LoopOwnedExitFlagRuntimeOracle = {}
 
@@ -19,6 +21,9 @@ local SCRIPT_LENGTH = 12
 local PINNED_WORKER = "owned_exit_boundary_exit_reentered"
 local PINNED_SCRIPT = "TTFFTTTTFFFF"
 local PINNED_EXPECTED = "ok:done [H0,S,I,E,H0,S,I,B,S,R,E,H0]"
+local SIDE_LOOP_WORKER = "side_escape_loop_exit_continue"
+local SIDE_LOOP_SCRIPT = "FTFTTFFFFFFF"
+local SIDE_LOOP_EXPECTED = "ok:done [entry,Z,H,I,B,L,W,H,I,E,Z]"
 
 local function trapEnvironment(): any
 	local real: any = getfenv(0)
@@ -188,6 +193,44 @@ local function exitToInfiniteHeader(step: (string) -> any): any
 	end
 end
 
+local function sideEscapeLoopExitContinue(step: (string) -> any): any
+	step("entry")
+	while step("Z") do
+		while true do
+			step("H")
+			local outcome: string? = nil
+			while step("I") do
+				if step("B") then
+					if step("L") then
+						outcome = "outer"
+					else
+						while true do
+							if not step("W") then
+								outcome = "middle"
+								break
+							end
+							if step("V") then
+								outcome = "outer"
+								break
+							end
+						end
+					end
+					break
+				end
+				step("C")
+			end
+			if outcome == "middle" then
+				continue
+			end
+			if outcome == nil then
+				step("E")
+			end
+			break
+		end
+	end
+	return "done"
+end
+
 -- The native loops run index over 1, 2, 3.
 local function ownedExitFor(step: (string) -> any): any
 	for index = 1, 3 do
@@ -236,6 +279,7 @@ local WORKERS: { WorkerEntry } = {
 	{ name = "side_escape_free_target", reference = sideEscapeFreeTarget, invoke = stepInvoke },
 	{ name = "exit_reentered", reference = exitReentered, invoke = stepInvoke },
 	{ name = "exit_to_infinite_header", reference = exitToInfiniteHeader, invoke = stepInvoke },
+	{ name = SIDE_LOOP_WORKER, reference = sideEscapeLoopExitContinue, invoke = stepInvoke },
 }
 
 local function scriptText(bits: { boolean }): string
@@ -326,11 +370,18 @@ function LoopOwnedExitFlagRuntimeOracle.run(chunk: any, _source: string, caseNam
 	if not pinnedHeld then
 		table.insert(lines, `pinned {PINNED_WORKER} {PINNED_SCRIPT} expected={PINNED_EXPECTED} got={pinnedActual}`)
 	end
+	local sideLoopReference = runScript(sideEscapeLoopExitContinue, stepInvoke, scriptBits(SIDE_LOOP_SCRIPT))
+	assert(sideLoopReference == SIDE_LOOP_EXPECTED, `{caseName} reference changed its written-out row: {sideLoopReference}`)
+	local sideLoopActual = runScript(workers[11], stepInvoke, scriptBits(SIDE_LOOP_SCRIPT))
+	if sideLoopActual ~= SIDE_LOOP_EXPECTED then
+		pinnedHeld = false
+		table.insert(lines, `pinned {SIDE_LOOP_WORKER} {SIDE_LOOP_SCRIPT} expected={SIDE_LOOP_EXPECTED} got={sideLoopActual}`)
+	end
 	if failed > 0 or not pinnedHeld then
 		for _, line in lines do
 			print(`{caseName} {line}`)
 		end
-		assert(false, `{caseName}: {failed} of {#WORKERS} workers failed, pinned row {if pinnedHeld then "held" else "failed"}`)
+		assert(false, `{caseName}: {failed} of {#WORKERS} workers failed, pinned rows {if pinnedHeld then "held" else "failed"}`)
 	end
 	return workers[1]
 end

@@ -1945,11 +1945,20 @@ fn validatedContinueProjectionAlloc(
             return null;
         };
         if (region.nodes.len == 0) return error.UnsupportedControlFlow;
-        const source = switch (region.nodes[region.nodes.len - 1]) {
-            .block => |block_id| block_id,
+        const edge = switch (region.nodes[region.nodes.len - 1]) {
+            .block => |block_id| try loop_continue_projection.validateFinal(program, block_id, projection.target, expected),
+            // The loop's exit arm writes the edge's copies and leaves the loop; the flag set after the loop carries
+            // the continue to the loop that owns the target.
+            .loop => |loop| try loop_continue_projection.validateStructuredLoopExit(
+                program,
+                loop.header,
+                loop.continue_on_true,
+                projection.target,
+                loop.exit_edge,
+                expected,
+            ),
             else => return null,
         };
-        const edge = try loop_continue_projection.validateFinal(program, source, projection.target, expected);
         return .{ .source_edge = edge, .target_edge = edge, .nonlocal = true };
     }
     if (projection.forwarding) |forwarding| {
@@ -5146,6 +5155,81 @@ test "nonlocal transferred continuation may omit a local target" {
         error.UnsupportedControlFlow,
         validatedContinueProjectionAlloc(std.testing.allocator, &program, &region),
     );
+}
+
+test "a nonlocal continue after a last loop is validated from the loop's exit edge" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const header = ir.BlockId.fromIndex(0);
+    const body = ir.BlockId.fromIndex(1);
+    const target = ir.BlockId.fromIndex(2);
+    const stop = ir.BlockId.fromIndex(3);
+    const condition = ir.ValueId.fromIndex(0);
+    const parameter = ir.ValueId.fromIndex(1);
+    const argument = ir.ValueId.fromIndex(2);
+    const body_edge: ir.Edge = .{ .target = body };
+    const exit_edge: ir.Edge = .{ .target = target, .arguments = &.{argument} };
+    const blocks = [_]ir.Block{
+        .{
+            .id = header,
+            .function = function_id,
+            .terminator = .{ .branch = .{
+                .condition = condition,
+                .then_edge = body_edge,
+                .else_edge = exit_edge,
+            } },
+        },
+        .{ .id = body, .function = function_id, .terminator = .{ .jump = .{ .target = header } } },
+        .{ .id = target, .function = function_id, .parameters = &.{parameter}, .terminator = .{ .return_values = &.{} } },
+        .{ .id = stop, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const program: ir.Program = .{
+        .program_id = "nonlocal-continue-after-last-loop",
+        .entry_function = function_id,
+        .functions = &.{},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &.{},
+    };
+    // The region's last node is a loop whose exit edge leaves for `target`, a block that is not the region's own
+    // continue target: the loop's exit arm writes the edge's copies and leaves the loop, and the region continues
+    // `target` through its escape flag after the loop.
+    var body_nodes = [_]structure.Node{.{ .block = body }};
+    var body_region = structure.Region{ .nodes = &body_nodes, .stop = header, .loop_exit = target, .continue_target = header };
+    var nodes = [_]structure.Node{.{ .loop = .{
+        .header = header,
+        .body_region = &body_region,
+        .body_edge = body_edge,
+        .exit_edge = exit_edge,
+        .continue_on_true = true,
+    } }};
+    var region = structure.Region{
+        .nodes = &nodes,
+        .stop = stop,
+        .loop_exit = null,
+        .continue_projection = .{ .target = target, .edge = exit_edge },
+    };
+
+    const validated = try validatedContinueProjectionAlloc(std.testing.allocator, &program, &region);
+    try std.testing.expectEqual(@as(?ir.BlockId, target), if (validated) |projection| projection.target_edge.target else null);
+    const projected = validated.?;
+    try std.testing.expect(projected.nonlocal);
+    try std.testing.expectEqualSlices(ir.ValueId, &.{argument}, projected.source_edge.arguments);
+    try std.testing.expectEqualSlices(ir.ValueId, &.{argument}, projected.target_edge.arguments);
+
+    // A projected edge that is not the loop's live exit edge is refused.
+    region.continue_projection = .{ .target = target, .edge = .{ .target = target, .arguments = &.{parameter} } };
+    try std.testing.expectError(
+        error.UnsupportedControlFlow,
+        validatedContinueProjectionAlloc(std.testing.allocator, &program, &region),
+    );
+
+    // A continue to the region's own continue target keeps the local form.
+    region.continue_target = target;
+    region.continue_projection = .{ .target = target, .edge = exit_edge };
+    const local = (try validatedContinueProjectionAlloc(std.testing.allocator, &program, &region)).?;
+    try std.testing.expect(!local.nonlocal);
+    try std.testing.expectEqual(target, local.target_edge.target);
+    try std.testing.expectEqualSlices(ir.ValueId, &.{argument}, local.target_edge.arguments);
 }
 
 test "empty loop-boundary continuation authenticates its entry edge" {
