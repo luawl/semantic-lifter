@@ -1170,6 +1170,121 @@ test "core ownership lists are complete bijections" {
     try std.testing.expect(report.contains(.duplicate_block_instruction));
 }
 
+test "edge-rewrite ids equal their array positions" {
+    const fixture = lifter.fixtures.absolute_value_module;
+    const profiles = [_]ir.AdmissionProfile{ .core, .readable_luau };
+    // The else edge skips the pure forwarder b_nonnegative, and one rewrite records that hop.
+    var blocks = fixture.blocks;
+    blocks[fixture.b_entry.index()].terminator.branch.else_edge = .{ .target = fixture.b_join, .arguments = &.{fixture.v_input} };
+    var rewrites = [_]ir.CfgEdgeRewrite{.{
+        .id = ir.EdgeRewriteId.fromIndex(0),
+        .source = fixture.b_entry,
+        .kind = .branch_else,
+        .from = .{ .target = fixture.b_nonnegative },
+        .to = .{ .target = fixture.b_join, .arguments = &.{fixture.v_input} },
+        .rule = .forwarding_jump,
+    }};
+    var program = fixture.program;
+    program.blocks = &blocks;
+    program.edge_rewrites = &rewrites;
+
+    for (profiles) |profile| {
+        var report = try validation.validate(std.testing.allocator, &program, profile);
+        defer report.deinit();
+        try std.testing.expect(report.isClean());
+    }
+
+    const noncanonical_ids = [_]usize{ 1, 99, std.math.maxInt(u32) };
+    for (noncanonical_ids) |id| {
+        rewrites[0].id = ir.EdgeRewriteId.fromIndex(id);
+        for (profiles) |profile| {
+            var report = try validation.validate(std.testing.allocator, &program, profile);
+            defer report.deinit();
+            try std.testing.expect(report.contains(.noncanonical_edge_rewrite_id));
+            var reported: usize = 0;
+            for (report.diagnostics.items) |diagnostic| {
+                if (diagnostic.code != .noncanonical_edge_rewrite_id) continue;
+                try std.testing.expectEqual(@as(?u32, 0), diagnostic.entity_index);
+                reported += 1;
+            }
+            try std.testing.expectEqual(@as(usize, 1), reported);
+        }
+    }
+}
+
+test "edge-rewrite ids reject duplicated, reordered and gapped histories" {
+    const fixture = lifter.fixtures.absolute_value_module;
+    const profiles = [_]ir.AdmissionProfile{ .core, .readable_luau };
+    // A relay block makes the else arm a chain of two forwarding hops: b_nonnegative to b_relay, then b_relay to b_join.
+    const b_relay = ir.BlockId.fromIndex(5);
+    var blocks = fixture.blocks ++ [_]ir.Block{.{
+        .id = b_relay,
+        .function = fixture.f_absolute,
+        .terminator = .{ .jump = .{ .target = fixture.b_join, .arguments = &.{fixture.v_input} } },
+        .evidence = &.{fixture.proof},
+    }};
+    blocks[fixture.b_nonnegative.index()].terminator = .{ .jump = .{ .target = b_relay } };
+    blocks[fixture.b_entry.index()].terminator.branch.else_edge = .{ .target = fixture.b_join, .arguments = &.{fixture.v_input} };
+    const absolute_blocks = [_]ir.BlockId{ fixture.b_join, fixture.b_negative, fixture.b_entry, fixture.b_nonnegative, b_relay };
+    var functions = fixture.functions;
+    functions[fixture.f_absolute.index()].blocks = &absolute_blocks;
+    var rewrites = [_]ir.CfgEdgeRewrite{
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(0),
+            .source = fixture.b_entry,
+            .kind = .branch_else,
+            .from = .{ .target = fixture.b_nonnegative },
+            .to = .{ .target = b_relay },
+            .rule = .forwarding_jump,
+        },
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(1),
+            .source = fixture.b_entry,
+            .kind = .branch_else,
+            .from = .{ .target = b_relay },
+            .to = .{ .target = fixture.b_join, .arguments = &.{fixture.v_input} },
+            .rule = .forwarding_jump,
+        },
+    };
+    var program = fixture.program;
+    program.functions = &functions;
+    program.blocks = &blocks;
+    program.edge_rewrites = &rewrites;
+
+    for (profiles) |profile| {
+        var report = try validation.validate(std.testing.allocator, &program, profile);
+        defer report.deinit();
+        try std.testing.expect(report.isClean());
+    }
+
+    // Every position whose id differs from the position is reported, in position order.
+    const Case = struct {
+        ids: [2]usize,
+        entities: []const u32,
+    };
+    const cases = [_]Case{
+        .{ .ids = .{ 0, 0 }, .entities = &.{1} },
+        .{ .ids = .{ 1, 0 }, .entities = &.{ 0, 1 } },
+        .{ .ids = .{ 0, 2 }, .entities = &.{1} },
+    };
+    for (cases) |case| {
+        for (case.ids, 0..) |id, position| rewrites[position].id = ir.EdgeRewriteId.fromIndex(id);
+        for (profiles) |profile| {
+            var report = try validation.validate(std.testing.allocator, &program, profile);
+            defer report.deinit();
+            try std.testing.expect(report.contains(.noncanonical_edge_rewrite_id));
+            var reported: usize = 0;
+            for (report.diagnostics.items) |diagnostic| {
+                if (diagnostic.code != .noncanonical_edge_rewrite_id) continue;
+                try std.testing.expect(reported < case.entities.len);
+                try std.testing.expectEqual(@as(?u32, case.entities[reported]), diagnostic.entity_index);
+                reported += 1;
+            }
+            try std.testing.expectEqual(case.entities.len, reported);
+        }
+    }
+}
+
 test "SSA uses must follow and be dominated by their definitions" {
     const fixtures = lifter.fixtures;
 

@@ -155,6 +155,7 @@ fn validateCanonicalIds(report: *Report, program: *const ir.Program) !void {
     for (program.solver_models, 0..) |model, index| if (model.id.index() != index) try report.add(.noncanonical_solver_model_id, index);
     for (program.unsat_cores, 0..) |core, index| if (core.id.index() != index) try report.add(.noncanonical_unsat_core_id, index);
     for (program.certificates, 0..) |certificate, index| if (certificate.id.index() != index) try report.add(.noncanonical_certificate_id, index);
+    for (program.edge_rewrites, 0..) |rewrite, index| if (rewrite.id.index() != index) try report.add(.noncanonical_edge_rewrite_id, index);
     for (program.claims, 0..) |claim, index| if (claim.id.index() != index) try report.add(.noncanonical_claim_id, index);
     for (program.obligations, 0..) |obligation, index| if (obligation.id.index() != index) try report.add(.noncanonical_obligation_id, index);
 }
