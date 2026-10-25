@@ -3946,3 +3946,106 @@ test "the function probe writes a structurable closure in its own layout as publ
     defer std.testing.allocator.free(probed);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, probed, "local __lifter_pc"));
 }
+
+test "closure stores whose target renders in parentheses open their own block" {
+    const proof = ir.EvidenceId.fromIndex(0);
+    const chunk = ir.FunctionId.fromIndex(0);
+    const child = ir.FunctionId.fromIndex(1);
+    const entry = ir.BlockId.fromIndex(0);
+    const child_entry = ir.BlockId.fromIndex(1);
+    const call_instruction = ir.InstructionId.fromIndex(0);
+    const target_instruction = ir.InstructionId.fromIndex(1);
+    const key_instruction = ir.InstructionId.fromIndex(2);
+    const closure_instruction = ir.InstructionId.fromIndex(3);
+    const store_instruction = ir.InstructionId.fromIndex(4);
+    const callee = ir.ValueId.fromIndex(0);
+    const target = ir.ValueId.fromIndex(1);
+    const key = ir.ValueId.fromIndex(2);
+    const closure = ir.ValueId.fromIndex(3);
+    const result = ir.ValueId.fromIndex(4);
+    const captured = ir.ValueId.fromIndex(5);
+    const capture = ir.CaptureId.fromIndex(0);
+    // The program without a capture uses values 0-3; values 4 and 5 are the call result its twin's closure captures.
+    const values = [_]ir.Value{
+        .{ .id = callee, .function = chunk, .type = .function, .name_hint = "callee", .origin = .{ .parameter = 0 } },
+        .{ .id = target, .function = chunk, .origin = .{ .instruction_result = .{ .instruction = target_instruction, .index = 0 } } },
+        .{ .id = key, .function = chunk, .type = .string, .origin = .{ .instruction_result = .{ .instruction = key_instruction, .index = 0 } } },
+        .{ .id = closure, .function = chunk, .type = .function, .origin = .{ .instruction_result = .{ .instruction = closure_instruction, .index = 0 } } },
+        .{ .id = result, .function = chunk, .name_hint = "x", .origin = .{ .instruction_result = .{ .instruction = call_instruction, .index = 0 } } },
+        .{ .id = captured, .function = child, .name_hint = "x", .origin = .{ .capture = capture } },
+    };
+    var instructions = [_]ir.Instruction{
+        .{ .id = call_instruction, .block = entry, .operation = .{ .call = .{ .callee = callee, .arguments = &.{}, .result_arity = .{ .fixed = 0 } } }, .results = &.{}, .effects = .dynamic_call, .evidence = &.{proof} },
+        .{ .id = target_instruction, .block = entry, .operation = .{ .constant = .{ .nil_value = {} } }, .results = &.{target}, .effects = .pure, .evidence = &.{proof} },
+        .{ .id = key_instruction, .block = entry, .operation = .{ .constant = .{ .string = "get" } }, .results = &.{key}, .effects = .pure, .evidence = &.{proof} },
+        .{ .id = closure_instruction, .block = entry, .operation = .{ .make_closure = .{ .function = child, .bindings = &.{} } }, .results = &.{closure}, .effects = .pure, .evidence = &.{proof} },
+        .{ .id = store_instruction, .block = entry, .operation = .{ .table_set = .{ .table = target, .key = key, .value = closure, .mode = .semantic } }, .results = &.{}, .effects = .semantic_table_write, .evidence = &.{proof} },
+    };
+    const capture_results = [_]ir.ValueId{result};
+    const capture_bindings = [_]ir.CaptureBinding{.{ .value = result }};
+    var capture_instructions = instructions;
+    capture_instructions[0].operation = .{ .call = .{ .callee = callee, .arguments = &.{}, .result_arity = .{ .fixed = 1 } } };
+    capture_instructions[0].results = &capture_results;
+    capture_instructions[3].operation = .{ .make_closure = .{ .function = child, .bindings = &capture_bindings } };
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = chunk, .instructions = &.{ call_instruction, target_instruction, key_instruction, closure_instruction, store_instruction }, .terminator = .{ .return_values = &.{} }, .evidence = &.{proof} },
+        .{ .id = child_entry, .function = child, .terminator = .{ .return_values = &.{} }, .evidence = &.{proof} },
+    };
+    const capture_blocks = [_]ir.Block{
+        blocks[0],
+        .{ .id = child_entry, .function = child, .terminator = .{ .return_values = &.{captured} }, .evidence = &.{proof} },
+    };
+    const functions = [_]ir.Function{
+        .{ .id = chunk, .name_hint = "chunk", .parameters = &.{callee}, .blocks = &.{entry}, .entry_block = entry, .evidence = &.{proof} },
+        .{ .id = child, .name_hint = "child", .lexical_parent = chunk, .blocks = &.{child_entry}, .entry_block = child_entry, .evidence = &.{proof} },
+    };
+    const capture_functions = [_]ir.Function{
+        functions[0],
+        .{ .id = child, .name_hint = "child", .lexical_parent = chunk, .captures = &.{capture}, .blocks = &.{child_entry}, .entry_block = child_entry, .evidence = &.{proof} },
+    };
+    const captures = [_]ir.Capture{.{ .id = capture, .function = child, .kind = .{ .immutable_value = captured }, .evidence = &.{proof} }};
+    const evidence = [_]ir.Evidence{.{ .id = proof, .kind = .dynamic_fixture, .locator = "fixture:closure-store-into-nil" }};
+    const program: ir.Program = .{
+        .program_id = "closure-store-into-nil",
+        .entry_function = chunk,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = values[0..4],
+        .evidence = &evidence,
+    };
+    const capture_program: ir.Program = .{
+        .program_id = "closure-store-into-nil-after-capture",
+        .entry_function = chunk,
+        .functions = &capture_functions,
+        .blocks = &capture_blocks,
+        .instructions = &capture_instructions,
+        .values = &values,
+        .captures = &captures,
+        .evidence = &evidence,
+    };
+
+    // After a call statement the store's head begins with `(`, so the store opens its own block: as a table store, then
+    // as an environment store whose environment is the value nil.
+    const table_source = try emitAlloc(std.testing.allocator, &program);
+    defer std.testing.allocator.free(table_source);
+    try std.testing.expect(std.mem.indexOf(u8, table_source, "callee()\n(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, table_source, "callee()\ndo\n  (nil).get = function()\n  end\nend\n") != null);
+    instructions[4].operation = .{ .environment_set = .{ .target = .{ .value = target }, .name = "get", .value = closure } };
+    const environment_source = try emitAlloc(std.testing.allocator, &program);
+    defer std.testing.allocator.free(environment_source);
+    try std.testing.expect(std.mem.indexOf(u8, environment_source, "callee()\n(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, environment_source, "callee()\ndo\n  (nil).get = function()\n  end\nend\n") != null);
+
+    // A closure that captures the call's result is written inside its bindings' `do` after `local <capture> =
+    // callee()`; the store opens its own block there too.
+    const captured_table_source = try emitAlloc(std.testing.allocator, &capture_program);
+    defer std.testing.allocator.free(captured_table_source);
+    try std.testing.expect(std.mem.indexOf(u8, captured_table_source, "callee()\n  (") == null);
+    try std.testing.expect(std.mem.indexOf(u8, captured_table_source, "= callee()\n  do\n    (nil).get = function()\n") != null);
+    capture_instructions[4].operation = .{ .environment_set = .{ .target = .{ .value = target }, .name = "get", .value = closure } };
+    const captured_environment_source = try emitAlloc(std.testing.allocator, &capture_program);
+    defer std.testing.allocator.free(captured_environment_source);
+    try std.testing.expect(std.mem.indexOf(u8, captured_environment_source, "callee()\n  (") == null);
+    try std.testing.expect(std.mem.indexOf(u8, captured_environment_source, "= callee()\n  do\n    (nil).get = function()\n") != null);
+}

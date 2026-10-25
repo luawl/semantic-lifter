@@ -6733,7 +6733,24 @@ fn emitClosure(
         try output.append(allocator, '\n');
     }
 
-    try output.appendSlice(allocator, closure_indent);
+    // A table or environment store whose target is written in parentheses would begin its line with `(`, which
+    // after a statement ending in a prefix expression Luau reads as a call: write the store inside its own
+    // `do ... end`, as the generic statement writer does, inside the bindings' `do` when there is one.
+    const store_needs_separator = switch (destination) {
+        .table => |store| render.statementNeedsSeparator(program, parent_values, .{ .table_set = store }),
+        .environment => |store| render.statementNeedsSeparator(program, parent_values, .{ .environment_set = store }),
+        .value, .place => false,
+    };
+    var store_indent = closure_indent;
+    var separated_indent: ?[]u8 = null;
+    defer if (separated_indent) |separated| allocator.free(separated);
+    if (store_needs_separator) {
+        try output.appendSlice(allocator, closure_indent);
+        try output.appendSlice(allocator, "do\n");
+        separated_indent = try allocDeeperIndent(allocator, closure_indent);
+        store_indent = separated_indent.?;
+    }
+    try output.appendSlice(allocator, store_indent);
     var closes_external = false;
     switch (destination) {
         .value => |value| {
@@ -6803,7 +6820,7 @@ fn emitClosure(
     try emitFunctionParameters(output, allocator, emission_plan, target);
     try output.appendSlice(allocator, ")\n");
 
-    const body_indent = try allocDeeperIndent(allocator, closure_indent);
+    const body_indent = try allocDeeperIndent(allocator, store_indent);
     defer allocator.free(body_indent);
     var child_plan = emission_plan.*;
     child_plan.force_dispatcher = emission_plan.explicit_dispatcher;
@@ -6815,10 +6832,14 @@ fn emitClosure(
         return err;
     };
 
-    try output.appendSlice(allocator, closure_indent);
+    try output.appendSlice(allocator, store_indent);
     try output.appendSlice(allocator, "end");
     if (closes_external) try output.append(allocator, ')');
     try output.append(allocator, '\n');
+    if (store_needs_separator) {
+        try output.appendSlice(allocator, closure_indent);
+        try output.appendSlice(allocator, "end\n");
+    }
     if (scopes_snapshots) {
         try output.appendSlice(allocator, indent);
         try output.appendSlice(allocator, "end\n");

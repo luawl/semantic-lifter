@@ -1622,6 +1622,30 @@ pub fn build(b: *std.Build) void {
         "source-frontend-closure-store-environment-direct-locals",
         "direct-locals-luau",
     );
+    const source_frontend_closure_store_parenthesized_target_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/closure_store_parenthesized_target_source.luau",
+        "source-frontend-closure-store-parenthesized-target",
+    );
+    const closure_store_parenthesized_target_dispatcher = addDispatcherRuntimeConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "source-frontend-closure-store-parenthesized-target",
+        source_frontend_closure_store_parenthesized_target_conformance.resolved_ir,
+    );
+    const closure_store_parenthesized_target_automatic = addAutomaticRuntimeConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "source-frontend-closure-store-parenthesized-target",
+        source_frontend_closure_store_parenthesized_target_conformance.resolved_ir,
+    );
     const source_frontend_interpolation_conformance = addLuauSourceConformance(
         b,
         exe,
@@ -2296,6 +2320,9 @@ pub fn build(b: *std.Build) void {
     source_frontend_function_statement_conformance.addTo(conformance_step);
     source_frontend_closure_store_environment_conformance.addTo(conformance_step);
     source_frontend_closure_store_environment_direct_locals_conformance.addTo(conformance_step);
+    source_frontend_closure_store_parenthesized_target_conformance.addTo(conformance_step);
+    conformance_step.dependOn(closure_store_parenthesized_target_dispatcher);
+    conformance_step.dependOn(closure_store_parenthesized_target_automatic);
     source_frontend_interpolation_conformance.addTo(conformance_step);
     source_frontend_intrinsic_invocation_conformance.addTo(conformance_step);
     source_frontend_coroutine_wrap_conformance.addTo(conformance_step);

@@ -1793,6 +1793,36 @@ function SourceRuntimeOracle.run(caseName: string, source: string, exported: any
 			end
 		end
 		assert(mismatches == 0, `{caseName}: {mismatches} of {rows} rows differ from the source; first {first}`)
+	elseif caseName == "source-frontend-closure-store-parenthesized-target" then
+		local previous = ""
+		for line in string.gmatch(source .. "\n", "([^\n]*)\n") do
+			if string.match(line, "^%s*%(") ~= nil then
+				local word = string.match(previous, "([%w_]+)%s*$")
+				local closes = string.match(previous, "[%)%]]%s*$") ~= nil
+				local keyword = word == "do" or word == "then" or word == "else" or word == "repeat" or word == "end"
+				assert(not closes and (word == nil or keyword), `a statement that begins with a parenthesis follows a prefix expression: {previous} / {line}`)
+			end
+			if string.match(line, "%S") ~= nil then
+				previous = line
+			end
+		end
+		local events: { string } = {}
+		local function observe(label: any): string
+			table.insert(events, tostring(label))
+			return "seen:" .. tostring(label)
+		end
+		assert(exported(observe, 0, false) == "seen:finish", "closure stores changed the normal completion")
+		assert(table.concat(events, ",") == "start,finish", "closure stores changed the call order of the normal completion")
+		table.clear(events)
+		local storeOk, storeError = pcall(exported, observe, 0, true)
+		assert(not storeOk, "a closure store into nil did not raise")
+		assert(string.find(tostring(storeError), "attempt to index nil with 'handler'", 1, true) ~= nil, "the closure store raised another error")
+		assert(table.concat(events, ",") == "start,store", "the closure store ran before or without its preceding call")
+		table.clear(events)
+		local loopOk, loopError = pcall(exported, observe, 2, false)
+		assert(not loopOk, "a captured closure store into nil did not raise")
+		assert(string.find(tostring(loopError), "attempt to index nil with 'captured'", 1, true) ~= nil, "the captured closure store raised another error")
+		assert(table.concat(events, ",") == "start,1", "the captured closure store ran before or without its binding's call")
 	else
 		return false
 	end
