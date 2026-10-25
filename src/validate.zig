@@ -50,6 +50,19 @@ pub fn validateForTargetWithStrategy(
     target: luau_runtime.Target,
     strategy: EmissionStrategy,
 ) !Report {
+    return validateForTargetWithLayout(allocator, program, profile, target, strategy, null);
+}
+
+/// `validateForTargetWithStrategy` with every function marked in `flat_functions` certified in the dispatcher
+/// layout, as `register_validation.validateWithLayout` states.
+pub fn validateForTargetWithLayout(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    profile: ir.AdmissionProfile,
+    target: luau_runtime.Target,
+    strategy: EmissionStrategy,
+    flat_functions: ?[]const bool,
+) !Report {
     var report = Report.init(allocator);
     errdefer report.deinit();
 
@@ -131,7 +144,7 @@ pub fn validateForTargetWithStrategy(
     try proof_validation.validate(&report, program, profile, scope);
     if (profile == .readable_luau) try operation_validation.validateReadableCapabilities(&report, program, scope.?);
     if (profile == .readable_luau and report.isClean()) {
-        try register_validation.validateWithStrategy(allocator, &report, program, scope.?, target, strategy);
+        try register_validation.validateWithLayout(allocator, &report, program, scope.?, target, strategy, flat_functions);
     }
 
     return report;

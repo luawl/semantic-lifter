@@ -37,6 +37,10 @@ pub const ContinueBinder = struct {
 pub const EmitState = struct {
     native_iteration_completion: ?*NativeIterationCompletion = null,
     continue_binder: ?*const ContinueBinder = null,
+    /// One mark per function of the prepared program, set by `emitFunctionBody` for a function it writes in the
+    /// dispatcher layout after the region writer refused its structured plan; null when no entry certifies the
+    /// written layout. Every copy of the plan holds this state by pointer, so a nested body marks the same set.
+    flat_fallbacks: ?[]bool = null,
 };
 
 pub const Plan = struct {

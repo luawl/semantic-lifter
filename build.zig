@@ -1858,6 +1858,7 @@ pub fn build(b: *std.Build) void {
     const register_budget_oracle = addRegisterBudgetOracle(b);
     const dispatcher_local_budget_conformance = addDispatcherLocalBudgetConformance(b, exe, z3_enabled, z3_bin);
     const dispatcher_generic_budget_conformance = addDispatcherGenericBudgetConformance(b, exe, z3_enabled, z3_bin);
+    const region_fallback_local_budget_conformance = addRegionFallbackLocalBudgetConformance(b, exe, z3_enabled, z3_bin);
     const native_loop_register_conformance = addNativeLoopRegisterConformance(b, exe, z3_enabled, z3_bin);
     const compile_check_positive = b.addRunArtifact(exe);
     if (z3_enabled) compile_check_positive.addPathDir(b.pathFromRoot(z3_bin));
@@ -2147,6 +2148,7 @@ pub fn build(b: *std.Build) void {
     conformance_step.dependOn(&register_budget_oracle.step);
     dispatcher_local_budget_conformance.addTo(conformance_step);
     dispatcher_generic_budget_conformance.addTo(conformance_step);
+    region_fallback_local_budget_conformance.addTo(conformance_step);
     native_loop_register_conformance.addTo(conformance_step);
     conformance_step.dependOn(&compile_check_positive.step);
     conformance_step.dependOn(&compile_check_rejection.step);
@@ -3560,7 +3562,7 @@ fn addAutomaticRuntimeCaseConformance(
 
 // An emission that must be refused with a typed line, in the dispatcher-budget refusal form
 // (`addDispatcherLocalBudgetConformance`): the emitter writes no output, so the output argument is
-// an empty seed file, and the step expects exit 1 and the typed line on stderr.
+// an empty seed file, and the step expects exit 1 and each of the given lines on stderr, the typed line first.
 fn addEmitRefusalConformance(
     b: *std.Build,
     exe: *std.Build.Step.Compile,
@@ -3568,8 +3570,9 @@ fn addEmitRefusalConformance(
     z3_bin: []const u8,
     ir: std.Build.LazyPath,
     seed_name: []const u8,
+    target: []const u8,
     strategy: []const u8,
-    stderr_match: []const u8,
+    stderr_matches: []const []const u8,
 ) *std.Build.Step {
     const emit = b.addRunArtifact(exe);
     if (z3_enabled) emit.addPathDir(b.pathFromRoot(z3_bin));
@@ -3577,10 +3580,121 @@ fn addEmitRefusalConformance(
     emit.addFileArg(ir);
     const seed_files = b.addWriteFiles();
     emit.addFileArg(seed_files.add(seed_name, ""));
-    emit.addArgs(&.{ "standard-luau", strategy });
+    emit.addArgs(&.{ target, strategy });
     emit.expectExitCode(1);
-    emit.expectStdErrMatch(stderr_match);
+    for (stderr_matches) |stderr_match| emit.expectStdErrMatch(stderr_match);
     return &emit.step;
+}
+
+// emitFunctionBody writes a function in the dispatcher layout when the region writer refuses its structured plan,
+// and the emission entry certifies that layout before it publishes the text. Each refused input below is admitted
+// structured while its dispatcher layout passes the 200-local limit, so each route that writes text exits 1 with the
+// typed line and `error: InvalidIr`, the emitter's refusal after a clean admission: the IR fixture with 76 places
+// allocated per execution in each of two sibling arms of a loop body, on the unchecked strategy route, the checked
+// `emit-luau` and the function probe; in direct locals, the source with seven single-assignment locals in each of two
+// arms before a repeat loop with a continue in an `if` arm and one in an `elseif` arm, on the strategy route and the
+// checked chain; in the standard target, the source with 60 mutable locals in each of two arms before a repeat loop
+// whose continue skips a join, whose 200 potential locals keep their registers and leave the `__lifter_pc` slot as the
+// 201st local, on the same two routes. With one place or local fewer per arm each input is admitted, written in the
+// flat layout and compiled at -O0 and at the default level.
+const region_fallback_refusal = [_][]const u8{ "diagnostic=unsupported_readable_register_pressure entity=1\n", "error: InvalidIr" };
+
+const RegionFallbackLocalBudgetConformance = struct {
+    steps: [10]*std.Build.Step,
+
+    fn addTo(self: RegionFallbackLocalBudgetConformance, step: *std.Build.Step) void {
+        for (self.steps) |checked| step.dependOn(checked);
+    }
+};
+
+fn addRegionFallbackLocalBudgetConformance(
+    b: *std.Build,
+    exe: *std.Build.Step.Compile,
+    z3_enabled: bool,
+    z3_bin: []const u8,
+) RegionFallbackLocalBudgetConformance {
+    const engine = if (z3_enabled) "z3" else "internal";
+    const places = b.path("luau/fixtures/region_fallback_allocated_places_76.lifter-ir.json");
+    const places_75 = b.path("luau/fixtures/region_fallback_allocated_places_75.lifter-ir.json");
+    const local_budget = addGenericBudgetResolvedIr(b, exe, z3_enabled, z3_bin, "luau/fixtures/region_fallback_local_budget_source.luau", "region-fallback-local-budget");
+    const local_budget_6 = addGenericBudgetResolvedIr(b, exe, z3_enabled, z3_bin, "luau/fixtures/region_fallback_local_budget_6_source.luau", "region-fallback-local-budget-6");
+    const pc_slot = addGenericBudgetResolvedIr(b, exe, z3_enabled, z3_bin, "luau/fixtures/region_fallback_pc_slot_source.luau", "region-fallback-pc-slot");
+    const pc_slot_59 = addGenericBudgetResolvedIr(b, exe, z3_enabled, z3_bin, "luau/fixtures/region_fallback_pc_slot_59_source.luau", "region-fallback-pc-slot-59");
+    return .{ .steps = .{
+        addEmitRefusalConformance(b, exe, z3_enabled, z3_bin, places, "region-fallback-allocated-places-76.automatic.luau", "standard-luau", "automatic", &region_fallback_refusal),
+        addRegionFallbackRefusal(b, exe, z3_enabled, z3_bin, "emit-luau", places, "region-fallback-allocated-places-76.generated.luau", &.{"standard-luau"}, true),
+        addRegionFallbackRefusal(b, exe, z3_enabled, z3_bin, "emit-function-probe", places, "region-fallback-allocated-places-76.probe.luau", &.{"1"}, false),
+        addEmitRefusalConformance(b, exe, z3_enabled, z3_bin, local_budget, "region-fallback-local-budget.automatic.luau", "direct-locals-luau", "automatic", &region_fallback_refusal),
+        addRegionFallbackRefusal(b, exe, z3_enabled, z3_bin, "emit-luau-solved", local_budget, "region-fallback-local-budget.generated.luau", &.{ engine, "direct-locals-luau" }, true),
+        addEmitRefusalConformance(b, exe, z3_enabled, z3_bin, pc_slot, "region-fallback-pc-slot.automatic.luau", "standard-luau", "automatic", &region_fallback_refusal),
+        addRegionFallbackRefusal(b, exe, z3_enabled, z3_bin, "emit-luau-solved", pc_slot, "region-fallback-pc-slot.generated.luau", &.{ engine, "standard-luau" }, true),
+        addRegionFallbackBoundary(b, exe, z3_enabled, z3_bin, places_75, "region-fallback-allocated-places-75", "standard-luau"),
+        addRegionFallbackBoundary(b, exe, z3_enabled, z3_bin, local_budget_6, "region-fallback-local-budget-6", "direct-locals-luau"),
+        addRegionFallbackBoundary(b, exe, z3_enabled, z3_bin, pc_slot_59, "region-fallback-pc-slot-59", "standard-luau"),
+    } };
+}
+
+// A refused emission of the region-fallback arms: `<command> <input> <seed> <args>`, then the compiler when the
+// command is checked. The emitter writes no output, so the output argument is an empty seed file; the step expects
+// exit 1 and both lines of `region_fallback_refusal`.
+fn addRegionFallbackRefusal(
+    b: *std.Build,
+    exe: *std.Build.Step.Compile,
+    z3_enabled: bool,
+    z3_bin: []const u8,
+    command: []const u8,
+    input: std.Build.LazyPath,
+    seed_name: []const u8,
+    args: []const []const u8,
+    checked: bool,
+) *std.Build.Step {
+    const emit = b.addRunArtifact(exe);
+    if (z3_enabled) emit.addPathDir(b.pathFromRoot(z3_bin));
+    emit.addArg(command);
+    emit.addFileArg(input);
+    const seed_files = b.addWriteFiles();
+    emit.addFileArg(seed_files.add(seed_name, ""));
+    emit.addArgs(args);
+    if (checked) emit.addFileArg(.{ .cwd_relative = luauCompileExe(b) });
+    emit.expectExitCode(1);
+    for (region_fallback_refusal) |line| emit.expectStdErrMatch(line);
+    return &emit.step;
+}
+
+// An admitted boundary input of the region-fallback arms: `emit-readable-luau-strategy <input> <name>.automatic.luau
+// <target> automatic` exits 0, the text compiles at -O0 and at the default level, and the layout oracle reports its
+// function written in the flat layout (exit 1 with a `flat` line).
+fn addRegionFallbackBoundary(
+    b: *std.Build,
+    exe: *std.Build.Step.Compile,
+    z3_enabled: bool,
+    z3_bin: []const u8,
+    input: std.Build.LazyPath,
+    name: []const u8,
+    target: []const u8,
+) *std.Build.Step {
+    const emit = b.addRunArtifact(exe);
+    if (z3_enabled) emit.addPathDir(b.pathFromRoot(z3_bin));
+    emit.addArg("emit-readable-luau-strategy");
+    emit.addFileArg(input);
+    const emitted = emit.addOutputFileArg(b.fmt("{s}.automatic.luau", .{name}));
+    emit.addArgs(&.{ target, "automatic" });
+    emit.expectExitCode(0);
+    const compile_o0 = b.addSystemCommand(&.{ luauCompileExe(b), "--null", "-O0" });
+    compile_o0.addFileArg(emitted);
+    compile_o0.expectExitCode(0);
+    const compile_default = b.addSystemCommand(&.{ luauCompileExe(b), "--null" });
+    compile_default.addFileArg(emitted);
+    compile_default.expectExitCode(0);
+    const layout = b.addSystemCommand(&.{ luneExe(b), "run" });
+    layout.addFileArg(b.path("luau/structured_layout_oracle.luau"));
+    layout.addArg(name);
+    layout.addFileArg(emitted);
+    layout.expectExitCode(1);
+    layout.expectStdOutMatch(" flat\n");
+    layout.step.dependOn(&compile_o0.step);
+    layout.step.dependOn(&compile_default.step);
+    return &layout.step;
 }
 
 // An admitted crafted IR whose numeric transition has an inlined operand, emitted,

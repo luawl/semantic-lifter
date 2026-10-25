@@ -56,9 +56,25 @@ pub fn validateWithStrategy(
     allocator: std.mem.Allocator,
     report: *diagnostics.Report,
     program: *const ir.Program,
+    scope: *const readable_scope.Scope,
+    target: luau_runtime.Target,
+    strategy: EmissionStrategy,
+) !void {
+    return validateWithLayout(allocator, report, program, scope, target, strategy, null);
+}
+
+/// `validateWithStrategy` with every function marked in `flat_functions` (indexed by function id; null marks none)
+/// certified in the dispatcher layout, the layout `emitFunctionBody` writes for a function whose structured plan the
+/// region writer refused: the register terms, the syntax depth, the jump budget and the stable values handed to the
+/// upvalue certificate of a marked function are computed on that layout.
+pub fn validateWithLayout(
+    allocator: std.mem.Allocator,
+    report: *diagnostics.Report,
+    program: *const ir.Program,
     _: *const readable_scope.Scope,
     target: luau_runtime.Target,
     strategy: EmissionStrategy,
+    flat_functions: ?[]const bool,
 ) !void {
     if (stage_trace.enabled) std.debug.print("register_validation stage=begin\n", .{});
     var transfer_arena = std.heap.ArenaAllocator.init(allocator);
@@ -71,7 +87,7 @@ pub fn validateWithStrategy(
     var readable = try readable_scope.Scope.init(allocator, &prepared);
     defer readable.deinit();
     if (stage_trace.enabled) std.debug.print("register_validation stage=scope\n", .{});
-    try validatePrepared(allocator, report, &prepared, &readable, target, strategy);
+    try validatePrepared(allocator, report, &prepared, &readable, target, strategy, flat_functions);
     if (stage_trace.enabled) std.debug.print("register_validation stage=done\n", .{});
 }
 
@@ -82,6 +98,7 @@ fn validatePrepared(
     readable: *const readable_scope.Scope,
     target: luau_runtime.Target,
     strategy: EmissionStrategy,
+    flat_functions: ?[]const bool,
 ) !void {
     if (stage_trace.enabled) std.debug.print("register_validation stage=emission_plan_begin\n", .{});
     var emission = try emission_planning.Plan.init(allocator, program, target);
@@ -110,6 +127,9 @@ fn validatePrepared(
         ),
     );
 
+    // The emitter sized the marks on its own preparation of this program, one mark per function this walk visits;
+    // a different count means the two preparations disagree and a function written flat could go uncertified.
+    if (flat_functions) |marks| std.debug.assert(marks.len == program.functions.len);
     for (program.functions) |function| {
         if (!emitted_functions[function.id.index()]) continue;
         if (stage_trace.enabled) std.debug.print("register_validation function={} stage=begin\n", .{function.id.index()});
@@ -128,7 +148,8 @@ fn validatePrepared(
             syntax_depths.recordDirectSpineFunction(function, direct_spine_depth);
             continue;
         }
-        var structured = (if (strategy == .dispatcher)
+        const written_flat = if (flat_functions) |marks| function.id.index() < marks.len and marks[function.id.index()] else false;
+        var structured = (if (strategy == .dispatcher or written_flat)
             structure.Plan.initArbitrary(allocator, &analysis)
         else
             structure.Plan.initWithArbitraryFallback(allocator, &analysis)) catch |err| switch (err) {

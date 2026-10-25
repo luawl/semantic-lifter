@@ -962,3 +962,102 @@ test "closed pack values contribute every emitted invocation argument" {
     try std.testing.expectEqual(@as(usize, 1), excessive.diagnostics.items.len);
     try std.testing.expect(excessive.contains(.unsupported_readable_temporary_register_pressure));
 }
+
+/// One function whose entry branches on its first parameter into two sibling arms that each write `arm_places`
+/// places allocated per execution and rejoin to return: the structured layout declares each arm's places in that
+/// arm's scope, the dispatcher layout declares both arms' places at the function root.
+fn siblingArmPlacesReport(
+    comptime arm_places: usize,
+    strategy: register_validation.EmissionStrategy,
+    flat_functions: ?[]const bool,
+) !diagnostics.Report {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const then_block = ir.BlockId.fromIndex(1);
+    const else_block = ir.BlockId.fromIndex(2);
+    const join = ir.BlockId.fromIndex(3);
+    const selector = ir.ValueId.fromIndex(0);
+    const budget = ir.ValueId.fromIndex(1);
+    const values = [_]ir.Value{
+        .{ .id = selector, .function = function_id, .type = .dynamic, .origin = .{ .parameter = 0 } },
+        .{ .id = budget, .function = function_id, .type = .dynamic, .origin = .{ .parameter = 1 } },
+    };
+    var places: [2 * arm_places]ir.Place = undefined;
+    var place_ids: [2 * arm_places]ir.PlaceId = undefined;
+    var instructions: [2 * arm_places]ir.Instruction = undefined;
+    var then_instructions: [arm_places]ir.InstructionId = undefined;
+    var else_instructions: [arm_places]ir.InstructionId = undefined;
+    for (0..2 * arm_places) |index| {
+        const in_then = index < arm_places;
+        const instruction_id = ir.InstructionId.fromIndex(index);
+        place_ids[index] = ir.PlaceId.fromIndex(index);
+        places[index] = .{ .id = place_ids[index], .function = function_id, .origin = .{ .instruction = instruction_id } };
+        instructions[index] = .{
+            .id = instruction_id,
+            .block = if (in_then) then_block else else_block,
+            .operation = .{ .place_write = .{ .place = place_ids[index], .value = if (in_then) selector else budget } },
+            .results = &.{},
+            .effects = .place_write,
+        };
+        if (in_then) then_instructions[index] = instruction_id else else_instructions[index - arm_places] = instruction_id;
+    }
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = selector,
+            .then_edge = .{ .target = then_block },
+            .else_edge = .{ .target = else_block },
+        } } },
+        .{ .id = then_block, .function = function_id, .instructions = &then_instructions, .terminator = .{ .jump = .{ .target = join } } },
+        .{ .id = else_block, .function = function_id, .instructions = &else_instructions, .terminator = .{ .jump = .{ .target = join } } },
+        .{ .id = join, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .parameters = &.{ selector, budget },
+        .local_places = &place_ids,
+        .blocks = &.{ entry, then_block, else_block, join },
+        .entry_block = entry,
+    }};
+    const program: ir.Program = .{
+        .program_id = "sibling-arm-places",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+        .places = &places,
+    };
+    var scope = try readable_scope.Scope.init(std.testing.allocator, &program);
+    defer scope.deinit();
+    var report = diagnostics.Report.init(std.testing.allocator);
+    errdefer report.deinit();
+    try register_validation.validateWithLayout(std.testing.allocator, &report, &program, &scope, .standard_luau, strategy, flat_functions);
+    return report;
+}
+
+test "a function marked flat is certified in the dispatcher layout" {
+    // 99 places in each arm: the structured layout holds one arm's places at a time; the dispatcher layout declares
+    // the 198 places at the root beside the two parameters and the `__lifter_pc` slot, 201 locals.
+    var structured = try siblingArmPlacesReport(99, .automatic, null);
+    defer structured.deinit();
+    try std.testing.expect(structured.isClean());
+
+    var unmarked = try siblingArmPlacesReport(99, .automatic, &.{false});
+    defer unmarked.deinit();
+    try std.testing.expect(unmarked.isClean());
+
+    var marked = try siblingArmPlacesReport(99, .automatic, &.{true});
+    defer marked.deinit();
+    try std.testing.expectEqual(@as(usize, 1), marked.diagnostics.items.len);
+    try std.testing.expect(marked.contains(.unsupported_readable_register_pressure));
+    try std.testing.expectEqual(@as(?u32, 0), marked.diagnostics.items[0].entity_index);
+
+    var dispatcher = try siblingArmPlacesReport(99, .dispatcher, null);
+    defer dispatcher.deinit();
+    try std.testing.expect(dispatcher.contains(.unsupported_readable_register_pressure));
+
+    // 98 places in each arm: 199 locals in the dispatcher layout, admitted.
+    var boundary = try siblingArmPlacesReport(98, .automatic, &.{true});
+    defer boundary.deinit();
+    try std.testing.expect(boundary.isClean());
+}

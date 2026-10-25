@@ -149,6 +149,8 @@ pub fn emitAdmittedAllocForTargetWithOptions(
     var emission_plan = try EmissionPlan.init(allocator, emission_program, target);
     defer emission_plan.deinit();
     emission_plan.explicit_dispatcher = options.force_dispatcher;
+    const flat_fallbacks = try allocFlatFallbacks(allocator, &emission_plan, emission_program.functions.len);
+    defer allocator.free(flat_fallbacks);
     for (options.ambient_helpers) |helper| emission_plan.runtime.requireAmbientHelper(helper);
     var entry_plan = lexical.EntryPlan.init(allocator, emission_program) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -198,6 +200,7 @@ pub fn emitAdmittedAllocForTargetWithOptions(
         return err;
     };
 
+    try certifyWrittenLayout(allocator, program, target, if (options.force_dispatcher) .dispatcher else .automatic, flat_fallbacks);
     return output.toOwnedSlice(allocator);
 }
 
@@ -221,12 +224,47 @@ pub fn emitAdmittedFunctionAlloc(
     var emission_plan = try EmissionPlan.init(allocator, &prepared, target);
     defer emission_plan.deinit();
     emission_plan.force_dispatcher = try functionNeedsArbitraryFallback(allocator, program, function_id);
+    const flat_fallbacks = try allocFlatFallbacks(allocator, &emission_plan, prepared.functions.len);
+    defer allocator.free(flat_fallbacks);
 
     var output: std.ArrayList(u8) = .empty;
     errdefer output.deinit(allocator);
     try emitRuntimePrelude(&output, allocator, &emission_plan, &prepared);
     try emitFunction(&output, allocator, &prepared, &emission_plan, prepared.functions[function_id.index()]);
+    try certifyWrittenLayout(allocator, program, target, .automatic, flat_fallbacks);
     return output.toOwnedSlice(allocator);
+}
+
+/// One clear mark per function of the prepared program, attached to the plan's shared state, where
+/// `emitFunctionBody` sets the mark of each function it writes in the dispatcher layout after the region writer
+/// refused its structured plan. The caller frees the marks.
+fn allocFlatFallbacks(allocator: std.mem.Allocator, emission_plan: *const EmissionPlan, function_count: usize) std.mem.Allocator.Error![]bool {
+    const marks = try allocator.alloc(bool, function_count);
+    @memset(marks, false);
+    emission_plan.state.flat_fallbacks = marks;
+    return marks;
+}
+
+/// The admission certified the structured plan of every function, and `emitFunctionBody` wrote each marked
+/// function in the dispatcher layout instead. When a function is marked, re-run the readable admission with the
+/// marked functions certified in the layout that was written; when that report is not clean, print each of its
+/// diagnostics as `diagnostic=<code> entity=<index>` and return `error.InvalidIr`, the error
+/// `emitAllocForTargetWithOptions` returns for a refused admission, so no text is published.
+fn certifyWrittenLayout(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    target: Target,
+    strategy: validation.EmissionStrategy,
+    flat_fallbacks: []const bool,
+) (EmitError || std.mem.Allocator.Error)!void {
+    if (std.mem.indexOfScalar(bool, flat_fallbacks, true) == null) return;
+    var written = try validation.validateForTargetWithLayout(allocator, program, .readable_luau, target, strategy, flat_fallbacks);
+    defer written.deinit();
+    if (written.isClean()) return;
+    for (written.diagnostics.items) |diagnostic| {
+        std.debug.print("diagnostic={s} entity={?d}\n", .{ @tagName(diagnostic.code), diagnostic.entity_index });
+    }
+    return error.InvalidIr;
 }
 
 fn functionNeedsArbitraryFallback(
@@ -451,6 +489,11 @@ fn emitFunctionBody(
     emitRegion(output, allocator, program, emission_plan, &scopes, plan.root, indent, place_aliases) catch |err| {
         if (err == error.UnsupportedControlFlow) {
             output.items.len = body_start;
+            // From here on the function is written in the dispatcher layout: its mark makes the emission entry
+            // certify that layout before the text leaves the emitter.
+            if (emission_plan.state.flat_fallbacks) |marks| {
+                if (function.id.index() < marks.len) marks[function.id.index()] = true;
+            }
             plan.deinit();
             plan = try structure.Plan.initArbitrary(allocator, &analysis);
             scopes.deinit();
