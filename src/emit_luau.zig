@@ -148,6 +148,7 @@ pub fn emitAdmittedAllocForTargetWithOptions(
     const emission_program = &prepared;
     var emission_plan = try EmissionPlan.init(allocator, emission_program, target);
     defer emission_plan.deinit();
+    emission_plan.explicit_dispatcher = options.force_dispatcher;
     for (options.ambient_helpers) |helper| emission_plan.runtime.requireAmbientHelper(helper);
     var entry_plan = lexical.EntryPlan.init(allocator, emission_program) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -6792,7 +6793,9 @@ fn emitClosure(
 
     const body_indent = try allocDeeperIndent(allocator, closure_indent);
     defer allocator.free(body_indent);
-    emitFunctionBody(output, allocator, program, emission_plan, target, body_indent, closure_plan.place_aliases) catch |err| {
+    var child_plan = emission_plan.*;
+    child_plan.force_dispatcher = emission_plan.explicit_dispatcher;
+    emitFunctionBody(output, allocator, program, &child_plan, target, body_indent, closure_plan.place_aliases) catch |err| {
         std.debug.print(
             "emit closure={} target={} stage=function_body error={s}\n",
             .{ closure.function.index(), target.id.index(), @errorName(err) },

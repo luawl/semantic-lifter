@@ -41,6 +41,8 @@ pub const EmitState = struct {
 
 pub const Plan = struct {
     force_dispatcher: bool = false,
+    // The caller's explicit dispatcher request.
+    explicit_dispatcher: bool = false,
     state: *EmitState,
     runtime: luau_runtime.Plan,
     names: name_plan.Plan,

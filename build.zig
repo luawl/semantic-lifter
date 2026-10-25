@@ -1006,6 +1006,28 @@ pub fn build(b: *std.Build) void {
         "per-execution-cell-inherited-flat",
         b.path("luau/fixtures/per_execution_cell_inherited_flat.lifter-ir.json"),
     );
+    const per_execution_cell_layout_automatic_emit = b.addRunArtifact(exe);
+    if (z3_enabled) per_execution_cell_layout_automatic_emit.addPathDir(b.pathFromRoot(z3_bin));
+    per_execution_cell_layout_automatic_emit.addArg("emit-readable-luau-strategy");
+    per_execution_cell_layout_automatic_emit.addFileArg(b.path("luau/fixtures/per_execution_cell_inherited_flat.lifter-ir.json"));
+    const per_execution_cell_layout_automatic_luau = per_execution_cell_layout_automatic_emit.addOutputFileArg("per-execution-cell-inherited-flat-layout.automatic.luau");
+    per_execution_cell_layout_automatic_emit.addArgs(&.{ "standard-luau", "automatic" });
+    per_execution_cell_layout_automatic_emit.expectExitCode(0);
+    const per_execution_cell_layout_automatic_audit = addStructureAstAudit(b, "per-execution-cell-inherited-flat", per_execution_cell_layout_automatic_luau);
+    per_execution_cell_layout_automatic_audit.expectExitCode(0);
+    per_execution_cell_layout_automatic_audit.expectStdOutMatch(" pc_declarations=1 dispatcher_loops=1 ");
+    const per_execution_cell_layout_dispatcher_emit = b.addRunArtifact(exe);
+    if (z3_enabled) per_execution_cell_layout_dispatcher_emit.addPathDir(b.pathFromRoot(z3_bin));
+    per_execution_cell_layout_dispatcher_emit.addArg("emit-readable-luau-strategy");
+    per_execution_cell_layout_dispatcher_emit.addFileArg(b.path("luau/fixtures/per_execution_cell_inherited_flat.lifter-ir.json"));
+    const per_execution_cell_layout_dispatcher_luau = per_execution_cell_layout_dispatcher_emit.addOutputFileArg("per-execution-cell-inherited-flat-layout.dispatcher.luau");
+    per_execution_cell_layout_dispatcher_emit.addArgs(&.{ "standard-luau", "dispatcher" });
+    per_execution_cell_layout_dispatcher_emit.expectExitCode(0);
+    const per_execution_cell_layout_dispatcher_audit = addStructureAstAudit(b, "per-execution-cell-inherited-flat", per_execution_cell_layout_dispatcher_luau);
+    per_execution_cell_layout_dispatcher_audit.expectExitCode(0);
+    per_execution_cell_layout_dispatcher_audit.expectStdOutMatch(" pc_declarations=3 dispatcher_loops=2 ");
+    const per_execution_cell_structured_child_runtime = addAutomaticRuntimeCaseConformance(b, exe, z3_enabled, z3_bin, "per-execution-cell-flat-root-structured-child", "per-execution-cell-inherited-flat", b.path("luau/fixtures/per_execution_cell_flat_root_structured_child.lifter-ir.json"));
+    const per_execution_cell_structured_grandchild_runtime = addAutomaticRuntimeCaseConformance(b, exe, z3_enabled, z3_bin, "per-execution-cell-flat-root-structured-grandchild", "per-execution-cell-inherited-flat", b.path("luau/fixtures/per_execution_cell_flat_root_structured_grandchild.lifter-ir.json"));
     const numeric_operand_flat_grouping = addNumericOperandGroupingConformance(
         b,
         exe,
@@ -2048,6 +2070,10 @@ pub fn build(b: *std.Build) void {
     source_frontend_cell_branch_conformance.addTo(conformance_step);
     conformance_step.dependOn(per_execution_cell_dispatcher_refusal);
     conformance_step.dependOn(per_execution_cell_inherited_flat_refusal);
+    conformance_step.dependOn(&per_execution_cell_layout_automatic_audit.step);
+    conformance_step.dependOn(&per_execution_cell_layout_dispatcher_audit.step);
+    conformance_step.dependOn(per_execution_cell_structured_child_runtime);
+    conformance_step.dependOn(per_execution_cell_structured_grandchild_runtime);
     conformance_step.dependOn(numeric_operand_flat_grouping);
     conformance_step.dependOn(numeric_operand_semantic_grouping);
     source_frontend_typed_block_conformance.addTo(conformance_step);
@@ -3258,6 +3284,46 @@ fn addNestedConstructorLastItemConformance(
     compile.addFileArg(emitted);
     compile.expectExitCode(0);
     return .{ &refusal.step, &compile.step };
+}
+
+// The automatic arm for a fixture whose results an existing runtime oracle case already checks: the fixture's
+// automatic output is named after the fixture, compiled at -O0 and executed by the oracle under that case's name.
+fn addAutomaticRuntimeCaseConformance(
+    b: *std.Build,
+    exe: *std.Build.Step.Compile,
+    z3_enabled: bool,
+    z3_bin: []const u8,
+    output_stem: []const u8,
+    case_name: []const u8,
+    resolved_ir: std.Build.LazyPath,
+) *std.Build.Step {
+    const emit_automatic = b.addRunArtifact(exe);
+    if (z3_enabled) emit_automatic.addPathDir(b.pathFromRoot(z3_bin));
+    emit_automatic.addArg("emit-readable-luau-strategy");
+    emit_automatic.addFileArg(resolved_ir);
+    const automatic_luau = emit_automatic.addOutputFileArg(b.fmt("{s}.automatic.luau", .{output_stem}));
+    emit_automatic.addArgs(&.{ "standard-luau", "automatic" });
+    emit_automatic.expectExitCode(0);
+
+    const compile_automatic = b.addSystemCommand(&.{ luauCompileExe(b), "--null", "-O0" });
+    compile_automatic.addFileArg(automatic_luau);
+    compile_automatic.expectExitCode(0);
+
+    const runtime_automatic = b.addSystemCommand(&.{ luneExe(b), "run" });
+    runtime_automatic.addFileArg(b.path("luau/runtime_oracle.luau"));
+    runtime_automatic.addFileInput(b.path("luau/source_runtime_oracle.luau"));
+    runtime_automatic.addFileInput(b.path("luau/pack_multi_latch_runtime_oracle.luau"));
+    runtime_automatic.addFileInput(b.path("luau/pack_return_storage_runtime_oracle.luau"));
+    runtime_automatic.addFileInput(b.path("luau/iteration_exit_transfer_runtime_oracle.luau"));
+    runtime_automatic.addFileInput(b.path("luau/iteration_break_exit_transfer_runtime_oracle.luau"));
+    runtime_automatic.addFileInput(b.path("luau/iteration_header_entry_runtime_oracle.luau"));
+    runtime_automatic.addFileInput(b.path("luau/wrapped_continue_runtime_oracle.luau"));
+    runtime_automatic.addFileInput(b.path("luau/loop_owned_exit_flag_runtime_oracle.luau"));
+    runtime_automatic.addArg(case_name);
+    runtime_automatic.addFileArg(automatic_luau);
+    runtime_automatic.expectExitCode(0);
+    runtime_automatic.step.dependOn(&compile_automatic.step);
+    return &runtime_automatic.step;
 }
 
 // An emission that must be refused with a typed line, in the dispatcher-budget refusal form

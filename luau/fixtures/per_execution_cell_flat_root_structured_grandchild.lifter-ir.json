@@ -1,0 +1,3122 @@
+{
+  "blocks": [
+    {
+      "evidence": [
+        0
+      ],
+      "function": 0,
+      "id": 0,
+      "instructions": [
+        50,
+        51,
+        54
+      ],
+      "name_hint": "entry",
+      "parameters": [],
+      "terminator": {
+        "branch": {
+          "condition": 45,
+          "then_edge": {
+            "target": 16,
+            "arguments": []
+          },
+          "else_edge": {
+            "target": 17,
+            "arguments": []
+          }
+        }
+      }
+    },
+    {
+      "evidence": [
+        3
+      ],
+      "function": 1,
+      "id": 1,
+      "instructions": [
+        0,
+        1,
+        2
+      ],
+      "name_hint": "entry",
+      "parameters": [],
+      "terminator": {
+        "jump": {
+          "arguments": [],
+          "target": 2
+        }
+      }
+    },
+    {
+      "evidence": [
+        8
+      ],
+      "function": 1,
+      "id": 2,
+      "instructions": [
+        3,
+        4
+      ],
+      "name_hint": "while_header",
+      "parameters": [],
+      "terminator": {
+        "branch": {
+          "condition": 5,
+          "else_edge": {
+            "arguments": [],
+            "target": 4
+          },
+          "then_edge": {
+            "arguments": [],
+            "target": 3
+          }
+        }
+      }
+    },
+    {
+      "evidence": [
+        11
+      ],
+      "function": 1,
+      "id": 3,
+      "instructions": [
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        22,
+        23,
+        24,
+        25
+      ],
+      "name_hint": "while_body",
+      "parameters": [],
+      "terminator": {
+        "branch": {
+          "condition": 22,
+          "else_edge": {
+            "arguments": [],
+            "target": 8
+          },
+          "then_edge": {
+            "arguments": [],
+            "target": 7
+          }
+        }
+      }
+    },
+    {
+      "evidence": [
+        8
+      ],
+      "function": 1,
+      "id": 4,
+      "instructions": [
+        29,
+        30,
+        31,
+        32
+      ],
+      "name_hint": "while_exit",
+      "parameters": [],
+      "terminator": {
+        "jump": {
+          "arguments": [],
+          "target": 10
+        }
+      }
+    },
+    {
+      "evidence": [
+        22
+      ],
+      "function": 2,
+      "id": 5,
+      "instructions": [
+        18,
+        19,
+        20,
+        21
+      ],
+      "name_hint": "entry",
+      "parameters": [],
+      "terminator": {
+        "return_pack": 1
+      }
+    },
+    {
+      "evidence": [
+        25
+      ],
+      "function": 3,
+      "id": 6,
+      "instructions": [
+        14,
+        15,
+        16,
+        17
+      ],
+      "name_hint": "entry",
+      "parameters": [],
+      "terminator": {
+        "return_values": [
+          17
+        ]
+      }
+    },
+    {
+      "evidence": [
+        35
+      ],
+      "function": 1,
+      "id": 7,
+      "instructions": [
+        26,
+        27,
+        28
+      ],
+      "name_hint": "then",
+      "parameters": [],
+      "terminator": {
+        "jump": {
+          "arguments": [],
+          "target": 9
+        }
+      }
+    },
+    {
+      "evidence": [
+        36
+      ],
+      "function": 1,
+      "id": 8,
+      "instructions": [],
+      "name_hint": "else",
+      "parameters": [],
+      "terminator": {
+        "jump": {
+          "arguments": [],
+          "target": 9
+        }
+      }
+    },
+    {
+      "evidence": [
+        36
+      ],
+      "function": 1,
+      "id": 9,
+      "instructions": [],
+      "name_hint": "join",
+      "parameters": [],
+      "terminator": {
+        "jump": {
+          "arguments": [],
+          "target": 2
+        }
+      }
+    },
+    {
+      "evidence": [
+        46
+      ],
+      "function": 1,
+      "id": 10,
+      "instructions": [
+        33,
+        34,
+        35
+      ],
+      "name_hint": "while_header",
+      "parameters": [],
+      "terminator": {
+        "branch": {
+          "condition": 29,
+          "else_edge": {
+            "arguments": [],
+            "target": 12
+          },
+          "then_edge": {
+            "arguments": [],
+            "target": 11
+          }
+        }
+      }
+    },
+    {
+      "evidence": [
+        50
+      ],
+      "function": 1,
+      "id": 11,
+      "instructions": [
+        36,
+        37,
+        38,
+        39,
+        40,
+        41,
+        42,
+        43,
+        44,
+        45,
+        46,
+        47,
+        48
+      ],
+      "name_hint": "while_body",
+      "parameters": [],
+      "terminator": {
+        "jump": {
+          "arguments": [],
+          "target": 10
+        }
+      }
+    },
+    {
+      "evidence": [
+        46
+      ],
+      "function": 1,
+      "id": 12,
+      "instructions": [
+        53
+      ],
+      "name_hint": "while_exit",
+      "parameters": [],
+      "terminator": {
+        "branch": {
+          "condition": 44,
+          "then_edge": {
+            "target": 13,
+            "arguments": []
+          },
+          "else_edge": {
+            "target": 14,
+            "arguments": []
+          }
+        }
+      }
+    },
+    {
+      "id": 13,
+      "function": 1,
+      "name_hint": "cycle_x",
+      "parameters": [],
+      "instructions": [],
+      "terminator": {
+        "branch": {
+          "condition": 44,
+          "then_edge": {
+            "target": 14,
+            "arguments": []
+          },
+          "else_edge": {
+            "target": 15,
+            "arguments": []
+          }
+        }
+      },
+      "evidence": [
+        2
+      ]
+    },
+    {
+      "id": 14,
+      "function": 1,
+      "name_hint": "cycle_y",
+      "parameters": [],
+      "instructions": [],
+      "terminator": {
+        "branch": {
+          "condition": 44,
+          "then_edge": {
+            "target": 13,
+            "arguments": []
+          },
+          "else_edge": {
+            "target": 15,
+            "arguments": []
+          }
+        }
+      },
+      "evidence": [
+        2
+      ]
+    },
+    {
+      "id": 15,
+      "function": 1,
+      "name_hint": "exit",
+      "parameters": [],
+      "instructions": [
+        49
+      ],
+      "terminator": {
+        "return_values": [
+          41
+        ]
+      },
+      "evidence": [
+        2
+      ]
+    },
+    {
+      "id": 16,
+      "function": 0,
+      "name_hint": "cycle_x",
+      "parameters": [],
+      "instructions": [],
+      "terminator": {
+        "branch": {
+          "condition": 45,
+          "then_edge": {
+            "target": 17,
+            "arguments": []
+          },
+          "else_edge": {
+            "target": 18,
+            "arguments": []
+          }
+        }
+      },
+      "evidence": [
+        0
+      ]
+    },
+    {
+      "id": 17,
+      "function": 0,
+      "name_hint": "cycle_y",
+      "parameters": [],
+      "instructions": [],
+      "terminator": {
+        "branch": {
+          "condition": 45,
+          "then_edge": {
+            "target": 16,
+            "arguments": []
+          },
+          "else_edge": {
+            "target": 18,
+            "arguments": []
+          }
+        }
+      },
+      "evidence": [
+        0
+      ]
+    },
+    {
+      "id": 18,
+      "function": 0,
+      "name_hint": "exit",
+      "parameters": [],
+      "instructions": [
+        52
+      ],
+      "terminator": {
+        "return_values": [
+          43
+        ]
+      },
+      "evidence": [
+        0
+      ]
+    }
+  ],
+  "captures": [
+    {
+      "evidence": [
+        19
+      ],
+      "function": 2,
+      "id": 0,
+      "kind": {
+        "shared_place": 4
+      }
+    },
+    {
+      "evidence": [
+        19
+      ],
+      "function": 3,
+      "id": 1,
+      "kind": {
+        "shared_place": 5
+      }
+    }
+  ],
+  "certificates": [],
+  "claims": [],
+  "constraints": [],
+  "edge_rewrites": [],
+  "entry_bindings": [],
+  "entry_function": 0,
+  "evidence": [
+    {
+      "id": 0,
+      "kind": "source_span",
+      "locator": "source:k_grand:0,0 - 26,0"
+    },
+    {
+      "id": 1,
+      "kind": "source_span",
+      "locator": "source:k_grand:0,15 - 0,21"
+    },
+    {
+      "id": 2,
+      "kind": "source_span",
+      "locator": "source:k_grand:0,0 - 24,3"
+    },
+    {
+      "id": 3,
+      "kind": "source_span",
+      "locator": "source:k_grand:0,39 - 24,0"
+    },
+    {
+      "id": 4,
+      "kind": "source_span",
+      "locator": "source:k_grand:1,13 - 1,15"
+    },
+    {
+      "id": 5,
+      "kind": "source_span",
+      "locator": "source:k_grand:2,11 - 2,12"
+    },
+    {
+      "id": 6,
+      "kind": "source_span",
+      "locator": "source:k_grand:2,7 - 2,8"
+    },
+    {
+      "id": 7,
+      "kind": "source_span",
+      "locator": "source:k_grand:2,1 - 2,12"
+    },
+    {
+      "id": 8,
+      "kind": "source_span",
+      "locator": "source:k_grand:3,1 - 16,4"
+    },
+    {
+      "id": 9,
+      "kind": "source_span",
+      "locator": "source:k_grand:3,7 - 3,8"
+    },
+    {
+      "id": 10,
+      "kind": "source_span",
+      "locator": "source:k_grand:3,7 - 3,17"
+    },
+    {
+      "id": 11,
+      "kind": "source_span",
+      "locator": "source:k_grand:3,20 - 16,1"
+    },
+    {
+      "id": 12,
+      "kind": "source_span",
+      "locator": "source:k_grand:4,6 - 4,7"
+    },
+    {
+      "id": 13,
+      "kind": "source_span",
+      "locator": "source:k_grand:4,10 - 4,11"
+    },
+    {
+      "id": 14,
+      "kind": "source_span",
+      "locator": "source:k_grand:4,6 - 4,11"
+    },
+    {
+      "id": 15,
+      "kind": "source_span",
+      "locator": "source:k_grand:4,2 - 4,11"
+    },
+    {
+      "id": 16,
+      "kind": "source_span",
+      "locator": "source:k_grand:5,12 - 5,13"
+    },
+    {
+      "id": 17,
+      "kind": "source_span",
+      "locator": "source:k_grand:5,16 - 5,18"
+    },
+    {
+      "id": 18,
+      "kind": "source_span",
+      "locator": "source:k_grand:5,12 - 5,18"
+    },
+    {
+      "id": 19,
+      "kind": "source_span",
+      "locator": "source:k_grand:5,8 - 5,9"
+    },
+    {
+      "id": 20,
+      "kind": "source_span",
+      "locator": "source:k_grand:6,6 - 6,7"
+    },
+    {
+      "id": 21,
+      "kind": "source_span",
+      "locator": "source:k_grand:6,11 - 12,5"
+    },
+    {
+      "id": 22,
+      "kind": "source_span",
+      "locator": "source:k_grand:6,25 - 12,2"
+    },
+    {
+      "id": 23,
+      "kind": "source_span",
+      "locator": "source:k_grand:7,18 - 7,22"
+    },
+    {
+      "id": 24,
+      "kind": "source_span",
+      "locator": "source:k_grand:7,3 - 10,6"
+    },
+    {
+      "id": 25,
+      "kind": "source_span",
+      "locator": "source:k_grand:7,25 - 10,3"
+    },
+    {
+      "id": 26,
+      "kind": "source_span",
+      "locator": "source:k_grand:8,8 - 8,9"
+    },
+    {
+      "id": 27,
+      "kind": "source_span",
+      "locator": "source:k_grand:8,8 - 8,13"
+    },
+    {
+      "id": 28,
+      "kind": "source_span",
+      "locator": "source:k_grand:8,4 - 8,13"
+    },
+    {
+      "id": 29,
+      "kind": "source_span",
+      "locator": "source:k_grand:9,11 - 9,12"
+    },
+    {
+      "id": 30,
+      "kind": "source_span",
+      "locator": "source:k_grand:11,10 - 11,14"
+    },
+    {
+      "id": 31,
+      "kind": "source_span",
+      "locator": "source:k_grand:11,10 - 11,20"
+    },
+    {
+      "id": 32,
+      "kind": "source_span",
+      "locator": "source:k_grand:6,2 - 12,5"
+    },
+    {
+      "id": 33,
+      "kind": "source_span",
+      "locator": "source:k_grand:13,14 - 13,15"
+    },
+    {
+      "id": 34,
+      "kind": "source_span",
+      "locator": "source:k_grand:13,5 - 13,15"
+    },
+    {
+      "id": 35,
+      "kind": "source_span",
+      "locator": "source:k_grand:13,20 - 15,2"
+    },
+    {
+      "id": 36,
+      "kind": "source_span",
+      "locator": "source:k_grand:13,2 - 15,5"
+    },
+    {
+      "id": 37,
+      "kind": "source_span",
+      "locator": "source:k_grand:14,7 - 14,8"
+    },
+    {
+      "id": 38,
+      "kind": "source_span",
+      "locator": "source:k_grand:14,7 - 14,19"
+    },
+    {
+      "id": 39,
+      "kind": "source_span",
+      "locator": "source:k_grand:14,3 - 14,19"
+    },
+    {
+      "id": 40,
+      "kind": "source_span",
+      "locator": "source:k_grand:17,15 - 17,16"
+    },
+    {
+      "id": 41,
+      "kind": "source_span",
+      "locator": "source:k_grand:17,7 - 17,12"
+    },
+    {
+      "id": 42,
+      "kind": "source_span",
+      "locator": "source:k_grand:17,1 - 17,16"
+    },
+    {
+      "id": 43,
+      "kind": "source_span",
+      "locator": "source:k_grand:18,15 - 18,16"
+    },
+    {
+      "id": 44,
+      "kind": "source_span",
+      "locator": "source:k_grand:18,7 - 18,12"
+    },
+    {
+      "id": 45,
+      "kind": "source_span",
+      "locator": "source:k_grand:18,1 - 18,16"
+    },
+    {
+      "id": 46,
+      "kind": "source_span",
+      "locator": "source:k_grand:19,1 - 22,4"
+    },
+    {
+      "id": 47,
+      "kind": "source_span",
+      "locator": "source:k_grand:19,7 - 19,12"
+    },
+    {
+      "id": 48,
+      "kind": "source_span",
+      "locator": "source:k_grand:19,15 - 19,19"
+    },
+    {
+      "id": 49,
+      "kind": "source_span",
+      "locator": "source:k_grand:19,7 - 19,19"
+    },
+    {
+      "id": 50,
+      "kind": "source_span",
+      "locator": "source:k_grand:19,22 - 22,1"
+    },
+    {
+      "id": 51,
+      "kind": "source_span",
+      "locator": "source:k_grand:20,10 - 20,15"
+    },
+    {
+      "id": 52,
+      "kind": "source_span",
+      "locator": "source:k_grand:20,18 - 20,19"
+    },
+    {
+      "id": 53,
+      "kind": "source_span",
+      "locator": "source:k_grand:20,10 - 20,19"
+    },
+    {
+      "id": 54,
+      "kind": "source_span",
+      "locator": "source:k_grand:20,2 - 20,19"
+    },
+    {
+      "id": 55,
+      "kind": "source_span",
+      "locator": "source:k_grand:21,10 - 21,15"
+    },
+    {
+      "id": 56,
+      "kind": "source_span",
+      "locator": "source:k_grand:21,22 - 21,27"
+    },
+    {
+      "id": 57,
+      "kind": "source_span",
+      "locator": "source:k_grand:21,18 - 21,28"
+    },
+    {
+      "id": 58,
+      "kind": "source_span",
+      "locator": "source:k_grand:21,29 - 21,30"
+    },
+    {
+      "id": 59,
+      "kind": "source_span",
+      "locator": "source:k_grand:21,18 - 21,31"
+    },
+    {
+      "id": 60,
+      "kind": "source_span",
+      "locator": "source:k_grand:21,34 - 21,39"
+    },
+    {
+      "id": 61,
+      "kind": "source_span",
+      "locator": "source:k_grand:21,18 - 21,39"
+    },
+    {
+      "id": 62,
+      "kind": "source_span",
+      "locator": "source:k_grand:21,10 - 21,39"
+    },
+    {
+      "id": 63,
+      "kind": "source_span",
+      "locator": "source:k_grand:21,2 - 21,39"
+    },
+    {
+      "id": 64,
+      "kind": "source_span",
+      "locator": "source:k_grand:23,8 - 23,13"
+    },
+    {
+      "id": 65,
+      "kind": "source_span",
+      "locator": "source:k_grand:25,7 - 25,13"
+    }
+  ],
+  "external_bindings": [],
+  "functions": [
+    {
+      "blocks": [
+        0,
+        16,
+        17,
+        18
+      ],
+      "captures": [],
+      "entry_block": 0,
+      "evidence": [
+        0
+      ],
+      "id": 0,
+      "is_variadic": true,
+      "local_places": [
+        0
+      ],
+      "name_hint": "chunk",
+      "parameters": [],
+      "vararg_pack": 0
+    },
+    {
+      "blocks": [
+        1,
+        2,
+        3,
+        4,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15
+      ],
+      "captures": [],
+      "entry_block": 1,
+      "evidence": [
+        2
+      ],
+      "id": 1,
+      "is_variadic": false,
+      "lexical_parent": 0,
+      "local_places": [
+        1,
+        2,
+        6,
+        7
+      ],
+      "name_hint": "worker",
+      "parameters": [
+        0,
+        1
+      ]
+    },
+    {
+      "blocks": [
+        5
+      ],
+      "captures": [
+        0
+      ],
+      "entry_block": 5,
+      "evidence": [
+        21
+      ],
+      "id": 2,
+      "is_variadic": false,
+      "lexical_parent": 1,
+      "local_places": [
+        3
+      ],
+      "name_hint": "assigned_1",
+      "parameters": [
+        13
+      ]
+    },
+    {
+      "blocks": [
+        6
+      ],
+      "captures": [
+        1
+      ],
+      "entry_block": 6,
+      "evidence": [
+        24
+      ],
+      "id": 3,
+      "is_variadic": false,
+      "lexical_parent": 2,
+      "local_places": [],
+      "name_hint": "bump",
+      "parameters": [
+        14
+      ]
+    }
+  ],
+  "instructions": [
+    {
+      "block": 1,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": true,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": true
+      },
+      "evidence": [
+        4
+      ],
+      "id": 0,
+      "operation": {
+        "make_table_literal": {
+          "fields": []
+        }
+      },
+      "results": [
+        2
+      ]
+    },
+    {
+      "block": 1,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        5
+      ],
+      "id": 1,
+      "operation": {
+        "constant": {
+          "integer": "0"
+        }
+      },
+      "results": [
+        3
+      ]
+    },
+    {
+      "block": 1,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": true
+      },
+      "evidence": [
+        7
+      ],
+      "id": 2,
+      "operation": {
+        "place_write": {
+          "place": 1,
+          "value": 3
+        }
+      },
+      "results": []
+    },
+    {
+      "block": 2,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": true,
+        "writes_memory": false
+      },
+      "evidence": [
+        9
+      ],
+      "id": 3,
+      "operation": {
+        "place_read": 1
+      },
+      "results": [
+        4
+      ]
+    },
+    {
+      "block": 2,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": true,
+        "may_throw": true,
+        "may_yield": true,
+        "precision": "conservative",
+        "reads_memory": true,
+        "writes_memory": true
+      },
+      "evidence": [
+        10
+      ],
+      "id": 4,
+      "operation": {
+        "binary": {
+          "left": 4,
+          "mode": "semantic",
+          "operator": "less",
+          "right": 1
+        }
+      },
+      "results": [
+        5
+      ]
+    },
+    {
+      "block": 3,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": true,
+        "writes_memory": false
+      },
+      "evidence": [
+        12
+      ],
+      "id": 5,
+      "operation": {
+        "place_read": 1
+      },
+      "results": [
+        6
+      ]
+    },
+    {
+      "block": 3,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        13
+      ],
+      "id": 6,
+      "operation": {
+        "constant": {
+          "integer": "1"
+        }
+      },
+      "results": [
+        7
+      ]
+    },
+    {
+      "block": 3,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        14
+      ],
+      "id": 7,
+      "operation": {
+        "binary": {
+          "left": 6,
+          "mode": "semantic",
+          "operator": "add",
+          "right": 7
+        }
+      },
+      "results": [
+        8
+      ]
+    },
+    {
+      "block": 3,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": true
+      },
+      "evidence": [
+        15
+      ],
+      "id": 8,
+      "operation": {
+        "place_write": {
+          "place": 1,
+          "value": 8
+        }
+      },
+      "results": []
+    },
+    {
+      "block": 3,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": true,
+        "writes_memory": false
+      },
+      "evidence": [
+        16
+      ],
+      "id": 9,
+      "operation": {
+        "place_read": 1
+      },
+      "results": [
+        9
+      ]
+    },
+    {
+      "block": 3,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        17
+      ],
+      "id": 10,
+      "operation": {
+        "constant": {
+          "integer": "10"
+        }
+      },
+      "results": [
+        10
+      ]
+    },
+    {
+      "block": 3,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        18
+      ],
+      "id": 11,
+      "operation": {
+        "binary": {
+          "left": 9,
+          "mode": "semantic",
+          "operator": "multiply",
+          "right": 10
+        }
+      },
+      "results": [
+        11
+      ]
+    },
+    {
+      "block": 3,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": true
+      },
+      "evidence": [
+        19
+      ],
+      "id": 12,
+      "operation": {
+        "place_write": {
+          "place": 2,
+          "value": 11
+        }
+      },
+      "results": []
+    },
+    {
+      "block": 3,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": true,
+        "writes_memory": false
+      },
+      "evidence": [
+        20
+      ],
+      "id": 13,
+      "operation": {
+        "place_read": 1
+      },
+      "results": [
+        12
+      ]
+    },
+    {
+      "block": 6,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": true,
+        "writes_memory": false
+      },
+      "evidence": [
+        26
+      ],
+      "id": 14,
+      "operation": {
+        "place_read": 5
+      },
+      "results": [
+        15
+      ]
+    },
+    {
+      "block": 6,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": true,
+        "may_throw": true,
+        "may_yield": true,
+        "precision": "conservative",
+        "reads_memory": true,
+        "writes_memory": true
+      },
+      "evidence": [
+        27
+      ],
+      "id": 15,
+      "operation": {
+        "binary": {
+          "left": 15,
+          "mode": "semantic",
+          "operator": "add",
+          "right": 14
+        }
+      },
+      "results": [
+        16
+      ]
+    },
+    {
+      "block": 6,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": true
+      },
+      "evidence": [
+        28
+      ],
+      "id": 16,
+      "operation": {
+        "place_write": {
+          "place": 5,
+          "value": 16
+        }
+      },
+      "results": []
+    },
+    {
+      "block": 6,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": true,
+        "writes_memory": false
+      },
+      "evidence": [
+        29
+      ],
+      "id": 17,
+      "operation": {
+        "place_read": 5
+      },
+      "results": [
+        17
+      ]
+    },
+    {
+      "block": 5,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        24
+      ],
+      "id": 18,
+      "operation": {
+        "make_closure": {
+          "bindings": [
+            {
+              "place": 4
+            }
+          ],
+          "function": 3
+        }
+      },
+      "results": [
+        18
+      ]
+    },
+    {
+      "block": 5,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": true
+      },
+      "evidence": [
+        24
+      ],
+      "id": 19,
+      "operation": {
+        "place_write": {
+          "place": 3,
+          "value": 18
+        }
+      },
+      "results": []
+    },
+    {
+      "block": 5,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": true,
+        "writes_memory": false
+      },
+      "evidence": [
+        30
+      ],
+      "id": 20,
+      "operation": {
+        "place_read": 3
+      },
+      "results": [
+        19
+      ]
+    },
+    {
+      "block": 5,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": true,
+        "may_throw": true,
+        "may_yield": true,
+        "precision": "conservative",
+        "reads_memory": true,
+        "writes_memory": true
+      },
+      "evidence": [
+        31
+      ],
+      "id": 21,
+      "operation": {
+        "call": {
+          "arguments": [
+            13
+          ],
+          "callee": 19,
+          "result_arity": {
+            "variadic": {}
+          }
+        }
+      },
+      "pack_result": 1,
+      "results": []
+    },
+    {
+      "block": 3,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        21
+      ],
+      "id": 22,
+      "operation": {
+        "make_closure": {
+          "bindings": [
+            {
+              "place": 2
+            }
+          ],
+          "function": 2
+        }
+      },
+      "results": [
+        20
+      ]
+    },
+    {
+      "block": 3,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": true,
+        "may_throw": true,
+        "may_yield": true,
+        "precision": "conservative",
+        "reads_memory": true,
+        "writes_memory": true
+      },
+      "evidence": [
+        32
+      ],
+      "id": 23,
+      "operation": {
+        "table_set": {
+          "key": 12,
+          "mode": "semantic",
+          "table": 2,
+          "value": 20
+        }
+      },
+      "results": []
+    },
+    {
+      "block": 3,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        33
+      ],
+      "id": 24,
+      "operation": {
+        "constant": {
+          "integer": "0"
+        }
+      },
+      "results": [
+        21
+      ]
+    },
+    {
+      "block": 3,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": true,
+        "may_throw": true,
+        "may_yield": true,
+        "precision": "conservative",
+        "reads_memory": true,
+        "writes_memory": true
+      },
+      "evidence": [
+        34
+      ],
+      "id": 25,
+      "operation": {
+        "binary": {
+          "left": 1,
+          "mode": "semantic",
+          "operator": "greater",
+          "right": 21
+        }
+      },
+      "results": [
+        22
+      ]
+    },
+    {
+      "block": 7,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": true,
+        "writes_memory": false
+      },
+      "evidence": [
+        37
+      ],
+      "id": 26,
+      "operation": {
+        "place_read": 2
+      },
+      "results": [
+        23
+      ]
+    },
+    {
+      "block": 7,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": true,
+        "may_throw": true,
+        "may_yield": true,
+        "precision": "conservative",
+        "reads_memory": true,
+        "writes_memory": true
+      },
+      "evidence": [
+        38
+      ],
+      "id": 27,
+      "operation": {
+        "binary": {
+          "left": 23,
+          "mode": "semantic",
+          "operator": "add",
+          "right": 0
+        }
+      },
+      "results": [
+        24
+      ]
+    },
+    {
+      "block": 7,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": true
+      },
+      "evidence": [
+        39
+      ],
+      "id": 28,
+      "operation": {
+        "place_write": {
+          "place": 2,
+          "value": 24
+        }
+      },
+      "results": []
+    },
+    {
+      "block": 4,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        40
+      ],
+      "id": 29,
+      "operation": {
+        "constant": {
+          "integer": "0"
+        }
+      },
+      "results": [
+        25
+      ]
+    },
+    {
+      "block": 4,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": true
+      },
+      "evidence": [
+        42
+      ],
+      "id": 30,
+      "operation": {
+        "place_write": {
+          "place": 6,
+          "value": 25
+        }
+      },
+      "results": []
+    },
+    {
+      "block": 4,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        43
+      ],
+      "id": 31,
+      "operation": {
+        "constant": {
+          "integer": "0"
+        }
+      },
+      "results": [
+        26
+      ]
+    },
+    {
+      "block": 4,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": true
+      },
+      "evidence": [
+        45
+      ],
+      "id": 32,
+      "operation": {
+        "place_write": {
+          "place": 7,
+          "value": 26
+        }
+      },
+      "results": []
+    },
+    {
+      "block": 10,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": true,
+        "writes_memory": false
+      },
+      "evidence": [
+        47
+      ],
+      "id": 33,
+      "operation": {
+        "place_read": 7
+      },
+      "results": [
+        27
+      ]
+    },
+    {
+      "block": 10,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": true,
+        "may_throw": true,
+        "may_yield": true,
+        "precision": "conservative",
+        "reads_memory": true,
+        "writes_memory": true
+      },
+      "evidence": [
+        48
+      ],
+      "id": 34,
+      "operation": {
+        "unary": {
+          "mode": "semantic",
+          "operand": 2,
+          "operator": "length"
+        }
+      },
+      "results": [
+        28
+      ]
+    },
+    {
+      "block": 10,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": true,
+        "may_throw": true,
+        "may_yield": true,
+        "precision": "conservative",
+        "reads_memory": true,
+        "writes_memory": true
+      },
+      "evidence": [
+        49
+      ],
+      "id": 35,
+      "operation": {
+        "binary": {
+          "left": 27,
+          "mode": "semantic",
+          "operator": "less",
+          "right": 28
+        }
+      },
+      "results": [
+        29
+      ]
+    },
+    {
+      "block": 11,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": true,
+        "writes_memory": false
+      },
+      "evidence": [
+        51
+      ],
+      "id": 36,
+      "operation": {
+        "place_read": 7
+      },
+      "results": [
+        30
+      ]
+    },
+    {
+      "block": 11,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        52
+      ],
+      "id": 37,
+      "operation": {
+        "constant": {
+          "integer": "1"
+        }
+      },
+      "results": [
+        31
+      ]
+    },
+    {
+      "block": 11,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        53
+      ],
+      "id": 38,
+      "operation": {
+        "binary": {
+          "left": 30,
+          "mode": "semantic",
+          "operator": "add",
+          "right": 31
+        }
+      },
+      "results": [
+        32
+      ]
+    },
+    {
+      "block": 11,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": true
+      },
+      "evidence": [
+        54
+      ],
+      "id": 39,
+      "operation": {
+        "place_write": {
+          "place": 7,
+          "value": 32
+        }
+      },
+      "results": []
+    },
+    {
+      "block": 11,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": true,
+        "writes_memory": false
+      },
+      "evidence": [
+        55
+      ],
+      "id": 40,
+      "operation": {
+        "place_read": 6
+      },
+      "results": [
+        33
+      ]
+    },
+    {
+      "block": 11,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": true,
+        "writes_memory": false
+      },
+      "evidence": [
+        56
+      ],
+      "id": 41,
+      "operation": {
+        "place_read": 7
+      },
+      "results": [
+        34
+      ]
+    },
+    {
+      "block": 11,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": true,
+        "may_throw": true,
+        "may_yield": true,
+        "precision": "conservative",
+        "reads_memory": true,
+        "writes_memory": true
+      },
+      "evidence": [
+        57
+      ],
+      "id": 42,
+      "operation": {
+        "table_get": {
+          "key": 34,
+          "mode": "semantic",
+          "table": 2
+        }
+      },
+      "results": [
+        35
+      ]
+    },
+    {
+      "block": 11,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        58
+      ],
+      "id": 43,
+      "operation": {
+        "constant": {
+          "integer": "1"
+        }
+      },
+      "results": [
+        36
+      ]
+    },
+    {
+      "block": 11,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": true,
+        "may_throw": true,
+        "may_yield": true,
+        "precision": "conservative",
+        "reads_memory": true,
+        "writes_memory": true
+      },
+      "evidence": [
+        59
+      ],
+      "id": 44,
+      "operation": {
+        "call": {
+          "arguments": [
+            36
+          ],
+          "callee": 35,
+          "result_arity": {
+            "fixed": 1
+          }
+        }
+      },
+      "results": [
+        37
+      ]
+    },
+    {
+      "block": 11,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": true,
+        "writes_memory": false
+      },
+      "evidence": [
+        60
+      ],
+      "id": 45,
+      "operation": {
+        "place_read": 7
+      },
+      "results": [
+        38
+      ]
+    },
+    {
+      "block": 11,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": true,
+        "may_throw": true,
+        "may_yield": true,
+        "precision": "conservative",
+        "reads_memory": true,
+        "writes_memory": true
+      },
+      "evidence": [
+        61
+      ],
+      "id": 46,
+      "operation": {
+        "binary": {
+          "left": 37,
+          "mode": "semantic",
+          "operator": "multiply",
+          "right": 38
+        }
+      },
+      "results": [
+        39
+      ]
+    },
+    {
+      "block": 11,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": true,
+        "may_throw": true,
+        "may_yield": true,
+        "precision": "conservative",
+        "reads_memory": true,
+        "writes_memory": true
+      },
+      "evidence": [
+        62
+      ],
+      "id": 47,
+      "operation": {
+        "binary": {
+          "left": 33,
+          "mode": "semantic",
+          "operator": "add",
+          "right": 39
+        }
+      },
+      "results": [
+        40
+      ]
+    },
+    {
+      "block": 11,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": true
+      },
+      "evidence": [
+        63
+      ],
+      "id": 48,
+      "operation": {
+        "place_write": {
+          "place": 6,
+          "value": 40
+        }
+      },
+      "results": []
+    },
+    {
+      "block": 15,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": true,
+        "writes_memory": false
+      },
+      "evidence": [
+        64
+      ],
+      "id": 49,
+      "operation": {
+        "place_read": 6
+      },
+      "results": [
+        41
+      ]
+    },
+    {
+      "block": 0,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        2
+      ],
+      "id": 50,
+      "operation": {
+        "make_closure": {
+          "bindings": [],
+          "function": 1
+        }
+      },
+      "results": [
+        42
+      ]
+    },
+    {
+      "block": 0,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": true
+      },
+      "evidence": [
+        2
+      ],
+      "id": 51,
+      "operation": {
+        "place_write": {
+          "place": 0,
+          "value": 42
+        }
+      },
+      "results": []
+    },
+    {
+      "block": 18,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": true,
+        "writes_memory": false
+      },
+      "evidence": [
+        65
+      ],
+      "id": 52,
+      "operation": {
+        "place_read": 0
+      },
+      "results": [
+        43
+      ]
+    },
+    {
+      "id": 53,
+      "block": 12,
+      "operation": {
+        "constant": {
+          "boolean": false
+        }
+      },
+      "results": [
+        44
+      ],
+      "pack_result": null,
+      "effects": {
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false,
+        "may_throw": false,
+        "may_yield": false,
+        "invokes_unknown_code": false
+      },
+      "evidence": [
+        2
+      ],
+      "claims": []
+    },
+    {
+      "id": 54,
+      "block": 0,
+      "operation": {
+        "constant": {
+          "boolean": false
+        }
+      },
+      "results": [
+        45
+      ],
+      "pack_result": null,
+      "effects": {
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false,
+        "may_throw": false,
+        "may_yield": false,
+        "invokes_unknown_code": false
+      },
+      "evidence": [
+        0
+      ],
+      "claims": []
+    }
+  ],
+  "obligations": [],
+  "places": [
+    {
+      "evidence": [
+        1
+      ],
+      "function": 0,
+      "id": 0,
+      "name_hint": "worker",
+      "origin": {
+        "local": 0
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "function",
+        "signed": false
+      }
+    },
+    {
+      "evidence": [
+        6
+      ],
+      "function": 1,
+      "id": 1,
+      "name_hint": "i",
+      "origin": {
+        "local": 0
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "evidence": [
+        19
+      ],
+      "function": 1,
+      "id": 2,
+      "name_hint": "j",
+      "origin": {
+        "instruction": 12
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "evidence": [
+        23
+      ],
+      "function": 2,
+      "id": 3,
+      "name_hint": "bump",
+      "origin": {
+        "local": 0
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "function",
+        "signed": false
+      }
+    },
+    {
+      "evidence": [
+        19
+      ],
+      "function": 2,
+      "id": 4,
+      "name_hint": "j",
+      "origin": {
+        "capture": 0
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "evidence": [
+        19
+      ],
+      "function": 3,
+      "id": 5,
+      "name_hint": "j",
+      "origin": {
+        "capture": 1
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "evidence": [
+        41
+      ],
+      "function": 1,
+      "id": 6,
+      "name_hint": "total",
+      "origin": {
+        "local": 2
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "evidence": [
+        44
+      ],
+      "function": 1,
+      "id": 7,
+      "name_hint": "index",
+      "origin": {
+        "local": 3
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    }
+  ],
+  "program_id": "k_grand",
+  "queries": [],
+  "schema_version": "lifter_ir_v1",
+  "solver_models": [],
+  "solver_terms": [],
+  "source_semantics": "luau",
+  "unsat_cores": [],
+  "value_packs": [
+    {
+      "evidence": [
+        0
+      ],
+      "function": 0,
+      "id": 0,
+      "origin": {
+        "varargs": 0
+      },
+      "shape": {
+        "prefix": [],
+        "tail": "open"
+      }
+    },
+    {
+      "evidence": [
+        31
+      ],
+      "function": 2,
+      "id": 1,
+      "origin": {
+        "instruction_result": 21
+      },
+      "shape": {
+        "prefix": [],
+        "tail": "open"
+      }
+    }
+  ],
+  "values": [
+    {
+      "function": 1,
+      "id": 0,
+      "name_hint": "selector",
+      "origin": {
+        "parameter": 0
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 1,
+      "name_hint": "budget",
+      "origin": {
+        "parameter": 1
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 2,
+      "name_hint": "fns",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 0
+        }
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "table",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 3,
+      "name_hint": "i",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 1
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "integer",
+        "signed": true
+      }
+    },
+    {
+      "function": 1,
+      "id": 4,
+      "name_hint": "i",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 3
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 5,
+      "name_hint": "while_condition",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 4
+        }
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "boolean",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 6,
+      "name_hint": "i",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 5
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 7,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 6
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "integer",
+        "signed": true
+      }
+    },
+    {
+      "function": 1,
+      "id": 8,
+      "name_hint": "assigned_1",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 7
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 9,
+      "name_hint": "i",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 9
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 10,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 10
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "integer",
+        "signed": true
+      }
+    },
+    {
+      "function": 1,
+      "id": 11,
+      "name_hint": "j",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 11
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 12,
+      "name_hint": "i",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 13
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 2,
+      "id": 13,
+      "name_hint": "step",
+      "origin": {
+        "parameter": 0
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 3,
+      "id": 14,
+      "name_hint": "k",
+      "origin": {
+        "parameter": 0
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 3,
+      "id": 15,
+      "name_hint": "j",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 14
+        }
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 3,
+      "id": 16,
+      "name_hint": "assigned_1",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 15
+        }
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 3,
+      "id": 17,
+      "name_hint": "j",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 17
+        }
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 2,
+      "id": 18,
+      "name_hint": "bump",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 18
+        }
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "function",
+        "signed": false
+      }
+    },
+    {
+      "function": 2,
+      "id": 19,
+      "name_hint": "bump",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 20
+        }
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "function",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 20,
+      "name_hint": "assigned_1",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 22
+        }
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "function",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 21,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 24
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "integer",
+        "signed": true
+      }
+    },
+    {
+      "function": 1,
+      "id": 22,
+      "name_hint": "condition",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 25
+        }
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "boolean",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 23,
+      "name_hint": "j",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 26
+        }
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 24,
+      "name_hint": "assigned_1",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 27
+        }
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 25,
+      "name_hint": "total",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 29
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "integer",
+        "signed": true
+      }
+    },
+    {
+      "function": 1,
+      "id": 26,
+      "name_hint": "index",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 31
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "integer",
+        "signed": true
+      }
+    },
+    {
+      "function": 1,
+      "id": 27,
+      "name_hint": "index",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 33
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 28,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 34
+        }
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 29,
+      "name_hint": "while_condition",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 35
+        }
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "boolean",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 30,
+      "name_hint": "index",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 36
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 31,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 37
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "integer",
+        "signed": true
+      }
+    },
+    {
+      "function": 1,
+      "id": 32,
+      "name_hint": "assigned_1",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 38
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 33,
+      "name_hint": "total",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 40
+        }
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 34,
+      "name_hint": "index",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 41
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 35,
+      "name_hint": "field",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 42
+        }
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 36,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 43
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "integer",
+        "signed": true
+      }
+    },
+    {
+      "function": 1,
+      "id": 37,
+      "name_hint": "call_result",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 44
+        }
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 38,
+      "name_hint": "index",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 45
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 39,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 46
+        }
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 40,
+      "name_hint": "assigned_1",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 47
+        }
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 41,
+      "name_hint": "total",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 49
+        }
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 0,
+      "id": 42,
+      "name_hint": "worker",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 50
+        }
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "function",
+        "signed": false
+      }
+    },
+    {
+      "function": 0,
+      "id": 43,
+      "name_hint": "worker",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 52
+        }
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "function",
+        "signed": false
+      }
+    },
+    {
+      "id": 44,
+      "function": 1,
+      "type": {
+        "kind": "boolean",
+        "bit_width": 0,
+        "signed": false
+      },
+      "name_hint": "never",
+      "origin": {
+        "instruction_result": {
+          "instruction": 53,
+          "index": 0
+        }
+      }
+    },
+    {
+      "id": 45,
+      "function": 0,
+      "type": {
+        "kind": "boolean",
+        "bit_width": 0,
+        "signed": false
+      },
+      "name_hint": "never",
+      "origin": {
+        "instruction_result": {
+          "instruction": 54,
+          "index": 0
+        }
+      }
+    }
+  ]
+}

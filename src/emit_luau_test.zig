@@ -3797,3 +3797,152 @@ fn expectExitFlagDeclaredInOuterLoop(source: []const u8) !void {
     try std.testing.expect(declaration < first_write);
     try std.testing.expect(declaration < first_read);
 }
+
+test "a structurable closure of an unstructurable entry keeps its own layout" {
+    // The entry opens with a two-entry cycle that never iterates, so the structurer refuses the entry and it is
+    // written flat, while the closure it makes has one block and structures by itself. An explicit dispatcher
+    // request writes both functions flat; without it only the entry is flat.
+    const proof = ir.EvidenceId.fromIndex(0);
+    const entry_id = ir.FunctionId.fromIndex(0);
+    const closure_id = ir.FunctionId.fromIndex(1);
+    const start_block = ir.BlockId.fromIndex(0);
+    const first_block = ir.BlockId.fromIndex(1);
+    const second_block = ir.BlockId.fromIndex(2);
+    const exit_block = ir.BlockId.fromIndex(3);
+    const closure_block = ir.BlockId.fromIndex(4);
+    const never_instruction = ir.InstructionId.fromIndex(0);
+    const make_instruction = ir.InstructionId.fromIndex(1);
+    const never = ir.ValueId.fromIndex(0);
+    const closure = ir.ValueId.fromIndex(1);
+    const parameter = ir.ValueId.fromIndex(2);
+    const values = [_]ir.Value{
+        .{ .id = never, .function = entry_id, .type = .boolean, .name_hint = "never", .origin = .{ .instruction_result = .{ .instruction = never_instruction, .index = 0 } } },
+        .{ .id = closure, .function = entry_id, .type = .function, .name_hint = "closure", .origin = .{ .instruction_result = .{ .instruction = make_instruction, .index = 0 } } },
+        .{ .id = parameter, .function = closure_id, .type = .dynamic, .name_hint = "value", .origin = .{ .parameter = 0 } },
+    };
+    const instructions = [_]ir.Instruction{
+        .{ .id = never_instruction, .block = start_block, .operation = .{ .constant = .{ .boolean = false } }, .results = &.{never}, .effects = .pure, .evidence = &.{proof} },
+        .{ .id = make_instruction, .block = start_block, .operation = .{ .make_closure = .{
+            .function = closure_id,
+            .bindings = &.{},
+        } }, .results = &.{closure}, .effects = .pure, .evidence = &.{proof} },
+    };
+    const blocks = [_]ir.Block{
+        .{ .id = start_block, .function = entry_id, .instructions = &.{ never_instruction, make_instruction }, .terminator = .{ .branch = .{ .condition = never, .then_edge = .{ .target = first_block }, .else_edge = .{ .target = second_block } } }, .evidence = &.{proof} },
+        .{ .id = first_block, .function = entry_id, .terminator = .{ .branch = .{ .condition = never, .then_edge = .{ .target = second_block }, .else_edge = .{ .target = exit_block } } }, .evidence = &.{proof} },
+        .{ .id = second_block, .function = entry_id, .terminator = .{ .branch = .{ .condition = never, .then_edge = .{ .target = first_block }, .else_edge = .{ .target = exit_block } } }, .evidence = &.{proof} },
+        .{ .id = exit_block, .function = entry_id, .terminator = .{ .return_values = &.{closure} }, .evidence = &.{proof} },
+        .{ .id = closure_block, .function = closure_id, .terminator = .{ .return_values = &.{parameter} }, .evidence = &.{proof} },
+    };
+    const functions = [_]ir.Function{
+        .{ .id = entry_id, .blocks = &.{ start_block, first_block, second_block, exit_block }, .entry_block = start_block, .evidence = &.{proof} },
+        .{ .id = closure_id, .lexical_parent = entry_id, .parameters = &.{parameter}, .blocks = &.{closure_block}, .entry_block = closure_block, .evidence = &.{proof} },
+    };
+    const evidence = [_]ir.Evidence{.{ .id = proof, .kind = .dynamic_fixture, .locator = "fixture:structurable-closure-of-unstructurable-entry" }};
+    const program: ir.Program = .{
+        .program_id = "structurable-closure-of-unstructurable-entry",
+        .entry_function = entry_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+        .evidence = &evidence,
+    };
+
+    const dispatcher = try lifter.emit_luau.emitAllocForTargetWithOptions(
+        std.testing.allocator,
+        &program,
+        .standard_luau,
+        .{ .force_dispatcher = true },
+    );
+    defer std.testing.allocator.free(dispatcher);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, dispatcher, "local __lifter_pc"));
+    const automatic = try lifter.emit_luau.emitAllocForTargetWithOptions(
+        std.testing.allocator,
+        &program,
+        .standard_luau,
+        .{},
+    );
+    defer std.testing.allocator.free(automatic);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, automatic, "local __lifter_pc"));
+}
+
+test "the function probe writes a structurable closure in its own layout as publication does" {
+    // The entry is structured and makes an outer closure that opens with a two-entry cycle that never iterates, so
+    // the outer closure is flat by its own decision; the inner closure it makes has one block and structures by
+    // itself. Publication writes only the outer closure flat, and the probe of the outer closure agrees.
+    const proof = ir.EvidenceId.fromIndex(0);
+    const entry_id = ir.FunctionId.fromIndex(0);
+    const outer_id = ir.FunctionId.fromIndex(1);
+    const inner_id = ir.FunctionId.fromIndex(2);
+    const entry_block = ir.BlockId.fromIndex(0);
+    const start_block = ir.BlockId.fromIndex(1);
+    const first_block = ir.BlockId.fromIndex(2);
+    const second_block = ir.BlockId.fromIndex(3);
+    const exit_block = ir.BlockId.fromIndex(4);
+    const inner_block = ir.BlockId.fromIndex(5);
+    const make_outer_instruction = ir.InstructionId.fromIndex(0);
+    const never_instruction = ir.InstructionId.fromIndex(1);
+    const make_inner_instruction = ir.InstructionId.fromIndex(2);
+    const outer_closure = ir.ValueId.fromIndex(0);
+    const never = ir.ValueId.fromIndex(1);
+    const inner_closure = ir.ValueId.fromIndex(2);
+    const parameter = ir.ValueId.fromIndex(3);
+    const values = [_]ir.Value{
+        .{ .id = outer_closure, .function = entry_id, .type = .function, .name_hint = "outer_closure", .origin = .{ .instruction_result = .{ .instruction = make_outer_instruction, .index = 0 } } },
+        .{ .id = never, .function = outer_id, .type = .boolean, .name_hint = "never", .origin = .{ .instruction_result = .{ .instruction = never_instruction, .index = 0 } } },
+        .{ .id = inner_closure, .function = outer_id, .type = .function, .name_hint = "inner_closure", .origin = .{ .instruction_result = .{ .instruction = make_inner_instruction, .index = 0 } } },
+        .{ .id = parameter, .function = inner_id, .type = .dynamic, .name_hint = "value", .origin = .{ .parameter = 0 } },
+    };
+    const instructions = [_]ir.Instruction{
+        .{ .id = make_outer_instruction, .block = entry_block, .operation = .{ .make_closure = .{
+            .function = outer_id,
+            .bindings = &.{},
+        } }, .results = &.{outer_closure}, .effects = .pure, .evidence = &.{proof} },
+        .{ .id = never_instruction, .block = start_block, .operation = .{ .constant = .{ .boolean = false } }, .results = &.{never}, .effects = .pure, .evidence = &.{proof} },
+        .{ .id = make_inner_instruction, .block = start_block, .operation = .{ .make_closure = .{
+            .function = inner_id,
+            .bindings = &.{},
+        } }, .results = &.{inner_closure}, .effects = .pure, .evidence = &.{proof} },
+    };
+    const blocks = [_]ir.Block{
+        .{ .id = entry_block, .function = entry_id, .instructions = &.{make_outer_instruction}, .terminator = .{ .return_values = &.{outer_closure} }, .evidence = &.{proof} },
+        .{ .id = start_block, .function = outer_id, .instructions = &.{ never_instruction, make_inner_instruction }, .terminator = .{ .branch = .{ .condition = never, .then_edge = .{ .target = first_block }, .else_edge = .{ .target = second_block } } }, .evidence = &.{proof} },
+        .{ .id = first_block, .function = outer_id, .terminator = .{ .branch = .{ .condition = never, .then_edge = .{ .target = second_block }, .else_edge = .{ .target = exit_block } } }, .evidence = &.{proof} },
+        .{ .id = second_block, .function = outer_id, .terminator = .{ .branch = .{ .condition = never, .then_edge = .{ .target = first_block }, .else_edge = .{ .target = exit_block } } }, .evidence = &.{proof} },
+        .{ .id = exit_block, .function = outer_id, .terminator = .{ .return_values = &.{inner_closure} }, .evidence = &.{proof} },
+        .{ .id = inner_block, .function = inner_id, .terminator = .{ .return_values = &.{parameter} }, .evidence = &.{proof} },
+    };
+    const functions = [_]ir.Function{
+        .{ .id = entry_id, .blocks = &.{entry_block}, .entry_block = entry_block, .evidence = &.{proof} },
+        .{ .id = outer_id, .lexical_parent = entry_id, .blocks = &.{ start_block, first_block, second_block, exit_block }, .entry_block = start_block, .evidence = &.{proof} },
+        .{ .id = inner_id, .lexical_parent = outer_id, .parameters = &.{parameter}, .blocks = &.{inner_block}, .entry_block = inner_block, .evidence = &.{proof} },
+    };
+    const evidence = [_]ir.Evidence{.{ .id = proof, .kind = .dynamic_fixture, .locator = "fixture:function-probe-structurable-closure" }};
+    const program: ir.Program = .{
+        .program_id = "function-probe-structurable-closure",
+        .entry_function = entry_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+        .evidence = &evidence,
+    };
+
+    const published = try lifter.emit_luau.emitAllocForTargetWithOptions(
+        std.testing.allocator,
+        &program,
+        .standard_luau,
+        .{},
+    );
+    defer std.testing.allocator.free(published);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, published, "local __lifter_pc"));
+    const probed = try lifter.emit_luau.emitAdmittedFunctionAlloc(
+        std.testing.allocator,
+        &program,
+        .standard_luau,
+        ir.FunctionId.fromIndex(1),
+    );
+    defer std.testing.allocator.free(probed);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, probed, "local __lifter_pc"));
+}
