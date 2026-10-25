@@ -3,6 +3,7 @@
 local serde = require("@lune/serde")
 local RecoveryManifestCore = require("./recovery_manifest")
 local TargetRecovery = require("./target_recovery")
+local AstAdmission = require("./ast_admission")
 local AstFrontend = require("./ast_frontend")
 local LifterIR = require("./lifter_ir")
 local JsonCodec = require("./json_codec")
@@ -10,7 +11,9 @@ local JsonCodec = require("./json_codec")
 local RecoveryManifest = {
 	decode = function(text: string, manifestName: string)
 		return RecoveryManifestCore.fromBytes(text, manifestName, function(bytes: string): any
-			return serde.decode("json", bytes)
+			return AstAdmission.decodeManifestBytes(bytes, function(marked: string): any
+				return serde.decode("json", marked)
+			end)
 		end)
 	end,
 }

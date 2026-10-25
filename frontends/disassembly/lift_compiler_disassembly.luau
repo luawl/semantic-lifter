@@ -4,8 +4,11 @@ local fs = require("@lune/fs")
 local process = require("@lune/process")
 local serde = require("@lune/serde")
 local IR = require("../../luau/lifter_ir")
+local JsonExact = require("../../luau/json_exact")
 
-local handoff: any = serde.decode("json", fs.readFile(process.args[1]))
+local handoff: any = JsonExact.decode(fs.readFile(process.args[1]), "compiler hand-off", function(bytes: string): any
+    return serde.decode("json", bytes)
+end)
 -- v3 is v2 plus `functions`, the caller-declared nested functions of the selected function.
 local version3 = handoff.schema_version == "compiler_disassembly_handoff_v3"
 local version2 = version3 or handoff.schema_version == "compiler_disassembly_handoff_v2"

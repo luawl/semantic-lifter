@@ -1,0 +1,131 @@
+{
+  "schema_version": "compiler_disassembly_handoff_v2",
+  "listing_sha256": "7d06798b8d1522857b0fed9f51f7add794cf460f4adde20ffd33971d22fc57b1",
+  "function_index": 0,
+  "parameter_count": 0,
+  "is_variadic": false,
+  "registers": [
+    0,
+    1,
+    2,
+    3,
+    4
+  ],
+  "instructions": [
+    {
+      "op": "LOADK",
+      "args": [
+        "R0",
+        "K0"
+      ],
+      "line_number": 7,
+      "reads": [],
+      "writes": [
+        0
+      ],
+      "kind": "constant",
+      "value": {
+        "number": 1.602176634e-19
+      },
+      "successors": [
+        1
+      ]
+    },
+    {
+      "op": "LOADK",
+      "args": [
+        "R1",
+        "K1"
+      ],
+      "line_number": 8,
+      "reads": [],
+      "writes": [
+        1
+      ],
+      "kind": "constant",
+      "value": {
+        "number": 4.69e+27
+      },
+      "successors": [
+        2
+      ]
+    },
+    {
+      "op": "LOADK",
+      "args": [
+        "R2",
+        "K2"
+      ],
+      "line_number": 9,
+      "reads": [],
+      "writes": [
+        2
+      ],
+      "kind": "constant",
+      "value": {
+        "number": 2.4823470202363574e-143
+      },
+      "successors": [
+        3
+      ]
+    },
+    {
+      "op": "LOADK",
+      "args": [
+        "R3",
+        "K3"
+      ],
+      "line_number": 10,
+      "reads": [],
+      "writes": [
+        3
+      ],
+      "kind": "constant",
+      "value": {
+        "number": 0.1
+      },
+      "successors": [
+        4
+      ]
+    },
+    {
+      "op": "LOADK",
+      "args": [
+        "R4",
+        "K4"
+      ],
+      "line_number": 11,
+      "reads": [],
+      "writes": [
+        4
+      ],
+      "kind": "constant",
+      "value": {
+        "number": 2.5
+      },
+      "successors": [
+        5
+      ]
+    },
+    {
+      "op": "RETURN",
+      "args": [
+        "R0",
+        "5"
+      ],
+      "line_number": 12,
+      "reads": [
+        0,
+        1,
+        2,
+        3,
+        4
+      ],
+      "writes": [],
+      "kind": "return",
+      "successors": []
+    }
+  ],
+  "signature_origin": "caller-declared; text disassembly does not encode arity",
+  "scope": "selected capture-free function; remaining compiled functions are not lifted"
+}

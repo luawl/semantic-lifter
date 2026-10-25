@@ -3,6 +3,7 @@
 local serde = require("@lune/serde")
 local RecoveryManifestCore = require("./recovery_manifest")
 local TargetRecovery = require("./target_recovery")
+local AstAdmission = require("./ast_admission")
 local AstFrontend = require("./ast_frontend")
 local LifterIR = require("./lifter_ir")
 local JsonCodec = require("./json_codec")
@@ -10,7 +11,9 @@ local JsonCodec = require("./json_codec")
 local RecoveryManifest = {
 	decode = function(text: string, manifestName: string)
 		return RecoveryManifestCore.fromBytes(text, manifestName, function(bytes: string): any
-			return serde.decode("json", bytes)
+			return AstAdmission.decodeManifestBytes(bytes, function(marked: string): any
+				return serde.decode("json", marked)
+			end)
 		end)
 	end,
 }
@@ -363,6 +366,33 @@ assert(
 	literalMismatch.program == nil and literalMismatch.diagnostics[1].code == "target_recovery_mismatch",
 	"frontend accepted a mismatched numeric literal path key"
 )
+
+do
+	-- A literal path key whose shortest text Lune's JSON decoder alone reads one unit in the last place away. The
+	-- manifest decode reads it from its text, so the key keeps the source literal's double and the path verifies.
+	local exactKey = 1.602176634e-19
+	local exactPath = path({ environment = "root" }, keys({ literal = { number = exactKey } }))
+	local exactManifest = RecoveryManifest.decode(
+		encodedManifest("lifter_recovery_manifest_v11", ordinaryCallLocation, exactPath),
+		"v11-exact-literal-path"
+	)
+	local exactRecovery = exactManifest.target_recovery :: any
+	local decodedKey = exactRecovery.target_resolutions[1].origin.access_path.keys[1].literal.number
+	assert(
+		type(decodedKey) == "number" and string.pack(">d", decodedKey) == string.pack(">d", exactKey),
+		`v11 manifest read the literal path key {exactKey} as {decodedKey}`
+	)
+	local exactDocument = makeDocument(false, nil, targetExpression(exactPath))
+	local exactVerified = TargetRecovery.verify(exactDocument, sourceText, exactRecovery)
+	local exactSite = exactVerified.by_call_location[ordinaryCallLocation]
+	assert(
+		exactSite ~= nil
+			and exactSite.resolution ~= nil
+			and exactSite.resolution.origin.kind == "access_path"
+			and exactSite.resolution.origin.key_origins[1].kind == "constant_number",
+		"target recovery refused a literal path key read from its manifest text"
+	)
+end
 
 local mutablePath = path(
 	{ local_place = mutableRoot.location },

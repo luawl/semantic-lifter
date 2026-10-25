@@ -2256,6 +2256,7 @@ pub fn build(b: *std.Build) void {
     run_luau_ir_typecheck.addFileArg(b.path("luau/ast_expression_scalar_test.luau"));
     run_luau_ir_typecheck.addFileArg(b.path("luau/ast_statement_slots.luau"));
     run_luau_ir_typecheck.addFileArg(b.path("luau/ast_admission.luau"));
+    run_luau_ir_typecheck.addFileArg(b.path("luau/json_exact.luau"));
     run_luau_ir_typecheck.addFileArg(b.path("luau/ast_admission_test.luau"));
     run_luau_ir_typecheck.addFileArg(b.path("luau/ast_local_identity_test.luau"));
     run_luau_ir_typecheck.addFileArg(b.path("luau/ast_frontend_control.luau"));
@@ -2433,6 +2434,21 @@ pub fn build(b: *std.Build) void {
     run_parser_number_transport_tests.addFileInput(b.path("luau/ast_statement_slots.luau"));
     run_parser_number_transport_tests.addFileInput(b.path("luau/invocation_frame.luau"));
     run_parser_number_transport_tests.addFileInput(b.path("luau/target_origin_expression_matcher.luau"));
+    const run_json_exact_transport_tests = b.addSystemCommand(&.{ luneExe(b), "run" });
+    run_json_exact_transport_tests.addFileArg(b.path("luau/json_exact_transport_test.luau"));
+    run_json_exact_transport_tests.addFileInput(b.path("luau/json_exact.luau"));
+    const run_exact_number_handoff_lift = b.addSystemCommand(&.{ luneExe(b), "run" });
+    run_exact_number_handoff_lift.addFileArg(b.path("frontends/disassembly/lift_compiler_disassembly.luau"));
+    run_exact_number_handoff_lift.addFileArg(b.path("luau/fixtures/exact_number_handoff.json"));
+    const exact_number_handoff_ir = run_exact_number_handoff_lift.addOutputFileArg("exact-number-handoff.lifter-ir.json");
+    run_exact_number_handoff_lift.addArg("exact-number-handoff");
+    run_exact_number_handoff_lift.addFileInput(b.path("luau/lifter_ir.luau"));
+    run_exact_number_handoff_lift.addFileInput(b.path("luau/json_codec.luau"));
+    run_exact_number_handoff_lift.addFileInput(b.path("luau/json_exact.luau"));
+    const run_handoff_number_transport_tests = b.addSystemCommand(&.{ luneExe(b), "run" });
+    run_handoff_number_transport_tests.addFileArg(b.path("luau/handoff_number_transport_test.luau"));
+    run_handoff_number_transport_tests.addFileArg(b.path("luau/fixtures/exact_number_handoff.json"));
+    run_handoff_number_transport_tests.addFileArg(exact_number_handoff_ir);
     const run_temporal_target_identity_tests = b.addSystemCommand(&.{ luneExe(b), "run" });
     run_temporal_target_identity_tests.addFileArg(b.path("luau/temporal_target_identity_test.luau"));
     addTemporalTestInputs(b, run_temporal_target_identity_tests);
@@ -2529,6 +2545,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_target_proof_bundle_tests.step);
     test_step.dependOn(&run_ast_admission_tests.step);
     test_step.dependOn(&run_parser_number_transport_tests.step);
+    test_step.dependOn(&run_json_exact_transport_tests.step);
+    test_step.dependOn(&run_handoff_number_transport_tests.step);
     test_step.dependOn(&run_temporal_target_identity_tests.step);
     test_step.dependOn(&run_direct_closure_return_tests.step);
     test_step.dependOn(&run_fixed_vararg_return_tests.step);
