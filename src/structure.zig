@@ -8934,7 +8934,7 @@ const Builder = struct {
                 .branch => |branch| {
                     if (!suppress_loop_detection and self.loop_headers[local_index]) {
                         const loop_probe_start = structural_overlap.structuralPhaseNow();
-                        const loop_candidate = try self.buildLoop(current, branch, allowed, escape_targets, continue_targets, loop_exit);
+                        const loop_candidate = try self.buildLoop(current, branch, allowed, stop, escape_targets, continue_targets, loop_exit);
                         const loop_probe_ms = structural_overlap.structuralPhaseMillis(loop_probe_start);
                         self.trace_loop_probe_calls += 1;
                         self.trace_loop_probe_ms += loop_probe_ms;
@@ -9662,6 +9662,7 @@ const Builder = struct {
         header: ir.BlockId,
         branch: ir.Branch,
         enclosing_allowed: ?[]const bool,
+        stop: ?ir.BlockId,
         escape_targets: ?*const EscapeTarget,
         continue_targets: ?*const EscapeTarget,
         enclosing_loop_exit: ?ir.BlockId,
@@ -9672,6 +9673,7 @@ const Builder = struct {
             header,
             branch,
             enclosing_allowed,
+            stop,
             escape_targets,
             continue_targets,
             enclosing_loop_exit,
@@ -9689,6 +9691,7 @@ const Builder = struct {
         header: ir.BlockId,
         branch: ir.Branch,
         enclosing_allowed: ?[]const bool,
+        stop: ?ir.BlockId,
         escape_targets: ?*const EscapeTarget,
         continue_targets: ?*const EscapeTarget,
         enclosing_loop_exit: ?ir.BlockId,
@@ -9701,6 +9704,20 @@ const Builder = struct {
         const then_is_body = membership.bits[then_index];
         const else_is_body = membership.bits[else_index];
         if (then_is_body == else_is_body) return null;
+        // A header whose own exit arm reaches, outside the loop, a block another member exits to is left to the
+        // latch and infinite-loop builders: as a `Loop` the body would own that block and the walk after the loop
+        // would meet it again.
+        const header_exit = if (then_is_body) branch.else_edge.target else branch.then_edge.target;
+        if (try self.headerExitRejoinsMemberExit(
+            membership.bits,
+            header,
+            header_exit,
+            enclosing_allowed,
+            stop,
+            escape_targets,
+            continue_targets,
+            enclosing_loop_exit,
+        )) return null;
         const exit_shape = try natural_loop.classifyExit(self.analysis, membership.bits);
         switch (exit_shape) {
             .multiple => if (!try self.loopSecondaryExitsAreOwned(
@@ -9957,6 +9974,88 @@ const Builder = struct {
         const predecessor = self.analysis.predecessorAt(target, 0) orelse return null;
         if (!self.analysis.isReachable(predecessor)) return null;
         return directEdgeReference(self.analysis.program, .{ .block = predecessor }, target);
+    }
+
+    // Whether a member other than the header exits to a block the header's own exit arm reaches without entering the
+    // loop. As a `Loop` the body region claims such a block (a terminal one through `makeLoopTerminalControl`, any
+    // other through the side region of `makeLoopBoundaryControl`), and the walk after the loop meets it again from the
+    // header's arm. The walk ends at a block that is the enclosing region's stop or that leads to the stop through
+    // empty jump blocks of the enclosing region (`ownedTransparentStopEdge` takes that chain as the region's end once
+    // the body owns it), and an escape target, a continue target or the enclosing loop exit is not claimed by the
+    // body, so none of them counts.
+    fn headerExitRejoinsMemberExit(
+        self: *Builder,
+        membership: []const bool,
+        header: ir.BlockId,
+        header_exit: ir.BlockId,
+        enclosing_allowed: ?[]const bool,
+        stop: ?ir.BlockId,
+        escape_targets: ?*const EscapeTarget,
+        continue_targets: ?*const EscapeTarget,
+        enclosing_loop_exit: ?ir.BlockId,
+    ) BuildError!bool {
+        if (membership.len != self.analysis.function.blocks.len) return error.UnsupportedShape;
+        for (membership, 0..) |is_member, local_index| {
+            if (!is_member) continue;
+            const block_id = self.analysis.function.blocks[local_index];
+            if (block_id == header) continue;
+            var targets: [2]ir.BlockId = undefined;
+            var target_count: usize = 0;
+            switch (self.analysis.program.blocks[block_id.index()].terminator) {
+                .jump => |edge| {
+                    targets[0] = edge.target;
+                    target_count = 1;
+                },
+                .branch => |candidate| {
+                    targets[0] = candidate.then_edge.target;
+                    targets[1] = candidate.else_edge.target;
+                    target_count = 2;
+                },
+                .return_values, .return_pack, .return_expanded, .throw_error, .unreachable_block => {},
+            }
+            for (targets[0..target_count]) |target| {
+                const target_index = self.analysis.blockIndex(target) orelse return error.UnsupportedShape;
+                if (membership[target_index] or target == header_exit) continue;
+                if (stop != null and self.reachesStopThroughEmptyJumps(target, stop.?, enclosing_allowed)) continue;
+                if (enclosing_loop_exit != null and target == enclosing_loop_exit.?) continue;
+                if (isEscapeTarget(escape_targets, target) or isEscapeTarget(continue_targets, target)) continue;
+                if (try natural_loop.canReachOutsideLoopAlloc(self.allocator, self.analysis, membership, header_exit, target)) return true;
+            }
+        }
+        return false;
+    }
+
+    // Whether `start` is `stop`, or leads to it through empty jump blocks inside `allowed`: the chain the region walk
+    // ends at when it meets the chain again already owned (`ownedTransparentStopEdge`, which also needs each block of
+    // the chain visited).
+    fn reachesStopThroughEmptyJumps(
+        self: *const Builder,
+        start: ir.BlockId,
+        stop: ir.BlockId,
+        allowed: ?[]const bool,
+    ) bool {
+        var current = start;
+        var traversed: usize = 0;
+        while (current != stop) : (traversed += 1) {
+            if (traversed >= self.analysis.function.blocks.len) return false;
+            const local_index = self.analysis.blockIndex(current) orelse return false;
+            if (allowed) |membership| {
+                if (local_index >= membership.len or !membership[local_index]) return false;
+            }
+            const block = self.analysis.program.blocks[current.index()];
+            if (block.parameters.len != 0 or block.instructions.len != 0) return false;
+            const edge = switch (block.terminator) {
+                .jump => |value| value,
+                else => return false,
+            };
+            if (edge.target == stop) {
+                const stop_block = self.analysis.program.blocks[stop.index()];
+                return edge.arguments.len == stop_block.parameters.len;
+            }
+            if (edge.arguments.len != 0) return false;
+            current = edge.target;
+        }
+        return true;
     }
 
     fn loopSecondaryExitsAreOwned(
@@ -10670,6 +10769,56 @@ const Builder = struct {
         return false;
     }
 
+    // The terminal block an infinite loop takes as its exit in place of `exit`, its unique classified exit: the
+    // header's branch has one arm outside the loop, to a block that does not end the function, and a member other
+    // than the header exits straight to a terminal block that arm reaches without entering the loop.
+    // `classifyExitAtBoundary` keeps the arm and drops that terminal block, so the body would claim it and the walk
+    // after the loop would meet it again from the arm; as the exit, the arm becomes a side exit that ends there and
+    // the member's edge a break. Null unless exactly one such block exists; the continuation, the enclosing loop exit
+    // and the escape and continue targets do not count.
+    fn headerExitRejoinedTerminal(
+        self: *const Builder,
+        membership: []const bool,
+        header: ir.BlockId,
+        exit: ir.BlockId,
+        continuation: ?ir.BlockId,
+        escape_targets: ?*const EscapeTarget,
+        continue_targets: ?*const EscapeTarget,
+        enclosing_loop_exit: ?ir.BlockId,
+    ) BuildError!?ir.BlockId {
+        const branch = switch (self.analysis.program.blocks[header.index()].terminator) {
+            .branch => |value| value,
+            else => return null,
+        };
+        const then_index = self.analysis.blockIndex(branch.then_edge.target) orelse return error.UnsupportedShape;
+        const else_index = self.analysis.blockIndex(branch.else_edge.target) orelse return error.UnsupportedShape;
+        if (membership[then_index] == membership[else_index]) return null;
+        const header_exit = if (membership[then_index]) branch.else_edge.target else branch.then_edge.target;
+        if (isTerminal(self.analysis.program.blocks[header_exit.index()].terminator)) return null;
+        var rejoined: ?ir.BlockId = null;
+        for (membership, 0..) |is_member, local_index| {
+            if (!is_member) continue;
+            const block = self.analysis.function.blocks[local_index];
+            if (block == header) continue;
+            for (0..self.analysis.successorCount(block)) |successor_index| {
+                const target = self.analysis.successorAt(block, successor_index) orelse
+                    return error.UnsupportedShape;
+                const target_index = self.analysis.blockIndex(target) orelse
+                    return error.UnsupportedShape;
+                if (membership[target_index] or target == exit) continue;
+                if (rejoined != null and target == rejoined.?) continue;
+                if (!isTerminal(self.analysis.program.blocks[target.index()].terminator)) continue;
+                if (continuation != null and target == continuation.?) continue;
+                if (enclosing_loop_exit != null and target == enclosing_loop_exit.?) continue;
+                if (isEscapeTarget(escape_targets, target) or isEscapeTarget(continue_targets, target)) continue;
+                if (!try natural_loop.canReachOutsideLoopAlloc(self.allocator, self.analysis, membership, header_exit, target)) continue;
+                if (rejoined != null) return null;
+                rejoined = target;
+            }
+        }
+        return rejoined;
+    }
+
     fn buildInfiniteLoop(
         self: *Builder,
         header: ir.BlockId,
@@ -10753,7 +10902,15 @@ const Builder = struct {
         }
         var exit: ?ir.BlockId = switch (try self.classifyInfiniteExitAtBoundary(membership.bits, structural_continuation)) {
             .closed => null,
-            .unique => |target| target,
+            .unique => |target| (try self.headerExitRejoinedTerminal(
+                membership.bits,
+                header,
+                target,
+                continuation,
+                escape_targets,
+                continue_targets,
+                enclosing_loop_exit,
+            )) orelse target,
             .multiple => multiple: {
                 if (structural_continuation) |target| {
                     if (try self.resolveInfiniteMultipleExit(membership.bits, target)) |selected| {

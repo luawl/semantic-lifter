@@ -1148,6 +1148,62 @@ pub fn build(b: *std.Build) void {
         "automatic",
         "semantic-normalized",
     );
+    // A `repeat` whose header block's own branch leaves the loop: six functions in one module (a store then a break,
+    // a bare break, a break in an `if` arm before a statement and as the arm's last statement, a header arm that
+    // returns, and a store then a break in an `if` arm of a `while` before a return), the same `repeat` nested in a
+    // `while`, and two whose `repeat` ends a `while` body or an `if` arm in one. Their cases pin no dispatcher form
+    // and the source's results.
+    const source_frontend_repeat_header_exit_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/repeat_header_exit_source.luau",
+        "source-frontend-repeat-header-exit",
+    );
+    const source_frontend_repeat_header_exit_direct_locals_conformance = addLuauSourceConformanceForTarget(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/repeat_header_exit_source.luau",
+        "source-frontend-repeat-header-exit-direct-locals",
+        "direct-locals-luau",
+    );
+    const source_frontend_repeat_header_exit_nested_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/repeat_header_exit_nested_source.luau",
+        "source-frontend-repeat-header-exit-nested",
+    );
+    const source_frontend_repeat_header_exit_nested_direct_locals_conformance = addLuauSourceConformanceForTarget(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/repeat_header_exit_nested_source.luau",
+        "source-frontend-repeat-header-exit-nested-direct-locals",
+        "direct-locals-luau",
+    );
+    const source_frontend_repeat_header_exit_while_tail_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/repeat_header_exit_while_tail_source.luau",
+        "source-frontend-repeat-header-exit-while-tail",
+    );
+    const source_frontend_repeat_header_exit_while_tail_direct_locals_conformance = addLuauSourceConformanceForTarget(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/repeat_header_exit_while_tail_source.luau",
+        "source-frontend-repeat-header-exit-while-tail-direct-locals",
+        "direct-locals-luau",
+    );
     const source_frontend_typed_block_conformance = addLuauSourceConformance(
         b,
         exe,
@@ -2191,6 +2247,12 @@ pub fn build(b: *std.Build) void {
     conformance_step.dependOn(per_execution_cell_structured_grandchild_runtime);
     conformance_step.dependOn(numeric_operand_flat_grouping);
     conformance_step.dependOn(numeric_operand_semantic_grouping);
+    source_frontend_repeat_header_exit_conformance.addTo(conformance_step);
+    source_frontend_repeat_header_exit_direct_locals_conformance.addTo(conformance_step);
+    source_frontend_repeat_header_exit_nested_conformance.addTo(conformance_step);
+    source_frontend_repeat_header_exit_nested_direct_locals_conformance.addTo(conformance_step);
+    source_frontend_repeat_header_exit_while_tail_conformance.addTo(conformance_step);
+    source_frontend_repeat_header_exit_while_tail_direct_locals_conformance.addTo(conformance_step);
     source_frontend_typed_block_conformance.addTo(conformance_step);
     source_frontend_numeric_for_conformance.addTo(conformance_step);
     source_frontend_generic_for_conformance.addTo(conformance_step);

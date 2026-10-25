@@ -657,6 +657,262 @@ function SourceRuntimeOracle.run(caseName: string, source: string, exported: any
 		assert(string.byte(rendered, 1) == 0xff and string.byte(rendered, 2) == 0xfe, "source frontend changed string byte transport")
 		assert(string.sub(rendered, 3) == "prefix %7 box:7 nil false suffix", "source frontend changed interpolation conversion or percent escaping")
 		assert(calls == 1, "source frontend changed interpolation __tostring dispatch count")
+	elseif
+		caseName == "source-frontend-repeat-header-exit"
+		or caseName == "source-frontend-repeat-header-exit-direct-locals"
+	then
+		-- Six functions with a `repeat` whose header block's own branch decides: five leave the loop from it (a store
+		-- then a break, a bare break, a break inside an `if` arm with and without a statement after the loop, and a store
+		-- then a break inside an `if` arm of a `while` whose arm returns after the loop), one returns from it. No function
+		-- of the module may be written in the dispatcher form, and each must return what a copy of its source returns on
+		-- n -1..6, with the arm flag true and false for the three in an `if` arm and m 0..3 for the one in a `while`.
+		assert(
+			string.find(source, "local __lifter_pc =", 1, true) == nil,
+			"source-frontend-repeat-header-exit: the generated module declares local __lifter_pc ="
+		)
+		local function assignThenBreak(n: number): (number, number)
+			local p, i = 0, 0
+			repeat
+				i = i + 1
+				if i == n then
+					p = 100
+					break
+				end
+			until i >= 3
+			return p, i
+		end
+		local function bareBreak(n: number): (number, number)
+			local p, i = 0, 0
+			repeat
+				i = i + 1
+				if i == n then
+					break
+				end
+			until i >= 3
+			return p, i
+		end
+		local function breakInArmBeforeStatement(n: number, a: boolean): (number, number)
+			local p, i = 0, 0
+			if a then
+				repeat
+					i = i + 1
+					if i == n then
+						p = 100
+						break
+					end
+				until i >= 3
+				p = p + 1
+			end
+			return p, i
+		end
+		local function returnFromHeader(n: number): (number, number)
+			local p, i = 0, 0
+			repeat
+				i = i + 1
+				if i == n then
+					return -1, i
+				end
+			until i >= 3
+			return p, i
+		end
+		local function breakInArmTail(n: number, a: boolean): (number, number)
+			local p, i = 0, 0
+			if a then
+				repeat
+					i = i + 1
+					if i == n then
+						p = 100
+						break
+					end
+				until i >= 3
+			end
+			return p, i
+		end
+		local function breakInWhileArmBeforeReturn(n: number, a: boolean, m: number): (number, number)
+			local count, step, round = 0, 0, 0
+			while round < m do
+				round = round + 1
+				if a then
+					repeat
+						step = step + 1
+						if step == n then
+							count = count + 100
+							break
+						end
+					until step % 3 == 0
+					return count, step
+				end
+			end
+			return -count, step
+		end
+		local functions = exported()
+		assert(type(functions) == "table", "source-frontend-repeat-header-exit: the module did not return its function table")
+		local rows = 0
+		local mismatches = 0
+		local first = "none"
+		local function check(label: string, expected: any, actual: any)
+			rows += 1
+			local same = expected.n == actual.n
+			for index = 1, expected.n do
+				if expected[index] ~= actual[index] then
+					same = false
+				end
+			end
+			if not same then
+				if mismatches == 0 then
+					first = label
+				end
+				mismatches += 1
+			end
+		end
+		for n = -1, 6 do
+			check(`assignThenBreak({n})`, table.pack(assignThenBreak(n)), table.pack(functions.assignThenBreak(n)))
+			check(`bareBreak({n})`, table.pack(bareBreak(n)), table.pack(functions.bareBreak(n)))
+			check(`returnFromHeader({n})`, table.pack(returnFromHeader(n)), table.pack(functions.returnFromHeader(n)))
+			for _, a in { true, false } do
+				check(
+					`breakInArmBeforeStatement({n}, {a})`,
+					table.pack(breakInArmBeforeStatement(n, a)),
+					table.pack(functions.breakInArmBeforeStatement(n, a))
+				)
+				check(`breakInArmTail({n}, {a})`, table.pack(breakInArmTail(n, a)), table.pack(functions.breakInArmTail(n, a)))
+				for m = 0, 3 do
+					check(
+						`breakInWhileArmBeforeReturn({n}, {a}, {m})`,
+						table.pack(breakInWhileArmBeforeReturn(n, a, m)),
+						table.pack(functions.breakInWhileArmBeforeReturn(n, a, m))
+					)
+				end
+			end
+		end
+		assert(rows == 120, `{caseName}: {rows} rows checked, not 120`)
+		assert(mismatches == 0, `{caseName}: {mismatches} of {rows} rows differ from the source; first {first}`)
+	elseif
+		caseName == "source-frontend-repeat-header-exit-nested"
+		or caseName == "source-frontend-repeat-header-exit-nested-direct-locals"
+	then
+		-- The same `repeat` nested in a `while`, so the loop's until exit continues the outer loop. No dispatcher form,
+		-- and the result equals a copy of the source's on n 0..6 and m 0..3.
+		assert(
+			string.find(source, "local __lifter_pc =", 1, true) == nil,
+			"source-frontend-repeat-header-exit-nested: the generated module declares local __lifter_pc ="
+		)
+		local function nested(n: number, m: number): (number, number)
+			local p, i, j = 0, 0, 0
+			while j < m do
+				j = j + 1
+				repeat
+					i = i + 1
+					if i == n then
+						p = p + 100
+						break
+					end
+				until i % 3 == 0
+				p = p + 1
+			end
+			return p, i
+		end
+		local rows = 0
+		local mismatches = 0
+		local first = "none"
+		for n = 0, 6 do
+			for m = 0, 3 do
+				rows += 1
+				local expectedP, expectedI = nested(n, m)
+				local actualP, actualI = exported(n, m)
+				if expectedP ~= actualP or expectedI ~= actualI then
+					if mismatches == 0 then
+						first = `({n}, {m})`
+					end
+					mismatches += 1
+				end
+			end
+		end
+		assert(rows == 28, `{caseName}: {rows} rows checked, not 28`)
+		assert(mismatches == 0, `{caseName}: {mismatches} of {rows} rows differ from the source; first {first}`)
+	elseif
+		caseName == "source-frontend-repeat-header-exit-while-tail"
+		or caseName == "source-frontend-repeat-header-exit-while-tail-direct-locals"
+	then
+		-- Two functions whose `repeat`, with a break from its header block, is the last statement of a `while` body,
+		-- directly or inside an `if` arm, so the break and the until exit both continue the `while`. No function of the
+		-- module may be written in the dispatcher form, and each must return what a copy of its source returns on
+		-- n -1..6 and m 0..3, with the arm flag true and false.
+		assert(
+			string.find(source, "local __lifter_pc =", 1, true) == nil,
+			"source-frontend-repeat-header-exit-while-tail: the generated module declares local __lifter_pc ="
+		)
+		local function repeatEndsWhileBody(n: number, a: boolean, m: number): (number, number)
+			local count, step, round = 0, 0, 0
+			while round < m do
+				round = round + 1
+				repeat
+					step = step + 1
+					if step == n then
+						count = count + 100
+						break
+					end
+				until step % 3 == 0
+			end
+			return count, step
+		end
+		local function repeatEndsWhileArm(n: number, a: boolean, m: number): (number, number)
+			local count, step, round = 0, 0, 0
+			while round < m do
+				round = round + 1
+				if a then
+					repeat
+						step = step + 1
+						if step == n then
+							count = count + 100
+							break
+						end
+					until step % 3 == 0
+				end
+			end
+			return count, step
+		end
+		local functions = exported()
+		assert(
+			type(functions) == "table",
+			"source-frontend-repeat-header-exit-while-tail: the module did not return its function table"
+		)
+		local rows = 0
+		local mismatches = 0
+		local first = "none"
+		local function check(label: string, expected: any, actual: any)
+			rows += 1
+			local same = expected.n == actual.n
+			for index = 1, expected.n do
+				if expected[index] ~= actual[index] then
+					same = false
+				end
+			end
+			if not same then
+				if mismatches == 0 then
+					first = label
+				end
+				mismatches += 1
+			end
+		end
+		for n = -1, 6 do
+			for m = 0, 3 do
+				for _, a in { true, false } do
+					check(
+						`repeatEndsWhileBody({n}, {a}, {m})`,
+						table.pack(repeatEndsWhileBody(n, a, m)),
+						table.pack(functions.repeatEndsWhileBody(n, a, m))
+					)
+					check(
+						`repeatEndsWhileArm({n}, {a}, {m})`,
+						table.pack(repeatEndsWhileArm(n, a, m)),
+						table.pack(functions.repeatEndsWhileArm(n, a, m))
+					)
+				end
+			end
+		end
+		assert(rows == 128, `{caseName}: {rows} rows checked, not 128`)
+		assert(mismatches == 0, `{caseName}: {mismatches} of {rows} rows differ from the source; first {first}`)
 	elseif caseName == "source-frontend-target-resolution" then
 		assert(string.find(source, "local __lifter_pcall = pcall", 1, true) ~= nil, "target recovery did not emit the protected-call capability")
 		assert(select(2, string.gsub(source, "__lifter_pcall%(", "")) == 3, "target recovery changed the resolved call count")
