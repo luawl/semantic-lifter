@@ -547,6 +547,106 @@ pub fn build(b: *std.Build) void {
     loop_exit_flag_reentry_mid_pass_layout.addFileArg(b.path("luau/structured_layout_oracle.luau"));
     loop_exit_flag_reentry_mid_pass_layout.addArg("source-frontend-loop-exit-flag-reentry-mid-pass");
     loop_exit_flag_reentry_mid_pass_layout.addFileArg(source_frontend_loop_exit_flag_reentry_mid_pass_conformance.generated_luau);
+    const source_frontend_nested_continue_side_exit_generic_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/nested_continue_side_exit_generic_source.luau",
+        "source-frontend-nested-continue-side-exit-generic",
+    );
+    const nested_continue_side_exit_generic_dispatcher = addDispatcherRuntimeConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "source-frontend-nested-continue-side-exit-generic",
+        source_frontend_nested_continue_side_exit_generic_conformance.resolved_ir,
+    );
+    const source_frontend_nested_continue_side_exit_while_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/nested_continue_side_exit_while_source.luau",
+        "source-frontend-nested-continue-side-exit-while",
+    );
+    const nested_continue_side_exit_while_dispatcher = addDispatcherRuntimeConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "source-frontend-nested-continue-side-exit-while",
+        source_frontend_nested_continue_side_exit_while_conformance.resolved_ir,
+    );
+    const source_frontend_nested_continue_side_exit_numeric_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/nested_continue_side_exit_numeric_source.luau",
+        "source-frontend-nested-continue-side-exit-numeric",
+    );
+    const nested_continue_side_exit_numeric_dispatcher = addDispatcherRuntimeConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "source-frontend-nested-continue-side-exit-numeric",
+        source_frontend_nested_continue_side_exit_numeric_conformance.resolved_ir,
+    );
+    const source_frontend_nested_continue_side_exit_elseif_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/nested_continue_side_exit_elseif_source.luau",
+        "source-frontend-nested-continue-side-exit-elseif",
+    );
+    const nested_continue_side_exit_elseif_dispatcher = addDispatcherRuntimeConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "source-frontend-nested-continue-side-exit-elseif",
+        source_frontend_nested_continue_side_exit_elseif_conformance.resolved_ir,
+    );
+    const source_frontend_nested_continue_side_exit_nested_break_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/nested_continue_side_exit_nested_break_source.luau",
+        "source-frontend-nested-continue-side-exit-nested-break",
+    );
+    const nested_continue_side_exit_nested_break_dispatcher = addDispatcherRuntimeConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "source-frontend-nested-continue-side-exit-nested-break",
+        source_frontend_nested_continue_side_exit_nested_break_conformance.resolved_ir,
+    );
+    const nested_continue_side_exit_generic_layout = b.addSystemCommand(&.{ luneExe(b), "run" });
+    nested_continue_side_exit_generic_layout.addFileArg(b.path("luau/structured_layout_oracle.luau"));
+    nested_continue_side_exit_generic_layout.addArg("source-frontend-nested-continue-side-exit-generic");
+    nested_continue_side_exit_generic_layout.addFileArg(source_frontend_nested_continue_side_exit_generic_conformance.generated_luau);
+    const nested_continue_side_exit_while_layout = b.addSystemCommand(&.{ luneExe(b), "run" });
+    nested_continue_side_exit_while_layout.addFileArg(b.path("luau/structured_layout_oracle.luau"));
+    nested_continue_side_exit_while_layout.addArg("source-frontend-nested-continue-side-exit-while");
+    nested_continue_side_exit_while_layout.addFileArg(source_frontend_nested_continue_side_exit_while_conformance.generated_luau);
+    const nested_continue_side_exit_numeric_layout = b.addSystemCommand(&.{ luneExe(b), "run" });
+    nested_continue_side_exit_numeric_layout.addFileArg(b.path("luau/structured_layout_oracle.luau"));
+    nested_continue_side_exit_numeric_layout.addArg("source-frontend-nested-continue-side-exit-numeric");
+    nested_continue_side_exit_numeric_layout.addFileArg(source_frontend_nested_continue_side_exit_numeric_conformance.generated_luau);
+    const nested_continue_side_exit_elseif_layout = b.addSystemCommand(&.{ luneExe(b), "run" });
+    nested_continue_side_exit_elseif_layout.addFileArg(b.path("luau/structured_layout_oracle.luau"));
+    nested_continue_side_exit_elseif_layout.addArg("source-frontend-nested-continue-side-exit-elseif");
+    nested_continue_side_exit_elseif_layout.addFileArg(source_frontend_nested_continue_side_exit_elseif_conformance.generated_luau);
+    const nested_continue_side_exit_nested_break_layout = b.addSystemCommand(&.{ luneExe(b), "run" });
+    nested_continue_side_exit_nested_break_layout.addFileArg(b.path("luau/structured_layout_oracle.luau"));
+    nested_continue_side_exit_nested_break_layout.addArg("source-frontend-nested-continue-side-exit-nested-break");
+    nested_continue_side_exit_nested_break_layout.addFileArg(source_frontend_nested_continue_side_exit_nested_break_conformance.generated_luau);
     const luau_iteration_header_forwarder_conformance = addLuauFixtureConformance(
         b,
         exe,
@@ -2017,6 +2117,21 @@ pub fn build(b: *std.Build) void {
     source_frontend_loop_exit_flag_reentry_mid_pass_direct_locals_conformance.addTo(conformance_step);
     conformance_step.dependOn(loop_exit_flag_reentry_mid_pass_dispatcher);
     conformance_step.dependOn(&loop_exit_flag_reentry_mid_pass_layout.step);
+    source_frontend_nested_continue_side_exit_generic_conformance.addTo(conformance_step);
+    conformance_step.dependOn(nested_continue_side_exit_generic_dispatcher);
+    conformance_step.dependOn(&nested_continue_side_exit_generic_layout.step);
+    source_frontend_nested_continue_side_exit_while_conformance.addTo(conformance_step);
+    conformance_step.dependOn(nested_continue_side_exit_while_dispatcher);
+    conformance_step.dependOn(&nested_continue_side_exit_while_layout.step);
+    source_frontend_nested_continue_side_exit_numeric_conformance.addTo(conformance_step);
+    conformance_step.dependOn(nested_continue_side_exit_numeric_dispatcher);
+    conformance_step.dependOn(&nested_continue_side_exit_numeric_layout.step);
+    source_frontend_nested_continue_side_exit_elseif_conformance.addTo(conformance_step);
+    conformance_step.dependOn(nested_continue_side_exit_elseif_dispatcher);
+    conformance_step.dependOn(&nested_continue_side_exit_elseif_layout.step);
+    source_frontend_nested_continue_side_exit_nested_break_conformance.addTo(conformance_step);
+    conformance_step.dependOn(nested_continue_side_exit_nested_break_dispatcher);
+    conformance_step.dependOn(&nested_continue_side_exit_nested_break_layout.step);
     luau_iteration_header_forwarder_conformance.addTo(conformance_step);
     conformance_step.dependOn(iteration_header_forwarder_dispatcher);
     luau_open_pack_projection_conformance.addTo(conformance_step);

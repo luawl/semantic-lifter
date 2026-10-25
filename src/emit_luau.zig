@@ -993,8 +993,14 @@ fn emitRegionWithPredeclaredBlock(
     const body_indent = try allocDeeperIndent(allocator, region_indent);
     defer allocator.free(body_indent);
 
+    // A loop-boundary exit below this region to its stop shares the stop's flag. A region inside the loop that owns
+    // the exit (its loop exit is the stop) declares no flag of that name: the consumers after the wrappers around it
+    // read the loop's flag. A region whose stop is the exit of a loop nested in it declares its stop flag as any other
+    // region does; inside a loop that owns the exit's flag (`loopOwnedExitFlag`) the loop's per-pass declaration
+    // shadows it.
     const has_predeclared_stop_flag = (predeclared_block != null and predeclared_block.? == target) or
-        structured_escape.regionHasLoopBoundaryExitTo(region, target);
+        (region.loop_exit != null and region.loop_exit.? == target and
+            structured_escape.regionHasLoopBoundaryExitTo(region, target));
     // The stop's flag is declared only where this region's own text sets it: after the region only the consumer of a
     // region that continues at its stop reads it, which needs such a set, and a side arm that sets it after its side
     // region writes that region with the side target predeclared.
@@ -3778,7 +3784,7 @@ fn emitLoopBoundaryControl(
             try render.valueUseScalar(output, allocator, program, valuePlan(emission_plan, place_aliases), branch.condition);
         }
         try output.appendSlice(allocator, " then\n");
-        try emitLoopBoundaryArm(output, allocator, program, emission_plan, scopes, control.boundary, side_falls_through, arm_indent, place_aliases);
+        try emitLoopBoundaryArm(output, allocator, program, emission_plan, scopes, control.boundary, side_falls_through, control.exit_via_flag, arm_indent, place_aliases);
         try output.appendSlice(allocator, indent);
         try output.appendSlice(allocator, "end\n");
         return;
@@ -3790,12 +3796,12 @@ fn emitLoopBoundaryControl(
     if (control.body_on_true) {
         try emitLoopBoundaryBody(output, allocator, program, emission_plan, scopes, control, body_exit, region.continue_target, arm_indent, place_aliases);
     } else {
-        try emitLoopBoundaryArm(output, allocator, program, emission_plan, scopes, control.boundary, side_falls_through, arm_indent, place_aliases);
+        try emitLoopBoundaryArm(output, allocator, program, emission_plan, scopes, control.boundary, side_falls_through, control.exit_via_flag, arm_indent, place_aliases);
     }
     try output.appendSlice(allocator, indent);
     try output.appendSlice(allocator, "else\n");
     if (control.body_on_true) {
-        try emitLoopBoundaryArm(output, allocator, program, emission_plan, scopes, control.boundary, side_falls_through, arm_indent, place_aliases);
+        try emitLoopBoundaryArm(output, allocator, program, emission_plan, scopes, control.boundary, side_falls_through, control.exit_via_flag, arm_indent, place_aliases);
     } else {
         try emitLoopBoundaryBody(output, allocator, program, emission_plan, scopes, control, body_exit, region.continue_target, arm_indent, place_aliases);
     }
@@ -3977,6 +3983,7 @@ fn emitLoopBoundaryArmImpl(
     scopes: *const emission_scope.Plan,
     boundary: structure.LoopBoundary,
     side_falls_through: bool,
+    exit_via_flag: bool,
     indent: []const u8,
     place_aliases: []const PlaceAlias,
 ) !void {
@@ -4018,6 +4025,9 @@ fn emitLoopBoundaryArmImpl(
             try emitEdgeParametersUnlessConsumed(output, allocator, program, emission_plan, scopes, entry, side_exit.entry_edge.arguments, indent, true, place_aliases);
             try emitRegion(output, allocator, program, emission_plan, scopes, side_exit.region, indent, place_aliases);
             if (!regionAlwaysFunctionTerminates(program, side_exit.region)) {
+                // A side exit whose `break` a transfer wrapper would capture leaves by the loop exit's flag, which each
+                // wrapper on the way forwards to the loop (`structure.markFlaggedContinues`).
+                if (exit_via_flag) try emitEscapeFlagSet(output, allocator, program, emission_plan, side_exit.region.stop.?, indent);
                 try emitBreakStatement(output, allocator, indent);
             }
         },
@@ -4081,6 +4091,7 @@ fn emitLoopBoundaryArm(
     scopes: *const emission_scope.Plan,
     boundary: structure.LoopBoundary,
     side_falls_through: bool,
+    exit_via_flag: bool,
     indent: []const u8,
     place_aliases: []const PlaceAlias,
 ) !void {
@@ -4092,6 +4103,7 @@ fn emitLoopBoundaryArm(
         scopes,
         boundary,
         side_falls_through,
+        exit_via_flag,
         indent,
         place_aliases,
     );
@@ -4775,7 +4787,7 @@ test "a side region declares no flag of the side target its arm sets after it" {
     // so the set reaches the flag of the region or loop that owns the side target.
     var sets_after: std.ArrayList(u8) = .empty;
     defer sets_after.deinit(allocator);
-    try emitLoopBoundaryArmImpl(&sets_after, allocator, &program, &plan, &scopes, boundary, false, "    ", &.{});
+    try emitLoopBoundaryArmImpl(&sets_after, allocator, &program, &plan, &scopes, boundary, false, false, "    ", &.{});
     try std.testing.expectEqualStrings(
         wrapped_side_region ++
             "    if not __lifter_escape_3 then\n" ++
@@ -4791,7 +4803,7 @@ test "a side region declares no flag of the side target its arm sets after it" {
     // wrapper declares no flag of that name either: nothing in its text sets it.
     var falls_through: std.ArrayList(u8) = .empty;
     defer falls_through.deinit(allocator);
-    try emitLoopBoundaryArmImpl(&falls_through, allocator, &program, &plan, &scopes, boundary, true, "    ", &.{});
+    try emitLoopBoundaryArmImpl(&falls_through, allocator, &program, &plan, &scopes, boundary, true, false, "    ", &.{});
     try std.testing.expectEqualStrings(wrapped_side_region, falls_through.items);
 }
 

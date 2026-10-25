@@ -1367,6 +1367,176 @@ function SourceRuntimeOracle.run(caseName: string, source: string, exported: any
 			type(items) == "table" and #items == 300 and items[1] == 5 and items[254] == 258 and items[300] == 304,
 			"a constructor with 300 computed items changed its items"
 		)
+	elseif
+		caseName == "source-frontend-nested-continue-side-exit-generic"
+		or caseName == "source-frontend-nested-continue-side-exit-while"
+		or caseName == "source-frontend-nested-continue-side-exit-numeric"
+		or caseName == "source-frontend-nested-continue-side-exit-elseif"
+		or caseName == "source-frontend-nested-continue-side-exit-nested-break"
+	then
+		-- The worker against a copy of its source function over the rows of the wrapped-local-continue case (n 0..4,
+		-- m 0..2, 32 masks for f, 4 for g and 8 for the values observe returns): the result and the order of the callback
+		-- calls must match. Each loop holds a `continue` two `if`s deep and a later `break` that leaves the loop from
+		-- inside the transfer wrapper the `continue` puts around the loop body; the generic shape enters its loop again on
+		-- the outer loop's second pass, so a flag that carries the `break` must start false on each entry. A run that makes
+		-- more than 400 callback calls stops with the error "call cap".
+		local function generic(n: number, m: number, marker: any, f: any, g: any, observe: any): any
+			local items: { number } = {}
+			for k = 1, n do
+				items[k] = k
+			end
+			local total = 0
+			for pass = 1, 2 do
+				for i, v in ipairs(items) do
+					if f(v) then
+						if g(v) then
+							continue
+						end
+						observe(v)
+					end
+					if f(v, pass) then
+						observe(300 + pass)
+						break
+					end
+					total += i
+				end
+				observe(100 + pass)
+			end
+			return if m < total then total else marker
+		end
+		local function whileLoop(n: number, m: number, marker: any, f: any, g: any, observe: any): any
+			local i = 0
+			while i < n do
+				i += 1
+				if f(i) then
+					if g(i) then
+						continue
+					end
+					observe(i)
+				end
+				if f(i, 1) then
+					break
+				end
+				observe(100)
+			end
+			return if m < i then i else marker
+		end
+		local function numeric(n: number, m: number, marker: any, f: any, g: any, observe: any): any
+			local acc = 0
+			for i = 1, n do
+				if f(i) then
+					if g(i) then
+						continue
+					end
+					acc += i
+				end
+				if f(i, 1) then
+					observe(300)
+					break
+				end
+				observe(100)
+			end
+			return if m < acc then acc else marker
+		end
+		local function elseifContinue(n: number, m: number, marker: any, f: any, g: any, observe: any): any
+			local acc = 0
+			for i = 1, n do
+				if f(i) then
+					acc += i
+				elseif g(i) then
+					continue
+				end
+				if f(i, 1) then
+					observe(300)
+					break
+				end
+				observe(100)
+			end
+			return if m < acc then acc else marker
+		end
+		local function nestedBreak(n: number, m: number, marker: any, f: any, g: any, observe: any): any
+			local acc = 0
+			for i = 1, n do
+				if f(i) then
+					if g(i) then
+						continue
+					end
+					acc += i
+				end
+				if f(i, 1) then
+					if acc > m then
+						observe(300)
+						break
+					end
+					acc += 1
+				end
+				observe(100)
+			end
+			return if m < acc then acc else marker
+		end
+		local references: { [string]: any } = {
+			["source-frontend-nested-continue-side-exit-generic"] = generic,
+			["source-frontend-nested-continue-side-exit-while"] = whileLoop,
+			["source-frontend-nested-continue-side-exit-numeric"] = numeric,
+			["source-frontend-nested-continue-side-exit-elseif"] = elseifContinue,
+			["source-frontend-nested-continue-side-exit-nested-break"] = nestedBreak,
+		}
+		local reference = references[caseName]
+		local function bit(mask: number, index: number): boolean
+			return bit32.band(mask, bit32.lshift(1, index)) ~= 0
+		end
+		local function runRow(worker: any, n: number, m: number, maskF: number, maskG: number, maskO: number): (string, string)
+			local log: { string } = {}
+			local calls = 0
+			local function tick(entry: string)
+				calls += 1
+				if calls > 400 then
+					error("call cap", 0)
+				end
+				table.insert(log, entry)
+			end
+			local function f(a: number, b: number?): boolean
+				tick(string.format("f(%s,%s)", tostring(a), tostring(b)))
+				if a > 5 then
+					return false
+				end
+				return bit(maskF, (a + (b or 0)) % 5)
+			end
+			local function g(a: number): boolean
+				tick(string.format("g(%s)", tostring(a)))
+				return bit(maskG, a % 2)
+			end
+			local function observe(value: number): boolean
+				tick(string.format("o(%s)", tostring(value)))
+				return bit(maskO, value % 3)
+			end
+			local ok, result = pcall(worker, n, m, "marker", f, g, observe)
+			local outcome = if ok then "ok:" .. tostring(result) else "err:" .. string.gsub(tostring(result), "^.-:%d+: ", "")
+			local shown = if #log <= 12 then table.concat(log, " ") else table.concat(log, " ", 1, 12) .. ` ... ({#log} calls)`
+			return outcome .. " [" .. table.concat(log, " ") .. "]", outcome .. " [" .. shown .. "]"
+		end
+		local rows, mismatches = 0, 0
+		local first = ""
+		for n = 0, 4 do
+			for m = 0, 2 do
+				for maskF = 0, 31 do
+					for maskG = 0, 3 do
+						for maskO = 0, 7 do
+							local expected, expectedShown = runRow(reference, n, m, maskF, maskG, maskO)
+							local actual, actualShown = runRow(exported, n, m, maskF, maskG, maskO)
+							rows += 1
+							if expected ~= actual then
+								mismatches += 1
+								if first == "" then
+									first = `n={n} m={m} maskF={maskF} maskG={maskG} maskO={maskO} expected={expectedShown} got={actualShown}`
+								end
+							end
+						end
+					end
+				end
+			end
+		end
+		assert(mismatches == 0, `{caseName}: {mismatches} of {rows} rows differ from the source; first {first}`)
 	else
 		return false
 	end
