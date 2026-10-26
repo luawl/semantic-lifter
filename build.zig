@@ -2153,6 +2153,7 @@ pub fn build(b: *std.Build) void {
     conformance_step.dependOn(&compile_check_positive.step);
     conformance_step.dependOn(&compile_check_rejection.step);
     conformance_step.dependOn(&compile_check_preserved_output.step);
+    addCompileGateLevelConformance(b, exe, z3_enabled, z3_bin, conformance_step, absolute_conformance.resolved_ir, rejection_output);
     conformance_step.dependOn(&legacy_unchecked_rejection.step);
     conformance_step.dependOn(&legacy_unchecked_preserved_output.step);
     conformance_step.dependOn(&resolve_refusal_audit.step);
@@ -3563,6 +3564,100 @@ fn addAutomaticRuntimeCaseConformance(
 // An emission that must be refused with a typed line, in the dispatcher-budget refusal form
 // (`addDispatcherLocalBudgetConformance`): the emitter writes no output, so the output argument is
 // an empty seed file, and the step expects exit 1 and each of the given lines on stderr, the typed line first.
+// The publication gate compiles the staged text at the compiler's default level, then at -O0, and publishes it only
+// when both accept; a refusal names the level that rejected. The level-named sibling of the rejection arm passes the
+// lifter itself as the compiler, so the default level rejects first. Two admitted sources whose structured text needs
+// one register more at -O0 than at the default level (a loop head's constant, a storage slot's key) are refused at
+// -O0, each beside a twin one parameter smaller that is published and compiles at -O0; the 250-argument call is the
+// boundary both levels accept.
+fn addCompileGateLevelConformance(
+    b: *std.Build,
+    exe: *std.Build.Step.Compile,
+    z3_enabled: bool,
+    z3_bin: []const u8,
+    conformance_step: *std.Build.Step,
+    absolute_resolved_ir: std.Build.LazyPath,
+    rejection_output: std.Build.LazyPath,
+) void {
+    const engine: []const u8 = if (z3_enabled) "z3" else "internal";
+    const sibling = b.addRunArtifact(exe);
+    if (z3_enabled) sibling.addPathDir(b.pathFromRoot(z3_bin));
+    sibling.addArg("emit-luau-solved-checked");
+    sibling.addFileArg(absolute_resolved_ir);
+    sibling.addFileArg(rejection_output);
+    sibling.addArg(engine);
+    sibling.addArg("standard-luau");
+    sibling.addArtifactArg(exe);
+    sibling.expectExitCode(1);
+    sibling.expectStdErrMatch("diagnostic=luau_compile_check_failed entity=null");
+    sibling.expectStdErrMatch("reason=compiler_rejected");
+    sibling.expectStdErrMatch("  level=default");
+    conformance_step.dependOn(&sibling.step);
+
+    for ([_][2][]const u8{
+        .{ "luau/fixtures/compile_gate_level_250_source.luau", "compile-gate-level-250" },
+        .{ "luau/fixtures/compile_gate_level_while_head_168_source.luau", "compile-gate-level-while-head-168" },
+        .{ "luau/fixtures/compile_gate_level_store_168_source.luau", "compile-gate-level-store-168" },
+    }) |control| {
+        const input_ir = addLuauSourceIr(b, control[0], null, control[1]);
+        const resolve = b.addRunArtifact(exe);
+        if (z3_enabled) resolve.addPathDir(b.pathFromRoot(z3_bin));
+        resolve.addArg("resolve-ir");
+        resolve.addFileArg(input_ir);
+        const resolved_ir = resolve.addOutputFileArg(b.fmt("{s}.resolved.lifter-ir.json", .{control[1]}));
+        resolve.addArg(engine);
+        const emit = b.addRunArtifact(exe);
+        if (z3_enabled) emit.addPathDir(b.pathFromRoot(z3_bin));
+        emit.addArg("emit-luau-solved");
+        emit.addFileArg(resolved_ir);
+        const published = emit.addOutputFileArg(b.fmt("{s}.published.luau", .{control[1]}));
+        emit.addArg(engine);
+        emit.addArg("standard-luau");
+        emit.addFileArg(.{ .cwd_relative = luauCompileExe(b) });
+        emit.expectExitCode(0);
+        const compile = b.addSystemCommand(&.{ luauCompileExe(b), "--null", "-O0" });
+        compile.addFileArg(published);
+        compile.expectExitCode(0);
+        conformance_step.dependOn(&compile.step);
+    }
+
+    for ([_][2][]const u8{
+        .{ "luau/fixtures/compile_gate_level_while_head_source.luau", "compile-gate-level-while-head" },
+        .{ "luau/fixtures/compile_gate_level_store_source.luau", "compile-gate-level-store" },
+    }) |refused| {
+        const input_ir = addLuauSourceIr(b, refused[0], null, refused[1]);
+        const resolve = b.addRunArtifact(exe);
+        if (z3_enabled) resolve.addPathDir(b.pathFromRoot(z3_bin));
+        resolve.addArg("resolve-ir");
+        resolve.addFileArg(input_ir);
+        const resolved_ir = resolve.addOutputFileArg(b.fmt("{s}.resolved.lifter-ir.json", .{refused[1]}));
+        resolve.addArg(engine);
+        const validate = b.addRunArtifact(exe);
+        if (z3_enabled) validate.addPathDir(b.pathFromRoot(z3_bin));
+        validate.addArg("validate");
+        validate.addFileArg(resolved_ir);
+        validate.addArg("readable-luau");
+        validate.expectExitCode(0);
+        const seed_files = b.addWriteFiles();
+        const seed = seed_files.add(b.fmt("{s}.unpublished.luau", .{refused[1]}), "");
+        const emit = b.addRunArtifact(exe);
+        if (z3_enabled) emit.addPathDir(b.pathFromRoot(z3_bin));
+        emit.addArg("emit-luau-solved");
+        emit.addFileArg(resolved_ir);
+        emit.addFileArg(seed);
+        emit.addArg(engine);
+        emit.addArg("standard-luau");
+        emit.addFileArg(.{ .cwd_relative = luauCompileExe(b) });
+        emit.expectExitCode(1);
+        emit.expectStdErrMatch("diagnostic=luau_compile_check_failed entity=null");
+        emit.expectStdErrMatch("reason=compiler_rejected");
+        emit.expectStdErrMatch("  level=O0");
+        emit.expectStdErrMatch("exceeded limit 255");
+        conformance_step.dependOn(&validate.step);
+        conformance_step.dependOn(&emit.step);
+    }
+}
+
 fn addEmitRefusalConformance(
     b: *std.Build,
     exe: *std.Build.Step.Compile,

@@ -48,7 +48,7 @@ flowchart LR
         G3 --> G4["normalization<br/>normalize-ir"]
         G4 --> G5["structuring<br/>(the planner)"]
         G5 --> G6["emission<br/>emit-luau"]
-        G6 --> G7["compile check<br/>luau-compile<br/>--null"]
+        G6 --> G7["compile check<br/>luau-compile --null<br/>default level, then -O0"]
         G7 --> P[["published Luau"]]
         G4 -.->|refuse| T["typed diagnostic<br/>code + entity"]
         G1 -.->|refuse| T

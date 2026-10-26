@@ -11,7 +11,7 @@ The repository ships the backend, a source frontend (Luau source to IR) and a co
 1. **Admission.** The `core` profile validates the frontend's handoff.
 2. **Checked resolution.** Proof queries run over the evidence; only proved facts change the program, as replayable rewrites of the control-flow graph. An internal engine answers the queries, and an optional Z3 backend is a build option ([Requirements](usage.md#requirements)). The `readable-luau` profile then admits the resolved program for emission.
 3. **Structuring.** Loops and branches are rebuilt from the control-flow graph; irreducible control is handled by guarded node splitting within a growth budget.
-4. **Emission.** Readable Luau is written in one of two output forms and published only after `luau-compile` accepts it.
+4. **Emission.** Readable Luau is written in one of two output forms and published only after `luau-compile` accepts it at its default optimisation level and at `-O0`.
 
 The full walkthrough is in [How Semantic-Lifter works](design.md).
 
@@ -21,7 +21,7 @@ The full walkthrough is in [How Semantic-Lifter works](design.md).
 - **Checked resolution**: only proved facts change the program, as replayable CFG rewrites; internal engine, optional [Z3 backend](usage.md#requirements).
 - **Restructuring**: `if`, `while`, `break`, `continue`, native numeric and generic `for`; guarded node splitting, within a growth budget, for irreducible control.
 - **Compiler-limit admission**: 200 live locals, 255 registers, 200 upvalues per nested function, jump budget, syntax depth, child prototypes.
-- **Compile-gated output**: `standard-luau` or `direct-locals-luau`, published only after `luau-compile` accepts it.
+- **Compile-gated output**: `standard-luau` or `direct-locals-luau`, published only after `luau-compile` accepts it at its default optimisation level and at `-O0`.
 - **Source frontend**: declarations, plain and compound assignment, `if`, `while`, `repeat`, both `for` forms, `break`, `continue`, open returns, closures, varargs, tables, method calls, string interpolation, `and`/`or` and `if` expressions.
 - **Compiler-disassembly frontend**: lifts a selected function from a `luau-compile --text` listing; the caller declares its signature.
 - **Tests**: over 850 unit tests and over 600 conformance steps; 66 fixture files, 29 conformance scripts, 10 audits, 7 oracles; emitted programs are compiled and run.

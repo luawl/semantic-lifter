@@ -33,6 +33,16 @@ const Runner = struct {
         source_path: []const u8,
         diagnostic_source_path: []const u8,
     ) anyerror!luau_compile_check.Result,
+    /// Compiles at a named level when set (the real compiler); a runner without it runs `run_fn` once per level.
+    run_level_fn: ?*const fn (
+        context: ?*anyopaque,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        compiler_path: []const u8,
+        source_path: []const u8,
+        diagnostic_source_path: []const u8,
+        level: luau_compile_check.Level,
+    ) anyerror!luau_compile_check.Result = null,
 
     fn run(
         self: Runner,
@@ -41,7 +51,11 @@ const Runner = struct {
         compiler_path: []const u8,
         source_path: []const u8,
         diagnostic_source_path: []const u8,
+        level: luau_compile_check.Level,
     ) !luau_compile_check.Result {
+        if (self.run_level_fn) |run_level| {
+            return run_level(self.context, allocator, io, compiler_path, source_path, diagnostic_source_path, level);
+        }
         return self.run_fn(self.context, allocator, io, compiler_path, source_path, diagnostic_source_path);
     }
 };
@@ -53,7 +67,7 @@ pub fn publish(
     compiler_path: []const u8,
     source: []const u8,
 ) Outcome {
-    return publishWithRunner(allocator, io, output_path, compiler_path, source, .{ .run_fn = runCompiler });
+    return publishWithRunner(allocator, io, output_path, compiler_path, source, .{ .run_fn = runCompiler, .run_level_fn = runCompilerAtLevel });
 }
 
 fn publishWithRunner(
@@ -70,13 +84,17 @@ fn publishWithRunner(
     defer allocator.free(staging_path);
     defer std.Io.Dir.cwd().deleteFile(io, staging_path) catch {};
 
-    var result = runner.run(allocator, io, compiler_path, staging_path, output_path) catch |err| {
-        return .{ .compiler_process_error = err };
-    };
-    switch (luau_compile_check.classifyTerm(result.term)) {
-        .compiler_rejected => return .{ .compiler_rejected = result },
-        .compiler_terminated => return .{ .compiler_terminated = result },
-        .success => result.deinit(),
+    // The default level first, then -O0: a text either level rejects is never published.
+    for ([_]luau_compile_check.Level{ .default, .O0 }) |level| {
+        var result = runner.run(allocator, io, compiler_path, staging_path, output_path, level) catch |err| {
+            return .{ .compiler_process_error = err };
+        };
+        result.level = level;
+        switch (luau_compile_check.classifyTerm(result.term)) {
+            .compiler_rejected => return .{ .compiler_rejected = result },
+            .compiler_terminated => return .{ .compiler_terminated = result },
+            .success => result.deinit(),
+        }
     }
 
     std.Io.Dir.cwd().rename(staging_path, std.Io.Dir.cwd(), output_path, io) catch |err| {
@@ -93,7 +111,19 @@ fn runCompiler(
     source_path: []const u8,
     diagnostic_source_path: []const u8,
 ) !luau_compile_check.Result {
-    return luau_compile_check.run(allocator, io, compiler_path, source_path, diagnostic_source_path);
+    return luau_compile_check.run(allocator, io, compiler_path, source_path, diagnostic_source_path, .default);
+}
+
+fn runCompilerAtLevel(
+    _: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    compiler_path: []const u8,
+    source_path: []const u8,
+    diagnostic_source_path: []const u8,
+    level: luau_compile_check.Level,
+) !luau_compile_check.Result {
+    return luau_compile_check.run(allocator, io, compiler_path, source_path, diagnostic_source_path, level);
 }
 
 fn writeFileWithOptions(
@@ -289,5 +319,65 @@ test "checked publication types staging and publication failures" {
     var publication_failure = publishWithRunner(allocator, std.testing.io, directory_path, "fake", "source", .{ .run_fn = acceptCompiler });
     defer publication_failure.deinit();
     try std.testing.expect(publication_failure == .publication_error);
+    try expectNoStagedFiles(&temp);
+}
+
+const LevelVerdicts = struct {
+    exit_codes: []const u8,
+    calls: usize = 0,
+};
+
+fn levelCountingCompiler(
+    context: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    _: std.Io,
+    _: []const u8,
+    _: []const u8,
+    _: []const u8,
+) !luau_compile_check.Result {
+    const verdicts: *LevelVerdicts = @ptrCast(@alignCast(context.?));
+    const exit_code = verdicts.exit_codes[verdicts.calls];
+    verdicts.calls += 1;
+    const stderr_text: []const u8 = if (exit_code == 0) "" else "rejected";
+    return fakeResult(allocator, .{ .exited = exit_code }, stderr_text);
+}
+
+test "checked publication compiles at the default level and at -O0" {
+    const allocator = std.testing.allocator;
+    var temp = std.testing.tmpDir(.{ .iterate = true });
+    defer temp.cleanup();
+    const output_path = try tempChildPathAlloc(allocator, &temp, "checked.luau");
+    defer allocator.free(output_path);
+
+    var both = LevelVerdicts{ .exit_codes = &.{ 0, 0 } };
+    var accepted = publishWithRunner(allocator, std.testing.io, output_path, "fake", "accepted", .{ .context = &both, .run_fn = levelCountingCompiler });
+    defer accepted.deinit();
+    try std.testing.expect(accepted.succeeded());
+    try std.testing.expectEqual(@as(usize, 2), both.calls);
+    const accepted_source = try readTempOutputAlloc(allocator, &temp);
+    defer allocator.free(accepted_source);
+    try std.testing.expectEqualStrings("accepted", accepted_source);
+    try expectNoStagedFiles(&temp);
+
+    var o0_rejects = LevelVerdicts{ .exit_codes = &.{ 0, 1 } };
+    var rejected_at_o0 = publishWithRunner(allocator, std.testing.io, output_path, "fake", "o0 rejected", .{ .context = &o0_rejects, .run_fn = levelCountingCompiler });
+    defer rejected_at_o0.deinit();
+    try std.testing.expect(rejected_at_o0 == .compiler_rejected);
+    try std.testing.expectEqual(luau_compile_check.Level.O0, rejected_at_o0.compiler_rejected.level);
+    try std.testing.expectEqual(@as(usize, 2), o0_rejects.calls);
+    const preserved_after_o0 = try readTempOutputAlloc(allocator, &temp);
+    defer allocator.free(preserved_after_o0);
+    try std.testing.expectEqualStrings("accepted", preserved_after_o0);
+    try expectNoStagedFiles(&temp);
+
+    var default_rejects = LevelVerdicts{ .exit_codes = &.{ 1, 0 } };
+    var rejected_at_default = publishWithRunner(allocator, std.testing.io, output_path, "fake", "default rejected", .{ .context = &default_rejects, .run_fn = levelCountingCompiler });
+    defer rejected_at_default.deinit();
+    try std.testing.expect(rejected_at_default == .compiler_rejected);
+    try std.testing.expectEqual(luau_compile_check.Level.default, rejected_at_default.compiler_rejected.level);
+    try std.testing.expectEqual(@as(usize, 1), default_rejects.calls);
+    const preserved_after_default = try readTempOutputAlloc(allocator, &temp);
+    defer allocator.free(preserved_after_default);
+    try std.testing.expectEqualStrings("accepted", preserved_after_default);
     try expectNoStagedFiles(&temp);
 }

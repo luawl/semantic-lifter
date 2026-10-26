@@ -324,6 +324,7 @@ fn printCompilerTermination(term: std.process.Child.Term) void {
 fn printCompilerFailure(reason: []const u8, result: lifter.luau_compile_check.Result) void {
     std.debug.print("diagnostic=luau_compile_check_failed entity=null\n", .{});
     std.debug.print("  reason={s}\n", .{reason});
+    std.debug.print("  level={s}\n", .{@tagName(result.level)});
     printCompilerTermination(result.term);
     std.debug.print("  stdout_bytes={d} stdout=\"{f}\"\n", .{ result.stdout.len, std.zig.fmtString(result.stdout) });
     std.debug.print("  stderr_bytes={d} stderr=\"{f}\"\n", .{ result.stderr.len, std.zig.fmtString(result.stderr) });

@@ -8,6 +8,8 @@ pub const Result = struct {
     term: std.process.Child.Term,
     stdout: []u8,
     stderr: []u8,
+    /// The optimisation level the compile ran at; a refusal of the publication gate names it.
+    level: Level = .default,
 
     pub fn deinit(self: *Result) void {
         self.allocator.free(self.stderr);
@@ -26,15 +28,40 @@ pub const Termination = enum {
     compiler_terminated,
 };
 
+/// The optimisation levels the publication gate compiles at: the compiler's default level, then -O0.
+pub const Level = enum {
+    default,
+    O0,
+};
+
+/// The compiler argv for one level, held by value so the slice never outlives its array.
+pub const GateArgv = struct {
+    items: [4][]const u8,
+    len: usize,
+
+    pub fn slice(self: *const GateArgv) []const []const u8 {
+        return self.items[0..self.len];
+    }
+};
+
+pub fn gateArgv(compiler_path: []const u8, source_path: []const u8, level: Level) GateArgv {
+    return switch (level) {
+        .default => .{ .items = .{ compiler_path, "--null", source_path, "" }, .len = 3 },
+        .O0 => .{ .items = .{ compiler_path, "--null", "-O0", source_path }, .len = 4 },
+    };
+}
+
 pub fn run(
     allocator: std.mem.Allocator,
     io: std.Io,
     compiler_path: []const u8,
     source_path: []const u8,
     diagnostic_source_path: []const u8,
+    level: Level,
 ) !Result {
+    const argv = gateArgv(compiler_path, source_path, level);
     const process_result = try std.process.run(allocator, io, .{
-        .argv = &.{ compiler_path, "--null", source_path },
+        .argv = argv.slice(),
         .stdout_limit = .limited(max_output_bytes),
         .stderr_limit = .limited(max_output_bytes),
         .timeout = .{ .duration = .{
@@ -52,6 +79,7 @@ pub fn run(
         .term = process_result.term,
         .stdout = stdout,
         .stderr = stderr,
+        .level = level,
     };
 }
 
@@ -110,4 +138,21 @@ test "compile checking normalizes staged source paths in diagnostics" {
     const normalized = try normalizeSourcePathAlloc(allocator, compiler_output, staged_path, output_path);
     defer allocator.free(normalized);
     try std.testing.expectEqualStrings(expected, normalized);
+}
+
+test "the gate argv names the optimisation level" {
+    const default_argv = gateArgv("luau-compile", "staged.luau", .default);
+    const default_items = default_argv.slice();
+    try std.testing.expectEqual(@as(usize, 3), default_items.len);
+    try std.testing.expectEqualStrings("luau-compile", default_items[0]);
+    try std.testing.expectEqualStrings("--null", default_items[1]);
+    try std.testing.expectEqualStrings("staged.luau", default_items[2]);
+
+    const o0_argv = gateArgv("luau-compile", "staged.luau", .O0);
+    const o0_items = o0_argv.slice();
+    try std.testing.expectEqual(@as(usize, 4), o0_items.len);
+    try std.testing.expectEqualStrings("luau-compile", o0_items[0]);
+    try std.testing.expectEqualStrings("--null", o0_items[1]);
+    try std.testing.expectEqualStrings("-O0", o0_items[2]);
+    try std.testing.expectEqualStrings("staged.luau", o0_items[3]);
 }
