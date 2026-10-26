@@ -64,7 +64,7 @@ fn evaluateDepth(program: *const ir.Program, term_id: ir.SolverTermId, depth: us
         else
             .{ .unknown = {} },
         .boolean_literal => |value| .{ .boolean = value },
-        .integer_literal => |value| parseInteger(value),
+        .integer_literal => |value| exactLuauIntegerConstant(parseInteger(value)),
         .real_literal => |value| parseReal(value),
         .bit_vector_literal => |value| parseBitVector(value),
         .logical_not => |operand| switch (evaluateDepth(program, operand, depth + 1)) {

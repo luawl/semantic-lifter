@@ -260,6 +260,72 @@ test "model replay checks exact normalized runtime values" {
     try std.testing.expectEqual(solver_model.Replay.contradictory, try solver_model.replayAlloc(std.testing.allocator, &program, query, &changed));
 }
 
+test "model replay reads IR integers with Luau rounding" {
+    const two53 = ir.ValueId.fromIndex(0);
+    const one = ir.ValueId.fromIndex(1);
+    const wide = ir.ValueId.fromIndex(2);
+    const four503 = ir.ValueId.fromIndex(3);
+    const sum = ir.ValueId.fromIndex(4);
+    const sum2 = ir.ValueId.fromIndex(5);
+    const wide64 = ir.ValueId.fromIndex(6);
+    const two53_64 = ir.ValueId.fromIndex(7);
+    const unsigned64: ir.ValueType = .{ .kind = .integer, .bit_width = 64, .signed = false };
+    const values = [_]ir.Value{
+        .{ .id = two53, .function = ir.FunctionId.fromIndex(0), .type = .integer, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(0), .index = 0 } } },
+        .{ .id = one, .function = ir.FunctionId.fromIndex(0), .type = .integer, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(1), .index = 0 } } },
+        .{ .id = wide, .function = ir.FunctionId.fromIndex(0), .type = .integer, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(2), .index = 0 } } },
+        .{ .id = four503, .function = ir.FunctionId.fromIndex(0), .type = .integer, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(3), .index = 0 } } },
+        .{ .id = sum, .function = ir.FunctionId.fromIndex(0), .type = .integer, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(4), .index = 0 } } },
+        .{ .id = sum2, .function = ir.FunctionId.fromIndex(0), .type = .integer, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(5), .index = 0 } } },
+        .{ .id = wide64, .function = ir.FunctionId.fromIndex(0), .type = unsigned64, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(6), .index = 0 } } },
+        .{ .id = two53_64, .function = ir.FunctionId.fromIndex(0), .type = unsigned64, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(7), .index = 0 } } },
+    };
+    const instructions = [_]ir.Instruction{
+        .{ .id = ir.InstructionId.fromIndex(0), .block = ir.BlockId.fromIndex(0), .operation = .{ .constant = .{ .integer = "9007199254740992" } }, .results = &.{two53}, .effects = .pure },
+        .{ .id = ir.InstructionId.fromIndex(1), .block = ir.BlockId.fromIndex(0), .operation = .{ .constant = .{ .integer = "1" } }, .results = &.{one}, .effects = .pure },
+        .{ .id = ir.InstructionId.fromIndex(2), .block = ir.BlockId.fromIndex(0), .operation = .{ .constant = .{ .integer = "9007199254740993" } }, .results = &.{wide}, .effects = .pure },
+        .{ .id = ir.InstructionId.fromIndex(3), .block = ir.BlockId.fromIndex(0), .operation = .{ .constant = .{ .integer = "4503599627370496" } }, .results = &.{four503}, .effects = .pure },
+        .{ .id = ir.InstructionId.fromIndex(4), .block = ir.BlockId.fromIndex(0), .operation = .{ .binary = .{ .operator = .add, .left = two53, .right = one } }, .results = &.{sum}, .effects = .pure },
+        .{ .id = ir.InstructionId.fromIndex(5), .block = ir.BlockId.fromIndex(0), .operation = .{ .binary = .{ .operator = .add, .left = four503, .right = one } }, .results = &.{sum2}, .effects = .pure },
+        .{ .id = ir.InstructionId.fromIndex(6), .block = ir.BlockId.fromIndex(0), .operation = .{ .constant = .{ .integer = "9007199254740993" } }, .results = &.{wide64}, .effects = .pure },
+        .{ .id = ir.InstructionId.fromIndex(7), .block = ir.BlockId.fromIndex(0), .operation = .{ .constant = .{ .integer = "9007199254740992" } }, .results = &.{two53_64}, .effects = .pure },
+    };
+    const integer: ir.SolverSort = .{ .kind = .integer };
+    const boolean: ir.SolverSort = .{ .kind = .boolean };
+    const bit_vector64: ir.SolverSort = .{ .kind = .bit_vector, .bit_width = 64 };
+    const terms = [_]ir.SolverTerm{
+        .{ .id = ir.SolverTermId.fromIndex(0), .sort = integer, .operation = .{ .value = two53 } },
+        .{ .id = ir.SolverTermId.fromIndex(1), .sort = integer, .operation = .{ .value = sum } },
+        .{ .id = ir.SolverTermId.fromIndex(2), .sort = boolean, .operation = .{ .binary = .{ .operator = .less, .left = ir.SolverTermId.fromIndex(0), .right = ir.SolverTermId.fromIndex(1) } } },
+        .{ .id = ir.SolverTermId.fromIndex(3), .sort = integer, .operation = .{ .value = wide } },
+        .{ .id = ir.SolverTermId.fromIndex(4), .sort = boolean, .operation = .{ .binary = .{ .operator = .not_equal, .left = ir.SolverTermId.fromIndex(3), .right = ir.SolverTermId.fromIndex(0) } } },
+        .{ .id = ir.SolverTermId.fromIndex(5), .sort = bit_vector64, .operation = .{ .value = wide64 } },
+        .{ .id = ir.SolverTermId.fromIndex(6), .sort = bit_vector64, .operation = .{ .value = two53_64 } },
+        .{ .id = ir.SolverTermId.fromIndex(7), .sort = boolean, .operation = .{ .binary = .{ .operator = .not_equal, .left = ir.SolverTermId.fromIndex(5), .right = ir.SolverTermId.fromIndex(6) } } },
+        .{ .id = ir.SolverTermId.fromIndex(8), .sort = integer, .operation = .{ .value = four503 } },
+        .{ .id = ir.SolverTermId.fromIndex(9), .sort = integer, .operation = .{ .value = sum2 } },
+        .{ .id = ir.SolverTermId.fromIndex(10), .sort = boolean, .operation = .{ .binary = .{ .operator = .less, .left = ir.SolverTermId.fromIndex(8), .right = ir.SolverTermId.fromIndex(9) } } },
+    };
+    const program: ir.Program = .{
+        .program_id = "model-replay-luau-integer-rounding",
+        .entry_function = ir.FunctionId.fromIndex(0),
+        .functions = &.{},
+        .blocks = &.{},
+        .instructions = &instructions,
+        .values = &values,
+        .solver_terms = &terms,
+    };
+    const sum_query: ir.SolverQuery = .{ .id = ir.QueryId.fromIndex(0), .kind = .find_model, .goal = ir.SolverTermId.fromIndex(2) };
+    const wide_query: ir.SolverQuery = .{ .id = ir.QueryId.fromIndex(1), .kind = .find_model, .goal = ir.SolverTermId.fromIndex(4) };
+    const bit_vector_query: ir.SolverQuery = .{ .id = ir.QueryId.fromIndex(2), .kind = .find_model, .goal = ir.SolverTermId.fromIndex(7) };
+    const control_query: ir.SolverQuery = .{ .id = ir.QueryId.fromIndex(3), .kind = .find_model, .goal = ir.SolverTermId.fromIndex(10) };
+
+    try std.testing.expect((try solver_model.replayAlloc(std.testing.allocator, &program, sum_query, &.{})) != solver_model.Replay.satisfied);
+    try std.testing.expect((try solver_model.replayAlloc(std.testing.allocator, &program, wide_query, &.{})) != solver_model.Replay.satisfied);
+    try std.testing.expect((try solver_model.replayAlloc(std.testing.allocator, &program, bit_vector_query, &.{})) != solver_model.Replay.satisfied);
+    try std.testing.expect((try solver_model.replayAlloc(std.testing.allocator, &program, control_query, &.{})) == solver_model.Replay.satisfied);
+}
+
 test "model replay authenticates exact concatenated string length" {
     const left = ir.ValueId.fromIndex(0);
     const right = ir.ValueId.fromIndex(1);

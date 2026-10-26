@@ -352,16 +352,55 @@ fn validPartialIntegerBinary(
         .floor_divide => switch (expression.operation) {
             .division => |division| division.mode == .integer_floor and
                 solver_equivalence.termRepresentsValue(program, division.left, binary.left) and
-                solver_equivalence.termRepresentsValue(program, division.right, binary.right),
+                solver_equivalence.termRepresentsValue(program, division.right, binary.right) and
+                luauExactFloorDivideOperands(program, division.left, division.right),
             else => false,
         },
         .modulo => switch (expression.operation) {
             .remainder => |remainder| remainder.mode == .integer_floor and
                 solver_equivalence.termRepresentsValue(program, remainder.left, binary.left) and
-                solver_equivalence.termRepresentsValue(program, remainder.right, binary.right),
+                solver_equivalence.termRepresentsValue(program, remainder.right, binary.right) and
+                luauExactModuloOperands(program, remainder.left, remainder.right),
             else => false,
         },
         else => false,
+    };
+}
+
+// Luau computes a % b as a - floor(a / b) * b in doubles; the exact floor remainder equals it when
+// |a| + |b| <= 2^53. A constant operand pair outside that range is refused.
+fn luauExactModuloOperands(program: *const ir.Program, left: ir.SolverTermId, right: ir.SolverTermId) bool {
+    const a = integerOperandMagnitude(program, left) orelse return true;
+    const b = integerOperandMagnitude(program, right) orelse return true;
+    return a <= luau_exact_integer_limit and b <= luau_exact_integer_limit and a + b <= luau_exact_integer_limit;
+}
+
+// Luau computes a // b as floor(a / b) in doubles; it equals the exact floor quotient when |a| <= 2^53 and
+// |b| <= 2^53 (2^53 // (2^53 + 1) is 1 in Luau, 0 exactly). A constant operand outside that range is refused.
+fn luauExactFloorDivideOperands(program: *const ir.Program, left: ir.SolverTermId, right: ir.SolverTermId) bool {
+    if (integerOperandMagnitude(program, left)) |a| {
+        if (a > luau_exact_integer_limit) return false;
+    }
+    if (integerOperandMagnitude(program, right)) |b| {
+        if (b > luau_exact_integer_limit) return false;
+    }
+    return true;
+}
+
+const luau_exact_integer_limit: u128 = 1 << 53;
+
+// The magnitude of an integer constant operand for the two guards above: a bare integer literal is read from its
+// text, since the internal walk reads a literal beyond 2^53 as unknown; any other operand through the internal
+// evaluator. Null when the operand is not a constant; a literal whose text is no i128 lies beyond every bound.
+fn integerOperandMagnitude(program: *const ir.Program, operand: ir.SolverTermId) ?u128 {
+    if (operand.index() >= program.solver_terms.len) return null;
+    switch (program.solver_terms[operand.index()].operation) {
+        .integer_literal => |text| return @abs(std.fmt.parseInt(i128, text, 10) catch return std.math.maxInt(u128)),
+        else => {},
+    }
+    return switch (solver.evaluate(program, operand)) {
+        .integer => |value| @as(u128, @abs(value)),
+        else => null,
     };
 }
 
@@ -557,6 +596,196 @@ test "partial integer value definitions replay operation identity and convention
     values[fixture.v_result.index()].type = .dynamic;
     program.values = &values;
     try std.testing.expect(!valid(&program, integer, definition));
+}
+
+test "partial integer definitions require the Luau exactness range" {
+    const a = ir.ValueId.fromIndex(0);
+    const b = ir.ValueId.fromIndex(1);
+    const r = ir.ValueId.fromIndex(2);
+    const values = [_]ir.Value{
+        .{ .id = a, .function = ir.FunctionId.fromIndex(0), .type = .integer, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(0), .index = 0 } } },
+        .{ .id = b, .function = ir.FunctionId.fromIndex(0), .type = .integer, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(1), .index = 0 } } },
+        .{ .id = r, .function = ir.FunctionId.fromIndex(0), .type = .integer, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(2), .index = 0 } } },
+    };
+    var instructions = [_]ir.Instruction{
+        .{ .id = ir.InstructionId.fromIndex(0), .block = ir.BlockId.fromIndex(0), .operation = .{ .constant = .{ .integer = "-9007199254740992" } }, .results = &.{a}, .effects = .pure },
+        .{ .id = ir.InstructionId.fromIndex(1), .block = ir.BlockId.fromIndex(0), .operation = .{ .constant = .{ .integer = "3" } }, .results = &.{b}, .effects = .pure },
+        .{ .id = ir.InstructionId.fromIndex(2), .block = ir.BlockId.fromIndex(0), .operation = .{ .binary = .{ .operator = .modulo, .left = a, .right = b } }, .results = &.{r}, .effects = .pure },
+    };
+    const integer: ir.SolverSort = .{ .kind = .integer };
+    const value_terms = [_]ir.SolverTerm{
+        .{ .id = ir.SolverTermId.fromIndex(0), .sort = integer, .operation = .{ .value = a } },
+        .{ .id = ir.SolverTermId.fromIndex(1), .sort = integer, .operation = .{ .value = b } },
+        .{ .id = ir.SolverTermId.fromIndex(2), .sort = .{ .kind = .boolean }, .operation = .{ .is_nonzero = ir.SolverTermId.fromIndex(1) } },
+        .{ .id = ir.SolverTermId.fromIndex(3), .sort = integer, .operation = .{ .remainder = .{
+            .mode = .integer_floor,
+            .left = ir.SolverTermId.fromIndex(0),
+            .right = ir.SolverTermId.fromIndex(1),
+            .defined_by = ir.SolverTermId.fromIndex(2),
+        } } },
+    };
+    var literal_terms = value_terms;
+    literal_terms[0].operation = .{ .integer_literal = "-9007199254740992" };
+    literal_terms[1].operation = .{ .integer_literal = "3" };
+    var program: ir.Program = .{
+        .program_id = "partial-integer-luau-exactness-range",
+        .entry_function = ir.FunctionId.fromIndex(0),
+        .functions = &.{},
+        .blocks = &.{},
+        .instructions = &instructions,
+        .values = &values,
+        .solver_terms = &value_terms,
+    };
+    const definition: ir.SolverValueDefinition = .{ .value = r, .expression = ir.SolverTermId.fromIndex(3) };
+
+    try std.testing.expect(!valid(&program, integer, definition));
+    program.solver_terms = &literal_terms;
+    try std.testing.expect(!valid(&program, integer, definition));
+
+    instructions[0].operation = .{ .constant = .{ .integer = "-9007199254740989" } };
+    literal_terms[0].operation = .{ .integer_literal = "-9007199254740989" };
+    program.solver_terms = &value_terms;
+    try std.testing.expect(valid(&program, integer, definition));
+    program.solver_terms = &literal_terms;
+    try std.testing.expect(valid(&program, integer, definition));
+}
+
+test "partial integer floor division requires a Luau-exact dividend" {
+    const a = ir.ValueId.fromIndex(0);
+    const b = ir.ValueId.fromIndex(1);
+    const q = ir.ValueId.fromIndex(2);
+    const values = [_]ir.Value{
+        .{ .id = a, .function = ir.FunctionId.fromIndex(0), .type = .integer, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(0), .index = 0 } } },
+        .{ .id = b, .function = ir.FunctionId.fromIndex(0), .type = .integer, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(1), .index = 0 } } },
+        .{ .id = q, .function = ir.FunctionId.fromIndex(0), .type = .integer, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(2), .index = 0 } } },
+    };
+    var instructions = [_]ir.Instruction{
+        .{ .id = ir.InstructionId.fromIndex(0), .block = ir.BlockId.fromIndex(0), .operation = .{ .constant = .{ .integer = "1152921504606846976" } }, .results = &.{a}, .effects = .pure },
+        .{ .id = ir.InstructionId.fromIndex(1), .block = ir.BlockId.fromIndex(0), .operation = .{ .constant = .{ .integer = "701" } }, .results = &.{b}, .effects = .pure },
+        .{ .id = ir.InstructionId.fromIndex(2), .block = ir.BlockId.fromIndex(0), .operation = .{ .binary = .{ .operator = .floor_divide, .left = a, .right = b } }, .results = &.{q}, .effects = .pure },
+    };
+    const integer: ir.SolverSort = .{ .kind = .integer };
+    var terms = [_]ir.SolverTerm{
+        .{ .id = ir.SolverTermId.fromIndex(0), .sort = integer, .operation = .{ .integer_literal = "1152921504606846976" } },
+        .{ .id = ir.SolverTermId.fromIndex(1), .sort = integer, .operation = .{ .integer_literal = "701" } },
+        .{ .id = ir.SolverTermId.fromIndex(2), .sort = .{ .kind = .boolean }, .operation = .{ .is_nonzero = ir.SolverTermId.fromIndex(1) } },
+        .{ .id = ir.SolverTermId.fromIndex(3), .sort = integer, .operation = .{ .division = .{
+            .mode = .integer_floor,
+            .left = ir.SolverTermId.fromIndex(0),
+            .right = ir.SolverTermId.fromIndex(1),
+            .defined_by = ir.SolverTermId.fromIndex(2),
+        } } },
+    };
+    const program: ir.Program = .{
+        .program_id = "partial-integer-floor-division-dividend",
+        .entry_function = ir.FunctionId.fromIndex(0),
+        .functions = &.{},
+        .blocks = &.{},
+        .instructions = &instructions,
+        .values = &values,
+        .solver_terms = &terms,
+    };
+    const definition: ir.SolverValueDefinition = .{ .value = q, .expression = ir.SolverTermId.fromIndex(3) };
+
+    try std.testing.expect(!valid(&program, integer, definition));
+
+    instructions[0].operation = .{ .constant = .{ .integer = "-9007199254740992" } };
+    instructions[1].operation = .{ .constant = .{ .integer = "3" } };
+    terms[0].operation = .{ .integer_literal = "-9007199254740992" };
+    terms[1].operation = .{ .integer_literal = "3" };
+    try std.testing.expect(valid(&program, integer, definition));
+}
+
+test "partial integer floor division requires a Luau-exact divisor" {
+    const a = ir.ValueId.fromIndex(0);
+    const b = ir.ValueId.fromIndex(1);
+    const q = ir.ValueId.fromIndex(2);
+    const values = [_]ir.Value{
+        .{ .id = a, .function = ir.FunctionId.fromIndex(0), .type = .integer, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(0), .index = 0 } } },
+        .{ .id = b, .function = ir.FunctionId.fromIndex(0), .type = .integer, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(1), .index = 0 } } },
+        .{ .id = q, .function = ir.FunctionId.fromIndex(0), .type = .integer, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(2), .index = 0 } } },
+    };
+    var instructions = [_]ir.Instruction{
+        .{ .id = ir.InstructionId.fromIndex(0), .block = ir.BlockId.fromIndex(0), .operation = .{ .constant = .{ .integer = "9007199254740992" } }, .results = &.{a}, .effects = .pure },
+        .{ .id = ir.InstructionId.fromIndex(1), .block = ir.BlockId.fromIndex(0), .operation = .{ .constant = .{ .integer = "9007199254740993" } }, .results = &.{b}, .effects = .pure },
+        .{ .id = ir.InstructionId.fromIndex(2), .block = ir.BlockId.fromIndex(0), .operation = .{ .binary = .{ .operator = .floor_divide, .left = a, .right = b } }, .results = &.{q}, .effects = .pure },
+    };
+    const integer: ir.SolverSort = .{ .kind = .integer };
+    var terms = [_]ir.SolverTerm{
+        .{ .id = ir.SolverTermId.fromIndex(0), .sort = integer, .operation = .{ .integer_literal = "9007199254740992" } },
+        .{ .id = ir.SolverTermId.fromIndex(1), .sort = integer, .operation = .{ .integer_literal = "9007199254740993" } },
+        .{ .id = ir.SolverTermId.fromIndex(2), .sort = .{ .kind = .boolean }, .operation = .{ .is_nonzero = ir.SolverTermId.fromIndex(1) } },
+        .{ .id = ir.SolverTermId.fromIndex(3), .sort = integer, .operation = .{ .division = .{
+            .mode = .integer_floor,
+            .left = ir.SolverTermId.fromIndex(0),
+            .right = ir.SolverTermId.fromIndex(1),
+            .defined_by = ir.SolverTermId.fromIndex(2),
+        } } },
+    };
+    const program: ir.Program = .{
+        .program_id = "partial-integer-floor-division-divisor",
+        .entry_function = ir.FunctionId.fromIndex(0),
+        .functions = &.{},
+        .blocks = &.{},
+        .instructions = &instructions,
+        .values = &values,
+        .solver_terms = &terms,
+    };
+    const definition: ir.SolverValueDefinition = .{ .value = q, .expression = ir.SolverTermId.fromIndex(3) };
+
+    try std.testing.expect(!valid(&program, integer, definition));
+
+    instructions[1].operation = .{ .constant = .{ .integer = "9007199254740992" } };
+    terms[1].operation = .{ .integer_literal = "9007199254740992" };
+    try std.testing.expect(valid(&program, integer, definition));
+}
+
+test "exact integer definitions over literals beyond 2^53 evaluate as unknown" {
+    const a = ir.ValueId.fromIndex(0);
+    const b = ir.ValueId.fromIndex(1);
+    const one = ir.ValueId.fromIndex(2);
+    const s = ir.ValueId.fromIndex(3);
+    const values = [_]ir.Value{
+        .{ .id = a, .function = ir.FunctionId.fromIndex(0), .type = .integer, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(0), .index = 0 } } },
+        .{ .id = b, .function = ir.FunctionId.fromIndex(0), .type = .integer, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(1), .index = 0 } } },
+        .{ .id = one, .function = ir.FunctionId.fromIndex(0), .type = .integer, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(2), .index = 0 } } },
+        .{ .id = s, .function = ir.FunctionId.fromIndex(0), .type = .integer, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(3), .index = 0 } } },
+    };
+    var instructions = [_]ir.Instruction{
+        .{ .id = ir.InstructionId.fromIndex(0), .block = ir.BlockId.fromIndex(0), .operation = .{ .constant = .{ .integer = "1152921504606846976" } }, .results = &.{a}, .effects = .pure },
+        .{ .id = ir.InstructionId.fromIndex(1), .block = ir.BlockId.fromIndex(0), .operation = .{ .constant = .{ .integer = "-1152921504606846975" } }, .results = &.{b}, .effects = .pure },
+        .{ .id = ir.InstructionId.fromIndex(2), .block = ir.BlockId.fromIndex(0), .operation = .{ .constant = .{ .integer = "1" } }, .results = &.{one}, .effects = .pure },
+        .{ .id = ir.InstructionId.fromIndex(3), .block = ir.BlockId.fromIndex(0), .operation = .{ .binary = .{ .operator = .add, .left = a, .right = b } }, .results = &.{s}, .effects = .pure },
+    };
+    const integer: ir.SolverSort = .{ .kind = .integer };
+    const definition: ir.SolverValueDefinition = .{ .value = s, .expression = ir.SolverTermId.fromIndex(2) };
+    var terms = [_]ir.SolverTerm{
+        .{ .id = ir.SolverTermId.fromIndex(0), .sort = integer, .operation = .{ .integer_literal = "1152921504606846976" } },
+        .{ .id = ir.SolverTermId.fromIndex(1), .sort = integer, .operation = .{ .integer_literal = "-1152921504606846975" } },
+        .{ .id = ir.SolverTermId.fromIndex(2), .sort = integer, .operation = .{ .binary = .{ .operator = .add, .left = ir.SolverTermId.fromIndex(0), .right = ir.SolverTermId.fromIndex(1) } } },
+        .{ .id = ir.SolverTermId.fromIndex(3), .sort = integer, .operation = .{ .value_definition = definition } },
+        .{ .id = ir.SolverTermId.fromIndex(4), .sort = integer, .operation = .{ .integer_literal = "1" } },
+        .{ .id = ir.SolverTermId.fromIndex(5), .sort = .{ .kind = .boolean }, .operation = .{ .binary = .{ .operator = .equal, .left = ir.SolverTermId.fromIndex(3), .right = ir.SolverTermId.fromIndex(4) } } },
+    };
+    const program: ir.Program = .{
+        .program_id = "exact-integer-definition-wide-literals",
+        .entry_function = ir.FunctionId.fromIndex(0),
+        .functions = &.{},
+        .blocks = &.{},
+        .instructions = &instructions,
+        .values = &values,
+        .solver_terms = &terms,
+    };
+
+    try std.testing.expect(valid(&program, integer, definition));
+    try std.testing.expect(!std.meta.eql(solver.evaluate(&program, ir.SolverTermId.fromIndex(3)), solver.Constant{ .integer = 1 }));
+    try std.testing.expect(solver.evaluateTruth(&program, ir.SolverTermId.fromIndex(5)) != .true_value);
+
+    instructions[0].operation = .{ .constant = .{ .integer = "4503599627370496" } };
+    instructions[1].operation = .{ .constant = .{ .integer = "1" } };
+    terms[0].operation = .{ .integer_literal = "4503599627370496" };
+    terms[1].operation = .{ .integer_literal = "1" };
+    try std.testing.expect(std.meta.eql(solver.evaluate(&program, ir.SolverTermId.fromIndex(3)), solver.Constant{ .integer = 4503599627370497 }));
 }
 
 test "exact mathematical value definitions require static nonwrapping domains" {

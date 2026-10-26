@@ -1195,3 +1195,60 @@ test "partial promotion adopts the divisor term owned by an admitted guard" {
     try std.testing.expectEqual(ir.SolverTermId.fromIndex(0), remainder.right);
     try std.testing.expectEqual(ir.SolverTermId.fromIndex(1), remainder.defined_by);
 }
+
+test "promoted integer modulo never decides against Luau doubles" {
+    const Case = struct {
+        dividend: []const u8,
+        divisor: []const u8,
+        expected: []const u8,
+        luau_holds: bool,
+    };
+    const cases = [_]Case{
+        .{ .dividend = "-9007199254740992", .divisor = "3", .expected = "1", .luau_holds = false },
+        .{ .dividend = "-9007199254740991", .divisor = "3", .expected = "2", .luau_holds = false },
+        .{ .dividend = "-9007199254740989", .divisor = "3", .expected = "1", .luau_holds = true },
+        .{ .dividend = "7", .divisor = "3", .expected = "1", .luau_holds = true },
+    };
+    const dividend = ir.ValueId.fromIndex(0);
+    const divisor = ir.ValueId.fromIndex(1);
+    const expected = ir.ValueId.fromIndex(2);
+    const remainder = ir.ValueId.fromIndex(3);
+    const condition = ir.ValueId.fromIndex(4);
+    const values = [_]ir.Value{
+        .{ .id = dividend, .function = ir.FunctionId.fromIndex(0), .type = .integer, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(0), .index = 0 } } },
+        .{ .id = divisor, .function = ir.FunctionId.fromIndex(0), .type = .integer, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(1), .index = 0 } } },
+        .{ .id = expected, .function = ir.FunctionId.fromIndex(0), .type = .integer, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(2), .index = 0 } } },
+        .{ .id = remainder, .function = ir.FunctionId.fromIndex(0), .type = .integer, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(3), .index = 0 } } },
+        .{ .id = condition, .function = ir.FunctionId.fromIndex(0), .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(4), .index = 0 } } },
+    };
+    for (cases) |case| {
+        const instructions = [_]ir.Instruction{
+            .{ .id = ir.InstructionId.fromIndex(0), .block = ir.BlockId.fromIndex(0), .operation = .{ .constant = .{ .integer = case.dividend } }, .results = &.{dividend}, .effects = .pure },
+            .{ .id = ir.InstructionId.fromIndex(1), .block = ir.BlockId.fromIndex(0), .operation = .{ .constant = .{ .integer = case.divisor } }, .results = &.{divisor}, .effects = .pure },
+            .{ .id = ir.InstructionId.fromIndex(2), .block = ir.BlockId.fromIndex(0), .operation = .{ .constant = .{ .integer = case.expected } }, .results = &.{expected}, .effects = .pure },
+            .{ .id = ir.InstructionId.fromIndex(3), .block = ir.BlockId.fromIndex(0), .operation = .{ .binary = .{ .operator = .modulo, .left = dividend, .right = divisor } }, .results = &.{remainder}, .effects = .pure },
+            .{ .id = ir.InstructionId.fromIndex(4), .block = ir.BlockId.fromIndex(0), .operation = .{ .binary = .{ .operator = .equal, .left = remainder, .right = expected } }, .results = &.{condition}, .effects = .pure },
+        };
+        var program: ir.Program = .{
+            .program_id = "promoted-integer-modulo-luau-range",
+            .entry_function = ir.FunctionId.fromIndex(0),
+            .functions = &.{},
+            .blocks = &.{},
+            .instructions = &instructions,
+            .values = &values,
+        };
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var terms: std.ArrayList(ir.SolverTerm) = .empty;
+        defer terms.deinit(arena.allocator());
+
+        const promoted = try ensureDefinition(arena.allocator(), &program, &terms, condition);
+        program.solver_terms = terms.items;
+        const answer: solver.Truth = if (promoted) |id| (if (solver_preconditions.termPreconditionsProved(&program, id, solver.evaluatesTrue)) solver.evaluateTruth(&program, id) else .unknown) else .unknown;
+        if (case.luau_holds) {
+            try std.testing.expect(answer == .true_value);
+        } else {
+            try std.testing.expect(answer != .true_value);
+        }
+    }
+}

@@ -379,6 +379,17 @@ pub fn dynamicBindingsSemanticallyCoherent(program: *const ir.Program, bindings:
     return dynamicBindingsCoherence(program, bindings) == .coherent;
 }
 
+// Luau reads an IR integer as a double: within +-2^53 the exact value is Luau's; beyond it the replay
+// must not use the mathematical value (the internal evaluator's walk applies the same bound).
+fn exactLuauReplayInteger(value: model_value.Value) model_value.Value {
+    const limit: i64 = 1 << 53;
+    return switch (value) {
+        .integer => |integer| if (integer.toConst().orderAgainstScalar(limit) == .gt or
+            integer.toConst().orderAgainstScalar(-limit) == .lt) model_value.unknown() else value,
+        else => value,
+    };
+}
+
 const SourceEvaluator = struct {
     program: *const ir.Program,
     context: model_value.Context,
@@ -400,8 +411,8 @@ const SourceEvaluator = struct {
         return switch (literal_value) {
             .boolean => |value| if (sort.kind == .boolean) self.context.booleanValue(value) else model_value.unknown(),
             .integer => |value| switch (sort.kind) {
-                .integer => self.context.integerLiteral(value),
-                .bit_vector => self.context.integerToBitVector(try self.context.integerLiteral(value), sort.bit_width),
+                .integer => exactLuauReplayInteger(try self.context.integerLiteral(value)),
+                .bit_vector => self.context.integerToBitVector(exactLuauReplayInteger(try self.context.integerLiteral(value)), sort.bit_width),
                 else => model_value.unknown(),
             },
             .nil_value, .number, .special_number, .string => model_value.unknown(),
@@ -455,12 +466,12 @@ const SourceEvaluator = struct {
         }
         const operator = normalized_value.solverBinaryOperator(operation.operator) orelse return model_value.unknown();
         const operand_sort = self.normalizedOperandSort(result_sort, operation) orelse return model_value.unknown();
-        return self.context.binary(
+        return exactLuauReplayInteger(try self.context.binary(
             operator,
             operand_sort,
             try self.evaluate(operation.left, operand_sort, depth),
             try self.evaluate(operation.right, operand_sort, depth),
-        );
+        ));
     }
 
     fn normalizedOperandSort(
