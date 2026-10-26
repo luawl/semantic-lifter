@@ -53,7 +53,7 @@ fn evaluateDepth(program: *const ir.Program, term_id: ir.SolverTermId, depth: us
     const term = program.solver_terms[term_id.index()];
     return switch (term.operation) {
         .value => |value_id| coerceValueToSort(evaluateValueDepth(program, value_id, depth + 1), term.sort),
-        .value_definition => |definition| evaluateDepth(program, definition.expression, depth + 1),
+        .value_definition => |definition| exactLuauIntegerConstant(evaluateDepth(program, definition.expression, depth + 1)),
         .semantic_atom => .{ .unknown = {} },
         .dynamic_truthiness => |operand| if (solver_equivalence.dynamicTermTruthiness(program, operand)) |truth|
             .{ .boolean = truth }
@@ -193,19 +193,30 @@ fn evaluateNormalizedBinary(
         .right = binary.right,
     } })) |value| return .{ .boolean = value };
     const operator = normalized_value.solverBinaryOperator(binary.operator) orelse return .{ .unknown = {} };
-    return evaluateBinary(
+    return exactLuauIntegerConstant(evaluateBinary(
         operator,
         evaluateValueDepth(program, binary.left, depth),
         evaluateValueDepth(program, binary.right, depth),
         null,
-    );
+    ));
 }
 
 fn evaluateLiteral(literal: ir.Literal) Constant {
     return switch (literal) {
         .boolean => |value| .{ .boolean = value },
-        .integer => |value| parseInteger(value),
+        .integer => |value| exactLuauIntegerConstant(parseInteger(value)),
         .nil_value, .number, .special_number, .string => .{ .unknown = {} },
+    };
+}
+
+/// Luau numbers are IEEE-754 doubles, so an integer payload outside [-2^53, 2^53] has no exact double. Such a
+/// payload reads as unknown wherever the exact-integer walk would otherwise return it, for every value type, so a
+/// branch is never decided against Luau's double arithmetic.
+fn exactLuauIntegerConstant(value: Constant) Constant {
+    const limit: i64 = 1 << 53;
+    return switch (value) {
+        .integer => |payload| if (payload < -limit or payload > limit) .{ .unknown = {} } else value,
+        else => value,
     };
 }
 
@@ -224,10 +235,10 @@ fn evaluateNormalizedUnary(
             .integer, .real, .bit_vector => .{ .boolean = false },
             .unknown => .{ .unknown = {} },
         },
-        .negate => switch (evaluateValueDepth(program, unary.operand, depth)) {
+        .negate => exactLuauIntegerConstant(switch (evaluateValueDepth(program, unary.operand, depth)) {
             .integer => |value| .{ .integer = std.math.sub(i64, 0, value) catch return .{ .unknown = {} } },
             else => .{ .unknown = {} },
-        },
+        }),
         .length => .{ .integer = std.math.cast(i64, normalized_value.exactStringLength(program, unary.operand) orelse return .{ .unknown = {} }) orelse return .{ .unknown = {} } },
         .bit_not => .{ .unknown = {} },
     };

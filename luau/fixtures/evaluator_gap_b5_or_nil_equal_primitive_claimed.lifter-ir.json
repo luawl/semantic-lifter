@@ -1,0 +1,499 @@
+{
+  "schema_version": "lifter_ir_v1",
+  "program_id": "b5-or-nil-equal-primitive-claimed",
+  "source_semantics": "luau",
+  "entry_function": 0,
+  "entry_bindings": [],
+  "external_bindings": [],
+  "functions": [
+    {
+      "id": 0,
+      "name_hint": "chunk",
+      "lexical_parent": null,
+      "parameters": [],
+      "captures": [],
+      "local_places": [],
+      "blocks": [
+        0
+      ],
+      "entry_block": 0,
+      "is_variadic": false,
+      "vararg_pack": null,
+      "evidence": [
+        0
+      ]
+    },
+    {
+      "id": 1,
+      "name_hint": "probe",
+      "lexical_parent": null,
+      "parameters": [
+        0,
+        1
+      ],
+      "captures": [],
+      "local_places": [],
+      "blocks": [
+        1,
+        2,
+        3
+      ],
+      "entry_block": 1,
+      "is_variadic": false,
+      "vararg_pack": null,
+      "evidence": [
+        0
+      ]
+    }
+  ],
+  "blocks": [
+    {
+      "id": 0,
+      "function": 0,
+      "name_hint": null,
+      "parameters": [],
+      "instructions": [
+        0
+      ],
+      "terminator": {
+        "return_values": [
+          2
+        ]
+      },
+      "evidence": [
+        0
+      ]
+    },
+    {
+      "id": 1,
+      "function": 1,
+      "name_hint": null,
+      "parameters": [],
+      "instructions": [
+        1,
+        2,
+        3
+      ],
+      "terminator": {
+        "branch": {
+          "condition": 5,
+          "then_edge": {
+            "target": 2,
+            "arguments": []
+          },
+          "else_edge": {
+            "target": 3,
+            "arguments": []
+          }
+        }
+      },
+      "evidence": [
+        0
+      ]
+    },
+    {
+      "id": 2,
+      "function": 1,
+      "name_hint": null,
+      "parameters": [],
+      "instructions": [
+        4
+      ],
+      "terminator": {
+        "return_values": [
+          6
+        ]
+      },
+      "evidence": [
+        0
+      ]
+    },
+    {
+      "id": 3,
+      "function": 1,
+      "name_hint": null,
+      "parameters": [],
+      "instructions": [
+        5
+      ],
+      "terminator": {
+        "return_values": [
+          7
+        ]
+      },
+      "evidence": [
+        0
+      ]
+    }
+  ],
+  "instructions": [
+    {
+      "id": 0,
+      "block": 0,
+      "operation": {
+        "function_ref": 1
+      },
+      "results": [
+        2
+      ],
+      "pack_result": null,
+      "effects": {
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false,
+        "may_throw": false,
+        "may_yield": false,
+        "invokes_unknown_code": false
+      },
+      "evidence": [
+        0
+      ],
+      "claims": []
+    },
+    {
+      "id": 1,
+      "block": 1,
+      "operation": {
+        "binary": {
+          "operator": "logical_or",
+          "left": 0,
+          "right": 1,
+          "mode": "semantic",
+          "shift_behavior": null
+        }
+      },
+      "results": [
+        3
+      ],
+      "pack_result": null,
+      "effects": {
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false,
+        "may_throw": false,
+        "may_yield": false,
+        "invokes_unknown_code": false
+      },
+      "evidence": [
+        0
+      ],
+      "claims": []
+    },
+    {
+      "id": 2,
+      "block": 1,
+      "operation": {
+        "constant": {
+          "nil_value": {}
+        }
+      },
+      "results": [
+        4
+      ],
+      "pack_result": null,
+      "effects": {
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false,
+        "may_throw": false,
+        "may_yield": false,
+        "invokes_unknown_code": false
+      },
+      "evidence": [
+        0
+      ],
+      "claims": []
+    },
+    {
+      "id": 3,
+      "block": 1,
+      "operation": {
+        "binary": {
+          "operator": "equal",
+          "left": 3,
+          "right": 4,
+          "mode": "primitive",
+          "shift_behavior": null
+        }
+      },
+      "results": [
+        5
+      ],
+      "pack_result": null,
+      "effects": {
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false,
+        "may_throw": false,
+        "may_yield": false,
+        "invokes_unknown_code": false
+      },
+      "evidence": [
+        0
+      ],
+      "claims": [
+        0
+      ]
+    },
+    {
+      "id": 4,
+      "block": 2,
+      "operation": {
+        "constant": {
+          "string": "then-arm"
+        }
+      },
+      "results": [
+        6
+      ],
+      "pack_result": null,
+      "effects": {
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false,
+        "may_throw": false,
+        "may_yield": false,
+        "invokes_unknown_code": false
+      },
+      "evidence": [
+        0
+      ],
+      "claims": []
+    },
+    {
+      "id": 5,
+      "block": 3,
+      "operation": {
+        "constant": {
+          "string": "else-arm"
+        }
+      },
+      "results": [
+        7
+      ],
+      "pack_result": null,
+      "effects": {
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false,
+        "may_throw": false,
+        "may_yield": false,
+        "invokes_unknown_code": false
+      },
+      "evidence": [
+        0
+      ],
+      "claims": []
+    }
+  ],
+  "values": [
+    {
+      "id": 0,
+      "function": 1,
+      "type": {
+        "kind": "dynamic",
+        "bit_width": 0,
+        "signed": false
+      },
+      "name_hint": "x",
+      "origin": {
+        "parameter": 0
+      }
+    },
+    {
+      "id": 1,
+      "function": 1,
+      "type": {
+        "kind": "dynamic",
+        "bit_width": 0,
+        "signed": false
+      },
+      "name_hint": "y",
+      "origin": {
+        "parameter": 1
+      }
+    },
+    {
+      "id": 2,
+      "function": 0,
+      "type": {
+        "kind": "function",
+        "bit_width": 0,
+        "signed": false
+      },
+      "name_hint": "probe",
+      "origin": {
+        "instruction_result": {
+          "instruction": 0,
+          "index": 0
+        }
+      }
+    },
+    {
+      "id": 3,
+      "function": 1,
+      "type": {
+        "kind": "dynamic",
+        "bit_width": 0,
+        "signed": false
+      },
+      "name_hint": "either",
+      "origin": {
+        "instruction_result": {
+          "instruction": 1,
+          "index": 0
+        }
+      }
+    },
+    {
+      "id": 4,
+      "function": 1,
+      "type": {
+        "kind": "nil_value",
+        "bit_width": 0,
+        "signed": false
+      },
+      "name_hint": "nil_constant",
+      "origin": {
+        "instruction_result": {
+          "instruction": 2,
+          "index": 0
+        }
+      }
+    },
+    {
+      "id": 5,
+      "function": 1,
+      "type": {
+        "kind": "boolean",
+        "bit_width": 0,
+        "signed": false
+      },
+      "name_hint": "both_nil",
+      "origin": {
+        "instruction_result": {
+          "instruction": 3,
+          "index": 0
+        }
+      }
+    },
+    {
+      "id": 6,
+      "function": 1,
+      "type": {
+        "kind": "string",
+        "bit_width": 0,
+        "signed": false
+      },
+      "name_hint": "then_result",
+      "origin": {
+        "instruction_result": {
+          "instruction": 4,
+          "index": 0
+        }
+      }
+    },
+    {
+      "id": 7,
+      "function": 1,
+      "type": {
+        "kind": "string",
+        "bit_width": 0,
+        "signed": false
+      },
+      "name_hint": "else_result",
+      "origin": {
+        "instruction_result": {
+          "instruction": 5,
+          "index": 0
+        }
+      }
+    }
+  ],
+  "value_packs": [],
+  "places": [],
+  "captures": [],
+  "evidence": [
+    {
+      "id": 0,
+      "kind": "dynamic_fixture",
+      "locator": "fixture:b5-or-nil-equal-primitive-claimed",
+      "digest": null
+    },
+    {
+      "id": 1,
+      "kind": "frontend_proof",
+      "locator": "fixture:primitive-eq-against-nil",
+      "digest": null
+    }
+  ],
+  "solver_terms": [
+    {
+      "id": 0,
+      "sort": {
+        "kind": "boolean",
+        "bit_width": 0,
+        "signed": false
+      },
+      "operation": {
+        "semantic_atom": {
+          "primitive_operator_domain": 3
+        }
+      }
+    }
+  ],
+  "constraints": [],
+  "queries": [
+    {
+      "id": 0,
+      "kind": "prove_true",
+      "assumptions": [],
+      "path_rewrites": [],
+      "goal": 0
+    }
+  ],
+  "solver_models": [],
+  "unsat_cores": [],
+  "certificates": [
+    {
+      "id": 0,
+      "query": 0,
+      "engine": "imported",
+      "resolution": "proved",
+      "evidence": [
+        1
+      ],
+      "certificate_digest": "fixture:primitive-eq-against-nil",
+      "model": null,
+      "unsat_core": null
+    }
+  ],
+  "edge_rewrites": [],
+  "claims": [
+    {
+      "id": 0,
+      "subject": {
+        "instruction": 3
+      },
+      "predicate": 0,
+      "purpose": {
+        "primitive_operator_domain": {
+          "precision": "exact",
+          "reads_memory": false,
+          "writes_memory": false,
+          "may_throw": false,
+          "may_yield": false,
+          "invokes_unknown_code": false
+        }
+      },
+      "status": "proved",
+      "required_for_emission": false,
+      "evidence": [
+        1
+      ],
+      "query": 0,
+      "certificate": 0
+    }
+  ],
+  "obligations": []
+}

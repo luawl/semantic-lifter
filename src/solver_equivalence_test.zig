@@ -235,6 +235,44 @@ test "exact primitive Boolean logic preserves truthiness and decisive unknown id
     try std.testing.expectEqual(@as(?bool, null), exactPrimitiveBooleanLogic(.logical_and, exact_true, .{ .category = .number }));
 }
 
+test "dynamic logical selection over non-boolean operands has no Boolean descriptor" {
+    const x = ir.ValueId.fromIndex(0);
+    const y = ir.ValueId.fromIndex(1);
+    const either = ir.ValueId.fromIndex(2);
+    const nil_constant = ir.ValueId.fromIndex(3);
+    const values = [_]ir.Value{
+        .{ .id = x, .function = ir.FunctionId.fromIndex(0), .type = .dynamic, .origin = .{ .parameter = 0 } },
+        .{ .id = y, .function = ir.FunctionId.fromIndex(0), .type = .dynamic, .origin = .{ .parameter = 1 } },
+        .{ .id = either, .function = ir.FunctionId.fromIndex(0), .type = .dynamic, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(0), .index = 0 } } },
+        .{ .id = nil_constant, .function = ir.FunctionId.fromIndex(0), .type = .{ .kind = .nil_value }, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(1), .index = 0 } } },
+    };
+    const instructions = [_]ir.Instruction{
+        .{ .id = ir.InstructionId.fromIndex(0), .block = ir.BlockId.fromIndex(0), .operation = .{ .binary = .{ .operator = .logical_or, .left = x, .right = y } }, .results = &.{either}, .effects = .pure },
+        .{ .id = ir.InstructionId.fromIndex(1), .block = ir.BlockId.fromIndex(0), .operation = .{ .constant = .{ .nil_value = {} } }, .results = &.{nil_constant}, .effects = .pure },
+    };
+    const program: ir.Program = .{
+        .program_id = "dynamic-logical-selection-descriptor",
+        .entry_function = ir.FunctionId.fromIndex(0),
+        .functions = &.{},
+        .blocks = &.{},
+        .instructions = &instructions,
+        .values = &values,
+    };
+
+    // A value-selecting `or`/`and` over non-boolean operands is not a normalized source, so it has no Boolean
+    // descriptor and the equality against nil stays undecided. Before the gate the descriptor decides it false.
+    try std.testing.expect(equivalence.exactPrimitiveEqualityResult(&program, .equal, either, nil_constant) == null);
+
+    var boolean_values = values;
+    boolean_values[x.index()].type = .boolean;
+    boolean_values[y.index()].type = .boolean;
+    boolean_values[either.index()].type = .boolean;
+    var boolean_program = program;
+    boolean_program.values = &boolean_values;
+    try std.testing.expect(dynamicValueDescriptor(&boolean_program, either).?.category == .boolean);
+    try std.testing.expect(equivalence.exactPrimitiveEqualityResult(&boolean_program, .equal, either, nil_constant).? == false);
+}
+
 test "exact primitive string comparison follows raw byte order and refuses unknown descriptors" {
     const prefix: DynamicDescriptor = .{ .category = .string, .exact_string = "ab" };
     const longer: DynamicDescriptor = .{ .category = .string, .exact_string = "aba" };

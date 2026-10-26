@@ -357,6 +357,48 @@ test "internal Boolean facts preserve decisive values with unknown operands" {
     try std.testing.expectEqual(ir.SolverResolution.proved, solve(&program, assumed));
 }
 
+test "dynamic logical selection is not evaluated as a Boolean connective" {
+    const x = ir.ValueId.fromIndex(0);
+    const yes = ir.ValueId.fromIndex(1);
+    const no = ir.ValueId.fromIndex(2);
+    const or_true = ir.ValueId.fromIndex(3);
+    const and_false = ir.ValueId.fromIndex(4);
+    const is_true = ir.ValueId.fromIndex(5);
+    const is_false = ir.ValueId.fromIndex(6);
+    const values = [_]ir.Value{
+        .{ .id = x, .function = ir.FunctionId.fromIndex(0), .type = .dynamic, .origin = .{ .parameter = 0 } },
+        .{ .id = yes, .function = ir.FunctionId.fromIndex(0), .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(0), .index = 0 } } },
+        .{ .id = no, .function = ir.FunctionId.fromIndex(0), .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(1), .index = 0 } } },
+        .{ .id = or_true, .function = ir.FunctionId.fromIndex(0), .type = .dynamic, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(2), .index = 0 } } },
+        .{ .id = and_false, .function = ir.FunctionId.fromIndex(0), .type = .dynamic, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(3), .index = 0 } } },
+        .{ .id = is_true, .function = ir.FunctionId.fromIndex(0), .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(4), .index = 0 } } },
+        .{ .id = is_false, .function = ir.FunctionId.fromIndex(0), .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(5), .index = 0 } } },
+    };
+    const instructions = [_]ir.Instruction{
+        .{ .id = ir.InstructionId.fromIndex(0), .block = ir.BlockId.fromIndex(0), .operation = .{ .constant = .{ .boolean = true } }, .results = &.{yes}, .effects = .pure },
+        .{ .id = ir.InstructionId.fromIndex(1), .block = ir.BlockId.fromIndex(0), .operation = .{ .constant = .{ .boolean = false } }, .results = &.{no}, .effects = .pure },
+        .{ .id = ir.InstructionId.fromIndex(2), .block = ir.BlockId.fromIndex(0), .operation = .{ .binary = .{ .operator = .logical_or, .left = x, .right = yes } }, .results = &.{or_true}, .effects = .pure },
+        .{ .id = ir.InstructionId.fromIndex(3), .block = ir.BlockId.fromIndex(0), .operation = .{ .binary = .{ .operator = .logical_and, .left = x, .right = no } }, .results = &.{and_false}, .effects = .pure },
+        .{ .id = ir.InstructionId.fromIndex(4), .block = ir.BlockId.fromIndex(0), .operation = .{ .binary = .{ .operator = .equal, .left = or_true, .right = yes } }, .results = &.{is_true}, .effects = .pure },
+        .{ .id = ir.InstructionId.fromIndex(5), .block = ir.BlockId.fromIndex(0), .operation = .{ .binary = .{ .operator = .equal, .left = and_false, .right = no } }, .results = &.{is_false}, .effects = .pure },
+    };
+    const program: ir.Program = .{
+        .program_id = "dynamic-logical-selection-evaluation",
+        .entry_function = ir.FunctionId.fromIndex(0),
+        .functions = &.{},
+        .blocks = &.{},
+        .instructions = &instructions,
+        .values = &values,
+    };
+
+    // `x or true` and `x and false` select a value from a non-boolean operand, so the walk must not decide the
+    // surrounding equality as if the result were a Boolean connective. Before the gate both are decided true.
+    const is_true_result = evaluateValue(&program, is_true);
+    try std.testing.expect(!(is_true_result == .boolean and is_true_result.boolean));
+    const is_false_result = evaluateValue(&program, is_false);
+    try std.testing.expect(!(is_false_result == .boolean and is_false_result.boolean));
+}
+
 test "internal integer arithmetic never wraps beyond its exact range" {
     const terms = [_]ir.SolverTerm{
         .{ .id = ir.SolverTermId.fromIndex(0), .sort = .{ .kind = .integer }, .operation = .{ .integer_literal = "9223372036854775807" } },
@@ -772,6 +814,84 @@ test "exact primitive IR expression chains normalize without solver-term duplica
     program.solver_terms = &terms;
     try std.testing.expectEqual(Constant{ .integer = 8 }, evaluateValue(&program, fixture.v_result));
     try std.testing.expectEqual(Truth.true_value, evaluateTruth(&program, ir.SolverTermId.fromIndex(2)));
+}
+
+test "IR integer arithmetic never contradicts Luau doubles beyond 2^53" {
+    const two53 = ir.ValueId.fromIndex(0);
+    const one = ir.ValueId.fromIndex(1);
+    const wide = ir.ValueId.fromIndex(2);
+    const sum = ir.ValueId.fromIndex(3);
+    const rounds_back = ir.ValueId.fromIndex(4);
+    const grew = ir.ValueId.fromIndex(5);
+    const same_double = ir.ValueId.fromIndex(6);
+    const small = ir.ValueId.fromIndex(7);
+    const number_base = ir.ValueId.fromIndex(8);
+    const number_four = ir.ValueId.fromIndex(9);
+    const number_sum = ir.ValueId.fromIndex(10);
+    const number_wide = ir.ValueId.fromIndex(11);
+    const number_sum_equal = ir.ValueId.fromIndex(12);
+    const number_high = ir.ValueId.fromIndex(13);
+    const number_low = ir.ValueId.fromIndex(14);
+    const number_literal_equal = ir.ValueId.fromIndex(15);
+    const values = [_]ir.Value{
+        .{ .id = two53, .function = ir.FunctionId.fromIndex(0), .type = .integer, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(0), .index = 0 } } },
+        .{ .id = one, .function = ir.FunctionId.fromIndex(0), .type = .integer, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(1), .index = 0 } } },
+        .{ .id = wide, .function = ir.FunctionId.fromIndex(0), .type = .integer, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(2), .index = 0 } } },
+        .{ .id = sum, .function = ir.FunctionId.fromIndex(0), .type = .integer, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(3), .index = 0 } } },
+        .{ .id = rounds_back, .function = ir.FunctionId.fromIndex(0), .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(4), .index = 0 } } },
+        .{ .id = grew, .function = ir.FunctionId.fromIndex(0), .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(5), .index = 0 } } },
+        .{ .id = same_double, .function = ir.FunctionId.fromIndex(0), .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(6), .index = 0 } } },
+        .{ .id = small, .function = ir.FunctionId.fromIndex(0), .type = .integer, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(7), .index = 0 } } },
+        .{ .id = number_base, .function = ir.FunctionId.fromIndex(0), .type = .number, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(8), .index = 0 } } },
+        .{ .id = number_four, .function = ir.FunctionId.fromIndex(0), .type = .number, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(9), .index = 0 } } },
+        .{ .id = number_sum, .function = ir.FunctionId.fromIndex(0), .type = .number, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(10), .index = 0 } } },
+        .{ .id = number_wide, .function = ir.FunctionId.fromIndex(0), .type = .number, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(11), .index = 0 } } },
+        .{ .id = number_sum_equal, .function = ir.FunctionId.fromIndex(0), .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(12), .index = 0 } } },
+        .{ .id = number_high, .function = ir.FunctionId.fromIndex(0), .type = .number, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(13), .index = 0 } } },
+        .{ .id = number_low, .function = ir.FunctionId.fromIndex(0), .type = .number, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(14), .index = 0 } } },
+        .{ .id = number_literal_equal, .function = ir.FunctionId.fromIndex(0), .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(15), .index = 0 } } },
+    };
+    const instructions = [_]ir.Instruction{
+        .{ .id = ir.InstructionId.fromIndex(0), .block = ir.BlockId.fromIndex(0), .operation = .{ .constant = .{ .integer = "9007199254740992" } }, .results = &.{two53}, .effects = .pure },
+        .{ .id = ir.InstructionId.fromIndex(1), .block = ir.BlockId.fromIndex(0), .operation = .{ .constant = .{ .integer = "1" } }, .results = &.{one}, .effects = .pure },
+        .{ .id = ir.InstructionId.fromIndex(2), .block = ir.BlockId.fromIndex(0), .operation = .{ .constant = .{ .integer = "9007199254740993" } }, .results = &.{wide}, .effects = .pure },
+        .{ .id = ir.InstructionId.fromIndex(3), .block = ir.BlockId.fromIndex(0), .operation = .{ .binary = .{ .operator = .add, .left = two53, .right = one } }, .results = &.{sum}, .effects = .pure },
+        .{ .id = ir.InstructionId.fromIndex(4), .block = ir.BlockId.fromIndex(0), .operation = .{ .binary = .{ .operator = .equal, .left = sum, .right = two53 } }, .results = &.{rounds_back}, .effects = .pure },
+        .{ .id = ir.InstructionId.fromIndex(5), .block = ir.BlockId.fromIndex(0), .operation = .{ .binary = .{ .operator = .less, .left = two53, .right = sum } }, .results = &.{grew}, .effects = .pure },
+        .{ .id = ir.InstructionId.fromIndex(6), .block = ir.BlockId.fromIndex(0), .operation = .{ .binary = .{ .operator = .equal, .left = wide, .right = two53 } }, .results = &.{same_double}, .effects = .pure },
+        .{ .id = ir.InstructionId.fromIndex(7), .block = ir.BlockId.fromIndex(0), .operation = .{ .binary = .{ .operator = .add, .left = one, .right = one } }, .results = &.{small}, .effects = .pure },
+        .{ .id = ir.InstructionId.fromIndex(8), .block = ir.BlockId.fromIndex(0), .operation = .{ .constant = .{ .integer = "9007199254740991" } }, .results = &.{number_base}, .effects = .pure },
+        .{ .id = ir.InstructionId.fromIndex(9), .block = ir.BlockId.fromIndex(0), .operation = .{ .constant = .{ .integer = "4" } }, .results = &.{number_four}, .effects = .pure },
+        .{ .id = ir.InstructionId.fromIndex(10), .block = ir.BlockId.fromIndex(0), .operation = .{ .binary = .{ .operator = .add, .left = number_base, .right = number_four } }, .results = &.{number_sum}, .effects = .pure },
+        .{ .id = ir.InstructionId.fromIndex(11), .block = ir.BlockId.fromIndex(0), .operation = .{ .constant = .{ .integer = "9007199254740996" } }, .results = &.{number_wide}, .effects = .pure },
+        .{ .id = ir.InstructionId.fromIndex(12), .block = ir.BlockId.fromIndex(0), .operation = .{ .binary = .{ .operator = .equal, .left = number_sum, .right = number_wide } }, .results = &.{number_sum_equal}, .effects = .pure },
+        .{ .id = ir.InstructionId.fromIndex(13), .block = ir.BlockId.fromIndex(0), .operation = .{ .constant = .{ .integer = "9007199254740993" } }, .results = &.{number_high}, .effects = .pure },
+        .{ .id = ir.InstructionId.fromIndex(14), .block = ir.BlockId.fromIndex(0), .operation = .{ .constant = .{ .integer = "9007199254740992" } }, .results = &.{number_low}, .effects = .pure },
+        .{ .id = ir.InstructionId.fromIndex(15), .block = ir.BlockId.fromIndex(0), .operation = .{ .binary = .{ .operator = .equal, .left = number_high, .right = number_low } }, .results = &.{number_literal_equal}, .effects = .pure },
+    };
+    const program: ir.Program = .{
+        .program_id = "ir-integer-arithmetic-versus-luau-doubles",
+        .entry_function = ir.FunctionId.fromIndex(0),
+        .functions = &.{},
+        .blocks = &.{},
+        .instructions = &instructions,
+        .values = &values,
+    };
+
+    // An integer payload beyond 2^53 anywhere in the walk must read as unknown, for every value type, so the
+    // resolver never decides a branch against Luau's double arithmetic. Before the bound these are decided wrong.
+    const rounds_back_result = evaluateValue(&program, rounds_back);
+    try std.testing.expect(!(rounds_back_result == .boolean and !rounds_back_result.boolean));
+    const grew_result = evaluateValue(&program, grew);
+    try std.testing.expect(!(grew_result == .boolean and grew_result.boolean));
+    const same_double_result = evaluateValue(&program, same_double);
+    try std.testing.expect(!(same_double_result == .boolean and !same_double_result.boolean));
+    const number_sum_result = evaluateValue(&program, number_sum_equal);
+    try std.testing.expect(!(number_sum_result == .boolean and !number_sum_result.boolean));
+    const number_literal_result = evaluateValue(&program, number_literal_equal);
+    try std.testing.expect(!(number_literal_result == .boolean and !number_literal_result.boolean));
+    const small_result = evaluateValue(&program, small);
+    try std.testing.expect(small_result == .integer and small_result.integer == 2);
 }
 
 test "partial source modulo does not enter the total solver binary theory" {

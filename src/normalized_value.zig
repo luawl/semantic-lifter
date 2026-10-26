@@ -147,12 +147,17 @@ fn canNormalizeBinary(values: []const ir.Value, result_kind: ir.TypeKind, binary
         binary.right.index() < values.len and
         values[binary.left.index()].type.kind == .string and
         values[binary.right.index()].type.kind == .string;
+    const static_booleans = binary.left.index() < values.len and
+        binary.right.index() < values.len and
+        values[binary.left.index()].type.kind == .boolean and
+        values[binary.right.index()].type.kind == .boolean;
     return switch (binary.operator) {
         .add, .subtract, .multiply => result_kind == .integer or result_kind == .dynamic or
             (result_kind == .number and static_numeric),
         .divide, .floor_divide, .modulo, .power => result_kind == .number and static_numeric,
         .concat => result_kind == .string and static_strings,
-        .equal, .not_equal, .less, .less_equal, .greater, .greater_equal, .logical_and, .logical_or => result_kind == .boolean or result_kind == .dynamic,
+        .equal, .not_equal, .less, .less_equal, .greater, .greater_equal => result_kind == .boolean or result_kind == .dynamic,
+        .logical_and, .logical_or => (result_kind == .boolean or result_kind == .dynamic) and static_booleans,
         .bit_and, .bit_or, .bit_xor, .shift_left, .shift_right => false,
     };
 }

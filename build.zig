@@ -1950,6 +1950,19 @@ pub fn build(b: *std.Build) void {
     resolve_refusal_audit.addArtifactArg(exe);
     resolve_refusal_audit.addFileArg(b.path("luau/fixtures/resolve_refusal_b3.lifter-ir.json"));
     _ = resolve_refusal_audit.addOutputDirectoryArg("resolve-refusal");
+    const evaluator_branch_probe_audit = b.addSystemCommand(&.{ luneExe(b), "run" });
+    if (z3_enabled) evaluator_branch_probe_audit.addPathDir(b.pathFromRoot(z3_bin));
+    evaluator_branch_probe_audit.addFileArg(b.path("luau/evaluator_branch_probe_audit.luau"));
+    evaluator_branch_probe_audit.addArtifactArg(exe);
+    _ = evaluator_branch_probe_audit.addOutputDirectoryArg("evaluator-branch-probes");
+    evaluator_branch_probe_audit.addFileArg(b.path("luau/fixtures/evaluator_gap_a1_integer_sum_equal.lifter-ir.json"));
+    evaluator_branch_probe_audit.addFileArg(b.path("luau/fixtures/evaluator_gap_a3_integer_sum_less.lifter-ir.json"));
+    evaluator_branch_probe_audit.addFileArg(b.path("luau/fixtures/evaluator_gap_b1_or_nil_equal_claimed.lifter-ir.json"));
+    evaluator_branch_probe_audit.addFileArg(b.path("luau/fixtures/evaluator_gap_b5_or_nil_equal_primitive_claimed.lifter-ir.json"));
+    evaluator_branch_probe_audit.addFileArg(b.path("luau/fixtures/evaluator_gap_c1_number_sum_equal_wide_literal.lifter-ir.json"));
+    evaluator_branch_probe_audit.addFileArg(b.path("luau/fixtures/evaluator_gap_c2_number_sum_less_wide_literal.lifter-ir.json"));
+    evaluator_branch_probe_audit.addFileArg(b.path("luau/fixtures/evaluator_gap_c3_all_number_typed_equal_wide.lifter-ir.json"));
+    evaluator_branch_probe_audit.addFileArg(b.path("luau/fixtures/evaluator_gap_c6_number_typed_literal_beyond_2p53.lifter-ir.json"));
     // Re-resolution fixed-point conformance over the recorded nested graph.
     // resolve-ir iterates to a fixed point (src/proof_orchestrator.zig), so re-resolving the resolved
     // IR is byte-idempotent and the resolved IR is already a normalizer fixed point.
@@ -2193,6 +2206,7 @@ pub fn build(b: *std.Build) void {
     conformance_step.dependOn(&legacy_unchecked_rejection.step);
     conformance_step.dependOn(&legacy_unchecked_preserved_output.step);
     conformance_step.dependOn(&resolve_refusal_audit.step);
+    conformance_step.dependOn(&evaluator_branch_probe_audit.step);
     conformance_step.dependOn(&nested_reresolve_audit.step);
     absolute_conformance.addTo(conformance_step);
     function_reference_conformance.addTo(conformance_step);
