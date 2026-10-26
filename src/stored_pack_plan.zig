@@ -109,8 +109,9 @@ fn directGuardedTailIsSafe(
     if (!validId(consumer_id, program.instructions.len)) return false;
     const consumer = program.instructions[consumer_id.index()];
     if (!scope.instruction(consumer.id) or
-        !validId(consumer.block, program.blocks.len) or
-        consumer.block == producer.block) return false;
+        !validId(consumer.block, program.blocks.len)) return false;
+    // A single tail later in the producer's own block runs in the same pass as the producer.
+    if (consumer.block == producer.block) return pack_closure_safety.precedesInSameBlock(program, producer, consumer);
 
     const producer_block = program.blocks[producer.block.index()];
     const consumer_block = program.blocks[consumer.block.index()];

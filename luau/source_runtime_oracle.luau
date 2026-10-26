@@ -347,6 +347,15 @@ function SourceRuntimeOracle.run(caseName: string, source: string, exported: any
 	elseif caseName == "source-frontend-builtin-fastcall-optimize0" or caseName == "source-frontend-builtin-fastcall-optimize0-direct-locals" then
 		local maximum, clamped, aliased = exported(1)
 		assert(maximum == 1 and clamped == 1 and aliased == 1, "source frontend treated a builtin call as a fast call at optimisation level 0")
+	elseif caseName == "source-frontend-method-receiver-loop-pack" or caseName == "source-frontend-method-receiver-loop-pack-direct-locals" then
+		local iteration, outer, whileBody, readOnly, whileCondition, repeatUntil, ifCondition, genericFor = exported(2)
+		assert(iteration == "new1 new2" and outer == "new new", "source frontend lost a numeric-for method receiver read after its open argument")
+		assert(whileBody == "new new", "source frontend lost a while-body method receiver read after its open argument")
+		assert(readOnly == "4/4", "source frontend changed a method receiver that a closure only reads in a loop body")
+		assert(whileCondition == "2 1 2 3", "source frontend lost a while-condition method receiver read after its open argument")
+		assert(repeatUntil == "2 0 1 2", "source frontend lost a repeat-until method receiver read after its open argument")
+		assert(ifCondition == "2 0 1 2", "source frontend lost an in-loop if-condition method receiver read after its open argument")
+		assert(genericFor == "new1:1 new1:2 new2:1 new2:2", "source frontend lost a generic-for initializer method receiver read after its open argument")
 	elseif caseName == "source-frontend-if-expression" then
 		assert(
 			string.find(source, 'consume(if condition() then arm("t") else arm("f"))', 1, true) ~= nil,

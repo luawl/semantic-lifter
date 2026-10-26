@@ -868,3 +868,69 @@ test "pack materialization stores focused same-block, cross-block, and structure
     defer std.testing.allocator.free(cyclic_source);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, cyclic_source, "producer()"));
 }
+
+test "a re-entered block stores an argument pack for its same-block consumer" {
+    const fixture = fixtures.open_pack_adjust_module;
+    const exit_block = ir.BlockId.fromIndex(fixture.blocks.len);
+    const gap_id = ir.InstructionId.fromIndex(fixture.instructions.len);
+    const repeat_loop = ir.ValueId.fromIndex(fixture.values.len);
+
+    var values = fixture.values ++ [_]ir.Value{.{
+        .id = repeat_loop,
+        .function = fixture.f_entry,
+        .type = .boolean,
+        .name_hint = "repeat_loop",
+        .origin = .{ .parameter = 0 },
+    }};
+    values[fixture.v_callee.index()].name_hint = "producer";
+    var instructions = fixture.instructions ++ [_]ir.Instruction{
+        observableGap(gap_id, fixture.b_entry, fixture.v_callee),
+    };
+    instructions[fixture.i_adjust.index()].operation = .{ .call = .{
+        .callee = fixture.v_callee,
+        .arguments = &.{},
+        .argument_pack = fixture.p_results,
+        .result_arity = .{ .fixed = 1 },
+    } };
+    instructions[fixture.i_adjust.index()].effects = .dynamic_call;
+    const loop_instructions = [_]ir.InstructionId{ fixture.i_get, fixture.i_call, gap_id, fixture.i_adjust };
+    var blocks = fixture.blocks ++ [_]ir.Block{.{
+        .id = exit_block,
+        .function = fixture.f_entry,
+        .terminator = .{ .return_values = &.{fixture.v_first} },
+        .evidence = &fixture_evidence,
+    }};
+    blocks[fixture.b_entry.index()].instructions = &loop_instructions;
+    blocks[fixture.b_entry.index()].terminator = .{ .branch = .{
+        .condition = repeat_loop,
+        .then_edge = .{ .target = fixture.b_entry },
+        .else_edge = .{ .target = exit_block },
+    } };
+    const function_blocks = [_]ir.BlockId{ fixture.b_entry, exit_block };
+    var functions = fixture.functions;
+    functions[fixture.f_entry.index()].parameters = &.{repeat_loop};
+    functions[fixture.f_entry.index()].blocks = &function_blocks;
+    var program = fixture.program;
+    program.functions = &functions;
+    program.blocks = &blocks;
+    program.instructions = &instructions;
+    program.values = &values;
+
+    var core_report = try validation.validate(std.testing.allocator, &program, .core);
+    defer core_report.deinit();
+    try std.testing.expect(core_report.isClean());
+    var plan = try pack_plan.Plan.init(std.testing.allocator, &program);
+    defer plan.deinit();
+    try std.testing.expect(plan.role(fixture.i_call) == .stored_invocation_producer);
+    try std.testing.expect(plan.storedPackServesInstruction(fixture.i_call, fixture.i_adjust));
+    try std.testing.expect(plan.invocationProjection(&program, fixture.i_call) == null);
+    var readable_report = try validation.validate(std.testing.allocator, &program, .readable_luau);
+    defer readable_report.deinit();
+    try std.testing.expect(readable_report.isClean());
+    const source = try emit_luau.emitStandardLuauAlloc(std.testing.allocator, &program);
+    defer std.testing.allocator.free(source);
+    const loop = std.mem.indexOf(u8, source, "while true do") orelse return error.TestUnexpectedResult;
+    const wrapper = std.mem.indexOf(u8, source, " = (function(...)") orelse return error.TestUnexpectedResult;
+    const expansion = std.mem.indexOf(u8, source, "__lifter_table_unpack(__lifter_pack_0") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(loop < wrapper and wrapper < expansion and std.mem.count(u8, source, "producer()") == 1);
+}
