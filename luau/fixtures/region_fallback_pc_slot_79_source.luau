@@ -1,5 +1,6 @@
 local function worker(selector, budget)
 	local total = 0
+	local rounds = 0
 	if selector == 1000 then
 		local a0_0 = selector
 		local a0_1 = selector
@@ -60,6 +61,26 @@ local function worker(selector, budget)
 		local a0_56 = selector
 		local a0_57 = selector
 		local a0_58 = selector
+		local a0_59 = selector
+		local a0_60 = selector
+		local a0_61 = selector
+		local a0_62 = selector
+		local a0_63 = selector
+		local a0_64 = selector
+		local a0_65 = selector
+		local a0_66 = selector
+		local a0_67 = selector
+		local a0_68 = selector
+		local a0_69 = selector
+		local a0_70 = selector
+		local a0_71 = selector
+		local a0_72 = selector
+		local a0_73 = selector
+		local a0_74 = selector
+		local a0_75 = selector
+		local a0_76 = selector
+		local a0_77 = selector
+		local a0_78 = selector
 		if budget > 1000 then
 			a0_0 = budget
 			a0_1 = budget
@@ -120,8 +141,28 @@ local function worker(selector, budget)
 			a0_56 = budget
 			a0_57 = budget
 			a0_58 = budget
+			a0_59 = budget
+			a0_60 = budget
+			a0_61 = budget
+			a0_62 = budget
+			a0_63 = budget
+			a0_64 = budget
+			a0_65 = budget
+			a0_66 = budget
+			a0_67 = budget
+			a0_68 = budget
+			a0_69 = budget
+			a0_70 = budget
+			a0_71 = budget
+			a0_72 = budget
+			a0_73 = budget
+			a0_74 = budget
+			a0_75 = budget
+			a0_76 = budget
+			a0_77 = budget
+			a0_78 = budget
 		end
-		total = total + a0_0 + a0_58
+		total = total + a0_0 + a0_78
 	elseif selector == 1001 then
 		local a1_0 = selector
 		local a1_1 = selector
@@ -182,6 +223,26 @@ local function worker(selector, budget)
 		local a1_56 = selector
 		local a1_57 = selector
 		local a1_58 = selector
+		local a1_59 = selector
+		local a1_60 = selector
+		local a1_61 = selector
+		local a1_62 = selector
+		local a1_63 = selector
+		local a1_64 = selector
+		local a1_65 = selector
+		local a1_66 = selector
+		local a1_67 = selector
+		local a1_68 = selector
+		local a1_69 = selector
+		local a1_70 = selector
+		local a1_71 = selector
+		local a1_72 = selector
+		local a1_73 = selector
+		local a1_74 = selector
+		local a1_75 = selector
+		local a1_76 = selector
+		local a1_77 = selector
+		local a1_78 = selector
 		if budget > 1000 then
 			a1_0 = budget
 			a1_1 = budget
@@ -242,23 +303,36 @@ local function worker(selector, budget)
 			a1_56 = budget
 			a1_57 = budget
 			a1_58 = budget
+			a1_59 = budget
+			a1_60 = budget
+			a1_61 = budget
+			a1_62 = budget
+			a1_63 = budget
+			a1_64 = budget
+			a1_65 = budget
+			a1_66 = budget
+			a1_67 = budget
+			a1_68 = budget
+			a1_69 = budget
+			a1_70 = budget
+			a1_71 = budget
+			a1_72 = budget
+			a1_73 = budget
+			a1_74 = budget
+			a1_75 = budget
+			a1_76 = budget
+			a1_77 = budget
+			a1_78 = budget
 		end
-		total = total + a1_0 + a1_58
+		total = total + a1_0 + a1_78
 	end
-	repeat
-		if selector == 4 then
-			total = total + 2
-			if budget > 7 then
-				continue
-			end
-			total = total + 1
+	while rounds < 8 do
+		rounds += 1
+		total += rounds
+		if selector == 5 or budget > 4 then
+			continue
 		end
-		total = total + 1
-		if selector ~= 0 then
-			total = total + 1
-		end
-	until total >= 6 or budget > 5
-	total = total + 100
-	return total
+	end
+	return total, rounds
 end
 return worker

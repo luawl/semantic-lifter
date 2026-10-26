@@ -1857,6 +1857,88 @@ function SourceRuntimeOracle.run(caseName: string, source: string, exported: any
 		assert(not loopOk, "a captured closure store into nil did not raise")
 		assert(string.find(tostring(loopError), "attempt to index nil with 'captured'", 1, true) ~= nil, "the captured closure store raised another error")
 		assert(table.concat(events, ",") == "start,1", "the captured closure store ran before or without its binding's call")
+	elseif
+		caseName == "source-frontend-repeat-continue-past-join"
+		or caseName == "source-frontend-repeat-continue-retry"
+		or caseName == "source-frontend-repeat-continue-body-local"
+		or caseName == "source-frontend-repeat-continue-queue-drain-layout"
+	then
+		-- A post-tested loop whose body holds a continue that skips code the body reaches after a join. The text is
+		-- written structured (no dispatcher pc name; __lifter_pcall is the protected-call local, not the pc) and the
+		-- worker returns what the source returns on the 45-point grid, an error where the source raises one. The
+		-- queue-drain worker pins only its layout and its agreement with the source on the grid.
+		local _, pcNames = string.gsub(source, "__lifter_pc", "")
+		local _, pcallNames = string.gsub(source, "__lifter_pcall", "")
+		assert(
+			pcNames == pcallNames,
+			`{caseName} was written in the dispatcher layout ({pcNames - pcallNames} __lifter_pc names)`
+		)
+		local expected: { [string]: { string } } = {
+			["source-frontend-repeat-continue-past-join"] = {
+				"106", "106", "106", "101", "101",
+				"106", "106", "106", "102", "102",
+				"106", "106", "106", "102", "102",
+				"106", "106", "106", "102", "102",
+				"106", "106", "106", "102", "102",
+				"106", "106", "106", "102", "102",
+				"110", "110", "110", "105", "102",
+				"106", "106", "106", "102", "102",
+				"106", "106", "106", "102", "102",
+			},
+			["source-frontend-repeat-continue-retry"] = {
+				"1,1", "2,2", "4,4", "4,4", "4,4",
+				"1,1", "2,2", "4,4", "4,4", "4,4",
+				"1,1", "2,2", "4,4", "4,4", "4,4",
+				"3,1", "3,1", "6,2", "9,3", "12,4",
+				"2.5,1", "2.5,1", "5,2", "7.5,3", "10,4",
+				"error", "error", "error", "error", "error",
+				"4,1", "4,1", "4,1", "8,2", "12,3",
+				"10,1", "10,1", "10,1", "10,1", "20,2",
+				"11,1", "11,1", "11,1", "11,1", "11,1",
+			},
+			["source-frontend-repeat-continue-body-local"] = {
+				"11", "11", "11", "11", "11",
+				"11", "11", "11", "11", "11",
+				"11", "11", "11", "11", "11",
+				"12", "12", "12", "12", "12",
+				"11", "11", "11", "10.5", "10.5",
+				"11", "11", "11", "11", "11",
+				"14", "14", "14", "15", "15",
+				"13", "13", "13", "11", "11",
+				"14", "14", "14", "12", "12",
+			},
+			["source-frontend-repeat-continue-queue-drain-layout"] = {
+				"3,0,1", "3,0,1", "4,0,2", "8,0,3", "14,0,5",
+				"3,0,1", "3,0,1", "7,1,3", "12,2,5", "12,2,5",
+				"3,0,1", "3,0,1", "4,0,2", "8,0,3", "14,0,5",
+				"1,1,2", "5,1,3", "5,1,3", "11,1,5", "11,1,5",
+				"3,0,1", "3,0,1", "4,0,2", "8,0,3", "14,0,5",
+				"3,0,1", "3,0,1", "4,0,2", "8,0,3", "14,0,5",
+				"3,0,1", "3,0,1", "4,0,2", "10,1,5", "19,1,6",
+				"3,0,1", "3,0,1", "4,0,2", "8,0,3", "14,0,5",
+				"3,0,1", "3,0,1", "4,0,2", "8,0,3", "14,0,5",
+			},
+		}
+		local rows = expected[caseName]
+		local row = 0
+		for _, selector in { 0, 1, -2, 3, 2.5, "x", 4, 10, 11 } :: { any } do
+			for _, budget in { 0, 1, 3, 7, 10 } do
+				row += 1
+				local packed = table.pack(pcall(exported, selector, budget))
+				local got = "error"
+				if packed[1] then
+					local parts: { string } = {}
+					for index = 2, packed.n do
+						table.insert(parts, tostring(packed[index]))
+					end
+					got = table.concat(parts, ",")
+				end
+				assert(
+					got == rows[row],
+					`{caseName} returned {got} for ({tostring(selector)}, {budget}), the source returns {rows[row]}`
+				)
+			end
+		end
 	else
 		return false
 	end

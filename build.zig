@@ -1042,6 +1042,42 @@ pub fn build(b: *std.Build) void {
         "luau/fixtures/repeat_loop_source.luau",
         "source-frontend-repeat-loop",
     );
+    const source_frontend_repeat_continue_past_join_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/repeat_continue_past_join_source.luau",
+        "source-frontend-repeat-continue-past-join",
+    );
+    const source_frontend_repeat_continue_retry_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/repeat_continue_retry_source.luau",
+        "source-frontend-repeat-continue-retry",
+    );
+    const source_frontend_repeat_continue_body_local_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/repeat_continue_body_local_source.luau",
+        "source-frontend-repeat-continue-body-local",
+    );
+    const source_frontend_repeat_continue_queue_drain_layout_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/repeat_continue_queue_drain_source.luau",
+        "source-frontend-repeat-continue-queue-drain-layout",
+    );
+    const repeat_continue_queue_drain_layout = b.addSystemCommand(&.{ luneExe(b), "run" });
+    repeat_continue_queue_drain_layout.addFileArg(b.path("luau/structured_layout_oracle.luau"));
+    repeat_continue_queue_drain_layout.addArg("source-frontend-repeat-continue-queue-drain-layout");
+    repeat_continue_queue_drain_layout.addFileArg(source_frontend_repeat_continue_queue_drain_layout_conformance.generated_luau);
     const source_frontend_repeat_continue_queue_drain_conformance = addLuauSourceConformance(
         b,
         exe,
@@ -2284,6 +2320,11 @@ pub fn build(b: *std.Build) void {
     source_frontend_method_conformance.addTo(conformance_step);
     source_frontend_recursive_conformance.addTo(conformance_step);
     source_frontend_repeat_conformance.addTo(conformance_step);
+    source_frontend_repeat_continue_past_join_conformance.addTo(conformance_step);
+    source_frontend_repeat_continue_retry_conformance.addTo(conformance_step);
+    source_frontend_repeat_continue_body_local_conformance.addTo(conformance_step);
+    source_frontend_repeat_continue_queue_drain_layout_conformance.addTo(conformance_step);
+    conformance_step.dependOn(&repeat_continue_queue_drain_layout.step);
     source_frontend_repeat_continue_queue_drain_conformance.addTo(conformance_step);
     source_frontend_repeat_continue_queue_drain_parameter_test_conformance.addTo(conformance_step);
     source_frontend_repeat_continue_queue_drain_derived_local_conformance.addTo(conformance_step);
@@ -3803,10 +3844,10 @@ fn addEmitRefusalConformance(
 // allocated per execution in each of two sibling arms of a loop body, on the unchecked strategy route, the checked
 // `emit-luau` and the function probe; in direct locals, the source with seven single-assignment locals in each of two
 // arms before a repeat loop with a continue in an `if` arm and one in an `elseif` arm, on the strategy route and the
-// checked chain; in the standard target, the source with 60 mutable locals in each of two arms before a repeat loop
-// whose continue skips a join, whose 200 potential locals keep their registers and leave the `__lifter_pc` slot as the
-// 201st local, on the same two routes. With one place or local fewer per arm each input is admitted, written in the
-// flat layout and compiled at -O0 and at the default level.
+// checked chain; in the standard target, the source with 80 mutable locals in each of two arms before a `while` loop
+// whose body ends in an `if` with an `or` test and only a `continue`, whose 200 potential locals keep their registers
+// and leave the `__lifter_pc` slot as the 201st local, on the same two routes. With one place or local fewer per arm
+// each input is admitted, written in the flat layout and compiled at -O0 and at the default level.
 const region_fallback_refusal = [_][]const u8{ "diagnostic=unsupported_readable_register_pressure entity=1\n", "error: InvalidIr" };
 
 const RegionFallbackLocalBudgetConformance = struct {
@@ -3829,7 +3870,7 @@ fn addRegionFallbackLocalBudgetConformance(
     const local_budget = addGenericBudgetResolvedIr(b, exe, z3_enabled, z3_bin, "luau/fixtures/region_fallback_local_budget_source.luau", "region-fallback-local-budget");
     const local_budget_6 = addGenericBudgetResolvedIr(b, exe, z3_enabled, z3_bin, "luau/fixtures/region_fallback_local_budget_6_source.luau", "region-fallback-local-budget-6");
     const pc_slot = addGenericBudgetResolvedIr(b, exe, z3_enabled, z3_bin, "luau/fixtures/region_fallback_pc_slot_source.luau", "region-fallback-pc-slot");
-    const pc_slot_59 = addGenericBudgetResolvedIr(b, exe, z3_enabled, z3_bin, "luau/fixtures/region_fallback_pc_slot_59_source.luau", "region-fallback-pc-slot-59");
+    const pc_slot_79 = addGenericBudgetResolvedIr(b, exe, z3_enabled, z3_bin, "luau/fixtures/region_fallback_pc_slot_79_source.luau", "region-fallback-pc-slot-79");
     return .{ .steps = .{
         addEmitRefusalConformance(b, exe, z3_enabled, z3_bin, places, "region-fallback-allocated-places-76.automatic.luau", "standard-luau", "automatic", &region_fallback_refusal),
         addRegionFallbackRefusal(b, exe, z3_enabled, z3_bin, "emit-luau", places, "region-fallback-allocated-places-76.generated.luau", &.{"standard-luau"}, true),
@@ -3840,7 +3881,7 @@ fn addRegionFallbackLocalBudgetConformance(
         addRegionFallbackRefusal(b, exe, z3_enabled, z3_bin, "emit-luau-solved", pc_slot, "region-fallback-pc-slot.generated.luau", &.{ engine, "standard-luau" }, true),
         addRegionFallbackBoundary(b, exe, z3_enabled, z3_bin, places_75, "region-fallback-allocated-places-75", "standard-luau"),
         addRegionFallbackBoundary(b, exe, z3_enabled, z3_bin, local_budget_6, "region-fallback-local-budget-6", "direct-locals-luau"),
-        addRegionFallbackBoundary(b, exe, z3_enabled, z3_bin, pc_slot_59, "region-fallback-pc-slot-59", "standard-luau"),
+        addRegionFallbackBoundary(b, exe, z3_enabled, z3_bin, pc_slot_79, "region-fallback-pc-slot-79", "standard-luau"),
     } };
 }
 

@@ -1610,6 +1610,183 @@ fn compoundShortCircuitSplitAlloc(
     };
 }
 
+/// The latch tail of a post-tested loop under a continue wrapper: the closure T in a Kahn order over its internal
+/// edges (the latch entry first) and the collision's incoming edge, which the split redirects to the entry's clone.
+const LatchTail = struct {
+    closure: []ir.BlockId,
+    clone_edge: ir.CfgEdgeRef,
+};
+
+const natural_loop = @import("natural_loop.zig");
+
+/// The latch tail of a post-tested loop under a continue wrapper.  For the
+/// collision's block `latch` (L) and its one incoming edge `incoming` (source
+/// s, target L): the innermost natural loop holding L and s has a header H
+/// other than L that carries no iteration transition, and T, the blocks
+/// reached from L inside that loop without entering H, is acyclic, entered
+/// only at L, holds no incoming source and holds a `branch`; every other edge
+/// leaving T enters H or leaves the loop, by construction.  Returns T in a
+/// Kahn order over its internal edges (L first) and the incoming edge; null
+/// otherwise, with nothing it allocated left behind.
+fn latchTailCloneEdge(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    latch: ir.BlockId,
+    incoming: ir.CfgEdgeRef,
+) std.mem.Allocator.Error!?LatchTail {
+    if (incoming.target != latch) return null;
+    if (latch.index() >= program.blocks.len or incoming.source.index() >= program.blocks.len) return null;
+    if (!analysis.isReachable(latch) or !analysis.isReachable(incoming.source)) return null;
+    const latch_local = analysis.blockIndex(latch) orelse return null;
+    const source_local = analysis.blockIndex(incoming.source) orelse return null;
+
+    // (1) The innermost natural loop holding L and s: the smallest body among
+    // the headers that dominate a predecessor targeting them.
+    const candidates = try natural_loop.headerCandidatesAlloc(allocator, analysis);
+    defer allocator.free(candidates);
+    var body: ?natural_loop.Membership = null;
+    defer if (body) |*held| held.deinit();
+    var header = latch;
+    var body_size: usize = 0;
+    for (analysis.function.blocks, candidates) |candidate, is_candidate| {
+        if (!is_candidate) continue;
+        var membership = (natural_loop.collect(allocator, analysis, candidate) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.UnsupportedShape => continue,
+        }) orelse continue;
+        var size: usize = 0;
+        for (membership.bits) |is_member| size += @intFromBool(is_member);
+        if (!membership.bits[latch_local] or !membership.bits[source_local] or
+            (body != null and size >= body_size))
+        {
+            membership.deinit();
+            continue;
+        }
+        if (body) |*previous| previous.deinit();
+        body = membership;
+        header = candidate;
+        body_size = size;
+    }
+    const members = if (body) |held| held.bits else return null;
+
+    // (2) H is not L and carries no iteration transition.
+    if (header == latch) return null;
+    if (iteration_protocol.transitionForHeader(program, program.blocks[header.index()]) != null) return null;
+
+    // (3) T: the blocks reached from L inside the loop without entering H.
+    const block_count = analysis.function.blocks.len;
+    const in_tail = try allocator.alloc(bool, block_count);
+    defer allocator.free(in_tail);
+    @memset(in_tail, false);
+    var tail: std.ArrayList(ir.BlockId) = .empty;
+    defer tail.deinit(allocator);
+    try tail.append(allocator, latch);
+    in_tail[latch_local] = true;
+    var cursor: usize = 0;
+    while (cursor < tail.items.len) : (cursor += 1) {
+        const block_id = tail.items[cursor];
+        for (0..analysis.successorCount(block_id)) |successor_index| {
+            const successor = analysis.successorAt(block_id, successor_index) orelse return null;
+            if (successor == header) continue;
+            const successor_local = analysis.blockIndex(successor) orelse return null;
+            if (!members[successor_local] or in_tail[successor_local]) continue;
+            in_tail[successor_local] = true;
+            try tail.append(allocator, successor);
+        }
+    }
+    if (in_tail[source_local]) return null;
+    var holds_branch = false;
+    for (tail.items) |block_id| {
+        switch (program.blocks[block_id.index()].terminator) {
+            .branch => holds_branch = true,
+            else => {},
+        }
+        if (block_id == latch) continue;
+        for (0..analysis.predecessorCount(block_id)) |predecessor_index| {
+            const predecessor = analysis.predecessorAt(block_id, predecessor_index) orelse return null;
+            const predecessor_local = analysis.blockIndex(predecessor) orelse return null;
+            if (!in_tail[predecessor_local]) return null;
+        }
+    }
+    if (!holds_branch) return null;
+
+    // T in a Kahn order over its internal edges; a cycle leaves a block
+    // unordered and is refused.
+    const indegree = try allocator.alloc(usize, block_count);
+    defer allocator.free(indegree);
+    @memset(indegree, 0);
+    for (tail.items) |block_id| {
+        for (0..analysis.successorCount(block_id)) |successor_index| {
+            const successor = analysis.successorAt(block_id, successor_index) orelse return null;
+            const successor_local = analysis.blockIndex(successor) orelse return null;
+            if (in_tail[successor_local]) indegree[successor_local] += 1;
+        }
+    }
+    var ordered: std.ArrayList(ir.BlockId) = .empty;
+    defer ordered.deinit(allocator);
+    for (tail.items) |block_id| {
+        if (indegree[analysis.blockIndex(block_id).?] == 0) try ordered.append(allocator, block_id);
+    }
+    var head: usize = 0;
+    while (head < ordered.items.len) : (head += 1) {
+        const block_id = ordered.items[head];
+        for (0..analysis.successorCount(block_id)) |successor_index| {
+            const successor = analysis.successorAt(block_id, successor_index) orelse return null;
+            const successor_local = analysis.blockIndex(successor) orelse return null;
+            if (!in_tail[successor_local]) continue;
+            indegree[successor_local] -= 1;
+            if (indegree[successor_local] == 0) try ordered.append(allocator, successor);
+        }
+    }
+    if (ordered.items.len != tail.items.len or ordered.items[0] != latch) return null;
+
+    return .{
+        .closure = try ordered.toOwnedSlice(allocator),
+        .clone_edge = incoming,
+    };
+}
+
+/// The split of a post-tested loop's latch tail, constructed directly for the collision's one incoming edge
+/// `tail.clone_edge`: the closure is the tail T (the latch entry first), the incoming edge is the collision's edge,
+/// the branch is that edge's source, and the entry and join are the latch entry (as the one-block split sets
+/// join = entry). Admitted by `structural_overlap.prepareClosureWithReplayContext` unseeded, as the short-circuit
+/// splits. Null (freeing the closure) when the preparation refuses the tail, so the feedback phase keeps its
+/// contextual and generic finders.
+fn latchTailSplitAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    analysis: *const cfg.Analysis,
+    function_index: usize,
+    tail: LatchTail,
+    replay_context: *structural_overlap.ReplayProjectionContext,
+) std.mem.Allocator.Error!?structural_overlap.Split {
+    const closure = tail.closure;
+    errdefer allocator.free(closure);
+    const incoming = [_]ir.CfgEdgeRef{tail.clone_edge};
+    if (!structural_overlap.prepareClosureWithReplayContext(
+        allocator,
+        program,
+        analysis,
+        closure,
+        &incoming,
+        replay_context,
+    )) {
+        allocator.free(closure);
+        return null;
+    }
+    const owned_incoming = try allocator.dupe(ir.CfgEdgeRef, &incoming);
+    return .{
+        .allocator = allocator,
+        .function_index = function_index,
+        .branch = tail.clone_edge.source,
+        .entry = tail.clone_edge.target,
+        .join = tail.clone_edge.target,
+        .incoming = owned_incoming,
+        .closure = closure,
+    };
+}
+
 // The per-function decline of admitted resolution
 // (NormalizeOptions.decline_unsplittable_functions). The structure feedback writes
 // only block terminators and function block lists in place and only appends to the
@@ -2408,6 +2585,38 @@ fn normalizeImpl(
                                                         seeded_fallback = true;
                                                     }
                                                 }
+                                            }
+                                        }
+                                    }
+                                    // A post-tested loop's latch tail under a continue wrapper: clone the tail once
+                                    // for the collision's one incoming edge instead of rotating the loop at its
+                                    // until-condition entry. Unseeded, as the two splits above.
+                                    if (selected == null and incoming.len == 1) {
+                                        if (try latchTailCloneEdge(
+                                            feedback_allocator,
+                                            &result.program,
+                                            &graph,
+                                            obstruction.block,
+                                            incoming[0],
+                                        )) |tail| {
+                                            if (try latchTailSplitAlloc(
+                                                feedback_allocator,
+                                                &result.program,
+                                                &graph,
+                                                function_index,
+                                                tail,
+                                                replay_context,
+                                            )) |candidate| {
+                                                traceNormalize("feedback_latch_tail_split function={} latch={} incoming_source={} closure={}\n", .{
+                                                    function_index,
+                                                    obstruction.block.index(),
+                                                    candidate.branch.index(),
+                                                    candidate.closure.len,
+                                                });
+                                                selected = candidate;
+                                                selected_context = null;
+                                                collision_seed = null;
+                                                seeded_fallback = true;
                                             }
                                         }
                                     }
@@ -12200,6 +12409,141 @@ test "clone fold refuses an owner that reads a renamed loop value" {
         try std.testing.expect(!(rewrite.rule == .clone_fold and rewrite.to.target == ir.BlockId.fromIndex(9)));
     }
     try std.testing.expect(normalized.program.blocks[25].terminator.branch.else_edge.target != ir.BlockId.fromIndex(9));
+}
+
+// The worker of a post-tested loop whose body holds a `continue` that skips the code the body reaches after a join,
+// as the disassembly frontend lifts it at -O0: block 3 tests the selector, block 7 tests the budget and either
+// continues to the until-condition block 12 or falls into the code after the inner `if`, and block 13 is the until
+// test (the exit 15 or the empty latch 14, which jumps back to block 2). The latch-tail split clones blocks 12-14 once
+// for the edge from block 11, where whole-program normalization otherwise rotated the loop at block 12 until the
+// clone limit.
+const post_tested_latch_tail_worker_json =
+    \\{"program_id":"post-tested-latch-tail","entry_function":0,
+    \\"functions":[{"id":0,"parameters":[0,1],"local_places":[0,1,2,3],"blocks":[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17],"entry_block":0}],
+    \\"blocks":[
+    \\{"id":0,"function":0,"instructions":[0,1],"terminator":{"jump":{"target":1}}},
+    \\{"id":1,"function":0,"instructions":[2,3],"terminator":{"jump":{"target":2}}},
+    \\{"id":2,"function":0,"instructions":[4,5],"terminator":{"jump":{"target":3}}},
+    \\{"id":3,"function":0,"instructions":[6,7,8],"terminator":{"branch":{"condition":6,"then_edge":{"target":4},"else_edge":{"target":10}}}},
+    \\{"id":4,"function":0,"instructions":[9,10],"terminator":{"jump":{"target":5}}},
+    \\{"id":5,"function":0,"instructions":[11,12,13,14],"terminator":{"jump":{"target":6}}},
+    \\{"id":6,"function":0,"instructions":[15,16],"terminator":{"jump":{"target":7}}},
+    \\{"id":7,"function":0,"instructions":[17,18,19],"terminator":{"branch":{"condition":14,"then_edge":{"target":12},"else_edge":{"target":8}}}},
+    \\{"id":8,"function":0,"instructions":[20,21],"terminator":{"jump":{"target":9}}},
+    \\{"id":9,"function":0,"instructions":[22,23,24,25],"terminator":{"jump":{"target":10}}},
+    \\{"id":10,"function":0,"instructions":[26,27],"terminator":{"jump":{"target":11}}},
+    \\{"id":11,"function":0,"instructions":[28,29,30,31],"terminator":{"jump":{"target":12}}},
+    \\{"id":12,"function":0,"instructions":[32,33],"terminator":{"jump":{"target":13}}},
+    \\{"id":13,"function":0,"instructions":[34,35,36],"terminator":{"branch":{"condition":26,"then_edge":{"target":15},"else_edge":{"target":14}}}},
+    \\{"id":14,"function":0,"terminator":{"jump":{"target":2}}},
+    \\{"id":15,"function":0,"instructions":[37,38],"terminator":{"jump":{"target":16}}},
+    \\{"id":16,"function":0,"instructions":[39,40,41,42],"terminator":{"jump":{"target":17}}},
+    \\{"id":17,"function":0,"instructions":[43],"terminator":{"return_values":[31]}}
+    \\],
+    \\"instructions":[
+    \\{"id":0,"block":0,"operation":{"place_write":{"place":0,"value":0}},"results":[],"effects":{"precision":"exact","writes_memory":true}},
+    \\{"id":1,"block":0,"operation":{"place_write":{"place":1,"value":1}},"results":[],"effects":{"precision":"exact","writes_memory":true}},
+    \\{"id":2,"block":1,"operation":{"constant":{"number":0}},"results":[2],"effects":{"precision":"exact"}},
+    \\{"id":3,"block":1,"operation":{"place_write":{"place":2,"value":2}},"results":[],"effects":{"precision":"exact","writes_memory":true}},
+    \\{"id":4,"block":2,"operation":{"constant":{"number":4}},"results":[3],"effects":{"precision":"exact"}},
+    \\{"id":5,"block":2,"operation":{"place_write":{"place":3,"value":3}},"results":[],"effects":{"precision":"exact","writes_memory":true}},
+    \\{"id":6,"block":3,"operation":{"place_read":0},"results":[4],"effects":{"precision":"exact","reads_memory":true}},
+    \\{"id":7,"block":3,"operation":{"place_read":3},"results":[5],"effects":{"precision":"exact","reads_memory":true}},
+    \\{"id":8,"block":3,"operation":{"binary":{"operator":"equal","left":4,"right":5}},"results":[6],"effects":{"precision":"conservative","reads_memory":true,"writes_memory":true,"may_throw":true,"may_yield":true,"invokes_unknown_code":true}},
+    \\{"id":9,"block":4,"operation":{"constant":{"number":2}},"results":[7],"effects":{"precision":"exact"}},
+    \\{"id":10,"block":4,"operation":{"place_write":{"place":3,"value":7}},"results":[],"effects":{"precision":"exact","writes_memory":true}},
+    \\{"id":11,"block":5,"operation":{"place_read":2},"results":[8],"effects":{"precision":"exact","reads_memory":true}},
+    \\{"id":12,"block":5,"operation":{"place_read":3},"results":[9],"effects":{"precision":"exact","reads_memory":true}},
+    \\{"id":13,"block":5,"operation":{"binary":{"operator":"add","left":8,"right":9}},"results":[10],"effects":{"precision":"conservative","reads_memory":true,"writes_memory":true,"may_throw":true,"may_yield":true,"invokes_unknown_code":true}},
+    \\{"id":14,"block":5,"operation":{"place_write":{"place":2,"value":10}},"results":[],"effects":{"precision":"exact","writes_memory":true}},
+    \\{"id":15,"block":6,"operation":{"constant":{"number":7}},"results":[11],"effects":{"precision":"exact"}},
+    \\{"id":16,"block":6,"operation":{"place_write":{"place":3,"value":11}},"results":[],"effects":{"precision":"exact","writes_memory":true}},
+    \\{"id":17,"block":7,"operation":{"place_read":3},"results":[12],"effects":{"precision":"exact","reads_memory":true}},
+    \\{"id":18,"block":7,"operation":{"place_read":1},"results":[13],"effects":{"precision":"exact","reads_memory":true}},
+    \\{"id":19,"block":7,"operation":{"binary":{"operator":"less","left":12,"right":13}},"results":[14],"effects":{"precision":"conservative","reads_memory":true,"writes_memory":true,"may_throw":true,"may_yield":true,"invokes_unknown_code":true}},
+    \\{"id":20,"block":8,"operation":{"constant":{"number":1}},"results":[15],"effects":{"precision":"exact"}},
+    \\{"id":21,"block":8,"operation":{"place_write":{"place":3,"value":15}},"results":[],"effects":{"precision":"exact","writes_memory":true}},
+    \\{"id":22,"block":9,"operation":{"place_read":2},"results":[16],"effects":{"precision":"exact","reads_memory":true}},
+    \\{"id":23,"block":9,"operation":{"place_read":3},"results":[17],"effects":{"precision":"exact","reads_memory":true}},
+    \\{"id":24,"block":9,"operation":{"binary":{"operator":"add","left":16,"right":17}},"results":[18],"effects":{"precision":"conservative","reads_memory":true,"writes_memory":true,"may_throw":true,"may_yield":true,"invokes_unknown_code":true}},
+    \\{"id":25,"block":9,"operation":{"place_write":{"place":2,"value":18}},"results":[],"effects":{"precision":"exact","writes_memory":true}},
+    \\{"id":26,"block":10,"operation":{"constant":{"number":1}},"results":[19],"effects":{"precision":"exact"}},
+    \\{"id":27,"block":10,"operation":{"place_write":{"place":3,"value":19}},"results":[],"effects":{"precision":"exact","writes_memory":true}},
+    \\{"id":28,"block":11,"operation":{"place_read":2},"results":[20],"effects":{"precision":"exact","reads_memory":true}},
+    \\{"id":29,"block":11,"operation":{"place_read":3},"results":[21],"effects":{"precision":"exact","reads_memory":true}},
+    \\{"id":30,"block":11,"operation":{"binary":{"operator":"add","left":20,"right":21}},"results":[22],"effects":{"precision":"conservative","reads_memory":true,"writes_memory":true,"may_throw":true,"may_yield":true,"invokes_unknown_code":true}},
+    \\{"id":31,"block":11,"operation":{"place_write":{"place":2,"value":22}},"results":[],"effects":{"precision":"exact","writes_memory":true}},
+    \\{"id":32,"block":12,"operation":{"constant":{"number":6}},"results":[23],"effects":{"precision":"exact"}},
+    \\{"id":33,"block":12,"operation":{"place_write":{"place":3,"value":23}},"results":[],"effects":{"precision":"exact","writes_memory":true}},
+    \\{"id":34,"block":13,"operation":{"place_read":3},"results":[24],"effects":{"precision":"exact","reads_memory":true}},
+    \\{"id":35,"block":13,"operation":{"place_read":2},"results":[25],"effects":{"precision":"exact","reads_memory":true}},
+    \\{"id":36,"block":13,"operation":{"binary":{"operator":"less_equal","left":24,"right":25}},"results":[26],"effects":{"precision":"conservative","reads_memory":true,"writes_memory":true,"may_throw":true,"may_yield":true,"invokes_unknown_code":true}},
+    \\{"id":37,"block":15,"operation":{"constant":{"number":100}},"results":[27],"effects":{"precision":"exact"}},
+    \\{"id":38,"block":15,"operation":{"place_write":{"place":3,"value":27}},"results":[],"effects":{"precision":"exact","writes_memory":true}},
+    \\{"id":39,"block":16,"operation":{"place_read":2},"results":[28],"effects":{"precision":"exact","reads_memory":true}},
+    \\{"id":40,"block":16,"operation":{"place_read":3},"results":[29],"effects":{"precision":"exact","reads_memory":true}},
+    \\{"id":41,"block":16,"operation":{"binary":{"operator":"add","left":28,"right":29}},"results":[30],"effects":{"precision":"conservative","reads_memory":true,"writes_memory":true,"may_throw":true,"may_yield":true,"invokes_unknown_code":true}},
+    \\{"id":42,"block":16,"operation":{"place_write":{"place":2,"value":30}},"results":[],"effects":{"precision":"exact","writes_memory":true}},
+    \\{"id":43,"block":17,"operation":{"place_read":2},"results":[31],"effects":{"precision":"exact","reads_memory":true}}
+    \\],
+    \\"values":[
+    \\{"id":0,"function":0,"origin":{"parameter":0}},
+    \\{"id":1,"function":0,"origin":{"parameter":1}},
+    \\{"id":2,"function":0,"type":{"kind":"number","bit_width":64},"origin":{"instruction_result":{"instruction":2,"index":0}}},
+    \\{"id":3,"function":0,"type":{"kind":"number","bit_width":64},"origin":{"instruction_result":{"instruction":4,"index":0}}},
+    \\{"id":4,"function":0,"origin":{"instruction_result":{"instruction":6,"index":0}}},
+    \\{"id":5,"function":0,"origin":{"instruction_result":{"instruction":7,"index":0}}},
+    \\{"id":6,"function":0,"type":{"kind":"boolean"},"origin":{"instruction_result":{"instruction":8,"index":0}}},
+    \\{"id":7,"function":0,"type":{"kind":"number","bit_width":64},"origin":{"instruction_result":{"instruction":9,"index":0}}},
+    \\{"id":8,"function":0,"origin":{"instruction_result":{"instruction":11,"index":0}}},
+    \\{"id":9,"function":0,"origin":{"instruction_result":{"instruction":12,"index":0}}},
+    \\{"id":10,"function":0,"origin":{"instruction_result":{"instruction":13,"index":0}}},
+    \\{"id":11,"function":0,"type":{"kind":"number","bit_width":64},"origin":{"instruction_result":{"instruction":15,"index":0}}},
+    \\{"id":12,"function":0,"origin":{"instruction_result":{"instruction":17,"index":0}}},
+    \\{"id":13,"function":0,"origin":{"instruction_result":{"instruction":18,"index":0}}},
+    \\{"id":14,"function":0,"type":{"kind":"boolean"},"origin":{"instruction_result":{"instruction":19,"index":0}}},
+    \\{"id":15,"function":0,"type":{"kind":"number","bit_width":64},"origin":{"instruction_result":{"instruction":20,"index":0}}},
+    \\{"id":16,"function":0,"origin":{"instruction_result":{"instruction":22,"index":0}}},
+    \\{"id":17,"function":0,"origin":{"instruction_result":{"instruction":23,"index":0}}},
+    \\{"id":18,"function":0,"origin":{"instruction_result":{"instruction":24,"index":0}}},
+    \\{"id":19,"function":0,"type":{"kind":"number","bit_width":64},"origin":{"instruction_result":{"instruction":26,"index":0}}},
+    \\{"id":20,"function":0,"origin":{"instruction_result":{"instruction":28,"index":0}}},
+    \\{"id":21,"function":0,"origin":{"instruction_result":{"instruction":29,"index":0}}},
+    \\{"id":22,"function":0,"origin":{"instruction_result":{"instruction":30,"index":0}}},
+    \\{"id":23,"function":0,"type":{"kind":"number","bit_width":64},"origin":{"instruction_result":{"instruction":32,"index":0}}},
+    \\{"id":24,"function":0,"origin":{"instruction_result":{"instruction":34,"index":0}}},
+    \\{"id":25,"function":0,"origin":{"instruction_result":{"instruction":35,"index":0}}},
+    \\{"id":26,"function":0,"type":{"kind":"boolean"},"origin":{"instruction_result":{"instruction":36,"index":0}}},
+    \\{"id":27,"function":0,"type":{"kind":"number","bit_width":64},"origin":{"instruction_result":{"instruction":37,"index":0}}},
+    \\{"id":28,"function":0,"origin":{"instruction_result":{"instruction":39,"index":0}}},
+    \\{"id":29,"function":0,"origin":{"instruction_result":{"instruction":40,"index":0}}},
+    \\{"id":30,"function":0,"origin":{"instruction_result":{"instruction":41,"index":0}}},
+    \\{"id":31,"function":0,"origin":{"instruction_result":{"instruction":43,"index":0}}}
+    \\],
+    \\"places":[
+    \\{"id":0,"function":0,"origin":{"local":0}},
+    \\{"id":1,"function":0,"origin":{"local":1}},
+    \\{"id":2,"function":0,"origin":{"local":2}},
+    \\{"id":3,"function":0,"origin":{"local":3}}
+    \\]}
+;
+
+test "a post-tested latch tail under a continue wrapper normalizes by one tail split" {
+    const parsed = try std.json.parseFromSlice(ir.Program, std.testing.allocator, post_tested_latch_tail_worker_json, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const normalized = try normalizeWithScratchInArena(arena.allocator(), std.testing.allocator, &parsed.value);
+    try std.testing.expect(normalized.cloned_blocks <= 3);
+    var graph = try cfg.Analysis.init(std.testing.allocator, &normalized.program, normalized.program.functions[0]);
+    defer graph.deinit();
+    var collision: ?structure.Collision = null;
+    defer if (collision) |*value| value.deinit(std.testing.allocator);
+    var plan = try structure.Plan.initWithCollision(std.testing.allocator, &graph, &collision);
+    defer plan.deinit();
 }
 
 test "eligible two-entry cycles normalize through authenticated node splitting" {
