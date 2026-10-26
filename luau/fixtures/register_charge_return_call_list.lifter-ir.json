@@ -1,0 +1,462 @@
+{
+  "blocks": [
+    {
+      "evidence": [
+        0
+      ],
+      "function": 0,
+      "id": 0,
+      "instructions": [
+        0,
+        1
+      ],
+      "name_hint": "entry",
+      "parameters": [],
+      "terminator": {
+        "return_expanded": {
+          "pack": 1,
+          "values": [
+            0
+          ]
+        }
+      }
+    }
+  ],
+  "captures": [],
+  "certificates": [],
+  "claims": [],
+  "constraints": [],
+  "edge_rewrites": [],
+  "entry_bindings": [],
+  "entry_function": 0,
+  "evidence": [
+    {
+      "id": 0,
+      "kind": "source_span",
+      "locator": "source:register-charge-return-call-list:0,0 - 2,0"
+    },
+    {
+      "id": 1,
+      "kind": "source_span",
+      "locator": "source:register-charge-return-call-list:0,16 - 0,19"
+    },
+    {
+      "id": 2,
+      "kind": "source_span",
+      "locator": "source:register-charge-return-call-list:1,10 - 1,764"
+    }
+  ],
+  "external_bindings": [],
+  "functions": [
+    {
+      "blocks": [
+        0
+      ],
+      "captures": [],
+      "entry_block": 0,
+      "evidence": [
+        0
+      ],
+      "id": 0,
+      "is_variadic": true,
+      "local_places": [],
+      "name_hint": "chunk",
+      "parameters": [],
+      "vararg_pack": 0
+    }
+  ],
+  "instructions": [
+    {
+      "block": 0,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        1
+      ],
+      "id": 0,
+      "operation": {
+        "adjust_pack": 0
+      },
+      "results": [
+        0,
+        1,
+        2
+      ]
+    },
+    {
+      "block": 0,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": true,
+        "may_throw": true,
+        "may_yield": true,
+        "precision": "conservative",
+        "reads_memory": true,
+        "writes_memory": true
+      },
+      "evidence": [
+        2
+      ],
+      "id": 1,
+      "operation": {
+        "call": {
+          "arguments": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "callee": 2,
+          "result_arity": {
+            "variadic": {}
+          }
+        }
+      },
+      "pack_result": 1,
+      "results": []
+    }
+  ],
+  "obligations": [],
+  "places": [],
+  "program_id": "register-charge-return-call-list",
+  "queries": [],
+  "schema_version": "lifter_ir_v1",
+  "solver_models": [],
+  "solver_terms": [],
+  "source_semantics": "luau",
+  "unsat_cores": [],
+  "value_packs": [
+    {
+      "evidence": [
+        0
+      ],
+      "function": 0,
+      "id": 0,
+      "origin": {
+        "varargs": 0
+      },
+      "shape": {
+        "prefix": [],
+        "tail": "open"
+      }
+    },
+    {
+      "evidence": [
+        2
+      ],
+      "function": 0,
+      "id": 1,
+      "origin": {
+        "instruction_result": 1
+      },
+      "shape": {
+        "prefix": [],
+        "tail": "open"
+      }
+    }
+  ],
+  "values": [
+    {
+      "function": 0,
+      "id": 0,
+      "name_hint": "x",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 0
+        }
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 0,
+      "id": 1,
+      "name_hint": "y",
+      "origin": {
+        "instruction_result": {
+          "index": 1,
+          "instruction": 0
+        }
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 0,
+      "id": 2,
+      "name_hint": "f",
+      "origin": {
+        "instruction_result": {
+          "index": 2,
+          "instruction": 0
+        }
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    }
+  ]
+}

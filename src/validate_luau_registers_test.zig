@@ -617,11 +617,14 @@ fn expandedReturnTemporaryPressureReport(comptime value_count: usize) !diagnosti
 }
 
 test "expanded returns stage a fixed prefix before the open tail" {
-    var boundary = try expandedReturnTemporaryPressureReport(126);
+    // The entry function's own varargs follow its parameter, so the return writes the open tail as
+    // `__lifter_select(2, ...)`, a call of three registers in the slot after the fixed values. With 125 values the text
+    // needs 255 registers at -O0 and at the default level; with 126 luau-compile rejects it (`allocate 3 registers`).
+    var boundary = try expandedReturnTemporaryPressureReport(125);
     defer boundary.deinit();
     try std.testing.expect(boundary.isClean());
 
-    var excessive = try expandedReturnTemporaryPressureReport(127);
+    var excessive = try expandedReturnTemporaryPressureReport(126);
     defer excessive.deinit();
     try std.testing.expectEqual(@as(usize, 1), excessive.diagnostics.items.len);
     try std.testing.expect(excessive.contains(.unsupported_readable_temporary_register_pressure));
@@ -1060,4 +1063,163 @@ test "a function marked flat is certified in the dispatcher layout" {
     var boundary = try siblingArmPlacesReport(98, .automatic, &.{true});
     defer boundary.deinit();
     try std.testing.expect(boundary.isClean());
+}
+
+fn flatClosureCallPressureReport(comptime snapshot_count: usize, comptime argument_count: usize) !diagnostics.Report {
+    const entry_function = ir.FunctionId.fromIndex(0);
+    const closure_function = ir.FunctionId.fromIndex(1);
+    const entry_block = ir.BlockId.fromIndex(0);
+    const closure_block = ir.BlockId.fromIndex(1);
+    const callee = ir.ValueId.fromIndex(0);
+    const argument = ir.ValueId.fromIndex(1);
+    const closure_result = ir.ValueId.fromIndex(2 + snapshot_count);
+    const call_result = ir.ValueId.fromIndex(3 + snapshot_count);
+    const closure_instruction = ir.InstructionId.fromIndex(snapshot_count);
+    const call_instruction = ir.InstructionId.fromIndex(snapshot_count + 1);
+
+    var values: [4 + 2 * snapshot_count]ir.Value = undefined;
+    var instructions: [snapshot_count + 2]ir.Instruction = undefined;
+    var instruction_ids: [snapshot_count + 2]ir.InstructionId = undefined;
+    var source_results: [snapshot_count][1]ir.ValueId = undefined;
+    var bindings: [snapshot_count]ir.CaptureBinding = undefined;
+    var capture_ids: [snapshot_count]ir.CaptureId = undefined;
+    var captures: [snapshot_count]ir.Capture = undefined;
+    var captured_values: [snapshot_count]ir.ValueId = undefined;
+    var arguments: [argument_count]ir.ValueId = undefined;
+    @memset(&arguments, argument);
+
+    values[callee.index()] = .{ .id = callee, .function = entry_function, .type = .function, .origin = .{ .parameter = 0 } };
+    values[argument.index()] = .{ .id = argument, .function = entry_function, .origin = .{ .parameter = 1 } };
+    for (0..snapshot_count) |index| {
+        const instruction_id = ir.InstructionId.fromIndex(index);
+        const source = ir.ValueId.fromIndex(2 + index);
+        instruction_ids[index] = instruction_id;
+        source_results[index][0] = source;
+        values[source.index()] = .{
+            .id = source,
+            .function = entry_function,
+            .origin = .{ .instruction_result = .{ .instruction = instruction_id, .index = 0 } },
+        };
+        bindings[index] = .{ .value = source };
+        instructions[index] = .{
+            .id = instruction_id,
+            .block = entry_block,
+            .operation = .{ .constant = .{ .integer = "0" } },
+            .results = &source_results[index],
+            .effects = .pure,
+        };
+        capture_ids[index] = ir.CaptureId.fromIndex(index);
+        captured_values[index] = ir.ValueId.fromIndex(4 + snapshot_count + index);
+        values[captured_values[index].index()] = .{
+            .id = captured_values[index],
+            .function = closure_function,
+            .origin = .{ .capture = capture_ids[index] },
+        };
+        captures[index] = .{
+            .id = capture_ids[index],
+            .function = closure_function,
+            .kind = .{ .immutable_value = captured_values[index] },
+        };
+    }
+    values[closure_result.index()] = .{
+        .id = closure_result,
+        .function = entry_function,
+        .type = .function,
+        .origin = .{ .instruction_result = .{ .instruction = closure_instruction, .index = 0 } },
+    };
+    values[call_result.index()] = .{
+        .id = call_result,
+        .function = entry_function,
+        .origin = .{ .instruction_result = .{ .instruction = call_instruction, .index = 0 } },
+    };
+    instruction_ids[snapshot_count] = closure_instruction;
+    instruction_ids[snapshot_count + 1] = call_instruction;
+    const closure_results = [_]ir.ValueId{closure_result};
+    const call_results = [_]ir.ValueId{call_result};
+    instructions[snapshot_count] = .{
+        .id = closure_instruction,
+        .block = entry_block,
+        .operation = .{ .make_closure = .{ .function = closure_function, .bindings = &bindings } },
+        .results = &closure_results,
+        .effects = .pure,
+    };
+    instructions[snapshot_count + 1] = .{
+        .id = call_instruction,
+        .block = entry_block,
+        .operation = .{ .call = .{ .callee = callee, .arguments = &arguments, .result_arity = .{ .fixed = 1 } } },
+        .results = &call_results,
+        .effects = .dynamic_call,
+    };
+    const returned = [_]ir.ValueId{ closure_result, call_result };
+    const blocks = [_]ir.Block{
+        .{
+            .id = entry_block,
+            .function = entry_function,
+            .instructions = &instruction_ids,
+            .terminator = .{ .return_values = &returned },
+        },
+        .{
+            .id = closure_block,
+            .function = closure_function,
+            .terminator = .{ .return_values = &captured_values },
+        },
+    };
+    const functions = [_]ir.Function{
+        .{
+            .id = entry_function,
+            .parameters = &.{ callee, argument },
+            .blocks = &.{entry_block},
+            .entry_block = entry_block,
+        },
+        .{
+            .id = closure_function,
+            .lexical_parent = entry_function,
+            .captures = &capture_ids,
+            .blocks = &.{closure_block},
+            .entry_block = closure_block,
+        },
+    };
+    const program: ir.Program = .{
+        .program_id = "flat-closure-call-register-pressure",
+        .entry_function = entry_function,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+        .captures = &captures,
+    };
+    var scope = try readable_scope.Scope.init(std.testing.allocator, &program);
+    defer scope.deinit();
+    var report = diagnostics.Report.init(std.testing.allocator);
+    errdefer report.deinit();
+    try register_validation.validateWithStrategy(std.testing.allocator, &report, &program, &scope, .direct_locals_luau, .dispatcher);
+    return report;
+}
+
+test "the dispatcher layout charges a statement above its flat locals and a closure's snapshot locals" {
+    // One function in the dispatcher layout: the parameters callee and argument, `snapshot_count` constants that one
+    // closure captures, the closure, and callee(argument, ...) with `argument_count` arguments, returned with the
+    // closure as `return closure, (callee(argument, ...))`. Its flat locals are the two parameters, the five values it
+    // declares and `__lifter_pc`; the closure's `do` block declares one snapshot local per constant above them.
+    // The return holds the closure's slot and the call's registers above the eight flat locals: with 245 arguments the
+    // text needs 255 registers at -O0, with 246 luau-compile rejects it (`allocate 246 registers`).
+    var boundary = try flatClosureCallPressureReport(3, 245);
+    defer boundary.deinit();
+    try std.testing.expect(boundary.isClean());
+
+    var excessive = try flatClosureCallPressureReport(3, 246);
+    defer excessive.deinit();
+    try std.testing.expectEqual(@as(usize, 1), excessive.diagnostics.items.len);
+    try std.testing.expect(excessive.contains(.unsupported_readable_temporary_register_pressure));
+
+    // With 97 constants the flat locals and the snapshots are 199 locals; with 98 they are 201, one past luau-compile's
+    // 200 (`Out of local registers`).
+    var locals_boundary = try flatClosureCallPressureReport(97, 1);
+    defer locals_boundary.deinit();
+    try std.testing.expect(locals_boundary.isClean());
+
+    var locals_excessive = try flatClosureCallPressureReport(98, 1);
+    defer locals_excessive.deinit();
+    try std.testing.expectEqual(@as(usize, 1), locals_excessive.diagnostics.items.len);
+    try std.testing.expect(locals_excessive.contains(.unsupported_readable_register_pressure));
 }

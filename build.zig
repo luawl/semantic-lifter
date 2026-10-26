@@ -2373,6 +2373,7 @@ pub fn build(b: *std.Build) void {
     ast_admission_compile_conformance.addTo(conformance_step);
     loop_module_compile_conformance.addTo(conformance_step);
     register_budget_module_compile_conformance.addTo(conformance_step);
+    addRegisterChargeConformance(b, exe, z3_enabled, z3_bin, conformance_step);
 
     const module_tests = b.addTest(.{
         .root_module = module,
@@ -3230,6 +3231,122 @@ fn addDispatcherGenericBudgetConformance(
     };
 }
 
+// Author-written sources at the edge of the register certificate's statement charges. Each refused source is one
+// step past a boundary its certificate once left out: a dispatcher-layout closure's snapshot locals above the flat
+// locals (the register total and the 200-local count), a branch composition stored into a storage slot, a wrapped
+// loop body's `until true` above the body's locals (in one group, and in two `do` groups inside a loop), a list of
+// storage slots, a loop's `while true`, a storage slot's compound, binary and plain stores, and the call frames under a
+// comparison, a return, a local, a branch, a call statement, an upvalue store and a place's declaration; luau-compile
+// rejects each one's emitted text at -O0 or at the default level, and the readable admission refuses it with the
+// diagnostic beside it (the emitter writes no output, so the output argument is an empty seed file). One step smaller,
+// each boundary source is admitted, emitted, and compiled at -O0 and at the default level.
+fn addRegisterChargeConformance(
+    b: *std.Build,
+    exe: *std.Build.Step.Compile,
+    z3_enabled: bool,
+    z3_bin: []const u8,
+    conformance_step: *std.Build.Step,
+) void {
+    const temporary = "diagnostic=unsupported_readable_temporary_register_pressure entity=1\n";
+    const temporary_root = "diagnostic=unsupported_readable_temporary_register_pressure entity=0\n";
+    for ([_][4][]const u8{
+        .{ "luau/fixtures/register_charge_flat_closure_call_source.luau", "register-charge-flat-closure-call", "dispatcher", temporary },
+        .{ "luau/fixtures/register_charge_flat_closure_snapshots_source.luau", "register-charge-flat-closure-snapshots", "dispatcher", "diagnostic=unsupported_readable_register_pressure entity=1\n" },
+        .{ "luau/fixtures/register_charge_slot_and_call_source.luau", "register-charge-slot-and-call", "automatic", temporary },
+        .{ "luau/fixtures/register_charge_slot_if_call_source.luau", "register-charge-slot-if-call", "automatic", temporary },
+        .{ "luau/fixtures/register_charge_slot_if_constructor_source.luau", "register-charge-slot-if-constructor", "automatic", temporary },
+        .{ "luau/fixtures/register_charge_wrapped_body_locals_source.luau", "register-charge-wrapped-body-locals", "automatic", temporary },
+        .{ "luau/fixtures/register_charge_grouped_wrapper_source.luau", "register-charge-grouped-wrapper", "automatic", temporary },
+        .{ "luau/fixtures/register_charge_grouped_wrapper_live_local_source.luau", "register-charge-grouped-wrapper-live-local", "automatic", temporary },
+        .{ "luau/fixtures/register_charge_slot_list_vararg_source.luau", "register-charge-slot-list-vararg", "automatic", temporary },
+        .{ "luau/fixtures/register_charge_slot_list_call_source.luau", "register-charge-slot-list-call", "automatic", temporary },
+        .{ "luau/fixtures/register_charge_loop_head_literal_source.luau", "register-charge-loop-head-literal", "automatic", temporary },
+        .{ "luau/fixtures/register_charge_slot_compound_source.luau", "register-charge-slot-compound", "automatic", temporary },
+        .{ "luau/fixtures/register_charge_slot_binary_source.luau", "register-charge-slot-binary", "automatic", temporary },
+        .{ "luau/fixtures/register_charge_slot_store_source.luau", "register-charge-slot-store", "automatic", temporary },
+        .{ "luau/fixtures/register_charge_call_compare_source.luau", "register-charge-call-compare", "automatic", temporary_root },
+        .{ "luau/fixtures/register_charge_return_binary_call_source.luau", "register-charge-return-binary-call", "automatic", temporary_root },
+        .{ "luau/fixtures/register_charge_local_fused_call_source.luau", "register-charge-local-fused-call", "automatic", temporary_root },
+        .{ "luau/fixtures/register_charge_local_binary_call_source.luau", "register-charge-local-binary-call", "automatic", temporary_root },
+        .{ "luau/fixtures/register_charge_branch_call_source.luau", "register-charge-branch-call", "automatic", temporary_root },
+        .{ "luau/fixtures/register_charge_call_statement_source.luau", "register-charge-call-statement", "automatic", temporary_root },
+        .{ "luau/fixtures/register_charge_upvalue_binary_call_source.luau", "register-charge-upvalue-binary-call", "automatic", temporary },
+        .{ "luau/fixtures/register_charge_place_binary_call_source.luau", "register-charge-place-binary-call", "automatic", temporary_root },
+    }) |refused| {
+        const resolved = addGenericBudgetResolvedIr(b, exe, z3_enabled, z3_bin, refused[0], refused[1]);
+        conformance_step.dependOn(addRegisterChargeRefusal(b, exe, z3_enabled, z3_bin, resolved, refused[1], refused[2], refused[3]));
+    }
+
+    // A program whose source the frontend refuses today (luau-compile rejects it), lifted when it did: the return of
+    // a value and a call over 251 arguments.
+    const recorded = b.addRunArtifact(exe);
+    if (z3_enabled) recorded.addPathDir(b.pathFromRoot(z3_bin));
+    recorded.addArg("resolve-ir");
+    recorded.addFileArg(b.path("luau/fixtures/register_charge_return_call_list.lifter-ir.json"));
+    const recorded_resolved = recorded.addOutputFileArg("register-charge-return-call-list.resolved.lifter-ir.json");
+    recorded.addArg(if (z3_enabled) "z3" else "internal");
+    conformance_step.dependOn(addRegisterChargeRefusal(b, exe, z3_enabled, z3_bin, recorded_resolved, "register-charge-return-call-list", "automatic", temporary_root));
+
+    for ([_][3][]const u8{
+        .{ "luau/fixtures/register_charge_flat_closure_call_boundary_source.luau", "register-charge-flat-closure-call-boundary", "dispatcher" },
+        .{ "luau/fixtures/register_charge_flat_call_boundary_source.luau", "register-charge-flat-call-boundary", "dispatcher" },
+        .{ "luau/fixtures/register_charge_flat_closure_snapshots_boundary_source.luau", "register-charge-flat-closure-snapshots-boundary", "dispatcher" },
+        .{ "luau/fixtures/register_charge_slot_and_call_boundary_source.luau", "register-charge-slot-and-call-boundary", "automatic" },
+        .{ "luau/fixtures/register_charge_slot_if_call_boundary_source.luau", "register-charge-slot-if-call-boundary", "automatic" },
+        .{ "luau/fixtures/register_charge_slot_if_constructor_boundary_source.luau", "register-charge-slot-if-constructor-boundary", "automatic" },
+        .{ "luau/fixtures/register_charge_wrapped_body_locals_boundary_source.luau", "register-charge-wrapped-body-locals-boundary", "automatic" },
+        .{ "luau/fixtures/register_charge_grouped_wrapper_boundary_source.luau", "register-charge-grouped-wrapper-boundary", "automatic" },
+        .{ "luau/fixtures/register_charge_grouped_wrapper_live_local_boundary_source.luau", "register-charge-grouped-wrapper-live-local-boundary", "automatic" },
+        .{ "luau/fixtures/register_charge_slot_list_vararg_boundary_source.luau", "register-charge-slot-list-vararg-boundary", "automatic" },
+        .{ "luau/fixtures/register_charge_slot_list_call_boundary_source.luau", "register-charge-slot-list-call-boundary", "automatic" },
+        .{ "luau/fixtures/register_charge_loop_head_literal_boundary_source.luau", "register-charge-loop-head-literal-boundary", "automatic" },
+        .{ "luau/fixtures/register_charge_slot_compound_boundary_source.luau", "register-charge-slot-compound-boundary", "automatic" },
+        .{ "luau/fixtures/register_charge_slot_store_boundary_source.luau", "register-charge-slot-store-boundary", "automatic" },
+        .{ "luau/fixtures/register_charge_return_binary_call_boundary_source.luau", "register-charge-return-binary-call-boundary", "automatic" },
+        .{ "luau/fixtures/register_charge_upvalue_binary_call_boundary_source.luau", "register-charge-upvalue-binary-call-boundary", "automatic" },
+        .{ "luau/fixtures/register_charge_return_or_constant_boundary_source.luau", "register-charge-return-or-constant-boundary", "automatic" },
+    }) |boundary| {
+        const resolved = addGenericBudgetResolvedIr(b, exe, z3_enabled, z3_bin, boundary[0], boundary[1]);
+        const emit = b.addRunArtifact(exe);
+        if (z3_enabled) emit.addPathDir(b.pathFromRoot(z3_bin));
+        emit.addArg("emit-readable-luau-strategy");
+        emit.addFileArg(resolved);
+        const emitted = emit.addOutputFileArg(b.fmt("{s}.{s}.luau", .{ boundary[1], boundary[2] }));
+        emit.addArgs(&.{ "standard-luau", boundary[2] });
+        emit.expectExitCode(0);
+        const compile_o0 = b.addSystemCommand(&.{ luauCompileExe(b), "--null", "-O0" });
+        compile_o0.addFileArg(emitted);
+        compile_o0.expectExitCode(0);
+        const compile_default = b.addSystemCommand(&.{ luauCompileExe(b), "--null" });
+        compile_default.addFileArg(emitted);
+        compile_default.expectExitCode(0);
+        conformance_step.dependOn(&compile_o0.step);
+        conformance_step.dependOn(&compile_default.step);
+    }
+}
+
+fn addRegisterChargeRefusal(
+    b: *std.Build,
+    exe: *std.Build.Step.Compile,
+    z3_enabled: bool,
+    z3_bin: []const u8,
+    resolved: std.Build.LazyPath,
+    name: []const u8,
+    strategy: []const u8,
+    stderr_match: []const u8,
+) *std.Build.Step {
+    const emit = b.addRunArtifact(exe);
+    if (z3_enabled) emit.addPathDir(b.pathFromRoot(z3_bin));
+    emit.addArg("emit-readable-luau-strategy");
+    emit.addFileArg(resolved);
+    const seed_files = b.addWriteFiles();
+    emit.addFileArg(seed_files.add(b.fmt("{s}.refused.luau", .{name}), ""));
+    emit.addArgs(&.{ "standard-luau", strategy });
+    emit.expectExitCode(1);
+    emit.expectStdErrMatch(stderr_match);
+    return &emit.step;
+}
+
 fn addGenericBudgetResolvedIr(
     b: *std.Build,
     exe: *std.Build.Step.Compile,
@@ -3566,10 +3683,10 @@ fn addAutomaticRuntimeCaseConformance(
 // an empty seed file, and the step expects exit 1 and each of the given lines on stderr, the typed line first.
 // The publication gate compiles the staged text at the compiler's default level, then at -O0, and publishes it only
 // when both accept; a refusal names the level that rejected. The level-named sibling of the rejection arm passes the
-// lifter itself as the compiler, so the default level rejects first. Two admitted sources whose structured text needs
-// one register more at -O0 than at the default level (a loop head's constant, a storage slot's key) are refused at
-// -O0, each beside a twin one parameter smaller that is published and compiles at -O0; the 250-argument call is the
-// boundary both levels accept.
+// lifter itself as the compiler, so the default level rejects first. Two sources whose structured text needs one
+// register more at -O0 than at the default level (a loop head's constant, a storage slot's key) are refused by the
+// register certificate, which charges both registers, before the gate compiles anything, each beside a twin one
+// parameter smaller that is published and compiles at -O0; the 250-argument call is the boundary both levels accept.
 fn addCompileGateLevelConformance(
     b: *std.Build,
     exe: *std.Build.Step.Compile,
@@ -3637,7 +3754,8 @@ fn addCompileGateLevelConformance(
         validate.addArg("validate");
         validate.addFileArg(resolved_ir);
         validate.addArg("readable-luau");
-        validate.expectExitCode(0);
+        validate.expectExitCode(1);
+        validate.expectStdErrMatch("diagnostic=unsupported_readable_temporary_register_pressure entity=1\nerror: ValidationFailed\n");
         const seed_files = b.addWriteFiles();
         const seed = seed_files.add(b.fmt("{s}.unpublished.luau", .{refused[1]}), "");
         const emit = b.addRunArtifact(exe);
@@ -3649,10 +3767,7 @@ fn addCompileGateLevelConformance(
         emit.addArg("standard-luau");
         emit.addFileArg(.{ .cwd_relative = luauCompileExe(b) });
         emit.expectExitCode(1);
-        emit.expectStdErrMatch("diagnostic=luau_compile_check_failed entity=null");
-        emit.expectStdErrMatch("reason=compiler_rejected");
-        emit.expectStdErrMatch("  level=O0");
-        emit.expectStdErrMatch("exceeded limit 255");
+        emit.expectStdErrMatch("diagnostic=unsupported_readable_temporary_register_pressure entity=1\nerror: ValidationFailed\n");
         conformance_step.dependOn(&validate.step);
         conformance_step.dependOn(&emit.step);
     }
