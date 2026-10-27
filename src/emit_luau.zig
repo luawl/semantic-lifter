@@ -3636,7 +3636,7 @@ fn emitLoopControl(
             try render.valueUseScalar(output, allocator, program, valuePlan(emission_plan, place_aliases), branch.condition);
         }
         try output.appendSlice(allocator, " then\n");
-        try emitLoopExit(output, allocator, program, emission_plan, scopes, control.exit_edge, arm_indent, place_aliases);
+        try emitLoopControlExit(output, allocator, program, emission_plan, scopes, control, arm_indent, place_aliases);
         try output.appendSlice(allocator, indent);
         try output.appendSlice(allocator, "end\n");
         return;
@@ -3648,17 +3648,35 @@ fn emitLoopControl(
     if (control.continue_on_true) {
         try emitLoopContinue(output, allocator, program, emission_plan, scopes, control.continue_edge, arm_indent, place_aliases);
     } else {
-        try emitLoopExit(output, allocator, program, emission_plan, scopes, control.exit_edge, arm_indent, place_aliases);
+        try emitLoopControlExit(output, allocator, program, emission_plan, scopes, control, arm_indent, place_aliases);
     }
     try output.appendSlice(allocator, indent);
     try output.appendSlice(allocator, "else\n");
     if (control.continue_on_true) {
-        try emitLoopExit(output, allocator, program, emission_plan, scopes, control.exit_edge, arm_indent, place_aliases);
+        try emitLoopControlExit(output, allocator, program, emission_plan, scopes, control, arm_indent, place_aliases);
     } else {
         try emitLoopContinue(output, allocator, program, emission_plan, scopes, control.continue_edge, arm_indent, place_aliases);
     }
     try output.appendSlice(allocator, indent);
     try output.appendSlice(allocator, "end\n");
+}
+
+/// The exit arm of a loop test: the exit edge's copies and a `break`, with the loop exit's flag set before the `break`
+/// when a transfer wrapper would capture it (`structure.LoopControl.exit_via_flag`); each wrapper on the way forwards
+/// the flag, and the consumer after the loop body's wrapper leaves the loop.
+fn emitLoopControlExit(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    scopes: *const emission_scope.Plan,
+    control: structure.LoopControl,
+    indent: []const u8,
+    place_aliases: []const PlaceAlias,
+) !void {
+    try emitEdgeParametersUnlessConsumed(output, allocator, program, emission_plan, scopes, program.blocks[control.exit_edge.target.index()], control.exit_edge.arguments, indent, false, place_aliases);
+    if (control.exit_via_flag) try emitEscapeFlagSet(output, allocator, program, emission_plan, control.exit_edge.target, indent);
+    try emitBreakStatement(output, allocator, indent);
 }
 
 fn emitLoopContinue(

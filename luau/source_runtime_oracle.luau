@@ -2069,6 +2069,83 @@ function SourceRuntimeOracle.run(caseName: string, source: string, exported: any
 			end
 		end
 		assert(mismatches == 0, `{caseName}: {mismatches} of {rows} rows differ from the source; first {first}`)
+	elseif caseName == "source-frontend-forwarding-loop-test-exit" or caseName == "source-frontend-wrapped-loop-test-exit" then
+		-- The worker against a copy of its source function over 378 rows (18 selectors, among them every queue value,
+		-- a fraction, a string and both booleans, by 21 budgets from -1 to 1000): the error status and every result
+		-- must match. Each loop holds a `continue` two `if`s deep and a loop test written as a `break`, which must leave
+		-- the loop whether or not a transfer wrapper is written around it.
+		local function queueSkipCounter(selector: any, budget: any): (number, number, number)
+			local queue = { 3, 1, 4, 1, 5, 9, 2, 6 }
+			local index = 0
+			local sum = 0
+			local skipped = 0
+			repeat
+				index += 1
+				local item = queue[index]
+				if item ~= nil then
+					if item == selector then
+						skipped += 1
+						continue
+					end
+					sum += 1
+				end
+				sum += 0
+			until index >= 8 or sum > budget
+			return sum, skipped, index
+		end
+		local function leaveTwice(selector: any, budget: any): (number, number)
+			local total = 0
+			local rounds = 0
+			while true do
+				if total >= 6 then
+					break
+				end
+				rounds += 1
+				if selector == 4 then
+					total += 2
+					if budget > 7 then
+						total += 1
+						continue
+					end
+					total += 1
+				end
+				total += 1
+				if budget > 5 then
+					break
+				end
+			end
+			return total, rounds
+		end
+		local reference: any = if caseName == "source-frontend-forwarding-loop-test-exit" then queueSkipCounter else leaveTwice
+		local function outcome(worker: any, selector: any, budget: any): string
+			local packed = table.pack(pcall(worker, selector, budget))
+			if not packed[1] then
+				return "err:" .. (string.gsub(tostring(packed[2]), "^.-:%d+: ", ""))
+			end
+			local parts: { string } = {}
+			for index = 2, packed.n do
+				table.insert(parts, tostring(packed[index]))
+			end
+			return "ok:" .. table.concat(parts, ",")
+		end
+		local selectors: { any } = { 0, 1, -2, 2, 3, 2.5, "x", 4, 5, 6, 7, 8, 9, 10, 11, 12, true, false }
+		local budgets = { -1, 0, 1, 2, 3, 4, 5, 7, 8, 10, 12, 15, 20, 25, 30, 31, 35, 40, 50, 100, 1000 }
+		local rows, mismatches = 0, 0
+		local first = ""
+		for _, selector in selectors do
+			for _, budget in budgets do
+				local expected = outcome(reference, selector, budget)
+				local actual = outcome(exported, selector, budget)
+				rows += 1
+				if expected ~= actual then
+					mismatches += 1
+					if first == "" then
+						first = `selector={tostring(selector)} budget={budget} expected={expected} got={actual}`
+					end
+				end
+			end
+		end
+		assert(mismatches == 0, `{caseName}: {mismatches} of {rows} rows differ from the source; first {first}`)
 	else
 		return false
 	end
