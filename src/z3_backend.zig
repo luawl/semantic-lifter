@@ -3,6 +3,7 @@ const ir = @import("ir.zig");
 const backend = @import("solver_backend.zig");
 const fact_solver = @import("solver.zig");
 const normalized_value = @import("normalized_value.zig");
+const numerals = @import("numerals.zig");
 const solver_equivalence = @import("solver_equivalence.zig");
 const solver_model = @import("solver_model.zig");
 const proof_closure = @import("proof_closure.zig");
@@ -85,6 +86,26 @@ fn solveThunk(raw_options: ?*anyopaque, allocator: std.mem.Allocator, program: *
     c.Z3_solver_assert(context, solver, asserted_goal);
 
     const checked = c.Z3_solver_check(context, solver);
+    // A satisfying model is kept only inside the region where every integer step is exact in Luau doubles.
+    if (checked == c.Z3_L_TRUE and translator.region_conditions.items.len != 0) {
+        const first_model = c.Z3_solver_get_model(context, solver) orelse return error.Z3ModelUnavailable;
+        c.Z3_model_inc_ref(context, first_model);
+        defer c.Z3_model_dec_ref(context, first_model);
+        const inside_region = for (translator.region_conditions.items) |condition| {
+            var evaluated: c.Z3_ast = null;
+            if (!c.Z3_model_eval(context, first_model, condition, true, &evaluated) or evaluated == null) return error.Z3ModelEvaluationFailed;
+            if (c.Z3_get_bool_value(context, evaluated) != c.Z3_L_TRUE) break false;
+        } else true;
+        if (!inside_region) {
+            const region = c.Z3_mk_and(context, @intCast(translator.region_conditions.items.len), translator.region_conditions.items.ptr) orelse return error.Z3AstCreationFailed;
+            c.Z3_solver_assert(context, solver, region);
+            if (c.Z3_solver_check(context, solver) != c.Z3_L_TRUE) return .{
+                .engine = .z3,
+                .resolution = .unknown,
+                .unknown_reason = .model_value_unrepresentability,
+            };
+        }
+    }
     const resolution: ir.SolverResolution = switch (checked) {
         c.Z3_L_FALSE => if (query.kind == .find_model) .disproved else .proved,
         c.Z3_L_TRUE => if (query.kind == .find_model) .proved else .disproved,
@@ -332,6 +353,8 @@ const Translator = struct {
     dynamic_sort: c.Z3_sort,
     dynamic_number_is_nan: c.Z3_func_decl,
     dynamic_atoms: std.ArrayList(DynamicAtom) = .empty,
+    // Every model the solver returns must satisfy these conditions, the region where integer steps are exact in Luau doubles.
+    region_conditions: std.ArrayList(c.Z3_ast) = .empty,
 
     fn init(allocator: std.mem.Allocator, context: c.Z3_context, program: *const ir.Program) !Translator {
         const terms = try allocator.alloc(c.Z3_ast, program.solver_terms.len);
@@ -355,6 +378,7 @@ const Translator = struct {
 
     fn deinit(self: *Translator) void {
         self.dynamic_atoms.deinit(self.allocator);
+        self.region_conditions.deinit(self.allocator);
         self.allocator.free(self.terms);
     }
 
@@ -407,7 +431,8 @@ const Translator = struct {
     fn translate(self: *Translator, term: ir.SolverTerm) !c.Z3_ast {
         return switch (term.operation) {
             .value => |value_id| self.translateValue(term.sort, value_id),
-            .value_definition => |definition| self.get(definition.expression),
+            // A value definition is exact only inside the region where its integer steps stay within 2^53.
+            .value_definition => |definition| self.translateDefinition(term.sort, definition),
             .semantic_atom => |atom| self.translateSemanticAtom(term.sort, atom),
             .dynamic_truthiness => |operand| self.translateDynamicTruthiness(operand),
             .dynamic_number_is_nan => |operand| self.translateDynamicNumberIsNaN(operand),
@@ -469,6 +494,122 @@ const Translator = struct {
             .division => |division| self.translateDivision(division),
             .remainder => |remainder| self.translateRemainder(remainder),
         };
+    }
+
+    // Outside its exact region a value definition takes the Luau rounded result of its one operation, or stays free.
+    fn translateDefinition(self: *Translator, sort: ir.SolverSort, definition: ir.SolverValueDefinition) !c.Z3_ast {
+        const expression = try self.get(definition.expression);
+        const terms = self.program.solver_terms;
+        const visited = try self.allocator.alloc(bool, terms.len);
+        defer self.allocator.free(visited);
+        @memset(visited, false);
+        var pending: std.ArrayList(ir.SolverTermId) = .empty;
+        defer pending.deinit(self.allocator);
+        var conditions: std.ArrayList(c.Z3_ast) = .empty;
+        defer conditions.deinit(self.allocator);
+        try pending.append(self.allocator, definition.expression);
+        while (pending.pop()) |term_id| {
+            if (term_id.index() >= terms.len) return error.InvalidSolverTermReference;
+            if (visited[term_id.index()] or !self.has(term_id)) continue;
+            visited[term_id.index()] = true;
+            switch (terms[term_id.index()].operation) {
+                .value, .value_definition, .semantic_atom, .boolean_literal, .real_literal, .bit_vector_literal => {},
+                .integer_literal => |decimal| if (!exactLuauDecimal(decimal)) {
+                    try conditions.append(self.allocator, c.Z3_mk_false(self.context) orelse return error.Z3AstCreationFailed);
+                },
+                .dynamic_truthiness, .dynamic_number_is_nan, .logical_not, .bit_vector_not, .integer_to_bit_vector, .arithmetic_negate, .is_nonzero => |operand| {
+                    try pending.append(self.allocator, operand);
+                },
+                .binary => |binary| {
+                    if (binary.left.index() >= terms.len) return error.InvalidSolverTermReference;
+                    const arithmetic = binary.operator == .add or binary.operator == .subtract or binary.operator == .multiply;
+                    if (arithmetic and terms[binary.left.index()].sort.kind == .integer) {
+                        try conditions.append(self.allocator, try self.luauExactRange(try self.get(term_id)));
+                    }
+                    try pending.append(self.allocator, binary.left);
+                    try pending.append(self.allocator, binary.right);
+                },
+                .if_then_else => |selection| {
+                    try pending.append(self.allocator, selection.condition);
+                    try pending.append(self.allocator, selection.then_term);
+                    try pending.append(self.allocator, selection.else_term);
+                },
+                .bit_vector_extract => |extract| try pending.append(self.allocator, extract.operand),
+                .bit_vector_concat => |concat| {
+                    try pending.append(self.allocator, concat.high);
+                    try pending.append(self.allocator, concat.low);
+                },
+                .bit_vector_extend => |extension| try pending.append(self.allocator, extension.operand),
+                .bit_vector_rotate => |rotation| {
+                    try pending.append(self.allocator, rotation.operand);
+                    try pending.append(self.allocator, rotation.amount);
+                },
+                .bit_vector_to_integer => |conversion| try pending.append(self.allocator, conversion.operand),
+                .division => |division| {
+                    if (division.mode == .integer_floor) {
+                        try conditions.append(self.allocator, try self.luauExactRange(try self.get(division.left)));
+                    }
+                    try pending.append(self.allocator, division.left);
+                    try pending.append(self.allocator, division.right);
+                },
+                .remainder => |remainder| {
+                    if (remainder.mode == .integer_floor) {
+                        var magnitudes = [_]c.Z3_ast{
+                            try self.integerMagnitude(try self.get(remainder.left)),
+                            try self.integerMagnitude(try self.get(remainder.right)),
+                        };
+                        const total = c.Z3_mk_add(self.context, magnitudes.len, &magnitudes) orelse return error.Z3AstCreationFailed;
+                        const limit = try self.translateNumeral(.{ .kind = .integer }, "9007199254740992");
+                        try conditions.append(self.allocator, c.Z3_mk_le(self.context, total, limit) orelse return error.Z3AstCreationFailed);
+                    }
+                    try pending.append(self.allocator, remainder.left);
+                    try pending.append(self.allocator, remainder.right);
+                },
+            }
+        }
+        if (conditions.items.len == 0) return expression;
+        const condition = c.Z3_mk_and(self.context, @intCast(conditions.items.len), conditions.items.ptr) orelse return error.Z3AstCreationFailed;
+        const fallback = if (definitionRoundsLikeLuau(self.program, definition.expression))
+            try self.luauIntegerResult(expression, definition.value)
+        else
+            try self.translateSymbolicValue(sort, definition.value);
+        try self.region_conditions.append(self.allocator, condition);
+        return c.Z3_mk_ite(self.context, condition, expression, fallback) orelse error.Z3AstCreationFailed;
+    }
+
+    // Within 2^53 an exact integer result is the Luau double; beyond it the double keeps the sign and is at least 2^53 in magnitude.
+    fn luauIntegerResult(self: *Translator, exact: c.Z3_ast, value_id: ir.ValueId) !c.Z3_ast {
+        const integer_sort: ir.SolverSort = .{ .kind = .integer };
+        const in_range = try self.luauExactRange(exact);
+        var name_buffer: [48]u8 = undefined;
+        const name = try std.fmt.bufPrintZ(&name_buffer, "rounded_value_{d}", .{value_id.index()});
+        const symbol = c.Z3_mk_string_symbol(self.context, name.ptr) orelse return error.Z3SymbolCreationFailed;
+        const rounded = c.Z3_mk_const(self.context, symbol, try self.translateSort(integer_sort)) orelse return error.Z3AstCreationFailed;
+        const magnitude = try self.integerMagnitude(rounded);
+        var above_arguments = [_]c.Z3_ast{ try self.translateNumeral(integer_sort, "9007199254740992"), magnitude };
+        const above = c.Z3_mk_add(self.context, above_arguments.len, &above_arguments) orelse return error.Z3AstCreationFailed;
+        var below_arguments = [_]c.Z3_ast{ try self.translateNumeral(integer_sort, "-9007199254740992"), magnitude };
+        const below = c.Z3_mk_sub(self.context, below_arguments.len, &below_arguments) orelse return error.Z3AstCreationFailed;
+        const exact_is_positive = c.Z3_mk_gt(self.context, exact, try self.translateNumeral(integer_sort, "0")) orelse return error.Z3AstCreationFailed;
+        const rounded_result = c.Z3_mk_ite(self.context, exact_is_positive, above, below) orelse return error.Z3AstCreationFailed;
+        try self.region_conditions.append(self.allocator, in_range);
+        return c.Z3_mk_ite(self.context, in_range, exact, rounded_result) orelse error.Z3AstCreationFailed;
+    }
+
+    // An exact integer is also a Luau double when it lies between -2^53 and 2^53 inclusive.
+    fn luauExactRange(self: *const Translator, exact: c.Z3_ast) !c.Z3_ast {
+        const integer_sort: ir.SolverSort = .{ .kind = .integer };
+        const above_lower = c.Z3_mk_le(self.context, try self.translateNumeral(integer_sort, "-9007199254740992"), exact) orelse return error.Z3AstCreationFailed;
+        const below_upper = c.Z3_mk_le(self.context, exact, try self.translateNumeral(integer_sort, "9007199254740992")) orelse return error.Z3AstCreationFailed;
+        var bounds = [_]c.Z3_ast{ above_lower, below_upper };
+        return c.Z3_mk_and(self.context, bounds.len, &bounds) orelse error.Z3AstCreationFailed;
+    }
+
+    // The magnitude of an integer term: its negation when it is below zero, else the term itself.
+    fn integerMagnitude(self: *const Translator, value: c.Z3_ast) !c.Z3_ast {
+        const is_negative = c.Z3_mk_lt(self.context, value, try self.translateNumeral(.{ .kind = .integer }, "0")) orelse return error.Z3AstCreationFailed;
+        const negated = c.Z3_mk_unary_minus(self.context, value) orelse return error.Z3AstCreationFailed;
+        return c.Z3_mk_ite(self.context, is_negative, negated, value) orelse error.Z3AstCreationFailed;
     }
 
     fn translateNonzero(self: *const Translator, operand: ir.SolverTermId) !c.Z3_ast {
@@ -583,7 +724,8 @@ const Translator = struct {
             .boolean => |value| if (sort.kind == .boolean) {
                 return (if (value) c.Z3_mk_true(self.context) else c.Z3_mk_false(self.context)) orelse error.Z3AstCreationFailed;
             },
-            .integer => |decimal| if (sort.kind == .integer or sort.kind == .bit_vector) {
+            // An integer literal beyond 2^53 stays opaque to the solver.
+            .integer => |decimal| if ((sort.kind == .integer or sort.kind == .bit_vector) and exactLuauDecimal(decimal)) {
                 if (sort.kind == .integer) return self.translateNumeral(sort, decimal);
                 const integer = try self.translateNumeral(.{ .kind = .integer }, decimal);
                 return c.Z3_mk_int2bv(self.context, sort.bit_width, integer) orelse error.Z3AstCreationFailed;
@@ -594,7 +736,8 @@ const Translator = struct {
             .boolean => |value| if (sort.kind == .boolean) {
                 return (if (value) c.Z3_mk_true(self.context) else c.Z3_mk_false(self.context)) orelse error.Z3AstCreationFailed;
             },
-            .integer => |value| if (sort.kind == .integer or sort.kind == .bit_vector) {
+            // An evaluated integer beyond 2^53 stays opaque to the solver.
+            .integer => |value| if ((sort.kind == .integer or sort.kind == .bit_vector) and value >= -(1 << 53) and value <= (1 << 53)) {
                 const decimal = try std.fmt.allocPrint(self.allocator, "{d}", .{value});
                 defer self.allocator.free(decimal);
                 if (sort.kind == .integer) return self.translateNumeral(sort, decimal);
@@ -733,7 +876,7 @@ const Translator = struct {
             .constant => null,
             .copy => |copy| try self.translateValueDepth(sort, copy.source, depth + 1),
             .unary => |unary| try self.translateNormalizedUnary(sort, unary, depth + 1),
-            .binary => |binary| try self.translateNormalizedBinary(sort, binary, depth + 1),
+            .binary => |binary| try self.translateNormalizedBinary(sort, binary, value_id, depth + 1),
         };
     }
 
@@ -760,13 +903,19 @@ const Translator = struct {
         self: *Translator,
         result_sort: ir.SolverSort,
         binary: @FieldType(fact_solver.NormalizedValueSource, "binary"),
+        value_id: ir.ValueId,
         depth: usize,
     ) !?c.Z3_ast {
         const operator = normalized_value.solverBinaryOperator(binary.operator) orelse return null;
         const operand_sort = self.normalizedOperandSort(result_sort, binary) orelse return null;
         const left = try self.translateValueDepth(operand_sort, binary.left, depth);
         const right = try self.translateValueDepth(operand_sort, binary.right, depth);
-        return try self.translateBinaryAsts(operator, operand_sort, left, right);
+        const exact = try self.translateBinaryAsts(operator, operand_sort, left, right);
+        // Integer add, subtract and multiply beyond 2^53 take the value Luau doubles round them to.
+        return switch (operator) {
+            .add, .subtract, .multiply => if (operand_sort.kind == .integer) try self.luauIntegerResult(exact, value_id) else exact,
+            else => exact,
+        };
     }
 
     fn normalizedOperandSort(
@@ -954,4 +1103,29 @@ fn exactLiteral(program: *const ir.Program, value_id: ir.ValueId, depth: usize) 
         .copy => |copy| exactLiteral(program, copy.source, depth + 1),
         .unary, .binary => null,
     };
+}
+
+// An integer literal is a Luau double exactly when it lies within 2^53 in magnitude.
+fn exactLuauDecimal(decimal: []const u8) bool {
+    const value = numerals.parseCanonicalSigned(i64, decimal) orelse return false;
+    return value >= -(1 << 53) and value <= (1 << 53);
+}
+
+// One integer add, subtract or multiply over values, definitions or exact literals rounds like one Luau operation.
+fn definitionRoundsLikeLuau(program: *const ir.Program, expression: ir.SolverTermId) bool {
+    if (expression.index() >= program.solver_terms.len) return false;
+    const binary = switch (program.solver_terms[expression.index()].operation) {
+        .binary => |operation| operation,
+        else => return false,
+    };
+    if (binary.operator != .add and binary.operator != .subtract and binary.operator != .multiply) return false;
+    for ([_]ir.SolverTermId{ binary.left, binary.right }) |operand| {
+        if (operand.index() >= program.solver_terms.len) return false;
+        switch (program.solver_terms[operand.index()].operation) {
+            .value, .value_definition => {},
+            .integer_literal => |decimal| if (!exactLuauDecimal(decimal)) return false,
+            else => return false,
+        }
+    }
+    return program.solver_terms[binary.left.index()].sort.kind == .integer;
 }

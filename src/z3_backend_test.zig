@@ -1398,7 +1398,7 @@ test "Z3 returns wide bit-vector models without host-width truncation" {
     try std.testing.expectEqualStrings("340282366920938463463374607431768211455", model.value);
 }
 
-test "Z3 receives exact wide constants from normalized IR value definitions" {
+test "Z3 reads IR integer constants beyond 2^53 as unknown" {
     const fixture = lifter.fixtures.arithmetic_module;
     var values = fixture.values;
     values[fixture.v_factor.index()].type = .{ .kind = .integer, .bit_width = 128, .signed = false };
@@ -1428,7 +1428,28 @@ test "Z3 receives exact wide constants from normalized IR value definitions" {
     try std.testing.expectEqual(ir.SolverResolution.unknown, lifter.solver.solve(&program, query));
     var result = try defaultBackend().solve(std.testing.allocator, &program, query);
     defer result.deinit(std.testing.allocator);
-    try std.testing.expectEqual(ir.SolverResolution.proved, result.resolution);
+    try std.testing.expect(result.resolution != .proved);
+
+    var control_instructions = instructions;
+    control_instructions[fixture.i_factor.index()].operation = .{ .constant = .{ .integer = "4503599627370496" } };
+    const control_terms = [_]ir.SolverTerm{
+        .{ .id = ir.SolverTermId.fromIndex(0), .sort = bv128, .operation = .{ .value = fixture.v_factor } },
+        .{ .id = ir.SolverTermId.fromIndex(1), .sort = bv128, .operation = .{ .bit_vector_literal = .{
+            .value = "4503599627370496",
+            .bit_width = 128,
+        } } },
+        .{ .id = ir.SolverTermId.fromIndex(2), .sort = .{ .kind = .boolean }, .operation = .{ .binary = .{
+            .operator = .equal,
+            .left = ir.SolverTermId.fromIndex(0),
+            .right = ir.SolverTermId.fromIndex(1),
+        } } },
+    };
+    var control_program = program;
+    control_program.instructions = &control_instructions;
+    control_program.solver_terms = &control_terms;
+    var control_result = try defaultBackend().solve(std.testing.allocator, &control_program, query);
+    defer control_result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ir.SolverResolution.proved, control_result.resolution);
 }
 
 test "Z3 semantic atoms require matching explicit assumptions" {
@@ -1645,4 +1666,397 @@ test "Z3 proves relational edge facts through exact-pure IR definitions" {
     try std.testing.expectEqual(fixture.b_false, outcome.program().?.blocks[fixture.b_right.index()].terminator.jump.target);
     try std.testing.expect(std.mem.indexOf(u8, outcome.luau_source.?, "state_matches") == null);
     try std.testing.expect(std.mem.indexOf(u8, outcome.luau_source.?, "if selector then") != null);
+}
+
+test "Z3 does not thread a relational edge fact that Luau doubles refute" {
+    const fixture = lifter.fixtures.relational_dispatch_module;
+    var instructions = fixture.instructions;
+    instructions[fixture.i_left_state.index()].operation = .{ .constant = .{ .integer = "9007199254740992" } };
+    instructions[fixture.i_eight.index()].operation = .{ .constant = .{ .integer = "9007199254740992" } };
+    var terms = fixture.solver_terms;
+    terms[fixture.t_seven.index()].operation = .{ .integer_literal = "9007199254740992" };
+    var program = fixture.program;
+    program.instructions = &instructions;
+    program.solver_terms = &terms;
+
+    var outcome = try lifter.pipeline.runAlloc(
+        std.testing.allocator,
+        &program,
+        defaultBackend(),
+        .{ .profile = .readable_luau, .emit_luau = .standard_luau },
+    );
+    defer outcome.deinit();
+    try std.testing.expect(outcome.isAdmitted());
+    try std.testing.expectEqual(fixture.b_dispatch, outcome.program().?.blocks[fixture.b_left.index()].terminator.jump.target);
+}
+
+test "Z3 never proves an integer fact Luau doubles refute: value walk wide literal" {
+    const fixture = lifter.fixtures.arithmetic_module;
+    const terms = [_]ir.SolverTerm{
+        .{ .id = ir.SolverTermId.fromIndex(0), .sort = .{ .kind = .integer }, .operation = .{ .value = fixture.v_factor } },
+        .{ .id = ir.SolverTermId.fromIndex(1), .sort = .{ .kind = .integer }, .operation = .{ .integer_literal = "9007199254740992" } },
+        .{ .id = ir.SolverTermId.fromIndex(2), .sort = .{ .kind = .boolean }, .operation = .{ .binary = .{ .operator = .equal, .left = ir.SolverTermId.fromIndex(0), .right = ir.SolverTermId.fromIndex(1) } } },
+        .{ .id = ir.SolverTermId.fromIndex(3), .sort = .{ .kind = .boolean }, .operation = .{ .logical_not = ir.SolverTermId.fromIndex(2) } },
+    };
+    const query: ir.SolverQuery = .{ .id = ir.QueryId.fromIndex(0), .kind = .prove_true, .goal = ir.SolverTermId.fromIndex(3) };
+    {
+        var instructions = fixture.instructions;
+        instructions[fixture.i_factor.index()].operation = .{ .constant = .{ .integer = "9007199254740993" } };
+        var program = fixture.program;
+        program.instructions = &instructions;
+        program.solver_terms = &terms;
+        var result = try defaultBackend().solve(std.testing.allocator, &program, query);
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expect(result.resolution != .proved);
+    }
+    {
+        var instructions = fixture.instructions;
+        instructions[fixture.i_factor.index()].operation = .{ .constant = .{ .integer = "9007199254740991" } };
+        var program = fixture.program;
+        program.instructions = &instructions;
+        program.solver_terms = &terms;
+        var result = try defaultBackend().solve(std.testing.allocator, &program, query);
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(ir.SolverResolution.proved, result.resolution);
+    }
+}
+
+test "Z3 never proves an integer fact Luau doubles refute: value walk sum" {
+    const fixture = lifter.fixtures.arithmetic_module;
+    const constraints = [_]ir.Constraint{
+        .{ .id = ir.ConstraintId.fromIndex(0), .predicate = ir.SolverTermId.fromIndex(5), .evidence = &.{fixture.proof} },
+        .{ .id = ir.ConstraintId.fromIndex(1), .predicate = ir.SolverTermId.fromIndex(6), .evidence = &.{fixture.proof} },
+    };
+    const query: ir.SolverQuery = .{
+        .id = ir.QueryId.fromIndex(0),
+        .kind = .prove_true,
+        .assumptions = &.{ ir.ConstraintId.fromIndex(0), ir.ConstraintId.fromIndex(1) },
+        .goal = ir.SolverTermId.fromIndex(8),
+    };
+    {
+        const terms = [_]ir.SolverTerm{
+            .{ .id = ir.SolverTermId.fromIndex(0), .sort = .{ .kind = .integer }, .operation = .{ .value = fixture.v_sum } },
+            .{ .id = ir.SolverTermId.fromIndex(1), .sort = .{ .kind = .integer }, .operation = .{ .value = fixture.v_left } },
+            .{ .id = ir.SolverTermId.fromIndex(2), .sort = .{ .kind = .integer }, .operation = .{ .value = fixture.v_right } },
+            .{ .id = ir.SolverTermId.fromIndex(3), .sort = .{ .kind = .integer }, .operation = .{ .integer_literal = "1" } },
+            .{ .id = ir.SolverTermId.fromIndex(4), .sort = .{ .kind = .integer }, .operation = .{ .integer_literal = "9007199254740992" } },
+            .{ .id = ir.SolverTermId.fromIndex(5), .sort = .{ .kind = .boolean }, .operation = .{ .binary = .{ .operator = .equal, .left = ir.SolverTermId.fromIndex(2), .right = ir.SolverTermId.fromIndex(3) } } },
+            .{ .id = ir.SolverTermId.fromIndex(6), .sort = .{ .kind = .boolean }, .operation = .{ .binary = .{ .operator = .equal, .left = ir.SolverTermId.fromIndex(0), .right = ir.SolverTermId.fromIndex(4) } } },
+            .{ .id = ir.SolverTermId.fromIndex(7), .sort = .{ .kind = .boolean }, .operation = .{ .binary = .{ .operator = .equal, .left = ir.SolverTermId.fromIndex(1), .right = ir.SolverTermId.fromIndex(4) } } },
+            .{ .id = ir.SolverTermId.fromIndex(8), .sort = .{ .kind = .boolean }, .operation = .{ .logical_not = ir.SolverTermId.fromIndex(7) } },
+        };
+        var program = fixture.program;
+        program.solver_terms = &terms;
+        program.constraints = &constraints;
+        var result = try defaultBackend().solve(std.testing.allocator, &program, query);
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expect(result.resolution != .proved);
+    }
+    {
+        const terms = [_]ir.SolverTerm{
+            .{ .id = ir.SolverTermId.fromIndex(0), .sort = .{ .kind = .integer }, .operation = .{ .value = fixture.v_sum } },
+            .{ .id = ir.SolverTermId.fromIndex(1), .sort = .{ .kind = .integer }, .operation = .{ .value = fixture.v_left } },
+            .{ .id = ir.SolverTermId.fromIndex(2), .sort = .{ .kind = .integer }, .operation = .{ .value = fixture.v_right } },
+            .{ .id = ir.SolverTermId.fromIndex(3), .sort = .{ .kind = .integer }, .operation = .{ .integer_literal = "1" } },
+            .{ .id = ir.SolverTermId.fromIndex(4), .sort = .{ .kind = .integer }, .operation = .{ .integer_literal = "8" } },
+            .{ .id = ir.SolverTermId.fromIndex(5), .sort = .{ .kind = .boolean }, .operation = .{ .binary = .{ .operator = .equal, .left = ir.SolverTermId.fromIndex(2), .right = ir.SolverTermId.fromIndex(3) } } },
+            .{ .id = ir.SolverTermId.fromIndex(6), .sort = .{ .kind = .boolean }, .operation = .{ .binary = .{ .operator = .equal, .left = ir.SolverTermId.fromIndex(0), .right = ir.SolverTermId.fromIndex(4) } } },
+            .{ .id = ir.SolverTermId.fromIndex(7), .sort = .{ .kind = .integer }, .operation = .{ .integer_literal = "7" } },
+            .{ .id = ir.SolverTermId.fromIndex(8), .sort = .{ .kind = .boolean }, .operation = .{ .binary = .{ .operator = .equal, .left = ir.SolverTermId.fromIndex(1), .right = ir.SolverTermId.fromIndex(7) } } },
+        };
+        var program = fixture.program;
+        program.solver_terms = &terms;
+        program.constraints = &constraints;
+        var result = try defaultBackend().solve(std.testing.allocator, &program, query);
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(ir.SolverResolution.proved, result.resolution);
+    }
+}
+
+test "Z3 never proves an integer fact Luau doubles refute: definition wide literal" {
+    const fixture = lifter.fixtures.arithmetic_module;
+    const query: ir.SolverQuery = .{ .id = ir.QueryId.fromIndex(0), .kind = .prove_true, .goal = ir.SolverTermId.fromIndex(4) };
+    {
+        var instructions = fixture.instructions;
+        instructions[fixture.i_factor.index()].operation = .{ .constant = .{ .integer = "9007199254740993" } };
+        const terms = [_]ir.SolverTerm{
+            .{ .id = ir.SolverTermId.fromIndex(0), .sort = .{ .kind = .integer }, .operation = .{ .integer_literal = "9007199254740993" } },
+            .{ .id = ir.SolverTermId.fromIndex(1), .sort = .{ .kind = .integer }, .operation = .{ .value_definition = .{ .value = fixture.v_factor, .expression = ir.SolverTermId.fromIndex(0) } } },
+            .{ .id = ir.SolverTermId.fromIndex(2), .sort = .{ .kind = .integer }, .operation = .{ .integer_literal = "9007199254740992" } },
+            .{ .id = ir.SolverTermId.fromIndex(3), .sort = .{ .kind = .boolean }, .operation = .{ .binary = .{ .operator = .equal, .left = ir.SolverTermId.fromIndex(1), .right = ir.SolverTermId.fromIndex(2) } } },
+            .{ .id = ir.SolverTermId.fromIndex(4), .sort = .{ .kind = .boolean }, .operation = .{ .logical_not = ir.SolverTermId.fromIndex(3) } },
+        };
+        var program = fixture.program;
+        program.instructions = &instructions;
+        program.solver_terms = &terms;
+        var report = try lifter.validate.validate(std.testing.allocator, &program, .core);
+        defer report.deinit();
+        try std.testing.expect(report.isClean());
+        var result = try defaultBackend().solve(std.testing.allocator, &program, query);
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expect(result.resolution != .proved);
+    }
+    {
+        var instructions = fixture.instructions;
+        instructions[fixture.i_factor.index()].operation = .{ .constant = .{ .integer = "9007199254740991" } };
+        const terms = [_]ir.SolverTerm{
+            .{ .id = ir.SolverTermId.fromIndex(0), .sort = .{ .kind = .integer }, .operation = .{ .integer_literal = "9007199254740991" } },
+            .{ .id = ir.SolverTermId.fromIndex(1), .sort = .{ .kind = .integer }, .operation = .{ .value_definition = .{ .value = fixture.v_factor, .expression = ir.SolverTermId.fromIndex(0) } } },
+            .{ .id = ir.SolverTermId.fromIndex(2), .sort = .{ .kind = .integer }, .operation = .{ .integer_literal = "9007199254740992" } },
+            .{ .id = ir.SolverTermId.fromIndex(3), .sort = .{ .kind = .boolean }, .operation = .{ .binary = .{ .operator = .equal, .left = ir.SolverTermId.fromIndex(1), .right = ir.SolverTermId.fromIndex(2) } } },
+            .{ .id = ir.SolverTermId.fromIndex(4), .sort = .{ .kind = .boolean }, .operation = .{ .logical_not = ir.SolverTermId.fromIndex(3) } },
+        };
+        var program = fixture.program;
+        program.instructions = &instructions;
+        program.solver_terms = &terms;
+        var result = try defaultBackend().solve(std.testing.allocator, &program, query);
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(ir.SolverResolution.proved, result.resolution);
+    }
+}
+
+test "Z3 never proves an integer fact Luau doubles refute: definition sum" {
+    const fixture = lifter.fixtures.arithmetic_module;
+    const query: ir.SolverQuery = .{
+        .id = ir.QueryId.fromIndex(0),
+        .kind = .prove_true,
+        .assumptions = &.{ ir.ConstraintId.fromIndex(0), ir.ConstraintId.fromIndex(1) },
+        .goal = ir.SolverTermId.fromIndex(9),
+    };
+    {
+        const terms = [_]ir.SolverTerm{
+            .{ .id = ir.SolverTermId.fromIndex(0), .sort = .{ .kind = .integer }, .operation = .{ .value = fixture.v_left } },
+            .{ .id = ir.SolverTermId.fromIndex(1), .sort = .{ .kind = .integer }, .operation = .{ .value = fixture.v_right } },
+            .{ .id = ir.SolverTermId.fromIndex(2), .sort = .{ .kind = .integer }, .operation = .{ .binary = .{ .operator = .add, .left = ir.SolverTermId.fromIndex(0), .right = ir.SolverTermId.fromIndex(1) } } },
+            .{ .id = ir.SolverTermId.fromIndex(3), .sort = .{ .kind = .integer }, .operation = .{ .value_definition = .{ .value = fixture.v_sum, .expression = ir.SolverTermId.fromIndex(2) } } },
+            .{ .id = ir.SolverTermId.fromIndex(4), .sort = .{ .kind = .integer }, .operation = .{ .integer_literal = "9007199254740992" } },
+            .{ .id = ir.SolverTermId.fromIndex(5), .sort = .{ .kind = .integer }, .operation = .{ .integer_literal = "1" } },
+            .{ .id = ir.SolverTermId.fromIndex(6), .sort = .{ .kind = .boolean }, .operation = .{ .binary = .{ .operator = .equal, .left = ir.SolverTermId.fromIndex(0), .right = ir.SolverTermId.fromIndex(4) } } },
+            .{ .id = ir.SolverTermId.fromIndex(7), .sort = .{ .kind = .boolean }, .operation = .{ .binary = .{ .operator = .equal, .left = ir.SolverTermId.fromIndex(1), .right = ir.SolverTermId.fromIndex(5) } } },
+            .{ .id = ir.SolverTermId.fromIndex(8), .sort = .{ .kind = .boolean }, .operation = .{ .binary = .{ .operator = .equal, .left = ir.SolverTermId.fromIndex(3), .right = ir.SolverTermId.fromIndex(4) } } },
+            .{ .id = ir.SolverTermId.fromIndex(9), .sort = .{ .kind = .boolean }, .operation = .{ .logical_not = ir.SolverTermId.fromIndex(8) } },
+        };
+        const constraints = [_]ir.Constraint{
+            .{ .id = ir.ConstraintId.fromIndex(0), .predicate = ir.SolverTermId.fromIndex(6), .evidence = &.{fixture.proof} },
+            .{ .id = ir.ConstraintId.fromIndex(1), .predicate = ir.SolverTermId.fromIndex(7), .evidence = &.{fixture.proof} },
+        };
+        var program = fixture.program;
+        program.solver_terms = &terms;
+        program.constraints = &constraints;
+        var result = try defaultBackend().solve(std.testing.allocator, &program, query);
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(ir.SolverResolution.unknown, result.resolution);
+        try std.testing.expectEqual(@as(usize, 0), result.model.items.len);
+    }
+    {
+        const terms = [_]ir.SolverTerm{
+            .{ .id = ir.SolverTermId.fromIndex(0), .sort = .{ .kind = .integer }, .operation = .{ .value = fixture.v_left } },
+            .{ .id = ir.SolverTermId.fromIndex(1), .sort = .{ .kind = .integer }, .operation = .{ .value = fixture.v_right } },
+            .{ .id = ir.SolverTermId.fromIndex(2), .sort = .{ .kind = .integer }, .operation = .{ .binary = .{ .operator = .add, .left = ir.SolverTermId.fromIndex(0), .right = ir.SolverTermId.fromIndex(1) } } },
+            .{ .id = ir.SolverTermId.fromIndex(3), .sort = .{ .kind = .integer }, .operation = .{ .value_definition = .{ .value = fixture.v_sum, .expression = ir.SolverTermId.fromIndex(2) } } },
+            .{ .id = ir.SolverTermId.fromIndex(4), .sort = .{ .kind = .integer }, .operation = .{ .integer_literal = "9007199254740992" } },
+            .{ .id = ir.SolverTermId.fromIndex(5), .sort = .{ .kind = .integer }, .operation = .{ .integer_literal = "1" } },
+            .{ .id = ir.SolverTermId.fromIndex(6), .sort = .{ .kind = .boolean }, .operation = .{ .binary = .{ .operator = .equal, .left = ir.SolverTermId.fromIndex(0), .right = ir.SolverTermId.fromIndex(4) } } },
+            .{ .id = ir.SolverTermId.fromIndex(7), .sort = .{ .kind = .boolean }, .operation = .{ .binary = .{ .operator = .equal, .left = ir.SolverTermId.fromIndex(1), .right = ir.SolverTermId.fromIndex(5) } } },
+            .{ .id = ir.SolverTermId.fromIndex(8), .sort = .{ .kind = .boolean }, .operation = .{ .binary = .{ .operator = .equal, .left = ir.SolverTermId.fromIndex(3), .right = ir.SolverTermId.fromIndex(4) } } },
+            .{ .id = ir.SolverTermId.fromIndex(9), .sort = .{ .kind = .boolean }, .operation = .{ .logical_not = ir.SolverTermId.fromIndex(8) } },
+            .{ .id = ir.SolverTermId.fromIndex(10), .sort = .{ .kind = .integer }, .operation = .{ .integer_literal = "7" } },
+            .{ .id = ir.SolverTermId.fromIndex(11), .sort = .{ .kind = .boolean }, .operation = .{ .binary = .{ .operator = .equal, .left = ir.SolverTermId.fromIndex(0), .right = ir.SolverTermId.fromIndex(10) } } },
+        };
+        const constraints = [_]ir.Constraint{
+            .{ .id = ir.ConstraintId.fromIndex(0), .predicate = ir.SolverTermId.fromIndex(11), .evidence = &.{fixture.proof} },
+            .{ .id = ir.ConstraintId.fromIndex(1), .predicate = ir.SolverTermId.fromIndex(7), .evidence = &.{fixture.proof} },
+        };
+        var program = fixture.program;
+        program.solver_terms = &terms;
+        program.constraints = &constraints;
+        var result = try defaultBackend().solve(std.testing.allocator, &program, query);
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(ir.SolverResolution.proved, result.resolution);
+    }
+}
+
+test "Z3 never proves an integer fact Luau doubles refute: definition floor remainder" {
+    const fixture = lifter.fixtures.arithmetic_module;
+    var instructions = fixture.instructions;
+    instructions[fixture.i_factor.index()].operation = .{ .constant = .{ .integer = "3" } };
+    instructions[fixture.i_result.index()].operation = .{ .binary = .{ .operator = .modulo, .left = fixture.v_sum, .right = fixture.v_factor } };
+    const constraints = [_]ir.Constraint{
+        .{ .id = ir.ConstraintId.fromIndex(0), .predicate = ir.SolverTermId.fromIndex(2), .evidence = &.{fixture.proof} },
+        .{ .id = ir.ConstraintId.fromIndex(1), .predicate = ir.SolverTermId.fromIndex(8), .evidence = &.{fixture.proof} },
+    };
+    const query: ir.SolverQuery = .{
+        .id = ir.QueryId.fromIndex(0),
+        .kind = .prove_true,
+        .assumptions = &.{ ir.ConstraintId.fromIndex(0), ir.ConstraintId.fromIndex(1) },
+        .goal = ir.SolverTermId.fromIndex(6),
+    };
+    {
+        const terms = [_]ir.SolverTerm{
+            .{ .id = ir.SolverTermId.fromIndex(0), .sort = .{ .kind = .integer }, .operation = .{ .value = fixture.v_sum } },
+            .{ .id = ir.SolverTermId.fromIndex(1), .sort = .{ .kind = .integer }, .operation = .{ .value = fixture.v_factor } },
+            .{ .id = ir.SolverTermId.fromIndex(2), .sort = .{ .kind = .boolean }, .operation = .{ .is_nonzero = ir.SolverTermId.fromIndex(1) } },
+            .{ .id = ir.SolverTermId.fromIndex(3), .sort = .{ .kind = .integer }, .operation = .{ .remainder = .{ .mode = .integer_floor, .left = ir.SolverTermId.fromIndex(0), .right = ir.SolverTermId.fromIndex(1), .defined_by = ir.SolverTermId.fromIndex(2) } } },
+            .{ .id = ir.SolverTermId.fromIndex(4), .sort = .{ .kind = .integer }, .operation = .{ .value_definition = .{ .value = fixture.v_result, .expression = ir.SolverTermId.fromIndex(3) } } },
+            .{ .id = ir.SolverTermId.fromIndex(5), .sort = .{ .kind = .integer }, .operation = .{ .integer_literal = "1" } },
+            .{ .id = ir.SolverTermId.fromIndex(6), .sort = .{ .kind = .boolean }, .operation = .{ .binary = .{ .operator = .equal, .left = ir.SolverTermId.fromIndex(4), .right = ir.SolverTermId.fromIndex(5) } } },
+            .{ .id = ir.SolverTermId.fromIndex(7), .sort = .{ .kind = .integer }, .operation = .{ .integer_literal = "-9007199254740992" } },
+            .{ .id = ir.SolverTermId.fromIndex(8), .sort = .{ .kind = .boolean }, .operation = .{ .binary = .{ .operator = .equal, .left = ir.SolverTermId.fromIndex(0), .right = ir.SolverTermId.fromIndex(7) } } },
+        };
+        var program = fixture.program;
+        program.instructions = &instructions;
+        program.solver_terms = &terms;
+        program.constraints = &constraints;
+        var result = try defaultBackend().solve(std.testing.allocator, &program, query);
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expect(result.resolution != .proved);
+    }
+    {
+        const terms = [_]ir.SolverTerm{
+            .{ .id = ir.SolverTermId.fromIndex(0), .sort = .{ .kind = .integer }, .operation = .{ .value = fixture.v_sum } },
+            .{ .id = ir.SolverTermId.fromIndex(1), .sort = .{ .kind = .integer }, .operation = .{ .value = fixture.v_factor } },
+            .{ .id = ir.SolverTermId.fromIndex(2), .sort = .{ .kind = .boolean }, .operation = .{ .is_nonzero = ir.SolverTermId.fromIndex(1) } },
+            .{ .id = ir.SolverTermId.fromIndex(3), .sort = .{ .kind = .integer }, .operation = .{ .remainder = .{ .mode = .integer_floor, .left = ir.SolverTermId.fromIndex(0), .right = ir.SolverTermId.fromIndex(1), .defined_by = ir.SolverTermId.fromIndex(2) } } },
+            .{ .id = ir.SolverTermId.fromIndex(4), .sort = .{ .kind = .integer }, .operation = .{ .value_definition = .{ .value = fixture.v_result, .expression = ir.SolverTermId.fromIndex(3) } } },
+            .{ .id = ir.SolverTermId.fromIndex(5), .sort = .{ .kind = .integer }, .operation = .{ .integer_literal = "1" } },
+            .{ .id = ir.SolverTermId.fromIndex(6), .sort = .{ .kind = .boolean }, .operation = .{ .binary = .{ .operator = .equal, .left = ir.SolverTermId.fromIndex(4), .right = ir.SolverTermId.fromIndex(5) } } },
+            .{ .id = ir.SolverTermId.fromIndex(7), .sort = .{ .kind = .integer }, .operation = .{ .integer_literal = "-9007199254740989" } },
+            .{ .id = ir.SolverTermId.fromIndex(8), .sort = .{ .kind = .boolean }, .operation = .{ .binary = .{ .operator = .equal, .left = ir.SolverTermId.fromIndex(0), .right = ir.SolverTermId.fromIndex(7) } } },
+        };
+        var program = fixture.program;
+        program.instructions = &instructions;
+        program.solver_terms = &terms;
+        program.constraints = &constraints;
+        var result = try defaultBackend().solve(std.testing.allocator, &program, query);
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(ir.SolverResolution.proved, result.resolution);
+    }
+}
+
+test "Z3 never proves an integer fact Luau doubles refute: definition floor division" {
+    const fixture = lifter.fixtures.arithmetic_module;
+    var instructions = fixture.instructions;
+    instructions[fixture.i_factor.index()].operation = .{ .constant = .{ .integer = "701" } };
+    instructions[fixture.i_result.index()].operation = .{ .binary = .{ .operator = .floor_divide, .left = fixture.v_sum, .right = fixture.v_factor } };
+    const constraints = [_]ir.Constraint{
+        .{ .id = ir.ConstraintId.fromIndex(0), .predicate = ir.SolverTermId.fromIndex(2), .evidence = &.{fixture.proof} },
+        .{ .id = ir.ConstraintId.fromIndex(1), .predicate = ir.SolverTermId.fromIndex(8), .evidence = &.{fixture.proof} },
+    };
+    const query: ir.SolverQuery = .{
+        .id = ir.QueryId.fromIndex(0),
+        .kind = .prove_true,
+        .assumptions = &.{ ir.ConstraintId.fromIndex(0), ir.ConstraintId.fromIndex(1) },
+        .goal = ir.SolverTermId.fromIndex(6),
+    };
+    {
+        const terms = [_]ir.SolverTerm{
+            .{ .id = ir.SolverTermId.fromIndex(0), .sort = .{ .kind = .integer }, .operation = .{ .value = fixture.v_sum } },
+            .{ .id = ir.SolverTermId.fromIndex(1), .sort = .{ .kind = .integer }, .operation = .{ .value = fixture.v_factor } },
+            .{ .id = ir.SolverTermId.fromIndex(2), .sort = .{ .kind = .boolean }, .operation = .{ .is_nonzero = ir.SolverTermId.fromIndex(1) } },
+            .{ .id = ir.SolverTermId.fromIndex(3), .sort = .{ .kind = .integer }, .operation = .{ .division = .{ .mode = .integer_floor, .left = ir.SolverTermId.fromIndex(0), .right = ir.SolverTermId.fromIndex(1), .defined_by = ir.SolverTermId.fromIndex(2) } } },
+            .{ .id = ir.SolverTermId.fromIndex(4), .sort = .{ .kind = .integer }, .operation = .{ .value_definition = .{ .value = fixture.v_result, .expression = ir.SolverTermId.fromIndex(3) } } },
+            .{ .id = ir.SolverTermId.fromIndex(5), .sort = .{ .kind = .integer }, .operation = .{ .integer_literal = "1644681176329310" } },
+            .{ .id = ir.SolverTermId.fromIndex(6), .sort = .{ .kind = .boolean }, .operation = .{ .binary = .{ .operator = .equal, .left = ir.SolverTermId.fromIndex(4), .right = ir.SolverTermId.fromIndex(5) } } },
+            .{ .id = ir.SolverTermId.fromIndex(7), .sort = .{ .kind = .integer }, .operation = .{ .integer_literal = "1152921504606846976" } },
+            .{ .id = ir.SolverTermId.fromIndex(8), .sort = .{ .kind = .boolean }, .operation = .{ .binary = .{ .operator = .equal, .left = ir.SolverTermId.fromIndex(0), .right = ir.SolverTermId.fromIndex(7) } } },
+        };
+        var program = fixture.program;
+        program.instructions = &instructions;
+        program.solver_terms = &terms;
+        program.constraints = &constraints;
+        var result = try defaultBackend().solve(std.testing.allocator, &program, query);
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expect(result.resolution != .proved);
+    }
+    {
+        const terms = [_]ir.SolverTerm{
+            .{ .id = ir.SolverTermId.fromIndex(0), .sort = .{ .kind = .integer }, .operation = .{ .value = fixture.v_sum } },
+            .{ .id = ir.SolverTermId.fromIndex(1), .sort = .{ .kind = .integer }, .operation = .{ .value = fixture.v_factor } },
+            .{ .id = ir.SolverTermId.fromIndex(2), .sort = .{ .kind = .boolean }, .operation = .{ .is_nonzero = ir.SolverTermId.fromIndex(1) } },
+            .{ .id = ir.SolverTermId.fromIndex(3), .sort = .{ .kind = .integer }, .operation = .{ .division = .{ .mode = .integer_floor, .left = ir.SolverTermId.fromIndex(0), .right = ir.SolverTermId.fromIndex(1), .defined_by = ir.SolverTermId.fromIndex(2) } } },
+            .{ .id = ir.SolverTermId.fromIndex(4), .sort = .{ .kind = .integer }, .operation = .{ .value_definition = .{ .value = fixture.v_result, .expression = ir.SolverTermId.fromIndex(3) } } },
+            .{ .id = ir.SolverTermId.fromIndex(5), .sort = .{ .kind = .integer }, .operation = .{ .integer_literal = "12849071690072" } },
+            .{ .id = ir.SolverTermId.fromIndex(6), .sort = .{ .kind = .boolean }, .operation = .{ .binary = .{ .operator = .equal, .left = ir.SolverTermId.fromIndex(4), .right = ir.SolverTermId.fromIndex(5) } } },
+            .{ .id = ir.SolverTermId.fromIndex(7), .sort = .{ .kind = .integer }, .operation = .{ .integer_literal = "9007199254740992" } },
+            .{ .id = ir.SolverTermId.fromIndex(8), .sort = .{ .kind = .boolean }, .operation = .{ .binary = .{ .operator = .equal, .left = ir.SolverTermId.fromIndex(0), .right = ir.SolverTermId.fromIndex(7) } } },
+        };
+        var program = fixture.program;
+        program.instructions = &instructions;
+        program.solver_terms = &terms;
+        program.constraints = &constraints;
+        var result = try defaultBackend().solve(std.testing.allocator, &program, query);
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(ir.SolverResolution.proved, result.resolution);
+    }
+}
+
+test "Z3 never proves an integer fact Luau doubles refute: value walk intermediate beyond 2^53" {
+    const proof = ir.EvidenceId.fromIndex(0);
+    const f0 = ir.FunctionId.fromIndex(0);
+    const b0 = ir.BlockId.fromIndex(0);
+    const i_big = ir.InstructionId.fromIndex(0);
+    const i_one = ir.InstructionId.fromIndex(1);
+    const i_sum = ir.InstructionId.fromIndex(2);
+    const i_difference = ir.InstructionId.fromIndex(3);
+    const c_big = ir.ValueId.fromIndex(0);
+    const c_one = ir.ValueId.fromIndex(1);
+    const s = ir.ValueId.fromIndex(2);
+    const d = ir.ValueId.fromIndex(3);
+    const values = [_]ir.Value{
+        .{ .id = c_big, .function = f0, .type = .integer, .name_hint = "big", .origin = .{ .instruction_result = .{ .instruction = i_big, .index = 0 } } },
+        .{ .id = c_one, .function = f0, .type = .integer, .name_hint = "one", .origin = .{ .instruction_result = .{ .instruction = i_one, .index = 0 } } },
+        .{ .id = s, .function = f0, .type = .integer, .name_hint = "sum", .origin = .{ .instruction_result = .{ .instruction = i_sum, .index = 0 } } },
+        .{ .id = d, .function = f0, .type = .integer, .name_hint = "difference", .origin = .{ .instruction_result = .{ .instruction = i_difference, .index = 0 } } },
+    };
+    const instructions = [_]ir.Instruction{
+        .{ .id = i_big, .block = b0, .operation = .{ .constant = .{ .integer = "9007199254740992" } }, .results = &.{c_big}, .effects = .pure, .evidence = &.{proof} },
+        .{ .id = i_one, .block = b0, .operation = .{ .constant = .{ .integer = "1" } }, .results = &.{c_one}, .effects = .pure, .evidence = &.{proof} },
+        .{ .id = i_sum, .block = b0, .operation = .{ .binary = .{ .operator = .add, .left = c_big, .right = c_one } }, .results = &.{s}, .effects = .pure, .evidence = &.{proof} },
+        .{ .id = i_difference, .block = b0, .operation = .{ .binary = .{ .operator = .subtract, .left = s, .right = c_one } }, .results = &.{d}, .effects = .pure, .evidence = &.{proof} },
+    };
+    const blocks = [_]ir.Block{
+        .{ .id = b0, .function = f0, .instructions = &.{ i_big, i_one, i_sum, i_difference }, .terminator = .{ .return_values = &.{d} }, .evidence = &.{proof} },
+    };
+    const functions = [_]ir.Function{
+        .{ .id = f0, .name_hint = "chunk", .blocks = &.{b0}, .entry_block = b0, .evidence = &.{proof} },
+    };
+    const evidence = [_]ir.Evidence{.{
+        .id = proof,
+        .kind = .dynamic_fixture,
+        .locator = "fixture:z3-wide-integer-intermediate",
+    }};
+    const terms = [_]ir.SolverTerm{
+        .{ .id = ir.SolverTermId.fromIndex(0), .sort = .{ .kind = .integer }, .operation = .{ .value = d } },
+        .{ .id = ir.SolverTermId.fromIndex(1), .sort = .{ .kind = .integer }, .operation = .{ .integer_literal = "9007199254740991" } },
+        .{ .id = ir.SolverTermId.fromIndex(2), .sort = .{ .kind = .boolean }, .operation = .{ .binary = .{ .operator = .equal, .left = ir.SolverTermId.fromIndex(0), .right = ir.SolverTermId.fromIndex(1) } } },
+        .{ .id = ir.SolverTermId.fromIndex(3), .sort = .{ .kind = .boolean }, .operation = .{ .logical_not = ir.SolverTermId.fromIndex(2) } },
+    };
+    const program: ir.Program = .{
+        .program_id = "z3-wide-integer-intermediate",
+        .entry_function = f0,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+        .evidence = &evidence,
+        .solver_terms = &terms,
+    };
+    const query: ir.SolverQuery = .{ .id = ir.QueryId.fromIndex(0), .kind = .prove_true, .goal = ir.SolverTermId.fromIndex(3) };
+    {
+        var result = try defaultBackend().solve(std.testing.allocator, &program, query);
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expect(result.resolution != .proved);
+    }
+    {
+        var control_instructions = instructions;
+        control_instructions[i_big.index()].operation = .{ .constant = .{ .integer = "4503599627370496" } };
+        var control_terms = terms;
+        control_terms[1].operation = .{ .integer_literal = "4503599627370495" };
+        var control_program = program;
+        control_program.instructions = &control_instructions;
+        control_program.solver_terms = &control_terms;
+        var result = try defaultBackend().solve(std.testing.allocator, &control_program, query);
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(ir.SolverResolution.proved, result.resolution);
+    }
 }
