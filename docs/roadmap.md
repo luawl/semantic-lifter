@@ -28,7 +28,7 @@ Active milestones, upcoming constructs, and evidence work. Day-to-day tracking l
 
 ## Solver
 
-- Building and testing the optional Z3 backend against the Z3 4.16.0 release ([#9](https://github.com/luawl/semantic-lifter/issues/9)).
+- Bringing conformance under the optional Z3 engine level with the internal engine ([#85](https://github.com/luawl/semantic-lifter/issues/85)).
 
 ## Evidence
 

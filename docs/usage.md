@@ -16,8 +16,11 @@
   an unpacked Z3 4.16.0 release for Windows x64 that holds `include/z3.h`, `bin/libz3.lib` and
   `bin/libz3.dll`; a relative `<path>` resolves against the repository root, and 61 tests compile
   only with it. Without `-Dz3-dir`, or when one of those files is missing, `zig build` stops at
-  configure time with a message that names `-Dz3-dir`. No build against a real Z3 release is on
-  record yet, and other platforms' Z3 archives are not wired.
+  configure time with a message that names `-Dz3-dir`. A build against the Z3 4.16.0 release for
+  Windows x64 is on record: with `-Dz3=true`, `zig build test` passes in Debug, ReleaseSafe and
+  ReleaseFast. A Z3 build of `semantic-lifter.exe` loads `libz3.dll` when it starts and runs with
+  `<path>/bin` on `PATH` (`zig build run` and `zig build test` add that entry themselves). Other
+  platforms' Z3 archives are not wired.
 
 ## Build and test
 
