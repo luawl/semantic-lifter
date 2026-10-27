@@ -857,11 +857,10 @@ fn trimTrailingEmptyReturn(output: *std.ArrayList(u8), indent: []const u8) void 
 }
 
 fn emitBlockInstructions(output: *std.ArrayList(u8), allocator: std.mem.Allocator, program: *const ir.Program, emission_plan: *const EmissionPlan, scopes: *const emission_scope.Plan, block: ir.Block, indent: []const u8, place_aliases: []const PlaceAlias) !void {
-    try emitBlockInstructionsWithDeclaration(output, allocator, program, emission_plan, scopes, block, indent, true, place_aliases, null);
+    try emitBlockInstructionsWithDeclaration(output, allocator, program, emission_plan, scopes, block, indent, place_aliases, null);
 }
 
-fn emitBlockInstructionsWithDeclaration(output: *std.ArrayList(u8), allocator: std.mem.Allocator, program: *const ir.Program, emission_plan: *const EmissionPlan, scopes: *const emission_scope.Plan, block: ir.Block, indent: []const u8, declare_results: bool, place_aliases: []const PlaceAlias, composition: ?*const branch_expression.Composition) !void {
-    _ = declare_results;
+fn emitBlockInstructionsWithDeclaration(output: *std.ArrayList(u8), allocator: std.mem.Allocator, program: *const ir.Program, emission_plan: *const EmissionPlan, scopes: *const emission_scope.Plan, block: ir.Block, indent: []const u8, place_aliases: []const PlaceAlias, composition: ?*const branch_expression.Composition) !void {
     var index: usize = 0;
     while (index < block.instructions.len) {
         const first_id = block.instructions[index];
@@ -1184,7 +1183,7 @@ fn emitRegionBodyWithPredeclaredBlock(
         switch (node.*) {
             .block => |block_id| {
                 const block = program.blocks[block_id.index()];
-                try emitBlockInstructionsWithDeclaration(output, allocator, program, emission_plan, scopes, block, indent, false, place_aliases, composition);
+                try emitBlockInstructionsWithDeclaration(output, allocator, program, emission_plan, scopes, block, indent, place_aliases, composition);
                 switch (block.terminator) {
                     .jump => |edge| {
                         if (forwarded_stop_edge) |forwarded_edge| {
@@ -1347,7 +1346,7 @@ fn emitRegionBodyWithPredeclaredBlock(
                     branch_plan.else_shared_reentry,
                 );
                 trace_stage = "branch_block";
-                try emitBlockInstructionsWithDeclaration(output, allocator, program, emission_plan, scopes, block, indent, false, place_aliases, composition);
+                try emitBlockInstructionsWithDeclaration(output, allocator, program, emission_plan, scopes, block, indent, place_aliases, composition);
 
                 if (branch_plan.join) |join_id| {
                     const join_is_region_stop = region.stop != null and join_id == region.stop.?;
@@ -2145,7 +2144,6 @@ fn emitProjectedTerminalBody(
         scopes,
         terminal,
         indent,
-        false,
         place_aliases,
         null,
     );
@@ -2310,7 +2308,7 @@ fn emitLoop(
     if (structured_escape.loopOwnedExitFlag(enclosing_region, .{ .loop = loop_plan })) |exit_flag| {
         try emitEscapeFlagDeclaration(output, allocator, program, emission_plan, exit_flag, loop_indent);
     }
-    try emitBlockInstructionsWithDeclaration(output, allocator, program, emission_plan, scopes, header, loop_indent, false, place_aliases, null);
+    try emitBlockInstructionsWithDeclaration(output, allocator, program, emission_plan, scopes, header, loop_indent, place_aliases, null);
     try output.appendSlice(allocator, loop_indent);
     try output.appendSlice(allocator, "if ");
     try render.valueUseScalar(output, allocator, program, valuePlan(emission_plan, place_aliases), branch.condition);

@@ -4049,3 +4049,52 @@ test "closure stores whose target renders in parentheses open their own block" {
     try std.testing.expect(std.mem.indexOf(u8, captured_environment_source, "callee()\n  (") == null);
     try std.testing.expect(std.mem.indexOf(u8, captured_environment_source, "= callee()\n  do\n    (nil).get = function()\n") != null);
 }
+
+test "a condition block declares the result it first defines as a local before its if" {
+    const proof = ir.EvidenceId.fromIndex(0);
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const then_block = ir.BlockId.fromIndex(1);
+    const else_block = ir.BlockId.fromIndex(2);
+    const get_id = ir.InstructionId.fromIndex(0);
+    const call_id = ir.InstructionId.fromIndex(1);
+    const else_id = ir.InstructionId.fromIndex(2);
+    const callee = ir.ValueId.fromIndex(0);
+    const result = ir.ValueId.fromIndex(1);
+    const else_value = ir.ValueId.fromIndex(2);
+
+    const values = [_]ir.Value{
+        .{ .id = callee, .function = function_id, .type = .function, .origin = .{ .instruction_result = .{ .instruction = get_id, .index = 0 } } },
+        .{ .id = result, .function = function_id, .name_hint = "result", .origin = .{ .instruction_result = .{ .instruction = call_id, .index = 0 } } },
+        .{ .id = else_value, .function = function_id, .type = .integer, .origin = .{ .instruction_result = .{ .instruction = else_id, .index = 0 } } },
+    };
+    const instructions = [_]ir.Instruction{
+        .{ .id = get_id, .block = entry, .operation = .{ .environment_get = .{ .target = .{ .ambient = {} }, .name = "produce" } }, .results = &.{callee}, .effects = .semantic_environment_read, .evidence = &.{proof} },
+        .{ .id = call_id, .block = entry, .operation = .{ .call = .{ .callee = callee, .arguments = &.{}, .result_arity = .{ .fixed = 1 } } }, .results = &.{result}, .effects = .dynamic_call, .evidence = &.{proof} },
+        .{ .id = else_id, .block = else_block, .operation = .{ .constant = .{ .integer = "0" } }, .results = &.{else_value}, .effects = .pure, .evidence = &.{proof} },
+    };
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .instructions = &.{ get_id, call_id }, .terminator = .{ .branch = .{ .condition = result, .then_edge = .{ .target = then_block }, .else_edge = .{ .target = else_block } } }, .evidence = &.{proof} },
+        .{ .id = then_block, .function = function_id, .terminator = .{ .return_values = &.{result} }, .evidence = &.{proof} },
+        .{ .id = else_block, .function = function_id, .instructions = &.{else_id}, .terminator = .{ .return_values = &.{else_value} }, .evidence = &.{proof} },
+    };
+    const functions = [_]ir.Function{.{ .id = function_id, .blocks = &.{ entry, then_block, else_block }, .entry_block = entry, .evidence = &.{proof} }};
+    const evidence = [_]ir.Evidence{.{ .id = proof, .kind = .dynamic_fixture, .locator = "fixture:branch-condition-block-declaration" }};
+    const program: ir.Program = .{
+        .program_id = "branch-condition-block-declaration",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+        .evidence = &evidence,
+    };
+
+    // The entry block is the branch's own condition block, which the region writes before its `if`. The call result is
+    // read by the condition and by the then arm, so the scope plan declares it in that block: the block writes it as a
+    // `local`, never as an assignment to an undeclared name.
+    const source = try emitAlloc(std.testing.allocator, &program);
+    defer std.testing.allocator.free(source);
+    try std.testing.expect(std.mem.indexOf(u8, source, "local result = produce()\nif result then\n") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "produce()"));
+}
