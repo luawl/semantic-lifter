@@ -21,6 +21,13 @@ pub fn termPreconditionsProved(program: *const ir.Program, term_id: ir.SolverTer
     return termCovered(program, query, term_id, condition_proved, 0);
 }
 
+/// Whether every guard met in the walk of `term_id`, the guards themselves included, evaluates true or is the
+/// predicate of one of `assumptions`: the walk queryCovered applies to a goal and to each of its assumptions.
+pub fn termCoveredBy(program: *const ir.Program, term_id: ir.SolverTermId, assumptions: []const ir.ConstraintId, condition_proved: ConditionProvedFn) bool {
+    const query: ir.SolverQuery = .{ .id = ir.QueryId.fromIndex(0), .kind = .prove_true, .goal = term_id, .assumptions = assumptions };
+    return termCovered(program, query, term_id, condition_proved, 0);
+}
+
 fn termCovered(
     program: *const ir.Program,
     query: ir.SolverQuery,
@@ -95,6 +102,51 @@ test "guarded value definitions require their semantic condition" {
     try @import("std").testing.expect(!termPreconditionsProved(&program, query.goal, neverProved));
     query.assumptions = &.{ir.ConstraintId.fromIndex(0)};
     try @import("std").testing.expect(queryCovered(&program, query, neverProved));
+}
+
+test "a guard is walked as a dependency of the term it guards" {
+    const std = @import("std");
+    const fixture = @import("fixtures.zig").arithmetic_module;
+    const term = ir.SolverTermId.fromIndex;
+    const terms = [_]ir.SolverTerm{
+        .{ .id = term(0), .sort = .{ .kind = .integer }, .operation = .{ .value = fixture.v_right } },
+        .{ .id = term(1), .sort = .{ .kind = .boolean }, .operation = .{ .is_nonzero = term(0) } },
+        .{ .id = term(2), .sort = .{ .kind = .integer }, .operation = .{ .value = fixture.v_left } },
+        .{ .id = term(3), .sort = .{ .kind = .integer }, .operation = .{ .remainder = .{
+            .mode = .integer_floor,
+            .left = term(2),
+            .right = term(0),
+            .defined_by = term(1),
+        } } },
+        .{ .id = term(4), .sort = .{ .kind = .integer }, .operation = .{ .integer_literal = "0" } },
+        .{ .id = term(5), .sort = .{ .kind = .boolean }, .operation = .{ .binary = .{ .operator = .equal, .left = term(3), .right = term(4) } } },
+        .{ .id = term(6), .sort = .{ .kind = .integer }, .operation = .{ .value = fixture.v_sum } },
+        .{ .id = term(7), .sort = .{ .kind = .integer }, .operation = .{ .value = fixture.v_factor } },
+        .{ .id = term(8), .sort = .{ .kind = .integer }, .operation = .{ .division = .{
+            .mode = .integer_floor,
+            .left = term(6),
+            .right = term(7),
+            .defined_by = term(5),
+        } } },
+    };
+    const c0 = ir.ConstraintId.fromIndex(0);
+    const c1 = ir.ConstraintId.fromIndex(1);
+    const constraints = [_]ir.Constraint{
+        .{ .id = c0, .predicate = term(5), .evidence = &.{fixture.proof} },
+        .{ .id = c1, .predicate = term(1), .evidence = &.{fixture.proof} },
+    };
+    var program = fixture.program;
+    program.solver_terms = &terms;
+    program.constraints = &constraints;
+    const goal = term(8);
+
+    // The division's guard is assumed, but the walk enters that guard and meets the remainder's own guard.
+    try std.testing.expect(!termCoveredBy(&program, goal, &.{c0}, neverProved));
+    try std.testing.expect(termCoveredBy(&program, goal, &.{ c0, c1 }, neverProved));
+    var query: ir.SolverQuery = .{ .id = ir.QueryId.fromIndex(0), .kind = .prove_true, .goal = goal, .assumptions = &.{c0} };
+    try std.testing.expect(!queryCovered(&program, query, neverProved));
+    query.assumptions = &.{ c0, c1 };
+    try std.testing.expect(queryCovered(&program, query, neverProved));
 }
 
 fn neverProved(_: *const ir.Program, _: ir.SolverTermId) bool {

@@ -2821,3 +2821,505 @@ test "an unreachable arm into the entry block does not specialize the entry's ed
     const entry_jump = resolved.program.blocks[fixture.base.entry_id.index()].terminator.jump;
     try std.testing.expectEqual(fixture.base.join_id, entry_jump.target);
 }
+
+test "a paired branch claim never submits an uncovered query" {
+    const fixtures = @import("fixtures.zig");
+    const check = paired_claim_checks;
+    const remainder = fixtures.uncovered_guard_retest_module;
+    const leaf = fixtures.leaf_retest_module;
+    const term = ir.SolverTermId.fromIndex;
+    const c0 = ir.ConstraintId.fromIndex(0);
+    const c1 = ir.ConstraintId.fromIndex(1);
+    const c2 = ir.ConstraintId.fromIndex(2);
+    const leaf_fact_terms = fixtures.uncoveredFactTerms(0, leaf.v_x, leaf.v_y);
+    {
+        // No solver state: the pair's goal, the definition of `x % y == 1`, holds the guard `y ~= 0`, which no
+        // assumption covers.
+        const program = remainder.program;
+        var resolved = try resolveAlloc(std.testing.allocator, &program, solver_backend.internalFacts());
+        defer resolved.deinit();
+        try check.expectAdmitted(&resolved);
+        try check.expectEntryThen(&resolved, remainder, remainder.b_again);
+    }
+    {
+        // The condition itself published on the entry block: the base pair selects the entry's then arm.
+        var program = remainder.program;
+        const terms = [_]ir.SolverTerm{.{ .id = term(0), .sort = .{ .kind = .boolean }, .operation = .{ .value = remainder.v_matches } }};
+        const constraints = [_]ir.Constraint{.{ .id = c0, .predicate = term(0), .evidence = &.{remainder.proof}, .scope = .{ .block = remainder.b_entry } }};
+        program.solver_terms = &terms;
+        program.constraints = &constraints;
+        var resolved = try resolveAlloc(std.testing.allocator, &program, solver_backend.internalFacts());
+        defer resolved.deinit();
+        try check.expectAdmitted(&resolved);
+        try check.expectEntryJump(&resolved, remainder, remainder.b_retest);
+    }
+    {
+        // The guard `y ~= 0` published on the re-test block covers the definition, so the pair keeps it.
+        var program = remainder.program;
+        const terms = [_]ir.SolverTerm{
+            .{ .id = term(0), .sort = .{ .kind = .integer }, .operation = .{ .value = remainder.v_y } },
+            .{ .id = term(1), .sort = .{ .kind = .boolean }, .operation = .{ .is_nonzero = term(0) } },
+        };
+        const constraints = [_]ir.Constraint{.{ .id = c0, .predicate = term(1), .evidence = &.{remainder.proof}, .scope = .{ .block = remainder.b_retest } }};
+        program.solver_terms = &terms;
+        program.constraints = &constraints;
+        var resolved = try resolveAlloc(std.testing.allocator, &program, solver_backend.internalFacts());
+        defer resolved.deinit();
+        try check.expectAdmitted(&resolved);
+        try check.expectEntryThen(&resolved, remainder, remainder.b_again);
+        try check.expectProvedDefinition(&resolved, remainder.v_matches);
+    }
+    {
+        // A boolean parameter re-tested with no solver state.
+        const program = leaf.program;
+        var resolved = try resolveAlloc(std.testing.allocator, &program, solver_backend.internalFacts());
+        defer resolved.deinit();
+        try check.expectAdmitted(&resolved);
+        try check.expectEntryThen(&resolved, leaf, leaf.b_again);
+    }
+    {
+        // `x % y == 1` published for the whole function with its guard uncovered: no pair may assume it.
+        var program = leaf.program;
+        const constraints = [_]ir.Constraint{.{ .id = c0, .predicate = term(5), .evidence = &.{leaf.proof}, .scope = .{ .function = leaf.f_probe } }};
+        program.solver_terms = &leaf_fact_terms;
+        program.constraints = &constraints;
+        var resolved = try resolveAlloc(std.testing.allocator, &program, solver_backend.internalFacts());
+        defer resolved.deinit();
+        try check.expectAdmitted(&resolved);
+        try check.expectEntryThen(&resolved, leaf, leaf.b_again);
+        try check.expectNoQueryAssumes(&resolved, c0);
+    }
+    {
+        // The same fact kept for explicit use only.
+        var program = leaf.program;
+        const constraints = [_]ir.Constraint{.{ .id = c0, .predicate = term(5), .evidence = &.{leaf.proof}, .scope = .{ .explicit_only = {} } }};
+        program.solver_terms = &leaf_fact_terms;
+        program.constraints = &constraints;
+        var resolved = try resolveAlloc(std.testing.allocator, &program, solver_backend.internalFacts());
+        defer resolved.deinit();
+        try check.expectAdmitted(&resolved);
+        try check.expectEntryThen(&resolved, leaf, leaf.b_again);
+    }
+    {
+        // The same fact with its guard published beside it: both are covered, and the proof assumes both.
+        var program = leaf.program;
+        const constraints = [_]ir.Constraint{
+            .{ .id = c0, .predicate = term(5), .evidence = &.{leaf.proof}, .scope = .{ .function = leaf.f_probe } },
+            .{ .id = c1, .predicate = term(2), .evidence = &.{leaf.proof}, .scope = .{ .function = leaf.f_probe } },
+        };
+        program.solver_terms = &leaf_fact_terms;
+        program.constraints = &constraints;
+        var resolved = try resolveAlloc(std.testing.allocator, &program, solver_backend.internalFacts());
+        defer resolved.deinit();
+        try check.expectAdmitted(&resolved);
+        try check.expectEntryThen(&resolved, leaf, leaf.b_again);
+        const proved = try check.provedQuery(&resolved);
+        try std.testing.expect(std.mem.indexOfScalar(ir.ConstraintId, proved.assumptions, c0) != null);
+        try std.testing.expect(std.mem.indexOfScalar(ir.ConstraintId, proved.assumptions, c1) != null);
+    }
+    {
+        // An input that already holds the pair over the then arm's fact, which the planner plans again.
+        var program = leaf.program;
+        const terms = comptime fixtures.uncoveredFactTerms(0, leaf.v_x, leaf.v_y) ++ [_]ir.SolverTerm{
+            .{ .id = term(6), .sort = .{ .kind = .boolean }, .operation = .{ .value = leaf.v_condition } },
+            .{ .id = term(7), .sort = .{ .kind = .boolean }, .operation = .{ .logical_not = term(6) } },
+        };
+        const constraints = [_]ir.Constraint{
+            .{ .id = c0, .predicate = term(5), .evidence = &.{leaf.proof}, .scope = .{ .function = leaf.f_probe } },
+            .{ .id = c1, .predicate = term(6), .evidence = &.{leaf.proof}, .scope = .{ .edge = .{ .source = leaf.b_entry, .kind = .branch_then, .target = leaf.b_retest } } },
+            .{ .id = c2, .predicate = term(7), .evidence = &.{leaf.proof}, .scope = .{ .edge = .{ .source = leaf.b_entry, .kind = .branch_else, .target = leaf.b_outer } } },
+        };
+        const queries = [_]ir.SolverQuery{
+            .{ .id = ir.QueryId.fromIndex(0), .kind = .prove_true, .goal = term(6), .assumptions = &.{c1} },
+            .{ .id = ir.QueryId.fromIndex(1), .kind = .prove_true, .goal = term(7), .assumptions = &.{c1} },
+        };
+        const claims = [_]ir.Claim{
+            .{ .id = ir.ClaimId.fromIndex(0), .subject = .{ .block = leaf.b_retest }, .predicate = term(6), .status = .unproven, .query = ir.QueryId.fromIndex(0) },
+            .{ .id = ir.ClaimId.fromIndex(1), .subject = .{ .block = leaf.b_retest }, .predicate = term(7), .status = .unproven, .query = ir.QueryId.fromIndex(1) },
+        };
+        program.solver_terms = &terms;
+        program.constraints = &constraints;
+        program.queries = &queries;
+        program.claims = &claims;
+        var resolved = try resolveAlloc(std.testing.allocator, &program, solver_backend.internalFacts());
+        defer resolved.deinit();
+        try check.expectAdmitted(&resolved);
+        try check.expectEntryThen(&resolved, leaf, leaf.b_again);
+        try std.testing.expectEqual(@as(usize, 2), resolved.program.queries.len);
+    }
+    {
+        // The condition published on the entry block beside the uncovered fact for the whole function.
+        var program = leaf.program;
+        const terms = comptime [_]ir.SolverTerm{.{ .id = term(0), .sort = .{ .kind = .boolean }, .operation = .{ .value = leaf.v_condition } }} ++ fixtures.uncoveredFactTerms(1, leaf.v_x, leaf.v_y);
+        const constraints = [_]ir.Constraint{
+            .{ .id = c0, .predicate = term(0), .evidence = &.{leaf.proof}, .scope = .{ .block = leaf.b_entry } },
+            .{ .id = c1, .predicate = term(6), .evidence = &.{leaf.proof}, .scope = .{ .function = leaf.f_probe } },
+        };
+        program.solver_terms = &terms;
+        program.constraints = &constraints;
+        var resolved = try resolveAlloc(std.testing.allocator, &program, solver_backend.internalFacts());
+        defer resolved.deinit();
+        try check.expectAdmitted(&resolved);
+        try check.expectEntryJump(&resolved, leaf, leaf.b_retest);
+    }
+    {
+        // `x % y == 1` both as the re-tested condition and as a fact for the whole function: neither the goal's
+        // guard nor the fact's is covered.
+        var program = remainder.program;
+        const terms = fixtures.uncoveredFactTerms(0, remainder.v_x, remainder.v_y);
+        const constraints = [_]ir.Constraint{.{ .id = c0, .predicate = term(5), .evidence = &.{remainder.proof}, .scope = .{ .function = remainder.f_probe } }};
+        program.solver_terms = &terms;
+        program.constraints = &constraints;
+        var resolved = try resolveAlloc(std.testing.allocator, &program, solver_backend.internalFacts());
+        defer resolved.deinit();
+        try check.expectAdmitted(&resolved);
+        try check.expectEntryThen(&resolved, remainder, remainder.b_again);
+        try check.expectNoQueryAssumes(&resolved, c0);
+    }
+}
+
+test "an uncovered base-scoped fact neither defers nor gates a branch" {
+    const fixtures = @import("fixtures.zig");
+    const check = paired_claim_checks;
+    const relevant = fixtures.relevant_retest_module;
+    const term = ir.SolverTermId.fromIndex;
+    const c0 = ir.ConstraintId.fromIndex(0);
+    const c1 = ir.ConstraintId.fromIndex(1);
+    const c2 = ir.ConstraintId.fromIndex(2);
+    const fact_terms = fixtures.uncoveredFactTerms(0, relevant.v_x, relevant.v_y);
+    const mixed_terms = comptime fixtures.uncoveredFactTerms(0, relevant.v_x, relevant.v_y) ++ fixtures.irrelevantFactTerms(6, term(1));
+    {
+        // `x == 1` re-tested with no solver state.
+        const program = relevant.program;
+        var resolved = try resolveAlloc(std.testing.allocator, &program, solver_backend.internalFacts());
+        defer resolved.deinit();
+        try check.expectAdmitted(&resolved);
+        try check.expectEntryThen(&resolved, relevant, relevant.b_again);
+    }
+    {
+        // `x % y == 1` published for the whole function with its guard uncovered: it relates to `x`, yet it
+        // neither defers the entry's arm facts nor opens a base pair, so the then arm's fact decides the re-test.
+        var program = relevant.program;
+        const constraints = [_]ir.Constraint{.{ .id = c0, .predicate = term(5), .evidence = &.{relevant.proof}, .scope = .{ .function = relevant.f_probe } }};
+        program.solver_terms = &fact_terms;
+        program.constraints = &constraints;
+        var resolved = try resolveAlloc(std.testing.allocator, &program, solver_backend.internalFacts());
+        defer resolved.deinit();
+        try check.expectAdmitted(&resolved);
+        try check.expectEntryThen(&resolved, relevant, relevant.b_again);
+        try check.expectArmFactPair(&resolved, relevant, &.{c1});
+        try check.expectNoQueryAssumes(&resolved, c0);
+    }
+    {
+        // The same fact kept for explicit use only decides the same way.
+        var program = relevant.program;
+        const constraints = [_]ir.Constraint{.{ .id = c0, .predicate = term(5), .evidence = &.{relevant.proof}, .scope = .{ .explicit_only = {} } }};
+        program.solver_terms = &fact_terms;
+        program.constraints = &constraints;
+        var resolved = try resolveAlloc(std.testing.allocator, &program, solver_backend.internalFacts());
+        defer resolved.deinit();
+        try check.expectAdmitted(&resolved);
+        try check.expectEntryThen(&resolved, relevant, relevant.b_again);
+        try check.expectArmFactPair(&resolved, relevant, &.{c1});
+    }
+    {
+        // The same fact with its guard published beside it: the base pairs over both stay.
+        var program = relevant.program;
+        const constraints = [_]ir.Constraint{
+            .{ .id = c0, .predicate = term(5), .evidence = &.{relevant.proof}, .scope = .{ .function = relevant.f_probe } },
+            .{ .id = c1, .predicate = term(2), .evidence = &.{relevant.proof}, .scope = .{ .function = relevant.f_probe } },
+        };
+        program.solver_terms = &fact_terms;
+        program.constraints = &constraints;
+        var resolved = try resolveAlloc(std.testing.allocator, &program, solver_backend.internalFacts());
+        defer resolved.deinit();
+        try check.expectAdmitted(&resolved);
+        try check.expectEntryThen(&resolved, relevant, relevant.b_again);
+        try std.testing.expectEqual(@as(usize, 4), resolved.program.queries.len);
+    }
+    {
+        // The uncovered fact published on the entry block.
+        var program = relevant.program;
+        const constraints = [_]ir.Constraint{.{ .id = c0, .predicate = term(5), .evidence = &.{relevant.proof}, .scope = .{ .block = relevant.b_entry } }};
+        program.solver_terms = &fact_terms;
+        program.constraints = &constraints;
+        var resolved = try resolveAlloc(std.testing.allocator, &program, solver_backend.internalFacts());
+        defer resolved.deinit();
+        try check.expectAdmitted(&resolved);
+        try check.expectEntryThen(&resolved, relevant, relevant.b_again);
+        try check.expectArmFactPair(&resolved, relevant, &.{c1});
+        try check.expectNoQueryAssumes(&resolved, c0);
+    }
+    {
+        // The fact and its guard, both on the entry block.
+        var program = relevant.program;
+        const constraints = [_]ir.Constraint{
+            .{ .id = c0, .predicate = term(5), .evidence = &.{relevant.proof}, .scope = .{ .block = relevant.b_entry } },
+            .{ .id = c1, .predicate = term(2), .evidence = &.{relevant.proof}, .scope = .{ .block = relevant.b_entry } },
+        };
+        program.solver_terms = &fact_terms;
+        program.constraints = &constraints;
+        var resolved = try resolveAlloc(std.testing.allocator, &program, solver_backend.internalFacts());
+        defer resolved.deinit();
+        try check.expectAdmitted(&resolved);
+        try check.expectEntryThen(&resolved, relevant, relevant.b_again);
+    }
+    {
+        // The uncovered fact beside the covered fact `y < 100`, which the branch does not read: the then arm's
+        // pair assumes the covered fact and the arm fact, and no base pair is planned over the covered fact alone.
+        var program = relevant.program;
+        const constraints = [_]ir.Constraint{
+            .{ .id = c0, .predicate = term(5), .evidence = &.{relevant.proof}, .scope = .{ .function = relevant.f_probe } },
+            .{ .id = c1, .predicate = term(7), .evidence = &.{relevant.proof}, .scope = .{ .function = relevant.f_probe } },
+        };
+        program.solver_terms = &mixed_terms;
+        program.constraints = &constraints;
+        var resolved = try resolveAlloc(std.testing.allocator, &program, solver_backend.internalFacts());
+        defer resolved.deinit();
+        try check.expectAdmitted(&resolved);
+        try check.expectEntryThen(&resolved, relevant, relevant.b_again);
+        try check.expectArmFactPair(&resolved, relevant, &.{ c1, c2 });
+        try check.expectNoQueryAssumes(&resolved, c0);
+    }
+    {
+        // The same with the uncovered fact kept for explicit use only.
+        var program = relevant.program;
+        const constraints = [_]ir.Constraint{
+            .{ .id = c0, .predicate = term(5), .evidence = &.{relevant.proof}, .scope = .{ .explicit_only = {} } },
+            .{ .id = c1, .predicate = term(7), .evidence = &.{relevant.proof}, .scope = .{ .function = relevant.f_probe } },
+        };
+        program.solver_terms = &mixed_terms;
+        program.constraints = &constraints;
+        var resolved = try resolveAlloc(std.testing.allocator, &program, solver_backend.internalFacts());
+        defer resolved.deinit();
+        try check.expectAdmitted(&resolved);
+        try check.expectEntryThen(&resolved, relevant, relevant.b_again);
+        try check.expectArmFactPair(&resolved, relevant, &.{ c1, c2 });
+    }
+    {
+        // The uncovered fact published on the re-test block.
+        var program = relevant.program;
+        const constraints = [_]ir.Constraint{.{ .id = c0, .predicate = term(5), .evidence = &.{relevant.proof}, .scope = .{ .block = relevant.b_retest } }};
+        program.solver_terms = &fact_terms;
+        program.constraints = &constraints;
+        var resolved = try resolveAlloc(std.testing.allocator, &program, solver_backend.internalFacts());
+        defer resolved.deinit();
+        try check.expectAdmitted(&resolved);
+        try check.expectEntryThen(&resolved, relevant, relevant.b_again);
+        try check.expectNoQueryAssumes(&resolved, c0);
+    }
+    {
+        // The fact and its guard, both on the re-test block.
+        var program = relevant.program;
+        const constraints = [_]ir.Constraint{
+            .{ .id = c0, .predicate = term(5), .evidence = &.{relevant.proof}, .scope = .{ .block = relevant.b_retest } },
+            .{ .id = c1, .predicate = term(2), .evidence = &.{relevant.proof}, .scope = .{ .block = relevant.b_retest } },
+        };
+        program.solver_terms = &fact_terms;
+        program.constraints = &constraints;
+        var resolved = try resolveAlloc(std.testing.allocator, &program, solver_backend.internalFacts());
+        defer resolved.deinit();
+        try check.expectAdmitted(&resolved);
+        try check.expectEntryThen(&resolved, relevant, relevant.b_again);
+    }
+}
+
+test "an uncovered edge-scoped fact leaves its arm unrewritten" {
+    const fixtures = @import("fixtures.zig");
+    const check = paired_claim_checks;
+    const relevant = fixtures.relevant_retest_module;
+    const forwarded = fixtures.forwarded_relevant_retest_module;
+    const term = ir.SolverTermId.fromIndex;
+    const c0 = ir.ConstraintId.fromIndex(0);
+    const c1 = ir.ConstraintId.fromIndex(1);
+    const c2 = ir.ConstraintId.fromIndex(2);
+    const fact_terms = fixtures.uncoveredFactTerms(0, relevant.v_x, relevant.v_y);
+    const then_edge: ir.CfgEdgeRef = .{ .source = relevant.b_entry, .kind = .branch_then, .target = relevant.b_retest };
+    const second_root: ir.CfgEdgeRef = .{ .source = relevant.b_entry, .kind = .branch_then, .target = forwarded.b_second_forwarder };
+    {
+        // `x % y == 1` published on the entry's then edge with its guard uncovered: no pair may be planned on
+        // that edge, so the arm stays as it is.
+        var program = relevant.program;
+        const constraints = [_]ir.Constraint{.{ .id = c0, .predicate = term(5), .evidence = &.{relevant.proof}, .scope = .{ .edge = then_edge } }};
+        program.solver_terms = &fact_terms;
+        program.constraints = &constraints;
+        var resolved = try resolveAlloc(std.testing.allocator, &program, solver_backend.internalFacts());
+        defer resolved.deinit();
+        try check.expectAdmitted(&resolved);
+        try check.expectEntryThen(&resolved, relevant, relevant.b_retest);
+        try std.testing.expectEqual(@as(usize, 0), resolved.program.edge_rewrites.len);
+        try std.testing.expectEqual(@as(usize, 0), resolved.program.queries.len);
+    }
+    {
+        // The fact and its guard on the same edge: the proof that rewrites the arm assumes both and the arm fact.
+        var program = relevant.program;
+        const constraints = [_]ir.Constraint{
+            .{ .id = c0, .predicate = term(5), .evidence = &.{relevant.proof}, .scope = .{ .edge = then_edge } },
+            .{ .id = c1, .predicate = term(2), .evidence = &.{relevant.proof}, .scope = .{ .edge = then_edge } },
+        };
+        program.solver_terms = &fact_terms;
+        program.constraints = &constraints;
+        var resolved = try resolveAlloc(std.testing.allocator, &program, solver_backend.internalFacts());
+        defer resolved.deinit();
+        try check.expectAdmitted(&resolved);
+        try check.expectEntryThen(&resolved, relevant, relevant.b_again);
+        try std.testing.expectEqualSlices(ir.ConstraintId, &.{ c0, c1, c2 }, (try check.provedQuery(&resolved)).assumptions);
+    }
+    {
+        // The forwarded arm with the fact kept for explicit use only: the proof follows both forwarding rewrites.
+        var program = forwarded.program;
+        const constraints = [_]ir.Constraint{.{ .id = c0, .predicate = term(5), .evidence = &.{relevant.proof}, .scope = .{ .explicit_only = {} } }};
+        program.solver_terms = &fact_terms;
+        program.constraints = &constraints;
+        var resolved = try resolveAlloc(std.testing.allocator, &program, solver_backend.internalFacts());
+        defer resolved.deinit();
+        try check.expectAdmitted(&resolved);
+        try check.expectEntryThen(&resolved, relevant, relevant.b_again);
+        try std.testing.expectEqualSlices(ir.EdgeRewriteId, &.{ forwarded.r_first, forwarded.r_second }, (try check.provedQuery(&resolved)).path_rewrites);
+    }
+    {
+        // The uncovered fact on the arm's second root, past the first forwarding rewrite: the arm keeps only its
+        // forwarding history.
+        var program = forwarded.program;
+        const constraints = [_]ir.Constraint{.{ .id = c0, .predicate = term(5), .evidence = &.{relevant.proof}, .scope = .{ .edge = second_root }, .path_rewrites = &.{forwarded.r_second} }};
+        program.solver_terms = &fact_terms;
+        program.constraints = &constraints;
+        var resolved = try resolveAlloc(std.testing.allocator, &program, solver_backend.internalFacts());
+        defer resolved.deinit();
+        try check.expectAdmitted(&resolved);
+        try check.expectEntryThen(&resolved, relevant, relevant.b_retest);
+        try check.expectForwardingOnly(&resolved);
+    }
+    {
+        // The same beside the covered fact `y < 100` for the whole function.
+        var program = forwarded.program;
+        const terms = comptime fixtures.uncoveredFactTerms(0, relevant.v_x, relevant.v_y) ++ fixtures.irrelevantFactTerms(6, term(1));
+        const constraints = [_]ir.Constraint{
+            .{ .id = c0, .predicate = term(5), .evidence = &.{relevant.proof}, .scope = .{ .edge = second_root }, .path_rewrites = &.{forwarded.r_second} },
+            .{ .id = c1, .predicate = term(7), .evidence = &.{relevant.proof}, .scope = .{ .function = relevant.f_probe } },
+        };
+        program.solver_terms = &terms;
+        program.constraints = &constraints;
+        var resolved = try resolveAlloc(std.testing.allocator, &program, solver_backend.internalFacts());
+        defer resolved.deinit();
+        try check.expectAdmitted(&resolved);
+        try check.expectEntryThen(&resolved, relevant, relevant.b_retest);
+        try check.expectForwardingOnly(&resolved);
+    }
+    {
+        // The fact and its guard, both on the second root: the pair over them is planned on that root's path and
+        // stays unproven.
+        var program = forwarded.program;
+        const constraints = [_]ir.Constraint{
+            .{ .id = c0, .predicate = term(5), .evidence = &.{relevant.proof}, .scope = .{ .edge = second_root }, .path_rewrites = &.{forwarded.r_second} },
+            .{ .id = c1, .predicate = term(2), .evidence = &.{relevant.proof}, .scope = .{ .edge = second_root }, .path_rewrites = &.{forwarded.r_second} },
+        };
+        program.solver_terms = &fact_terms;
+        program.constraints = &constraints;
+        var resolved = try resolveAlloc(std.testing.allocator, &program, solver_backend.internalFacts());
+        defer resolved.deinit();
+        try check.expectAdmitted(&resolved);
+        try check.expectEntryThen(&resolved, relevant, relevant.b_retest);
+        try std.testing.expectEqual(@as(usize, 2), resolved.program.queries.len);
+        for (resolved.program.queries) |query| {
+            try std.testing.expectEqualSlices(ir.ConstraintId, &.{ c0, c1 }, query.assumptions);
+            try std.testing.expectEqualSlices(ir.EdgeRewriteId, &.{forwarded.r_second}, query.path_rewrites);
+        }
+    }
+}
+
+// Checks shared by the three tests above. Each program re-tests its entry block's branch condition in the block
+// the entry's then arm enters: a proof on that arm rewrites it to the re-test block's then target, and an arm
+// left unrewritten keeps the re-test block.
+const paired_claim_checks = struct {
+    /// Every query of the resolved program is one the backend accepts, and the program is admitted under both
+    /// profiles.
+    fn expectAdmitted(resolved: *const ResolvedProgram) !void {
+        for (resolved.program.queries) |query| {
+            try std.testing.expect(@import("solver_preconditions.zig").queryCovered(&resolved.program, query, @import("solver.zig").evaluatesTrue));
+        }
+        var core_report = try @import("validate.zig").validate(std.testing.allocator, &resolved.program, .core);
+        defer core_report.deinit();
+        try std.testing.expect(core_report.isClean());
+        var readable_report = try @import("validate.zig").validate(std.testing.allocator, &resolved.program, .readable_luau);
+        defer readable_report.deinit();
+        try std.testing.expect(readable_report.isClean());
+    }
+
+    /// The entry block still branches: to `then_target` on its then arm and to the outer block on its else arm.
+    fn expectEntryThen(resolved: *const ResolvedProgram, comptime module: type, then_target: ir.BlockId) !void {
+        const branch = switch (resolved.program.blocks[module.b_entry.index()].terminator) {
+            .branch => |value| value,
+            else => return error.TestExpectedEntryBranch,
+        };
+        try std.testing.expectEqual(then_target, branch.then_edge.target);
+        try std.testing.expectEqual(module.b_outer, branch.else_edge.target);
+    }
+
+    /// The entry block's branch was selected: it jumps to `target`.
+    fn expectEntryJump(resolved: *const ResolvedProgram, comptime module: type, target: ir.BlockId) !void {
+        const jump = switch (resolved.program.blocks[module.b_entry.index()].terminator) {
+            .jump => |value| value,
+            else => return error.TestExpectedEntryJump,
+        };
+        try std.testing.expectEqual(target, jump.target);
+    }
+
+    /// No query of the resolved program assumes `constraint`.
+    fn expectNoQueryAssumes(resolved: *const ResolvedProgram, constraint: ir.ConstraintId) !void {
+        for (resolved.program.queries) |query| {
+            try std.testing.expect(std.mem.indexOfScalar(ir.ConstraintId, query.assumptions, constraint) == null);
+        }
+    }
+
+    /// The query of the one certificate that proves its query.
+    fn provedQuery(resolved: *const ResolvedProgram) !ir.SolverQuery {
+        var proved: ?ir.SolverQuery = null;
+        for (resolved.program.certificates) |certificate| {
+            if (certificate.resolution != .proved) continue;
+            if (proved != null) return error.TestExpectedOneProvedCertificate;
+            proved = resolved.program.queries[certificate.query.index()];
+        }
+        return proved orelse error.TestExpectedOneProvedCertificate;
+    }
+
+    /// Some proved claim's predicate is the definition of `value`.
+    fn expectProvedDefinition(resolved: *const ResolvedProgram, value: ir.ValueId) !void {
+        for (resolved.program.claims) |claim| {
+            if (claim.status != .proved) continue;
+            switch (resolved.program.solver_terms[claim.predicate.index()].operation) {
+                .value_definition => |definition| if (definition.value == value) return,
+                else => {},
+            }
+        }
+        return error.TestExpectedProvedDefinition;
+    }
+
+    /// Two queries, each assuming exactly `assumptions`, the last of them the fact of the entry's then arm: scoped
+    /// to the then edge into the re-test block, its predicate the condition value itself.
+    fn expectArmFactPair(resolved: *const ResolvedProgram, comptime module: type, assumptions: []const ir.ConstraintId) !void {
+        try std.testing.expectEqual(@as(usize, 2), resolved.program.queries.len);
+        const then_edge: ir.CfgEdgeRef = .{ .source = module.b_entry, .kind = .branch_then, .target = module.b_retest };
+        for (resolved.program.queries) |query| {
+            try std.testing.expectEqualSlices(ir.ConstraintId, assumptions, query.assumptions);
+            const arm_fact = resolved.program.constraints[assumptions[assumptions.len - 1].index()];
+            try std.testing.expect(std.meta.eql(ir.ConstraintScope{ .edge = then_edge }, arm_fact.scope));
+            switch (resolved.program.solver_terms[arm_fact.predicate.index()].operation) {
+                .value => |value| try std.testing.expectEqual(module.v_matches, value),
+                else => return error.TestExpectedConditionValue,
+            }
+        }
+    }
+
+    /// The arm keeps exactly its two forwarding rewrites, and no query is planned.
+    fn expectForwardingOnly(resolved: *const ResolvedProgram) !void {
+        const forwarded = @import("fixtures.zig").forwarded_relevant_retest_module;
+        try std.testing.expectEqual(@as(usize, 2), resolved.program.edge_rewrites.len);
+        try std.testing.expectEqual(forwarded.r_first, resolved.program.edge_rewrites[0].id);
+        try std.testing.expectEqual(forwarded.r_second, resolved.program.edge_rewrites[1].id);
+        for (resolved.program.edge_rewrites) |rewrite| {
+            try std.testing.expectEqual(ir.EdgeRewriteRule.forwarding_jump, rewrite.rule);
+        }
+        try std.testing.expectEqual(@as(usize, 0), resolved.program.queries.len);
+    }
+};

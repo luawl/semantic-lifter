@@ -364,7 +364,7 @@ pub const State = struct {
                 else => continue,
             };
             if (exactBranchTruth(program, branch.condition, findValueDefinition(program.solver_terms, branch.condition)) == .unknown and
-                hasRelevantBaseConstraint(program, block, branch.condition, findValueDefinition(program.solver_terms, branch.condition))) return true;
+                try hasRelevantBaseConstraint(self.allocator, program, block, branch.condition, findValueDefinition(program.solver_terms, branch.condition))) return true;
         }
         return false;
     }
@@ -373,7 +373,7 @@ pub const State = struct {
     /// predicate of `hasDeferredBranchArms`). No claim is planned over such an edge before the release, even
     /// from facts already on it: a proof that rewrote the arm now would not assume the arm facts released
     /// later, which would then fall outside its edge scope.
-    fn armEdgeOfDeferredBlock(self: *const State, program: *const ir.Program, edge: ir.CfgEdgeRef) bool {
+    fn armEdgeOfDeferredBlock(self: *const State, program: *const ir.Program, edge: ir.CfgEdgeRef) !bool {
         if (!self.defer_base_branch_arms or edge.kind == .jump or edge.source.index() >= program.blocks.len) return false;
         const source = program.blocks[edge.source.index()];
         const branch = switch (source.terminator) {
@@ -382,7 +382,7 @@ pub const State = struct {
         };
         const promoted = findValueDefinition(program.solver_terms, branch.condition);
         return exactBranchTruth(program, branch.condition, promoted) == .unknown and
-            hasRelevantBaseConstraint(program, source, branch.condition, promoted);
+            try hasRelevantBaseConstraint(self.allocator, program, source, branch.condition, promoted);
     }
 
     fn deriveEdgeFacts(self: *State, program: *const ir.Program, scope: *const readable_scope.Scope) !void {
@@ -408,7 +408,7 @@ pub const State = struct {
                     // (replay, validate_proofs.zig:60) and must be carried by every proof that rewrites an
                     // arm (edge scope, :73), so the block's facts are all derived in one call.
                     if (!has_exact_truth and self.defer_base_branch_arms and
-                        hasRelevantBaseConstraint(&working, block, branch.condition, promoted)) continue;
+                        try hasRelevantBaseConstraint(self.allocator, &working, block, branch.condition, promoted)) continue;
                     break :blk !has_exact_truth;
                 },
                 else => true,
@@ -535,23 +535,52 @@ pub const State = struct {
                     break :blk id;
                 };
                 const goals = [_]ir.SolverTermId{ term_id, negated_term };
-                if (hasRelevantBaseConstraint(working, block, branch.condition, promoted)) {
-                    const assumptions = try applicableConstraintsAlloc(self.allocator, working, block, .{ .base = {} });
-                    try appendPairedClaims(self.allocator, working, block.id, goals, assumptions, &.{}, &self.queries, &self.claims);
+                if (try hasRelevantBaseConstraint(self.allocator, working, block, branch.condition, promoted)) {
+                    const assumptions = (try usableConstraintsAlloc(self.allocator, working, block, .{ .base = {} })).?;
+                    try self.appendCoveredPairedClaims(working, block.id, branch.condition, goals, assumptions, &.{});
                     planned = self.programView(&planned);
                 }
                 const incoming = try incomingEdgesAlloc(self.allocator, working, &scope, block.id);
                 for (incoming) |edge| {
-                    if (self.armEdgeOfDeferredBlock(working, edge)) continue;
+                    if (try self.armEdgeOfDeferredBlock(working, edge)) continue;
                     const path = try relevantEdgePathAlloc(self.allocator, working, edge, branch.condition, promoted) orelse continue;
-                    const assumptions = try applicableConstraintsAlloc(self.allocator, working, block, .{ .edge = .{ .edge = edge, .path = path } });
-                    try appendPairedClaims(self.allocator, working, block.id, goals, assumptions, path.rewrites, &self.queries, &self.claims);
+                    const assumptions = (try usableConstraintsAlloc(self.allocator, working, block, .{ .edge = .{ .edge = edge, .path = path } })) orelse continue;
+                    try self.appendCoveredPairedClaims(working, block.id, branch.condition, goals, assumptions, path.rewrites);
                     planned = self.programView(&planned);
                 }
             }
         }
 
         return self.programView(&planned);
+    }
+
+    /// Plans a branch's paired claims over `assumptions`, a set that covers itself. Backend.solve also refuses a
+    /// query whose goal is not covered, so the goal is planned when the assumptions cover it, else the boolean
+    /// condition's value leaf and its negation (as a query promotion keeps an unpromoted goal), else nothing.
+    fn appendCoveredPairedClaims(
+        self: *State,
+        planned: *ir.Program,
+        block_id: ir.BlockId,
+        condition: ir.ValueId,
+        goals: [2]ir.SolverTermId,
+        assumptions: []const ir.ConstraintId,
+        path_rewrites: []const ir.EdgeRewriteId,
+    ) !void {
+        var pair = goals;
+        if (!solver_preconditions.termCoveredBy(planned, goals[0], assumptions, solver.evaluatesTrue)) {
+            if (condition.index() >= planned.values.len or planned.values[condition.index()].type.kind != .boolean) return;
+            const leaf = findValueLeaf(self.terms.items, condition) orelse try self.appendBooleanTerm(.{ .value = condition });
+            const negated = findNegatedTerm(self.terms.items, leaf) orelse try self.appendBooleanTerm(.{ .logical_not = leaf });
+            planned.* = self.programView(planned);
+            pair = .{ leaf, negated };
+        }
+        try appendPairedClaims(self.allocator, planned, block_id, pair, assumptions, path_rewrites, &self.queries, &self.claims);
+    }
+
+    fn appendBooleanTerm(self: *State, operation: ir.SolverTermOperation) !ir.SolverTermId {
+        const id = ir.SolverTermId.fromIndex(self.terms.items.len);
+        try self.terms.append(self.allocator, .{ .id = id, .sort = .{ .kind = .boolean }, .operation = operation });
+        return id;
     }
 
     fn ensureBranchTerm(
@@ -907,6 +936,19 @@ fn findValueTerm(terms: []const ir.SolverTerm, value_id: ir.ValueId) ?ir.SolverT
     return null;
 }
 
+/// Only a boolean `.value` leaf: findValueTerm also returns a promoted value_definition, which the edge facts
+/// append before the arm-fact leaf, so it would rebuild the uncovered goal.
+fn findValueLeaf(terms: []const ir.SolverTerm, value_id: ir.ValueId) ?ir.SolverTermId {
+    for (terms) |term| {
+        if (term.sort.kind != .boolean) continue;
+        switch (term.operation) {
+            .value => |candidate| if (candidate == value_id) return term.id,
+            else => {},
+        }
+    }
+    return null;
+}
+
 fn findDynamicValueTerm(terms: []const ir.SolverTerm, value_id: ir.ValueId) ?ir.SolverTermId {
     for (terms) |term| {
         if (term.sort.kind != .dynamic_value) continue;
@@ -1140,19 +1182,30 @@ fn hasAnyRelevantConstraint(
     return false;
 }
 
+/// Whether a relevant constraint that a base pair may assume applies to `block`: an applicable constraint the base
+/// set does not cover neither opens the base pair nor defers the block's arm facts.
 fn hasRelevantBaseConstraint(
+    allocator: std.mem.Allocator,
     program: *const ir.Program,
     block: ir.Block,
     condition: ir.ValueId,
     promoted: ?ir.SolverTermId,
-) bool {
+) !bool {
+    var any_relevant = false;
     for (program.constraints) |constraint| {
         if (constraint.evidence.len != 0 and
             baseConstraintApplies(constraint, block) and
             constraintRelevant(program, constraint.predicate, condition, promoted))
         {
-            return true;
+            any_relevant = true;
+            break;
         }
+    }
+    if (!any_relevant) return false;
+    const usable = (try usableConstraintsAlloc(allocator, program, block, .{ .base = {} })).?;
+    defer allocator.free(usable);
+    for (usable) |constraint_id| {
+        if (constraintRelevant(program, program.constraints[constraint_id.index()].predicate, condition, promoted)) return true;
     }
     return false;
 }
@@ -1332,6 +1385,34 @@ fn applicableConstraintsAlloc(
         }
     }
     return assumptions.toOwnedSlice(allocator);
+}
+
+/// The constraints a pair planned in `context` may assume, or null when no pair may be planned there. Backend.solve
+/// refuses a query unless every guard of its goal and of its assumptions evaluates true or is assumed. An applicable
+/// constraint that the applicable set does not cover is dropped when it is base-scoped, because no rewrite or branch
+/// selection moves it. An uncovered edge-scoped one makes the context unplannable: a proof that rewrites its arm
+/// would have to assume it or leave it behind the rewrite, and it cannot be assumed. One pass suffices, because the
+/// coverage walk visits every guard as a dependency of the term it guards.
+fn usableConstraintsAlloc(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    block: ir.Block,
+    context: ConstraintContext,
+) !?[]ir.ConstraintId {
+    const applicable = try applicableConstraintsAlloc(allocator, program, block, context);
+    defer allocator.free(applicable);
+    var usable: std.ArrayList(ir.ConstraintId) = .empty;
+    errdefer usable.deinit(allocator);
+    for (applicable) |constraint_id| {
+        const constraint = program.constraints[constraint_id.index()];
+        if (solver_preconditions.termCoveredBy(program, constraint.predicate, applicable, solver.evaluatesTrue)) {
+            try usable.append(allocator, constraint_id);
+        } else if (constraint.scope == .edge) {
+            usable.deinit(allocator);
+            return null;
+        }
+    }
+    return try usable.toOwnedSlice(allocator);
 }
 
 fn incomingEdgesAlloc(
@@ -2050,4 +2131,146 @@ test "edge facts over numeric state plan queries for a derived dispatcher condit
         else => return error.TestExpectedValueGoal,
     };
     try std.testing.expectEqual(fixture.v_condition, goal_value);
+}
+
+test "paired branch queries neither carry nor drop a fact they cannot assume" {
+    const fixtures = @import("fixtures.zig");
+    const remainder = fixtures.uncovered_guard_retest_module;
+    const leaf = fixtures.leaf_retest_module;
+    const relevant = fixtures.relevant_retest_module;
+    const forwarded = fixtures.forwarded_relevant_retest_module;
+    const term = ir.SolverTermId.fromIndex;
+    const c0 = ir.ConstraintId.fromIndex(0);
+    const c1 = ir.ConstraintId.fromIndex(1);
+    const checks = struct {
+        /// The planned query count; then, for every query, the backend accepts it, a query that lists a path
+        /// resolves to an edge, and every edge fact on the query's own root whose computed path is the query's
+        /// path is among its assumptions.
+        fn expectPlanned(allocator: std.mem.Allocator, expanded: *const ir.Program, count: usize) !void {
+            try std.testing.expectEqual(count, expanded.queries.len);
+            for (expanded.queries) |query| {
+                try std.testing.expect(solver_preconditions.queryCovered(expanded, query, solver.evaluatesTrue));
+                if (query.path_rewrites.len != 0) try std.testing.expect(edge_path.resolvedQueryEdge(expanded, query) != null);
+                const root = switch (edge_path.queryRoot(expanded, query)) {
+                    .one => |edge| edge,
+                    .none, .ambiguous => continue,
+                };
+                const current = edge_path.resolvedQueryEdge(expanded, query) orelse return error.TestExpectedResolvedQueryEdge;
+                for (expanded.constraints) |constraint| {
+                    const scoped = switch (constraint.scope) {
+                        .edge => |edge| edge,
+                        else => continue,
+                    };
+                    if (!std.meta.eql(scoped, root)) continue;
+                    const path = try edge_path.pathForConstraintAlloc(allocator, expanded, constraint, current) orelse continue;
+                    if (!std.mem.eql(ir.EdgeRewriteId, path, query.path_rewrites)) continue;
+                    try std.testing.expect(std.mem.indexOfScalar(ir.ConstraintId, query.assumptions, constraint.id) != null);
+                }
+            }
+        }
+
+        /// The goal of `query` is the bare value `value`.
+        fn expectValueGoal(expanded: *const ir.Program, query: ir.SolverQuery, value: ir.ValueId) !void {
+            switch (expanded.solver_terms[query.goal.index()].operation) {
+                .value => |goal_value| try std.testing.expectEqual(value, goal_value),
+                else => return error.TestExpectedValueGoal,
+            }
+        }
+
+        /// No query assumes `constraint`.
+        fn expectNoQueryAssumes(expanded: *const ir.Program, constraint: ir.ConstraintId) !void {
+            for (expanded.queries) |query| {
+                try std.testing.expect(std.mem.indexOfScalar(ir.ConstraintId, query.assumptions, constraint) == null);
+            }
+        }
+    };
+    {
+        // No solver state: the definition of `matches`, `x % y == 1`, holds the guard `y ~= 0`, which the then
+        // arm's fact does not cover, so the pair's goal is the condition value itself.
+        const program = remainder.program;
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const expanded = try expandInArena(arena.allocator(), &program);
+        try checks.expectPlanned(arena.allocator(), &expanded, 2);
+        try checks.expectValueGoal(&expanded, expanded.queries[0], remainder.v_matches);
+    }
+    {
+        // `x % y == 1` also published for the whole function with its guard uncovered: no pair assumes it, and
+        // the pair's goal is still the condition value.
+        var program = remainder.program;
+        const terms = fixtures.uncoveredFactTerms(0, remainder.v_x, remainder.v_y);
+        const constraints = [_]ir.Constraint{.{ .id = c0, .predicate = term(5), .evidence = &.{remainder.proof}, .scope = .{ .function = remainder.f_probe } }};
+        program.solver_terms = &terms;
+        program.constraints = &constraints;
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const expanded = try expandInArena(arena.allocator(), &program);
+        try checks.expectPlanned(arena.allocator(), &expanded, 2);
+        try checks.expectNoQueryAssumes(&expanded, c0);
+        try checks.expectValueGoal(&expanded, expanded.queries[0], remainder.v_matches);
+    }
+    {
+        // A boolean parameter re-tested beside the same uncovered fact: no pair assumes the fact.
+        var program = leaf.program;
+        const terms = fixtures.uncoveredFactTerms(0, leaf.v_x, leaf.v_y);
+        const constraints = [_]ir.Constraint{.{ .id = c0, .predicate = term(5), .evidence = &.{leaf.proof}, .scope = .{ .function = leaf.f_probe } }};
+        program.solver_terms = &terms;
+        program.constraints = &constraints;
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const expanded = try expandInArena(arena.allocator(), &program);
+        try checks.expectPlanned(arena.allocator(), &expanded, 2);
+        try checks.expectNoQueryAssumes(&expanded, c0);
+    }
+    {
+        // `x == 1` re-tested beside the same uncovered fact: each pair assumes only the then arm's fact, the
+        // condition value on the then edge into the re-test block.
+        var program = relevant.program;
+        const terms = fixtures.uncoveredFactTerms(0, relevant.v_x, relevant.v_y);
+        const constraints = [_]ir.Constraint{.{ .id = c0, .predicate = term(5), .evidence = &.{relevant.proof}, .scope = .{ .function = relevant.f_probe } }};
+        program.solver_terms = &terms;
+        program.constraints = &constraints;
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const expanded = try expandInArena(arena.allocator(), &program);
+        try checks.expectPlanned(arena.allocator(), &expanded, 2);
+        const then_edge: ir.CfgEdgeRef = .{ .source = relevant.b_entry, .kind = .branch_then, .target = relevant.b_retest };
+        for (expanded.queries) |query| {
+            try std.testing.expectEqual(@as(usize, 1), query.assumptions.len);
+            const arm_fact = expanded.constraints[query.assumptions[0].index()];
+            try std.testing.expect(std.meta.eql(ir.ConstraintScope{ .edge = then_edge }, arm_fact.scope));
+            switch (expanded.solver_terms[arm_fact.predicate.index()].operation) {
+                .value => |value| try std.testing.expectEqual(relevant.v_matches, value),
+                else => return error.TestExpectedConditionValue,
+            }
+        }
+    }
+    {
+        // The uncovered fact published on the entry's then edge: no pair may be planned on that edge.
+        var program = relevant.program;
+        const terms = fixtures.uncoveredFactTerms(0, relevant.v_x, relevant.v_y);
+        const constraints = [_]ir.Constraint{.{ .id = c0, .predicate = term(5), .evidence = &.{relevant.proof}, .scope = .{ .edge = .{ .source = relevant.b_entry, .kind = .branch_then, .target = relevant.b_retest } } }};
+        program.solver_terms = &terms;
+        program.constraints = &constraints;
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const expanded = try expandInArena(arena.allocator(), &program);
+        try checks.expectPlanned(arena.allocator(), &expanded, 0);
+    }
+    {
+        // The uncovered fact on the forwarded arm's second root, beside the covered fact `y < 100` for the whole
+        // function: no pair is planned.
+        var program = forwarded.program;
+        const terms = comptime fixtures.uncoveredFactTerms(0, relevant.v_x, relevant.v_y) ++ fixtures.irrelevantFactTerms(6, term(1));
+        const constraints = [_]ir.Constraint{
+            .{ .id = c0, .predicate = term(5), .evidence = &.{relevant.proof}, .scope = .{ .edge = .{ .source = relevant.b_entry, .kind = .branch_then, .target = forwarded.b_second_forwarder } }, .path_rewrites = &.{forwarded.r_second} },
+            .{ .id = c1, .predicate = term(7), .evidence = &.{relevant.proof}, .scope = .{ .function = relevant.f_probe } },
+        };
+        program.solver_terms = &terms;
+        program.constraints = &constraints;
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const expanded = try expandInArena(arena.allocator(), &program);
+        try checks.expectPlanned(arena.allocator(), &expanded, 0);
+    }
 }

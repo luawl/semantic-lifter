@@ -766,6 +766,256 @@ pub const absolute_value_module = struct {
     };
 };
 
+/// A function that tests a boolean condition in its entry block and again in the block the entry's then arm
+/// enters: the entry computes `matches` and branches to the re-test block when it holds and to a block that
+/// returns "outer" otherwise, and the re-test block returns "again" when `matches` holds and "never" otherwise.
+/// With `compares_remainder`, `matches` is `x % y == 1`; otherwise it is `x == 1` and the remainder is unused.
+pub fn RetestModule(comptime compares_remainder: bool) type {
+    return struct {
+        pub const proof = ir.EvidenceId.fromIndex(0);
+        pub const f_chunk = ir.FunctionId.fromIndex(0);
+        pub const f_probe = ir.FunctionId.fromIndex(1);
+        pub const b_chunk = ir.BlockId.fromIndex(0);
+        pub const b_entry = ir.BlockId.fromIndex(1);
+        pub const b_retest = ir.BlockId.fromIndex(2);
+        pub const b_outer = ir.BlockId.fromIndex(3);
+        pub const b_again = ir.BlockId.fromIndex(4);
+        pub const b_never = ir.BlockId.fromIndex(5);
+        pub const i_export = ir.InstructionId.fromIndex(0);
+        pub const i_one = ir.InstructionId.fromIndex(1);
+        pub const i_remainder = ir.InstructionId.fromIndex(2);
+        pub const i_matches = ir.InstructionId.fromIndex(3);
+        pub const i_outer = ir.InstructionId.fromIndex(4);
+        pub const i_again = ir.InstructionId.fromIndex(5);
+        pub const i_never = ir.InstructionId.fromIndex(6);
+        pub const v_x = ir.ValueId.fromIndex(0);
+        pub const v_y = ir.ValueId.fromIndex(1);
+        pub const v_export = ir.ValueId.fromIndex(2);
+        pub const v_one = ir.ValueId.fromIndex(3);
+        pub const v_remainder = ir.ValueId.fromIndex(4);
+        pub const v_matches = ir.ValueId.fromIndex(5);
+        pub const v_outer = ir.ValueId.fromIndex(6);
+        pub const v_again = ir.ValueId.fromIndex(7);
+        pub const v_never = ir.ValueId.fromIndex(8);
+
+        pub const values = [_]ir.Value{
+            .{ .id = v_x, .function = f_probe, .type = .integer, .name_hint = "x", .origin = .{ .parameter = 0 } },
+            .{ .id = v_y, .function = f_probe, .type = .integer, .name_hint = "y", .origin = .{ .parameter = 1 } },
+            .{ .id = v_export, .function = f_chunk, .type = .function, .name_hint = "probe", .origin = .{ .instruction_result = .{ .instruction = i_export, .index = 0 } } },
+            .{ .id = v_one, .function = f_probe, .type = .integer, .name_hint = "one", .origin = .{ .instruction_result = .{ .instruction = i_one, .index = 0 } } },
+            .{ .id = v_remainder, .function = f_probe, .type = .integer, .name_hint = "remainder", .origin = .{ .instruction_result = .{ .instruction = i_remainder, .index = 0 } } },
+            .{ .id = v_matches, .function = f_probe, .type = .boolean, .name_hint = "matches", .origin = .{ .instruction_result = .{ .instruction = i_matches, .index = 0 } } },
+            .{ .id = v_outer, .function = f_probe, .type = .string, .name_hint = "outer_result", .origin = .{ .instruction_result = .{ .instruction = i_outer, .index = 0 } } },
+            .{ .id = v_again, .function = f_probe, .type = .string, .name_hint = "again_result", .origin = .{ .instruction_result = .{ .instruction = i_again, .index = 0 } } },
+            .{ .id = v_never, .function = f_probe, .type = .string, .name_hint = "never_result", .origin = .{ .instruction_result = .{ .instruction = i_never, .index = 0 } } },
+        };
+
+        pub const instructions = [_]ir.Instruction{
+            .{ .id = i_export, .block = b_chunk, .operation = .{ .function_ref = f_probe }, .results = &.{v_export}, .effects = .pure, .evidence = &.{proof} },
+            .{ .id = i_one, .block = b_entry, .operation = .{ .constant = .{ .integer = "1" } }, .results = &.{v_one}, .effects = .pure, .evidence = &.{proof} },
+            .{ .id = i_remainder, .block = b_entry, .operation = .{ .binary = .{ .operator = .modulo, .left = v_x, .right = v_y } }, .results = &.{v_remainder}, .effects = .pure, .evidence = &.{proof} },
+            .{ .id = i_matches, .block = b_entry, .operation = .{ .binary = .{ .operator = .equal, .left = if (compares_remainder) v_remainder else v_x, .right = v_one } }, .results = &.{v_matches}, .effects = .pure, .evidence = &.{proof} },
+            .{ .id = i_outer, .block = b_outer, .operation = .{ .constant = .{ .string = "outer" } }, .results = &.{v_outer}, .effects = .pure, .evidence = &.{proof} },
+            .{ .id = i_again, .block = b_again, .operation = .{ .constant = .{ .string = "again" } }, .results = &.{v_again}, .effects = .pure, .evidence = &.{proof} },
+            .{ .id = i_never, .block = b_never, .operation = .{ .constant = .{ .string = "never" } }, .results = &.{v_never}, .effects = .pure, .evidence = &.{proof} },
+        };
+
+        pub const blocks = [_]ir.Block{
+            .{ .id = b_chunk, .function = f_chunk, .instructions = &.{i_export}, .terminator = .{ .return_values = &.{v_export} }, .evidence = &.{proof} },
+            .{ .id = b_entry, .function = f_probe, .instructions = &.{ i_one, i_remainder, i_matches }, .terminator = .{ .branch = .{
+                .condition = v_matches,
+                .then_edge = .{ .target = b_retest },
+                .else_edge = .{ .target = b_outer },
+            } }, .evidence = &.{proof} },
+            .{ .id = b_retest, .function = f_probe, .terminator = .{ .branch = .{
+                .condition = v_matches,
+                .then_edge = .{ .target = b_again },
+                .else_edge = .{ .target = b_never },
+            } }, .evidence = &.{proof} },
+            .{ .id = b_outer, .function = f_probe, .instructions = &.{i_outer}, .terminator = .{ .return_values = &.{v_outer} }, .evidence = &.{proof} },
+            .{ .id = b_again, .function = f_probe, .instructions = &.{i_again}, .terminator = .{ .return_values = &.{v_again} }, .evidence = &.{proof} },
+            .{ .id = b_never, .function = f_probe, .instructions = &.{i_never}, .terminator = .{ .return_values = &.{v_never} }, .evidence = &.{proof} },
+        };
+
+        pub const functions = [_]ir.Function{
+            .{ .id = f_chunk, .name_hint = "chunk", .blocks = &.{b_chunk}, .entry_block = b_chunk, .evidence = &.{proof} },
+            .{ .id = f_probe, .name_hint = "probe", .parameters = &.{ v_x, v_y }, .blocks = &.{ b_entry, b_retest, b_outer, b_again, b_never }, .entry_block = b_entry, .evidence = &.{proof} },
+        };
+
+        pub const evidence = [_]ir.Evidence{.{
+            .id = proof,
+            .kind = .dynamic_fixture,
+            .locator = if (compares_remainder) "fixture:uncovered-guard-retest-module" else "fixture:relevant-retest-module",
+        }};
+
+        pub const program: ir.Program = .{
+            .program_id = if (compares_remainder) "uncovered-guard-retest-module" else "relevant-retest-module",
+            .entry_function = f_chunk,
+            .functions = &functions,
+            .blocks = &blocks,
+            .instructions = &instructions,
+            .values = &values,
+            .evidence = &evidence,
+        };
+    };
+}
+
+pub const uncovered_guard_retest_module = RetestModule(true);
+pub const relevant_retest_module = RetestModule(false);
+
+/// `relevant_retest_module` with the entry's then arm reaching the re-test block through two forwarding
+/// blocks that earlier rewrites folded away: the live then edge targets the re-test block, and the arm's
+/// history starts at the first forwarding block, which jumps to the second, which jumps to the re-test block.
+pub const forwarded_relevant_retest_module = struct {
+    pub const base = relevant_retest_module;
+    pub const b_first_forwarder = ir.BlockId.fromIndex(6);
+    pub const b_second_forwarder = ir.BlockId.fromIndex(7);
+    pub const r_first = ir.EdgeRewriteId.fromIndex(0);
+    pub const r_second = ir.EdgeRewriteId.fromIndex(1);
+
+    pub const blocks = base.blocks ++ [_]ir.Block{
+        .{ .id = b_first_forwarder, .function = base.f_probe, .terminator = .{ .jump = .{ .target = b_second_forwarder } }, .evidence = &.{base.proof} },
+        .{ .id = b_second_forwarder, .function = base.f_probe, .terminator = .{ .jump = .{ .target = base.b_retest } }, .evidence = &.{base.proof} },
+    };
+
+    pub const functions = [_]ir.Function{
+        base.functions[0],
+        .{ .id = base.f_probe, .name_hint = "probe", .parameters = &.{ base.v_x, base.v_y }, .blocks = &.{ base.b_entry, base.b_retest, base.b_outer, base.b_again, base.b_never, b_first_forwarder, b_second_forwarder }, .entry_block = base.b_entry, .evidence = &.{base.proof} },
+    };
+
+    pub const edge_rewrites = [_]ir.CfgEdgeRewrite{
+        .{ .id = r_first, .source = base.b_entry, .kind = .branch_then, .from = .{ .target = b_first_forwarder }, .to = .{ .target = b_second_forwarder }, .rule = .forwarding_jump },
+        .{ .id = r_second, .source = base.b_entry, .kind = .branch_then, .from = .{ .target = b_second_forwarder }, .to = .{ .target = base.b_retest }, .rule = .forwarding_jump },
+    };
+
+    pub const evidence = [_]ir.Evidence{.{
+        .id = base.proof,
+        .kind = .dynamic_fixture,
+        .locator = "fixture:forwarded-relevant-retest-module",
+    }};
+
+    pub const program: ir.Program = .{
+        .program_id = "forwarded-relevant-retest-module",
+        .entry_function = base.f_chunk,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &base.instructions,
+        .values = &base.values,
+        .evidence = &evidence,
+        .edge_rewrites = &edge_rewrites,
+    };
+};
+
+/// The same re-test over a boolean parameter `m`, beside two integer parameters `x` and `y`: the entry
+/// branches on `m` to the re-test block or to the block that returns "outer", and the re-test block branches
+/// on `m` again.
+pub const leaf_retest_module = struct {
+    pub const proof = ir.EvidenceId.fromIndex(0);
+    pub const f_chunk = ir.FunctionId.fromIndex(0);
+    pub const f_probe = ir.FunctionId.fromIndex(1);
+    pub const b_chunk = ir.BlockId.fromIndex(0);
+    pub const b_entry = ir.BlockId.fromIndex(1);
+    pub const b_retest = ir.BlockId.fromIndex(2);
+    pub const b_outer = ir.BlockId.fromIndex(3);
+    pub const b_again = ir.BlockId.fromIndex(4);
+    pub const b_never = ir.BlockId.fromIndex(5);
+    pub const i_export = ir.InstructionId.fromIndex(0);
+    pub const i_outer = ir.InstructionId.fromIndex(1);
+    pub const i_again = ir.InstructionId.fromIndex(2);
+    pub const i_never = ir.InstructionId.fromIndex(3);
+    pub const v_condition = ir.ValueId.fromIndex(0);
+    pub const v_x = ir.ValueId.fromIndex(1);
+    pub const v_y = ir.ValueId.fromIndex(2);
+    pub const v_export = ir.ValueId.fromIndex(3);
+    pub const v_outer = ir.ValueId.fromIndex(4);
+    pub const v_again = ir.ValueId.fromIndex(5);
+    pub const v_never = ir.ValueId.fromIndex(6);
+
+    pub const values = [_]ir.Value{
+        .{ .id = v_condition, .function = f_probe, .type = .boolean, .name_hint = "m", .origin = .{ .parameter = 0 } },
+        .{ .id = v_x, .function = f_probe, .type = .integer, .name_hint = "x", .origin = .{ .parameter = 1 } },
+        .{ .id = v_y, .function = f_probe, .type = .integer, .name_hint = "y", .origin = .{ .parameter = 2 } },
+        .{ .id = v_export, .function = f_chunk, .type = .function, .name_hint = "probe", .origin = .{ .instruction_result = .{ .instruction = i_export, .index = 0 } } },
+        .{ .id = v_outer, .function = f_probe, .type = .string, .name_hint = "outer_result", .origin = .{ .instruction_result = .{ .instruction = i_outer, .index = 0 } } },
+        .{ .id = v_again, .function = f_probe, .type = .string, .name_hint = "again_result", .origin = .{ .instruction_result = .{ .instruction = i_again, .index = 0 } } },
+        .{ .id = v_never, .function = f_probe, .type = .string, .name_hint = "never_result", .origin = .{ .instruction_result = .{ .instruction = i_never, .index = 0 } } },
+    };
+
+    pub const instructions = [_]ir.Instruction{
+        .{ .id = i_export, .block = b_chunk, .operation = .{ .function_ref = f_probe }, .results = &.{v_export}, .effects = .pure, .evidence = &.{proof} },
+        .{ .id = i_outer, .block = b_outer, .operation = .{ .constant = .{ .string = "outer" } }, .results = &.{v_outer}, .effects = .pure, .evidence = &.{proof} },
+        .{ .id = i_again, .block = b_again, .operation = .{ .constant = .{ .string = "again" } }, .results = &.{v_again}, .effects = .pure, .evidence = &.{proof} },
+        .{ .id = i_never, .block = b_never, .operation = .{ .constant = .{ .string = "never" } }, .results = &.{v_never}, .effects = .pure, .evidence = &.{proof} },
+    };
+
+    pub const blocks = [_]ir.Block{
+        .{ .id = b_chunk, .function = f_chunk, .instructions = &.{i_export}, .terminator = .{ .return_values = &.{v_export} }, .evidence = &.{proof} },
+        .{ .id = b_entry, .function = f_probe, .terminator = .{ .branch = .{
+            .condition = v_condition,
+            .then_edge = .{ .target = b_retest },
+            .else_edge = .{ .target = b_outer },
+        } }, .evidence = &.{proof} },
+        .{ .id = b_retest, .function = f_probe, .terminator = .{ .branch = .{
+            .condition = v_condition,
+            .then_edge = .{ .target = b_again },
+            .else_edge = .{ .target = b_never },
+        } }, .evidence = &.{proof} },
+        .{ .id = b_outer, .function = f_probe, .instructions = &.{i_outer}, .terminator = .{ .return_values = &.{v_outer} }, .evidence = &.{proof} },
+        .{ .id = b_again, .function = f_probe, .instructions = &.{i_again}, .terminator = .{ .return_values = &.{v_again} }, .evidence = &.{proof} },
+        .{ .id = b_never, .function = f_probe, .instructions = &.{i_never}, .terminator = .{ .return_values = &.{v_never} }, .evidence = &.{proof} },
+    };
+
+    pub const functions = [_]ir.Function{
+        .{ .id = f_chunk, .name_hint = "chunk", .blocks = &.{b_chunk}, .entry_block = b_chunk, .evidence = &.{proof} },
+        .{ .id = f_probe, .name_hint = "probe", .parameters = &.{ v_condition, v_x, v_y }, .blocks = &.{ b_entry, b_retest, b_outer, b_again, b_never }, .entry_block = b_entry, .evidence = &.{proof} },
+    };
+
+    pub const evidence = [_]ir.Evidence{.{
+        .id = proof,
+        .kind = .dynamic_fixture,
+        .locator = "fixture:leaf-retest-module",
+    }};
+
+    pub const program: ir.Program = .{
+        .program_id = "leaf-retest-module",
+        .entry_function = f_chunk,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+        .evidence = &evidence,
+    };
+};
+
+/// The terms of the integer fact `x % y == 1` under floor division, ids `first` to `first + 5`: `x`, `y`,
+/// `y` being nonzero (the guard the remainder is defined by), the remainder, the literal 1 and the fact.
+pub fn uncoveredFactTerms(first: usize, x: ir.ValueId, y: ir.ValueId) [6]ir.SolverTerm {
+    const term = ir.SolverTermId.fromIndex;
+    return .{
+        .{ .id = term(first), .sort = .{ .kind = .integer }, .operation = .{ .value = x } },
+        .{ .id = term(first + 1), .sort = .{ .kind = .integer }, .operation = .{ .value = y } },
+        .{ .id = term(first + 2), .sort = .{ .kind = .boolean }, .operation = .{ .is_nonzero = term(first + 1) } },
+        .{ .id = term(first + 3), .sort = .{ .kind = .integer }, .operation = .{ .remainder = .{
+            .mode = .integer_floor,
+            .left = term(first),
+            .right = term(first + 1),
+            .defined_by = term(first + 2),
+        } } },
+        .{ .id = term(first + 4), .sort = .{ .kind = .integer }, .operation = .{ .integer_literal = "1" } },
+        .{ .id = term(first + 5), .sort = .{ .kind = .boolean }, .operation = .{ .binary = .{ .operator = .equal, .left = term(first + 3), .right = term(first + 4) } } },
+    };
+}
+
+/// The terms of the integer fact `y < 100` over the existing term `y_term`: the literal 100 at `first` and
+/// the fact at `first + 1`.
+pub fn irrelevantFactTerms(first: usize, y_term: ir.SolverTermId) [2]ir.SolverTerm {
+    const term = ir.SolverTermId.fromIndex;
+    return .{
+        .{ .id = term(first), .sort = .{ .kind = .integer }, .operation = .{ .integer_literal = "100" } },
+        .{ .id = term(first + 1), .sort = .{ .kind = .boolean }, .operation = .{ .binary = .{ .operator = .less, .left = y_term, .right = term(first) } } },
+    };
+}
+
 pub const immutable_closure_module = struct {
     pub const proof = ir.EvidenceId.fromIndex(0);
     pub const f_entry = ir.FunctionId.fromIndex(0);

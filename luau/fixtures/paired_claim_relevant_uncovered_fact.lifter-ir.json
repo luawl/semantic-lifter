@@ -1,0 +1,602 @@
+{
+  "schema_version": "lifter_ir_v1",
+  "program_id": "d1-relevant-uncovered-function-fact",
+  "source_semantics": "luau",
+  "entry_function": 0,
+  "entry_bindings": [],
+  "external_bindings": [],
+  "functions": [
+    {
+      "id": 0,
+      "name_hint": "chunk",
+      "lexical_parent": null,
+      "parameters": [],
+      "captures": [],
+      "local_places": [],
+      "blocks": [
+        0
+      ],
+      "entry_block": 0,
+      "is_variadic": false,
+      "vararg_pack": null,
+      "evidence": [
+        0
+      ]
+    },
+    {
+      "id": 1,
+      "name_hint": "probe",
+      "lexical_parent": null,
+      "parameters": [
+        0,
+        1
+      ],
+      "captures": [],
+      "local_places": [],
+      "blocks": [
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "entry_block": 1,
+      "is_variadic": false,
+      "vararg_pack": null,
+      "evidence": [
+        0
+      ]
+    }
+  ],
+  "blocks": [
+    {
+      "id": 0,
+      "function": 0,
+      "name_hint": null,
+      "parameters": [],
+      "instructions": [
+        0
+      ],
+      "terminator": {
+        "return_values": [
+          2
+        ]
+      },
+      "evidence": [
+        0
+      ]
+    },
+    {
+      "id": 1,
+      "function": 1,
+      "name_hint": null,
+      "parameters": [],
+      "instructions": [
+        1,
+        2,
+        3
+      ],
+      "terminator": {
+        "branch": {
+          "condition": 5,
+          "then_edge": {
+            "target": 2,
+            "arguments": []
+          },
+          "else_edge": {
+            "target": 3,
+            "arguments": []
+          }
+        }
+      },
+      "evidence": [
+        0
+      ]
+    },
+    {
+      "id": 2,
+      "function": 1,
+      "name_hint": null,
+      "parameters": [],
+      "instructions": [],
+      "terminator": {
+        "branch": {
+          "condition": 5,
+          "then_edge": {
+            "target": 4,
+            "arguments": []
+          },
+          "else_edge": {
+            "target": 5,
+            "arguments": []
+          }
+        }
+      },
+      "evidence": [
+        0
+      ]
+    },
+    {
+      "id": 3,
+      "function": 1,
+      "name_hint": null,
+      "parameters": [],
+      "instructions": [
+        4
+      ],
+      "terminator": {
+        "return_values": [
+          6
+        ]
+      },
+      "evidence": [
+        0
+      ]
+    },
+    {
+      "id": 4,
+      "function": 1,
+      "name_hint": null,
+      "parameters": [],
+      "instructions": [
+        5
+      ],
+      "terminator": {
+        "return_values": [
+          7
+        ]
+      },
+      "evidence": [
+        0
+      ]
+    },
+    {
+      "id": 5,
+      "function": 1,
+      "name_hint": null,
+      "parameters": [],
+      "instructions": [
+        6
+      ],
+      "terminator": {
+        "return_values": [
+          8
+        ]
+      },
+      "evidence": [
+        0
+      ]
+    }
+  ],
+  "instructions": [
+    {
+      "id": 0,
+      "block": 0,
+      "operation": {
+        "function_ref": 1
+      },
+      "results": [
+        2
+      ],
+      "pack_result": null,
+      "effects": {
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false,
+        "may_throw": false,
+        "may_yield": false,
+        "invokes_unknown_code": false
+      },
+      "evidence": [
+        0
+      ],
+      "claims": []
+    },
+    {
+      "id": 1,
+      "block": 1,
+      "operation": {
+        "constant": {
+          "integer": "1"
+        }
+      },
+      "results": [
+        3
+      ],
+      "pack_result": null,
+      "effects": {
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false,
+        "may_throw": false,
+        "may_yield": false,
+        "invokes_unknown_code": false
+      },
+      "evidence": [
+        0
+      ],
+      "claims": []
+    },
+    {
+      "id": 2,
+      "block": 1,
+      "operation": {
+        "binary": {
+          "operator": "modulo",
+          "left": 0,
+          "right": 1,
+          "mode": "semantic",
+          "shift_behavior": null
+        }
+      },
+      "results": [
+        4
+      ],
+      "pack_result": null,
+      "effects": {
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false,
+        "may_throw": false,
+        "may_yield": false,
+        "invokes_unknown_code": false
+      },
+      "evidence": [
+        0
+      ],
+      "claims": []
+    },
+    {
+      "id": 3,
+      "block": 1,
+      "operation": {
+        "binary": {
+          "operator": "equal",
+          "left": 0,
+          "right": 3,
+          "mode": "semantic",
+          "shift_behavior": null
+        }
+      },
+      "results": [
+        5
+      ],
+      "pack_result": null,
+      "effects": {
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false,
+        "may_throw": false,
+        "may_yield": false,
+        "invokes_unknown_code": false
+      },
+      "evidence": [
+        0
+      ],
+      "claims": []
+    },
+    {
+      "id": 4,
+      "block": 3,
+      "operation": {
+        "constant": {
+          "string": "outer"
+        }
+      },
+      "results": [
+        6
+      ],
+      "pack_result": null,
+      "effects": {
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false,
+        "may_throw": false,
+        "may_yield": false,
+        "invokes_unknown_code": false
+      },
+      "evidence": [
+        0
+      ],
+      "claims": []
+    },
+    {
+      "id": 5,
+      "block": 4,
+      "operation": {
+        "constant": {
+          "string": "again"
+        }
+      },
+      "results": [
+        7
+      ],
+      "pack_result": null,
+      "effects": {
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false,
+        "may_throw": false,
+        "may_yield": false,
+        "invokes_unknown_code": false
+      },
+      "evidence": [
+        0
+      ],
+      "claims": []
+    },
+    {
+      "id": 6,
+      "block": 5,
+      "operation": {
+        "constant": {
+          "string": "never"
+        }
+      },
+      "results": [
+        8
+      ],
+      "pack_result": null,
+      "effects": {
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false,
+        "may_throw": false,
+        "may_yield": false,
+        "invokes_unknown_code": false
+      },
+      "evidence": [
+        0
+      ],
+      "claims": []
+    }
+  ],
+  "values": [
+    {
+      "id": 0,
+      "function": 1,
+      "type": {
+        "kind": "integer",
+        "bit_width": 64,
+        "signed": true
+      },
+      "name_hint": "x",
+      "origin": {
+        "parameter": 0
+      }
+    },
+    {
+      "id": 1,
+      "function": 1,
+      "type": {
+        "kind": "integer",
+        "bit_width": 64,
+        "signed": true
+      },
+      "name_hint": "y",
+      "origin": {
+        "parameter": 1
+      }
+    },
+    {
+      "id": 2,
+      "function": 0,
+      "type": {
+        "kind": "function",
+        "bit_width": 0,
+        "signed": false
+      },
+      "name_hint": "probe",
+      "origin": {
+        "instruction_result": {
+          "instruction": 0,
+          "index": 0
+        }
+      }
+    },
+    {
+      "id": 3,
+      "function": 1,
+      "type": {
+        "kind": "integer",
+        "bit_width": 64,
+        "signed": true
+      },
+      "name_hint": "one",
+      "origin": {
+        "instruction_result": {
+          "instruction": 1,
+          "index": 0
+        }
+      }
+    },
+    {
+      "id": 4,
+      "function": 1,
+      "type": {
+        "kind": "integer",
+        "bit_width": 64,
+        "signed": true
+      },
+      "name_hint": "remainder",
+      "origin": {
+        "instruction_result": {
+          "instruction": 2,
+          "index": 0
+        }
+      }
+    },
+    {
+      "id": 5,
+      "function": 1,
+      "type": {
+        "kind": "boolean",
+        "bit_width": 0,
+        "signed": false
+      },
+      "name_hint": "matches",
+      "origin": {
+        "instruction_result": {
+          "instruction": 3,
+          "index": 0
+        }
+      }
+    },
+    {
+      "id": 6,
+      "function": 1,
+      "type": {
+        "kind": "string",
+        "bit_width": 0,
+        "signed": false
+      },
+      "name_hint": "outer_result",
+      "origin": {
+        "instruction_result": {
+          "instruction": 4,
+          "index": 0
+        }
+      }
+    },
+    {
+      "id": 7,
+      "function": 1,
+      "type": {
+        "kind": "string",
+        "bit_width": 0,
+        "signed": false
+      },
+      "name_hint": "again_result",
+      "origin": {
+        "instruction_result": {
+          "instruction": 5,
+          "index": 0
+        }
+      }
+    },
+    {
+      "id": 8,
+      "function": 1,
+      "type": {
+        "kind": "string",
+        "bit_width": 0,
+        "signed": false
+      },
+      "name_hint": "never_result",
+      "origin": {
+        "instruction_result": {
+          "instruction": 6,
+          "index": 0
+        }
+      }
+    }
+  ],
+  "value_packs": [],
+  "places": [],
+  "captures": [],
+  "evidence": [
+    {
+      "id": 0,
+      "kind": "dynamic_fixture",
+      "locator": "fixture:d1-relevant-uncovered-function-fact",
+      "digest": null
+    }
+  ],
+  "solver_terms": [
+    {
+      "id": 0,
+      "sort": {
+        "kind": "integer",
+        "bit_width": 0,
+        "signed": false
+      },
+      "operation": {
+        "value": 0
+      }
+    },
+    {
+      "id": 1,
+      "sort": {
+        "kind": "integer",
+        "bit_width": 0,
+        "signed": false
+      },
+      "operation": {
+        "value": 1
+      }
+    },
+    {
+      "id": 2,
+      "sort": {
+        "kind": "boolean",
+        "bit_width": 0,
+        "signed": false
+      },
+      "operation": {
+        "is_nonzero": 1
+      }
+    },
+    {
+      "id": 3,
+      "sort": {
+        "kind": "integer",
+        "bit_width": 0,
+        "signed": false
+      },
+      "operation": {
+        "remainder": {
+          "mode": "integer_floor",
+          "left": 0,
+          "right": 1,
+          "defined_by": 2
+        }
+      }
+    },
+    {
+      "id": 4,
+      "sort": {
+        "kind": "integer",
+        "bit_width": 0,
+        "signed": false
+      },
+      "operation": {
+        "integer_literal": "1"
+      }
+    },
+    {
+      "id": 5,
+      "sort": {
+        "kind": "boolean",
+        "bit_width": 0,
+        "signed": false
+      },
+      "operation": {
+        "binary": {
+          "operator": "equal",
+          "left": 3,
+          "right": 4
+        }
+      }
+    }
+  ],
+  "constraints": [
+    {
+      "id": 0,
+      "predicate": 5,
+      "evidence": [
+        0
+      ],
+      "scope": {
+        "function": 1
+      },
+      "path_rewrites": []
+    }
+  ],
+  "queries": [],
+  "solver_models": [],
+  "unsat_cores": [],
+  "certificates": [],
+  "edge_rewrites": [],
+  "claims": [],
+  "obligations": []
+}

@@ -2345,6 +2345,20 @@ pub fn build(b: *std.Build) void {
     conformance_step.dependOn(&resolve_refusal_audit.step);
     conformance_step.dependOn(&evaluator_branch_probe_audit.step);
     conformance_step.dependOn(&nested_reresolve_audit.step);
+    const paired_claim_relevant_uncovered_fact_resolve = b.addRunArtifact(exe);
+    if (z3_enabled) paired_claim_relevant_uncovered_fact_resolve.addPathDir(b.pathFromRoot(z3_bin));
+    paired_claim_relevant_uncovered_fact_resolve.addArg("resolve-ir");
+    paired_claim_relevant_uncovered_fact_resolve.addFileArg(b.path("luau/fixtures/paired_claim_relevant_uncovered_fact.lifter-ir.json"));
+    const paired_claim_relevant_uncovered_fact_resolved_ir = paired_claim_relevant_uncovered_fact_resolve.addOutputFileArg("paired-claim-relevant-uncovered-fact.resolved.lifter-ir.json");
+    paired_claim_relevant_uncovered_fact_resolve.addArg("internal");
+    conformance_step.dependOn(addAutomaticRuntimeConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "paired-claim-relevant-uncovered-fact",
+        paired_claim_relevant_uncovered_fact_resolved_ir,
+    ));
     absolute_conformance.addTo(conformance_step);
     function_reference_conformance.addTo(conformance_step);
     dynamic_truthiness_conformance.addTo(conformance_step);

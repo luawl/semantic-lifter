@@ -1242,6 +1242,12 @@ then
 	assert(exported(3, false, false) == 0, "the loop with both branches off changed its result")
 	assert(exported(0, true, true) == 0, "the loop entered a branch with no iteration")
 	assert(exported(5, nil, nil) == 0, "the loop with nil branch values changed its result")
+elseif caseName == "paired-claim-relevant-uncovered-fact" then
+	-- Every input satisfies the fixture's function-scoped fact x % y == 1 under Luau's floor modulo.
+	assert(exported(1, 2) == "again", "paired claim fixture changed probe(1, 2)")
+	assert(exported(4, 3) == "outer", "paired claim fixture changed probe(4, 3)")
+	assert(exported(-2, 3) == "outer", "paired claim fixture changed probe(-2, 3)")
+	assert(exported(7, 3) == "outer", "paired claim fixture changed probe(7, 3)")
 elseif SourceRuntimeOracle.run(caseName, source, exported) then
 	-- Checked by the focused source-runtime oracle.
 else
