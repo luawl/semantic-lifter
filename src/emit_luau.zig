@@ -1246,7 +1246,11 @@ fn emitRegionBodyWithPredeclaredBlock(
                         }
                         if (region.escape_projection) |projection| {
                             if (projection.edge) |projected_edge| {
-                                if (node_index + 1 == region.nodes.len and sameEdge(edge, projected_edge)) {
+                                // The planner's clone boundary projects a jump into a node-split clone onto the clone's
+                                // root: the jump and the projected edge differ in their target only.
+                                if (node_index + 1 == region.nodes.len and (sameEdge(edge, projected_edge) or
+                                    try cloneBoundaryEntry(program, block_id, .jump, edge, projection.target, projected_edge)))
+                                {
                                     try emitEdgeParametersUnlessConsumed(
                                         output,
                                         allocator,
@@ -1259,6 +1263,9 @@ fn emitRegionBodyWithPredeclaredBlock(
                                         false,
                                         place_aliases,
                                     );
+                                    // Only the clone boundary projects an edge-carrying escape onto the region's own stop,
+                                    // which the region reaches by ending, as an exiting jump does: no flag and no `break`.
+                                    if (region.stop != null and projection.target == region.stop.?) continue;
                                     try emitEscapeFlagSet(output, allocator, program, emission_plan, projection.target, indent);
                                     try emitBreakStatement(output, allocator, indent);
                                     continue;
@@ -2143,6 +2150,54 @@ fn emitProjectedTerminalBody(
         null,
     );
     try call_emission.terminator(output, allocator, program, emission_plan, terminal, indent, values);
+}
+
+/// Whether `live`, the edge `source` takes on its `kind` arm, enters a node-split clone of `root` while `projected`
+/// enters `root` with `live`'s tuple: the planner's clone boundary (structure.zig
+/// `authenticatedUnvisitedBoundaryProjection`) projects such an edge onto the clone's root. The clone relation is
+/// read from the function's rewrite records: a node split rewrote this exact edge into `live.target` with
+/// `live.arguments`, and the clone lineage of `live.target` ends at `root`. Both edges' arities are then checked, so
+/// the transfer may copy into the root's parameters; the entry clone itself is never written.
+fn cloneBoundaryEntry(
+    program: *const ir.Program,
+    source: ir.BlockId,
+    kind: ir.CfgEdgeKind,
+    live: ir.Edge,
+    root: ir.BlockId,
+    projected: ir.Edge,
+) EmitError!bool {
+    if (projected.target != root or live.target == root or
+        !std.mem.eql(ir.ValueId, live.arguments, projected.arguments)) return false;
+    var split = false;
+    for (program.edge_rewrites) |rewrite| {
+        if (rewrite.rule == .node_split and rewrite.source == source and rewrite.kind == kind and
+            rewrite.to.target == live.target and std.mem.eql(ir.ValueId, rewrite.to.arguments, live.arguments))
+        {
+            split = true;
+        }
+    }
+    const lineage_root = nodeSplitLineageRoot(program, live.target) orelse return false;
+    if (!split or lineage_root != root) return false;
+    _ = try loop_continue_projection.validateEntry(program, live.target, live);
+    _ = try loop_continue_projection.validateEntry(program, root, projected);
+    return true;
+}
+
+/// The block whose node-split clones `block` descends from: each clone's parent is the `from` target of the node-split
+/// rewrites into it, which must agree, and the walk ends at a block that no node split entered. Null when the records
+/// disagree or the walk does not end.
+fn nodeSplitLineageRoot(program: *const ir.Program, block: ir.BlockId) ?ir.BlockId {
+    var current = block;
+    for (0..program.blocks.len + 1) |_| {
+        var parent: ?ir.BlockId = null;
+        for (program.edge_rewrites) |rewrite| {
+            if (rewrite.rule != .node_split or rewrite.to.target != current or rewrite.from.target == current) continue;
+            if (parent != null and parent.? != rewrite.from.target) return null;
+            parent = rewrite.from.target;
+        }
+        current = parent orelse return current;
+    }
+    return null;
 }
 
 fn sameEdge(left: ir.Edge, right: ir.Edge) bool {
@@ -3935,10 +3990,17 @@ fn emitLoopBoundaryBodyImpl(
     indent: []const u8,
     place_aliases: []const PlaceAlias,
 ) !void {
-    const entry = program.blocks[control.body_edge.target.index()];
-    const enters_loop_header = control.body_region.stop != null and control.body_edge.target == control.body_region.stop.?;
-    try emitEdgeParametersUnlessConsumed(output, allocator, program, emission_plan, scopes, entry, control.body_edge.arguments, indent, !enters_loop_header, place_aliases);
+    const body_kind: ir.CfgEdgeKind = if (control.body_on_true) .branch_then else .branch_else;
     if (try validateEmptyBoundaryContinue(program, control.body_region, control.body_edge)) |transfer| {
+        // The copies go to the transfer target's parameters. An edge-free projection's body edge enters the target;
+        // an edge-carrying one is the planner's clone boundary, whose body edge enters a node-split clone of the
+        // target that is never written, so it must be the entry the rewrite records give (`cloneBoundaryEntry`).
+        if (control.body_region.continue_projection.?.edge != null and
+            !try cloneBoundaryEntry(program, control.block, body_kind, control.body_edge, transfer.target, transfer.edge))
+        {
+            return error.UnsupportedControlFlow;
+        }
+        try emitEdgeParametersUnlessConsumed(output, allocator, program, emission_plan, scopes, program.blocks[transfer.target.index()], transfer.edge.arguments, indent, false, place_aliases);
         if (transfer.nonlocal) {
             try emitEscapeFlagSet(output, allocator, program, emission_plan, transfer.target, indent);
             try emitForwardedSetBreak(output, allocator, emission_plan, indent);
@@ -3948,6 +4010,12 @@ fn emitLoopBoundaryBodyImpl(
         }
         return;
     }
+    // The same clone boundary onto an escape target copies into the root's parameters; the empty region's trailing
+    // projection then sets the root's flag and leaves, as for any escape (`emptyBodyCloneEscape`).
+    const entry_edge = try emptyBodyCloneEscape(program, control, body_kind) orelse control.body_edge;
+    const entry = program.blocks[entry_edge.target.index()];
+    const enters_loop_header = control.body_region.stop != null and entry_edge.target == control.body_region.stop.?;
+    try emitEdgeParametersUnlessConsumed(output, allocator, program, emission_plan, scopes, entry, entry_edge.arguments, indent, !enters_loop_header, place_aliases);
     try emitRegion(output, allocator, program, emission_plan, scopes, control.body_region, indent, place_aliases);
     // No termination test: a body region whose last node returns is written inside a transfer wrapper (when
     // that node is a branch, each returning arm is), so this continue never follows a bare return; after a
@@ -3975,6 +4043,10 @@ fn emitLoopBoundaryBodyImpl(
 const EmptyBoundaryContinue = struct {
     target: ir.BlockId,
     nonlocal: bool,
+    /// The edge whose copies the transfer writes into `target`'s parameters: the body edge, which enters `target`,
+    /// for an edge-free projection; the projected edge into `target` for the planner's clone boundary, whose body
+    /// edge enters a node-split clone of `target`.
+    edge: ir.Edge,
 };
 
 fn validateEmptyBoundaryContinue(
@@ -3984,12 +4056,28 @@ fn validateEmptyBoundaryContinue(
 ) (EmitError)!?EmptyBoundaryContinue {
     if (region.nodes.len != 0) return null;
     const projection = region.continue_projection orelse return null;
-    if (projection.edge != null or projection.forwarding != null) return error.UnsupportedControlFlow;
-    _ = try loop_continue_projection.validateEntry(program, projection.target, entry);
-    return .{
-        .target = projection.target,
-        .nonlocal = region.continue_target == null or region.continue_target.? != projection.target,
-    };
+    if (projection.forwarding != null) return error.UnsupportedControlFlow;
+    const nonlocal = region.continue_target == null or region.continue_target.? != projection.target;
+    // An edge-carrying projection is checked as an empty branch arm's is (`validateEmptyProjectedContinue`).
+    if (try validateEmptyProjectedContinue(program, region, entry)) |projected_edge| {
+        return .{ .target = projection.target, .nonlocal = nonlocal, .edge = projected_edge };
+    }
+    const edge = try loop_continue_projection.validateEntry(program, projection.target, entry);
+    return .{ .target = projection.target, .nonlocal = nonlocal, .edge = edge };
+}
+
+/// The projected edge of the planner's clone boundary onto an escape target of an empty loop-boundary body: the body
+/// region holds no node and its escape projection carries an edge into the root of the node-split clone the body edge
+/// enters, which must hold (`cloneBoundaryEntry`). Its copies go to the root's parameters, not the clone's. Null for
+/// a region with nodes, without an escape projection, or with an edge-free one.
+fn emptyBodyCloneEscape(program: *const ir.Program, control: structure.LoopBoundaryControl, body_kind: ir.CfgEdgeKind) EmitError!?ir.Edge {
+    if (control.body_region.nodes.len != 0) return null;
+    const projection = control.body_region.escape_projection orelse return null;
+    const projected = projection.edge orelse return null;
+    if (!try cloneBoundaryEntry(program, control.block, body_kind, control.body_edge, projection.target, projected)) {
+        return error.UnsupportedControlFlow;
+    }
+    return projected;
 }
 
 fn emitLoopBoundaryBody(
@@ -5382,6 +5470,337 @@ test "empty branch arm clone continuation authenticates its mapped edge" {
     try std.testing.expectError(
         error.UnsupportedControlFlow,
         validateEmptyProjectedContinue(&program, &region, wrong_entry),
+    );
+}
+
+/// A function whose entry branches into two blocks that each enter `root` (block 3) or `clone` (block 4), a node-split
+/// clone of `root`, with `arg` or with `other`: both blocks are reachable and each takes two tuples, so neither
+/// parameter is an alias and a copy into either is written. The rewrite records hold the two node splits.
+const CloneBoundaryProgram = struct {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const first = ir.BlockId.fromIndex(1);
+    const second = ir.BlockId.fromIndex(2);
+    const root = ir.BlockId.fromIndex(3);
+    const clone = ir.BlockId.fromIndex(4);
+    const argument = ir.ValueId.fromIndex(0);
+    const other = ir.ValueId.fromIndex(1);
+    const root_parameter = ir.ValueId.fromIndex(2);
+    const clone_parameter = ir.ValueId.fromIndex(3);
+    const function_blocks = [_]ir.BlockId{ entry, first, second, root, clone };
+    const function_parameters = [_]ir.ValueId{ argument, other };
+    const root_parameters = [_]ir.ValueId{root_parameter};
+    const clone_parameters = [_]ir.ValueId{clone_parameter};
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{ .condition = argument, .then_edge = .{ .target = first }, .else_edge = .{ .target = second } } } },
+        .{ .id = first, .function = function_id, .terminator = .{ .branch = .{
+            .condition = other,
+            .then_edge = .{ .target = clone, .arguments = &.{argument} },
+            .else_edge = .{ .target = root, .arguments = &.{argument} },
+        } } },
+        .{ .id = second, .function = function_id, .terminator = .{ .branch = .{
+            .condition = other,
+            .then_edge = .{ .target = clone, .arguments = &.{other} },
+            .else_edge = .{ .target = root, .arguments = &.{other} },
+        } } },
+        .{ .id = root, .function = function_id, .parameters = &root_parameters, .terminator = .{ .return_values = &.{root_parameter} } },
+        .{ .id = clone, .function = function_id, .parameters = &clone_parameters, .terminator = .{ .return_values = &.{clone_parameter} } },
+    };
+    const values = [_]ir.Value{
+        .{ .id = argument, .function = function_id, .name_hint = "arg", .origin = .{ .parameter = 0 } },
+        .{ .id = other, .function = function_id, .name_hint = "other", .origin = .{ .parameter = 1 } },
+        .{ .id = root_parameter, .function = function_id, .name_hint = "rp", .origin = .{ .block_parameter = .{ .block = root, .index = 0 } } },
+        .{ .id = clone_parameter, .function = function_id, .name_hint = "cp", .origin = .{ .block_parameter = .{ .block = clone, .index = 0 } } },
+    };
+    const rewrites = [_]ir.CfgEdgeRewrite{
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(0),
+            .source = first,
+            .kind = .branch_then,
+            .from = .{ .target = root, .arguments = &.{argument} },
+            .to = .{ .target = clone, .arguments = &.{argument} },
+            .rule = .node_split,
+            .node_split_group = ir.NodeSplitGroupId.fromIndex(0),
+        },
+        .{
+            .id = ir.EdgeRewriteId.fromIndex(1),
+            .source = second,
+            .kind = .branch_then,
+            .from = .{ .target = root, .arguments = &.{other} },
+            .to = .{ .target = clone, .arguments = &.{other} },
+            .rule = .node_split,
+            .node_split_group = ir.NodeSplitGroupId.fromIndex(0),
+        },
+    };
+    const functions = [_]ir.Function{.{ .id = function_id, .parameters = &function_parameters, .blocks = &function_blocks, .entry_block = entry }};
+    const program: ir.Program = .{
+        .program_id = "clone-boundary-entry",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+        .edge_rewrites = &rewrites,
+    };
+};
+
+/// The emission plan, analysis, structure and scopes the loop-boundary body writer reads for `CloneBoundaryProgram`.
+const CloneBoundaryHarness = struct {
+    plan: EmissionPlan,
+    analysis: cfg.Analysis,
+    structured: structure.Plan,
+    scopes: emission_scope.Plan,
+
+    fn init(self: *CloneBoundaryHarness, allocator: std.mem.Allocator) !void {
+        const program = &CloneBoundaryProgram.program;
+        self.plan = try EmissionPlan.init(allocator, program, .standard_luau);
+        errdefer self.plan.deinit();
+        self.analysis = try cfg.Analysis.init(allocator, program, CloneBoundaryProgram.functions[0]);
+        errdefer self.analysis.deinit();
+        self.structured = try structure.Plan.initWithArbitraryFallback(allocator, &self.analysis);
+        errdefer self.structured.deinit();
+        self.scopes = try emission_scope.Plan.init(
+            allocator,
+            program,
+            CloneBoundaryProgram.functions[0],
+            &self.analysis,
+            &self.structured,
+            &self.plan.packs,
+            &self.plan.dead,
+            &self.plan.place_writes,
+            &self.plan.place_reads,
+            &self.plan.fused_values,
+            &self.plan.closure_stores,
+        );
+    }
+
+    fn deinit(self: *CloneBoundaryHarness) void {
+        self.plan.state.continue_binder = null;
+        self.scopes.deinit();
+        self.structured.deinit();
+        self.analysis.deinit();
+        self.plan.deinit();
+    }
+};
+
+test "an empty loop-boundary body that enters a node-split clone continues the clone's root" {
+    const allocator = std.testing.allocator;
+    const P = CloneBoundaryProgram;
+    var harness: CloneBoundaryHarness = undefined;
+    try harness.init(allocator);
+    defer harness.deinit();
+
+    // The clone boundary's body region (structure.zig authenticatedUnvisitedBoundaryProjection): empty, its continue
+    // projection the root with the body edge's tuple, while the body edge enters the clone.
+    var nodes = [_]structure.Node{};
+    var body_region = structure.Region{
+        .nodes = &nodes,
+        .stop = P.root,
+        .loop_exit = null,
+        .continue_target = P.root,
+        .continue_projection = .{ .target = P.root, .edge = .{ .target = P.root, .arguments = &.{P.argument} } },
+    };
+    var control: structure.LoopBoundaryControl = .{
+        .block = P.first,
+        .body_edge = .{ .target = P.clone, .arguments = &.{P.argument} },
+        .body_region = &body_region,
+        .boundary = .{ .exit = .{ .target = P.second } },
+        .body_on_true = true,
+    };
+
+    // A continue to the body region's own continue target, the header of the loop around it: the root's parameter
+    // takes the tuple and a lexical continue follows; the clone's parameter is never written.
+    const loop: ContinueBinder = .{ .kind = .loop, .header = P.root, .stop = P.root };
+    harness.plan.state.continue_binder = &loop;
+    var local: std.ArrayList(u8) = .empty;
+    defer local.deinit(allocator);
+    try emitLoopBoundaryBodyImpl(&local, allocator, &P.program, &harness.plan, &harness.scopes, control, .parent_stop, P.root, "    ", &.{});
+    try std.testing.expectEqualStrings(
+        "    rp = arg\n" ++
+            "    do\n" ++
+            "      continue\n" ++
+            "    end\n",
+        local.items,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, local.items, "cp") == null);
+
+    // A continue to an outer loop's header (the body region continues at another block): the root's flag, which the
+    // enclosing wrapper carries to the loop; inside the wrapper the set falls to its `until true`.
+    body_region.stop = P.second;
+    body_region.continue_target = P.second;
+    const wrapper: ContinueBinder = .{ .kind = .wrapper, .stop = P.second, .parent = &loop };
+    harness.plan.state.continue_binder = &wrapper;
+    var nonlocal: std.ArrayList(u8) = .empty;
+    defer nonlocal.deinit(allocator);
+    try emitLoopBoundaryBodyImpl(&nonlocal, allocator, &P.program, &harness.plan, &harness.scopes, control, .parent_stop, P.second, "    ", &.{});
+    try std.testing.expectEqualStrings(
+        "    rp = arg\n" ++
+            "    __lifter_escape_3 = true\n",
+        nonlocal.items,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, nonlocal.items, "cp") == null);
+
+    // A projected tuple that is not the body edge's is refused.
+    body_region.continue_projection.?.edge = .{ .target = P.root, .arguments = &.{P.other} };
+    var mismatched: std.ArrayList(u8) = .empty;
+    defer mismatched.deinit(allocator);
+    try std.testing.expectError(
+        error.UnsupportedControlFlow,
+        emitLoopBoundaryBodyImpl(&mismatched, allocator, &P.program, &harness.plan, &harness.scopes, control, .parent_stop, P.second, "    ", &.{}),
+    );
+
+    // So is a body edge no node split entered: the second block's other arm enters the root, not the clone.
+    body_region.continue_projection.?.edge = .{ .target = P.root, .arguments = &.{P.argument} };
+    control.block = P.second;
+    control.body_on_true = false;
+    var unsplit: std.ArrayList(u8) = .empty;
+    defer unsplit.deinit(allocator);
+    try std.testing.expectError(
+        error.UnsupportedControlFlow,
+        emitLoopBoundaryBodyImpl(&unsplit, allocator, &P.program, &harness.plan, &harness.scopes, control, .parent_stop, P.second, "    ", &.{}),
+    );
+}
+
+test "an empty loop-boundary body that enters a node-split clone of its escape target copies into the clone's root" {
+    const allocator = std.testing.allocator;
+    const P = CloneBoundaryProgram;
+    var harness: CloneBoundaryHarness = undefined;
+    try harness.init(allocator);
+    defer harness.deinit();
+
+    // The clone boundary onto an escape target: the empty body region's escape projection enters the root with the
+    // body edge's tuple, while the body edge enters the clone. The region forwards through, so no wrapper is written.
+    var nodes = [_]structure.Node{};
+    var body_region = structure.Region{
+        .nodes = &nodes,
+        .stop = P.second,
+        .loop_exit = null,
+        .continue_target = P.second,
+        .escape_projection = .{ .target = P.root, .edge = .{ .target = P.root, .arguments = &.{P.argument} } },
+        .forwards_through = true,
+    };
+    var control: structure.LoopBoundaryControl = .{
+        .block = P.first,
+        .body_edge = .{ .target = P.clone, .arguments = &.{P.argument} },
+        .body_region = &body_region,
+        .boundary = .{ .exit = .{ .target = P.second } },
+        .body_on_true = true,
+    };
+    const wrapper: ContinueBinder = .{ .kind = .wrapper, .stop = P.second };
+    harness.plan.state.continue_binder = &wrapper;
+    var escaped: std.ArrayList(u8) = .empty;
+    defer escaped.deinit(allocator);
+    try emitLoopBoundaryBodyImpl(&escaped, allocator, &P.program, &harness.plan, &harness.scopes, control, .parent_stop, P.second, "    ", &.{});
+    try std.testing.expectEqualStrings(
+        "    rp = arg\n" ++
+            "    __lifter_escape_3 = true\n" ++
+            "    do\n" ++
+            "      break\n" ++
+            "    end\n",
+        escaped.items,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, escaped.items, "cp") == null);
+
+    // A body edge no node split entered is refused.
+    control.block = P.second;
+    control.body_on_true = false;
+    var unsplit: std.ArrayList(u8) = .empty;
+    defer unsplit.deinit(allocator);
+    try std.testing.expectError(
+        error.UnsupportedControlFlow,
+        emitLoopBoundaryBodyImpl(&unsplit, allocator, &P.program, &harness.plan, &harness.scopes, control, .parent_stop, P.second, "    ", &.{}),
+    );
+}
+
+test "a region whose last block enters a node-split clone of its escape target leaves by the target's flag" {
+    const allocator = std.testing.allocator;
+    const function_id = ir.FunctionId.fromIndex(0);
+    const source = ir.BlockId.fromIndex(0);
+    const clone = ir.BlockId.fromIndex(1);
+    const root = ir.BlockId.fromIndex(2);
+    const stop = ir.BlockId.fromIndex(3);
+    const function_blocks = [_]ir.BlockId{ source, clone, root, stop };
+    const blocks = [_]ir.Block{
+        .{ .id = source, .function = function_id, .terminator = .{ .jump = .{ .target = clone } } },
+        .{ .id = clone, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = root, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = stop, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const rewrites = [_]ir.CfgEdgeRewrite{.{
+        .id = ir.EdgeRewriteId.fromIndex(0),
+        .source = source,
+        .kind = .jump,
+        .from = .{ .target = root },
+        .to = .{ .target = clone },
+        .rule = .node_split,
+        .node_split_group = ir.NodeSplitGroupId.fromIndex(0),
+    }};
+    const functions = [_]ir.Function{.{ .id = function_id, .blocks = &function_blocks, .entry_block = source }};
+    const program: ir.Program = .{
+        .program_id = "clone-boundary-jump",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &.{},
+        .edge_rewrites = &rewrites,
+    };
+    var plan = try EmissionPlan.init(allocator, &program, .standard_luau);
+    defer plan.deinit();
+    var analysis = try cfg.Analysis.init(allocator, &program, functions[0]);
+    defer analysis.deinit();
+    var structured = try structure.Plan.initWithArbitraryFallback(allocator, &analysis);
+    defer structured.deinit();
+    var scopes = try emission_scope.Plan.init(
+        allocator,
+        &program,
+        functions[0],
+        &analysis,
+        &structured,
+        &plan.packs,
+        &plan.dead,
+        &plan.place_writes,
+        &plan.place_reads,
+        &plan.fused_values,
+        &plan.closure_stores,
+    );
+    defer scopes.deinit();
+    // The planner's own node for block 0 (the scope plan keys nodes by address), in a region that ends there with the
+    // clone boundary's escape projection: the root with the jump's tuple, while the jump enters the clone.
+    try std.testing.expect(structured.root.nodes.len != 0 and structured.root.nodes[0] == .block);
+    var region = structure.Region{
+        .nodes = structured.root.nodes[0..1],
+        .stop = stop,
+        .loop_exit = null,
+        .escape_projection = .{ .target = root, .edge = .{ .target = root } },
+    };
+    var escaped: std.ArrayList(u8) = .empty;
+    defer escaped.deinit(allocator);
+    try emitRegionBodyWithPredeclaredBlock(&escaped, allocator, &program, &plan, &scopes, &region, "    ", &.{}, null);
+    try std.testing.expectEqualStrings(
+        "    __lifter_escape_2 = true\n" ++
+            "    do\n" ++
+            "      break\n" ++
+            "    end\n",
+        escaped.items,
+    );
+
+    // A clone of the region's own stop is left by reaching the stop: no flag and no `break`.
+    region.stop = root;
+    var reaches_stop: std.ArrayList(u8) = .empty;
+    defer reaches_stop.deinit(allocator);
+    try emitRegionBodyWithPredeclaredBlock(&reaches_stop, allocator, &program, &plan, &scopes, &region, "    ", &.{}, null);
+    try std.testing.expectEqualStrings("", reaches_stop.items);
+
+    // Without the node split of the jump the clone relation does not hold, and the region is refused.
+    region.stop = stop;
+    var unsplit_program = program;
+    unsplit_program.edge_rewrites = &.{};
+    var unsplit: std.ArrayList(u8) = .empty;
+    defer unsplit.deinit(allocator);
+    try std.testing.expectError(
+        error.UnsupportedControlFlow,
+        emitRegionBodyWithPredeclaredBlock(&unsplit, allocator, &unsplit_program, &plan, &scopes, &region, "    ", &.{}, null),
     );
 }
 

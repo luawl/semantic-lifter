@@ -1948,6 +1948,127 @@ function SourceRuntimeOracle.run(caseName: string, source: string, exported: any
 				)
 			end
 		end
+	elseif
+		caseName == "source-frontend-empty-boundary-clone-continue"
+		or caseName == "source-frontend-empty-boundary-clone-continue-nonlocal"
+		or caseName == "source-frontend-empty-boundary-clone-continue-inner-loop"
+		or caseName == "source-frontend-clone-escape-jump"
+	then
+		-- The worker against a copy of its source function over 378 rows (18 selectors, among them every queue value,
+		-- a fraction, a string and both booleans, by 21 budgets from -1 to 1000): the error status and every result
+		-- must match. Each loop is a `repeat` whose `continue` two `if`s deep reaches the `until` test, where the
+		-- written text may enter a copy of the loop header that the normalizer split, or its original.
+		local function queueSkip(selector: any, budget: any): (number, number)
+			local queue = { 3, 1, 4, 1, 5, 9, 2, 6 }
+			local index = 0
+			local sum = 0
+			repeat
+				index += 1
+				local item = queue[index]
+				if item ~= nil then
+					if item == selector then
+						continue
+					end
+					sum += item
+				end
+				sum += 0
+			until index >= 8 or sum > budget
+			return sum, index
+		end
+		local function skipTotal(selector: any, budget: any): (number, number, number)
+			local queue = { 3, 1, 4, 1, 5, 9, 2, 6 }
+			local index = 0
+			local sum = 0
+			local skipped = 0
+			repeat
+				index += 1
+				local item = queue[index]
+				if item ~= nil then
+					if item == selector then
+						skipped += item
+						continue
+					end
+					sum += item
+				end
+				sum += 0
+			until index >= #queue or sum > budget
+			return sum, skipped, index
+		end
+		local function passCounter(selector: any, budget: any): (number, number)
+			local total = 0
+			local passes = 0
+			repeat
+				passes += 1
+				if selector == 4 then
+					total = total + 2
+					if budget > 7 then
+						continue
+					end
+					total = total + 1
+				end
+				total = total + 1
+				if selector ~= 0 then
+					total = total + 1
+				end
+			until total >= 6 or budget > 5
+			total = total + 100
+			return total, passes
+		end
+		local function twoLevelContinue(selector: any, budget: any): (number, number)
+			local total = 0
+			local rounds = 0
+			repeat
+				rounds += 1
+				if selector == 4 then
+					total = total + 2
+					if budget > 7 then
+						continue
+					end
+					total = total + 1
+				elseif selector == 3 then
+					if budget > 1 then
+						continue
+					end
+					total = total + 4
+				end
+				total = total + 1
+			until rounds >= 5 or total >= 6 or budget > 5
+			return total, rounds
+		end
+		local reference: any = if caseName == "source-frontend-empty-boundary-clone-continue"
+			then queueSkip
+			elseif caseName == "source-frontend-empty-boundary-clone-continue-nonlocal" then passCounter
+			elseif caseName == "source-frontend-empty-boundary-clone-continue-inner-loop" then skipTotal
+			else twoLevelContinue
+		local function outcome(worker: any, selector: any, budget: any): string
+			local packed = table.pack(pcall(worker, selector, budget))
+			if not packed[1] then
+				return "err:" .. (string.gsub(tostring(packed[2]), "^.-:%d+: ", ""))
+			end
+			local parts: { string } = {}
+			for index = 2, packed.n do
+				table.insert(parts, tostring(packed[index]))
+			end
+			return "ok:" .. table.concat(parts, ",")
+		end
+		local selectors: { any } = { 0, 1, -2, 2, 3, 2.5, "x", 4, 5, 6, 7, 8, 9, 10, 11, 12, true, false }
+		local budgets = { -1, 0, 1, 2, 3, 4, 5, 7, 8, 10, 12, 15, 20, 25, 30, 31, 35, 40, 50, 100, 1000 }
+		local rows, mismatches = 0, 0
+		local first = ""
+		for _, selector in selectors do
+			for _, budget in budgets do
+				local expected = outcome(reference, selector, budget)
+				local actual = outcome(exported, selector, budget)
+				rows += 1
+				if expected ~= actual then
+					mismatches += 1
+					if first == "" then
+						first = `selector={tostring(selector)} budget={budget} expected={expected} got={actual}`
+					end
+				end
+			end
+		end
+		assert(mismatches == 0, `{caseName}: {mismatches} of {rows} rows differ from the source; first {first}`)
 	else
 		return false
 	end

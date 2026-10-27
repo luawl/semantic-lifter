@@ -647,6 +647,86 @@ pub fn build(b: *std.Build) void {
     nested_continue_side_exit_nested_break_layout.addFileArg(b.path("luau/structured_layout_oracle.luau"));
     nested_continue_side_exit_nested_break_layout.addArg("source-frontend-nested-continue-side-exit-nested-break");
     nested_continue_side_exit_nested_break_layout.addFileArg(source_frontend_nested_continue_side_exit_nested_break_conformance.generated_luau);
+    const source_frontend_empty_boundary_clone_continue_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/empty_boundary_clone_continue_source.luau",
+        "source-frontend-empty-boundary-clone-continue",
+    );
+    const empty_boundary_clone_continue_dispatcher = addDispatcherRuntimeConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "source-frontend-empty-boundary-clone-continue",
+        source_frontend_empty_boundary_clone_continue_conformance.resolved_ir,
+    );
+    const source_frontend_empty_boundary_clone_continue_nonlocal_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/empty_boundary_clone_continue_nonlocal_source.luau",
+        "source-frontend-empty-boundary-clone-continue-nonlocal",
+    );
+    const empty_boundary_clone_continue_nonlocal_dispatcher = addDispatcherRuntimeConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "source-frontend-empty-boundary-clone-continue-nonlocal",
+        source_frontend_empty_boundary_clone_continue_nonlocal_conformance.resolved_ir,
+    );
+    const source_frontend_empty_boundary_clone_continue_inner_loop_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/empty_boundary_clone_continue_inner_loop_source.luau",
+        "source-frontend-empty-boundary-clone-continue-inner-loop",
+    );
+    const empty_boundary_clone_continue_inner_loop_dispatcher = addDispatcherRuntimeConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "source-frontend-empty-boundary-clone-continue-inner-loop",
+        source_frontend_empty_boundary_clone_continue_inner_loop_conformance.resolved_ir,
+    );
+    const source_frontend_clone_escape_jump_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/clone_escape_jump_source.luau",
+        "source-frontend-clone-escape-jump",
+    );
+    const clone_escape_jump_dispatcher = addDispatcherRuntimeConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "source-frontend-clone-escape-jump",
+        source_frontend_clone_escape_jump_conformance.resolved_ir,
+    );
+    const empty_boundary_clone_continue_layout = b.addSystemCommand(&.{ luneExe(b), "run" });
+    empty_boundary_clone_continue_layout.addFileArg(b.path("luau/structured_layout_oracle.luau"));
+    empty_boundary_clone_continue_layout.addArg("source-frontend-empty-boundary-clone-continue");
+    empty_boundary_clone_continue_layout.addFileArg(source_frontend_empty_boundary_clone_continue_conformance.generated_luau);
+    const empty_boundary_clone_continue_nonlocal_layout = b.addSystemCommand(&.{ luneExe(b), "run" });
+    empty_boundary_clone_continue_nonlocal_layout.addFileArg(b.path("luau/structured_layout_oracle.luau"));
+    empty_boundary_clone_continue_nonlocal_layout.addArg("source-frontend-empty-boundary-clone-continue-nonlocal");
+    empty_boundary_clone_continue_nonlocal_layout.addFileArg(source_frontend_empty_boundary_clone_continue_nonlocal_conformance.generated_luau);
+    const empty_boundary_clone_continue_inner_loop_layout = b.addSystemCommand(&.{ luneExe(b), "run" });
+    empty_boundary_clone_continue_inner_loop_layout.addFileArg(b.path("luau/structured_layout_oracle.luau"));
+    empty_boundary_clone_continue_inner_loop_layout.addArg("source-frontend-empty-boundary-clone-continue-inner-loop");
+    empty_boundary_clone_continue_inner_loop_layout.addFileArg(source_frontend_empty_boundary_clone_continue_inner_loop_conformance.generated_luau);
+    const clone_escape_jump_layout = b.addSystemCommand(&.{ luneExe(b), "run" });
+    clone_escape_jump_layout.addFileArg(b.path("luau/structured_layout_oracle.luau"));
+    clone_escape_jump_layout.addArg("source-frontend-clone-escape-jump");
+    clone_escape_jump_layout.addFileArg(source_frontend_clone_escape_jump_conformance.generated_luau);
     const luau_iteration_header_forwarder_conformance = addLuauFixtureConformance(
         b,
         exe,
@@ -2306,6 +2386,18 @@ pub fn build(b: *std.Build) void {
     source_frontend_nested_continue_side_exit_nested_break_conformance.addTo(conformance_step);
     conformance_step.dependOn(nested_continue_side_exit_nested_break_dispatcher);
     conformance_step.dependOn(&nested_continue_side_exit_nested_break_layout.step);
+    source_frontend_empty_boundary_clone_continue_conformance.addTo(conformance_step);
+    conformance_step.dependOn(empty_boundary_clone_continue_dispatcher);
+    conformance_step.dependOn(&empty_boundary_clone_continue_layout.step);
+    source_frontend_empty_boundary_clone_continue_nonlocal_conformance.addTo(conformance_step);
+    conformance_step.dependOn(empty_boundary_clone_continue_nonlocal_dispatcher);
+    conformance_step.dependOn(&empty_boundary_clone_continue_nonlocal_layout.step);
+    source_frontend_empty_boundary_clone_continue_inner_loop_conformance.addTo(conformance_step);
+    conformance_step.dependOn(empty_boundary_clone_continue_inner_loop_dispatcher);
+    conformance_step.dependOn(&empty_boundary_clone_continue_inner_loop_layout.step);
+    source_frontend_clone_escape_jump_conformance.addTo(conformance_step);
+    conformance_step.dependOn(clone_escape_jump_dispatcher);
+    conformance_step.dependOn(&clone_escape_jump_layout.step);
     luau_iteration_header_forwarder_conformance.addTo(conformance_step);
     conformance_step.dependOn(iteration_header_forwarder_dispatcher);
     luau_open_pack_projection_conformance.addTo(conformance_step);
@@ -3875,12 +3967,12 @@ fn addEmitRefusalConformance(
 // structured while its dispatcher layout passes the 200-local limit, so each route that writes text exits 1 with the
 // typed line and `error: InvalidIr`, the emitter's refusal after a clean admission: the IR fixture with 76 places
 // allocated per execution in each of two sibling arms of a loop body, on the unchecked strategy route, the checked
-// `emit-luau` and the function probe; in direct locals, the source with seven single-assignment locals in each of two
-// arms before a repeat loop with a continue in an `if` arm and one in an `elseif` arm, on the strategy route and the
-// checked chain; in the standard target, the source with 80 mutable locals in each of two arms before a `while` loop
-// whose body ends in an `if` with an `or` test and only a `continue`, whose 200 potential locals keep their registers
-// and leave the `__lifter_pc` slot as the 201st local, on the same two routes. With one place or local fewer per arm
-// each input is admitted, written in the flat layout and compiled at -O0 and at the default level.
+// `emit-luau` and the function probe; in direct locals, the source with fifteen single-assignment locals in each of
+// two arms before a `while` loop whose body ends in an `if` with an `or` test and only a `continue`, on the strategy
+// route and the checked chain; in the standard target, the source with 80 mutable locals in each of two arms before
+// that loop, whose 200 potential locals keep their registers and leave the `__lifter_pc` slot as the 201st local, on
+// the same two routes. With one place or local fewer per arm each input is admitted, written in the
+// flat layout and compiled at -O0 and at the default level.
 const region_fallback_refusal = [_][]const u8{ "diagnostic=unsupported_readable_register_pressure entity=1\n", "error: InvalidIr" };
 
 const RegionFallbackLocalBudgetConformance = struct {
@@ -3901,7 +3993,7 @@ fn addRegionFallbackLocalBudgetConformance(
     const places = b.path("luau/fixtures/region_fallback_allocated_places_76.lifter-ir.json");
     const places_75 = b.path("luau/fixtures/region_fallback_allocated_places_75.lifter-ir.json");
     const local_budget = addGenericBudgetResolvedIr(b, exe, z3_enabled, z3_bin, "luau/fixtures/region_fallback_local_budget_source.luau", "region-fallback-local-budget");
-    const local_budget_6 = addGenericBudgetResolvedIr(b, exe, z3_enabled, z3_bin, "luau/fixtures/region_fallback_local_budget_6_source.luau", "region-fallback-local-budget-6");
+    const local_budget_14 = addGenericBudgetResolvedIr(b, exe, z3_enabled, z3_bin, "luau/fixtures/region_fallback_local_budget_14_source.luau", "region-fallback-local-budget-14");
     const pc_slot = addGenericBudgetResolvedIr(b, exe, z3_enabled, z3_bin, "luau/fixtures/region_fallback_pc_slot_source.luau", "region-fallback-pc-slot");
     const pc_slot_79 = addGenericBudgetResolvedIr(b, exe, z3_enabled, z3_bin, "luau/fixtures/region_fallback_pc_slot_79_source.luau", "region-fallback-pc-slot-79");
     return .{ .steps = .{
@@ -3913,7 +4005,7 @@ fn addRegionFallbackLocalBudgetConformance(
         addEmitRefusalConformance(b, exe, z3_enabled, z3_bin, pc_slot, "region-fallback-pc-slot.automatic.luau", "standard-luau", "automatic", &region_fallback_refusal),
         addRegionFallbackRefusal(b, exe, z3_enabled, z3_bin, "emit-luau-solved", pc_slot, "region-fallback-pc-slot.generated.luau", &.{ engine, "standard-luau" }, true),
         addRegionFallbackBoundary(b, exe, z3_enabled, z3_bin, places_75, "region-fallback-allocated-places-75", "standard-luau"),
-        addRegionFallbackBoundary(b, exe, z3_enabled, z3_bin, local_budget_6, "region-fallback-local-budget-6", "direct-locals-luau"),
+        addRegionFallbackBoundary(b, exe, z3_enabled, z3_bin, local_budget_14, "region-fallback-local-budget-14", "direct-locals-luau"),
         addRegionFallbackBoundary(b, exe, z3_enabled, z3_bin, pc_slot_79, "region-fallback-pc-slot-79", "standard-luau"),
     } };
 }

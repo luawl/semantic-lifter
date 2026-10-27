@@ -9,6 +9,14 @@ local function worker(selector, budget)
 		local a0_4 = selector * 6
 		local a0_5 = selector * 7
 		local a0_6 = selector * 8
+		local a0_7 = selector * 9
+		local a0_8 = selector * 10
+		local a0_9 = selector * 11
+		local a0_10 = selector * 12
+		local a0_11 = selector * 13
+		local a0_12 = selector * 14
+		local a0_13 = selector * 15
+		local a0_14 = selector * 16
 		total = total + a0_0
 		total = total + a0_1
 		total = total + a0_2
@@ -16,6 +24,14 @@ local function worker(selector, budget)
 		total = total + a0_4
 		total = total + a0_5
 		total = total + a0_6
+		total = total + a0_7
+		total = total + a0_8
+		total = total + a0_9
+		total = total + a0_10
+		total = total + a0_11
+		total = total + a0_12
+		total = total + a0_13
+		total = total + a0_14
 		total = total - a0_0
 		total = total - a0_1
 		total = total - a0_2
@@ -23,6 +39,14 @@ local function worker(selector, budget)
 		total = total - a0_4
 		total = total - a0_5
 		total = total - a0_6
+		total = total - a0_7
+		total = total - a0_8
+		total = total - a0_9
+		total = total - a0_10
+		total = total - a0_11
+		total = total - a0_12
+		total = total - a0_13
+		total = total - a0_14
 	elseif selector == 1001 then
 		local a1_0 = selector * 2
 		local a1_1 = selector * 3
@@ -31,6 +55,14 @@ local function worker(selector, budget)
 		local a1_4 = selector * 6
 		local a1_5 = selector * 7
 		local a1_6 = selector * 8
+		local a1_7 = selector * 9
+		local a1_8 = selector * 10
+		local a1_9 = selector * 11
+		local a1_10 = selector * 12
+		local a1_11 = selector * 13
+		local a1_12 = selector * 14
+		local a1_13 = selector * 15
+		local a1_14 = selector * 16
 		total = total + a1_0
 		total = total + a1_1
 		total = total + a1_2
@@ -38,6 +70,14 @@ local function worker(selector, budget)
 		total = total + a1_4
 		total = total + a1_5
 		total = total + a1_6
+		total = total + a1_7
+		total = total + a1_8
+		total = total + a1_9
+		total = total + a1_10
+		total = total + a1_11
+		total = total + a1_12
+		total = total + a1_13
+		total = total + a1_14
 		total = total - a1_0
 		total = total - a1_1
 		total = total - a1_2
@@ -45,23 +85,22 @@ local function worker(selector, budget)
 		total = total - a1_4
 		total = total - a1_5
 		total = total - a1_6
+		total = total - a1_7
+		total = total - a1_8
+		total = total - a1_9
+		total = total - a1_10
+		total = total - a1_11
+		total = total - a1_12
+		total = total - a1_13
+		total = total - a1_14
 	end
-	repeat
+	while rounds < 8 do
 		rounds += 1
-		if selector == 4 then
-			total = total + 2
-			if budget > 7 then
-				continue
-			end
-			total = total + 1
-		elseif selector == 3 then
-			if budget > 1 then
-				continue
-			end
-			total = total + 4
+		total += rounds
+		if selector == 5 or budget > 4 then
+			continue
 		end
-		total = total + 1
-	until rounds >= 5 or total >= 6 or budget > 5
-	return total
+	end
+	return total, rounds
 end
 return worker
