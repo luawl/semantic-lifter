@@ -1943,11 +1943,13 @@ function SourceRuntimeOracle.run(caseName: string, source: string, exported: any
 		or caseName == "source-frontend-repeat-continue-retry"
 		or caseName == "source-frontend-repeat-continue-body-local"
 		or caseName == "source-frontend-repeat-continue-queue-drain-layout"
+		or caseName == "source-frontend-side-exit-owned-escape-flag"
 	then
 		-- A post-tested loop whose body holds a continue that skips code the body reaches after a join. The text is
 		-- written structured (no dispatcher pc name; __lifter_pcall is the protected-call local, not the pc) and the
 		-- worker returns what the source returns on the 45-point grid, an error where the source raises one. The
-		-- queue-drain worker pins only its layout and its agreement with the source on the grid.
+		-- queue-drain worker pins only its layout and its agreement with the source on the grid, and so does the
+		-- side-exit worker, whose text is written from its normalized IR and leaves its loop by the exit's flag.
 		local _, pcNames = string.gsub(source, "__lifter_pc", "")
 		local _, pcallNames = string.gsub(source, "__lifter_pcall", "")
 		assert(
@@ -1998,6 +2000,17 @@ function SourceRuntimeOracle.run(caseName: string, source: string, exported: any
 				"3,0,1", "3,0,1", "4,0,2", "10,1,5", "19,1,6",
 				"3,0,1", "3,0,1", "4,0,2", "8,0,3", "14,0,5",
 				"3,0,1", "3,0,1", "4,0,2", "8,0,3", "14,0,5",
+			},
+			["source-frontend-side-exit-owned-escape-flag"] = {
+				"106", "106", "106", "106", "106",
+				"106", "106", "106", "106", "106",
+				"106", "106", "106", "106", "106",
+				"106", "106", "106", "106", "106",
+				"106", "106", "106", "106", "106",
+				"106", "106", "106", "106", "106",
+				"106", "106", "106", "106", "106",
+				"106", "106", "106", "106", "106",
+				"106", "106", "106", "106", "106",
 			},
 		}
 		local rows = expected[caseName]

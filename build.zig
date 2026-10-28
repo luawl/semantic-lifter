@@ -1222,6 +1222,47 @@ pub fn build(b: *std.Build) void {
         "luau/fixtures/repeat_continue_queue_drain_derived_local_source.luau",
         "source-frontend-repeat-continue-queue-drain-derived-local",
     );
+    // A post-tested loop whose body leaves through a loop boundary's side exit once the structure feedback has split the
+    // loop, so its text is written from the normalized IR: the side exit leaves by the loop exit's flag under the loop
+    // body's transfer wrapper, and its side region owns escapes to that exit too. The audit refuses a wrapper that
+    // declares that flag again where its block sets the flag after it. It runs before the runtime oracle, which has no
+    // timeout: a set that misses the loop's flag makes the loop run passes it should not, and this worker's never end.
+    const side_exit_owned_escape_flag_name = "source-frontend-side-exit-owned-escape-flag";
+    const side_exit_owned_escape_flag_ir = addLuauSourceIr(b, "luau/fixtures/side_exit_owned_escape_flag_source.luau", null, side_exit_owned_escape_flag_name);
+    const side_exit_owned_escape_flag_normalize = b.addRunArtifact(exe);
+    if (z3_enabled) side_exit_owned_escape_flag_normalize.addPathDir(b.pathFromRoot(z3_bin));
+    side_exit_owned_escape_flag_normalize.addArg("normalize-ir");
+    side_exit_owned_escape_flag_normalize.addFileArg(side_exit_owned_escape_flag_ir);
+    const side_exit_owned_escape_flag_normalized = side_exit_owned_escape_flag_normalize.addOutputFileArg(side_exit_owned_escape_flag_name ++ ".normalized.lifter-ir.json");
+    side_exit_owned_escape_flag_normalize.expectExitCode(0);
+    const side_exit_owned_escape_flag_emit = b.addRunArtifact(exe);
+    if (z3_enabled) side_exit_owned_escape_flag_emit.addPathDir(b.pathFromRoot(z3_bin));
+    side_exit_owned_escape_flag_emit.addArg("emit-readable-luau-strategy");
+    side_exit_owned_escape_flag_emit.addFileArg(side_exit_owned_escape_flag_normalized);
+    const side_exit_owned_escape_flag_luau = side_exit_owned_escape_flag_emit.addOutputFileArg(side_exit_owned_escape_flag_name ++ ".automatic.luau");
+    side_exit_owned_escape_flag_emit.addArgs(&.{ "standard-luau", "automatic" });
+    side_exit_owned_escape_flag_emit.expectExitCode(0);
+    const side_exit_owned_escape_flag_audit = b.addSystemCommand(&.{ luneExe(b), "run" });
+    side_exit_owned_escape_flag_audit.addFileArg(b.path("luau/transfer_wrapper_audit.luau"));
+    side_exit_owned_escape_flag_audit.addFileArg(side_exit_owned_escape_flag_luau);
+    const side_exit_owned_escape_flag_compile = b.addSystemCommand(&.{ luauCompileExe(b), "--null", "-O0" });
+    side_exit_owned_escape_flag_compile.addFileArg(side_exit_owned_escape_flag_luau);
+    side_exit_owned_escape_flag_compile.expectExitCode(0);
+    const side_exit_owned_escape_flag_runtime = b.addSystemCommand(&.{ luneExe(b), "run" });
+    side_exit_owned_escape_flag_runtime.addFileArg(b.path("luau/runtime_oracle.luau"));
+    side_exit_owned_escape_flag_runtime.addFileInput(b.path("luau/source_runtime_oracle.luau"));
+    side_exit_owned_escape_flag_runtime.addFileInput(b.path("luau/pack_multi_latch_runtime_oracle.luau"));
+    side_exit_owned_escape_flag_runtime.addFileInput(b.path("luau/pack_return_storage_runtime_oracle.luau"));
+    side_exit_owned_escape_flag_runtime.addFileInput(b.path("luau/iteration_exit_transfer_runtime_oracle.luau"));
+    side_exit_owned_escape_flag_runtime.addFileInput(b.path("luau/iteration_break_exit_transfer_runtime_oracle.luau"));
+    side_exit_owned_escape_flag_runtime.addFileInput(b.path("luau/iteration_header_entry_runtime_oracle.luau"));
+    side_exit_owned_escape_flag_runtime.addFileInput(b.path("luau/wrapped_continue_runtime_oracle.luau"));
+    side_exit_owned_escape_flag_runtime.addFileInput(b.path("luau/loop_owned_exit_flag_runtime_oracle.luau"));
+    side_exit_owned_escape_flag_runtime.addArg(side_exit_owned_escape_flag_name);
+    side_exit_owned_escape_flag_runtime.addFileArg(side_exit_owned_escape_flag_luau);
+    side_exit_owned_escape_flag_runtime.expectExitCode(0);
+    side_exit_owned_escape_flag_runtime.step.dependOn(&side_exit_owned_escape_flag_audit.step);
+    side_exit_owned_escape_flag_runtime.step.dependOn(&side_exit_owned_escape_flag_compile.step);
     const source_frontend_compound_conformance = addLuauSourceConformance(
         b,
         exe,
@@ -2591,6 +2632,7 @@ pub fn build(b: *std.Build) void {
     source_frontend_repeat_continue_queue_drain_conformance.addTo(conformance_step);
     source_frontend_repeat_continue_queue_drain_parameter_test_conformance.addTo(conformance_step);
     source_frontend_repeat_continue_queue_drain_derived_local_conformance.addTo(conformance_step);
+    conformance_step.dependOn(&side_exit_owned_escape_flag_runtime.step);
     conformance_step.dependOn(repeat_loop_dispatcher);
     source_frontend_compound_conformance.addTo(conformance_step);
     source_frontend_if_expression_conformance.addTo(conformance_step);

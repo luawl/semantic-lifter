@@ -1,7 +1,8 @@
 --!strict
 -- Transfer wrapper audit for structured generated texts: no `repeat ... until true` transfer wrapper may only
--- forward escape flags, and no wrapper may declare a stop flag (`local __lifter_escape_<n> = false` right before its
--- `repeat`) that nothing in its scope sets or reads.
+-- forward escape flags, no wrapper may declare a stop flag (`local __lifter_escape_<n> = false` right before its
+-- `repeat`) that nothing in its scope sets or reads, and no wrapper may declare its stop flag while a declaration of
+-- that name in an enclosing block is in scope and the wrapper's own block sets the flag after its `until true`.
 -- A wrapper only forwards flags when the flag it declares, if any, is such a dead declaration; no `continue` binds to
 -- it; every `break` that binds to it (through `if` arms and `do` blocks) follows a set of, or is the whole body of a
 -- consumer `if <flag> then break end` of, a flag that the propagation right after its `until true` re-dispatches with
@@ -9,9 +10,14 @@
 -- without a `break` is the last statement on its path. Without that wrapper the same transfers leave the statement
 -- around it directly. A wrapper with no declaration counts on the same rules, unless it sets a flag its propagation
 -- does not read.
--- A passing run prints nothing. A failing run prints one line per finding, `<path> forwarding <line of repeat>` or
--- `<path> dead-flag <line of declaration> <flag>`, and fails one assertion that counts them. With --counts it prints
--- `<path> forwarding=<f> dead=<d>` for every text and asserts nothing.
+-- A wrapper's declaration of a flag that an enclosing block also declares shadows the enclosing one for the rest of
+-- the wrapper's block: a set written there after the wrapper, meant for the enclosing flag that a consumer outside
+-- that block reads, lands in the wrapper's flag instead. The flag declarations that open a loop's body are the
+-- loop's own, declared on every pass, not a wrapper's.
+-- A passing run prints nothing. A failing run prints one line per finding, `<path> forwarding <line of repeat>`,
+-- `<path> dead-flag <line of declaration> <flag>` or `<path> shadowed-flag <line of declaration> <flag>`, and fails
+-- one assertion that counts them. With --counts it prints `<path> forwarding=<f> dead=<d> shadowed=<s>` for every
+-- text and asserts nothing.
 -- argv: [--counts] <generated Luau path>...
 local fs = require("@lune/fs")
 local process = require("@lune/process")
@@ -27,6 +33,7 @@ type Wrapper = {
 	declLine: number,
 	repeatLine: number,
 	dead: boolean,
+	shadowed: boolean,
 	continues: number,
 	breaks: { string },
 	loose: { { cls: string, tail: boolean } },
@@ -344,7 +351,7 @@ local function audit(text: string): { Wrapper }
 		end
 	end
 	local wrappers: { Wrapper } = {}
-	local function describe(list: { Item }, index: number)
+	local function describe(list: { Item }, index: number, outer: { [string]: boolean }, opensLoopBody: boolean)
 		local item = list[index]
 		local before = list[index - 1]
 		local flag = if before ~= nil and before.kind == "simple" then string.match(textOf(before), "^local (__lifter_escape_[%w_]+) = false$") else nil
@@ -404,33 +411,50 @@ local function audit(text: string): { Wrapper }
 			local from: { Item } = table.move(list, index, #list, 1, {})
 			dead = countUses(body, flag, false) == 0 and countUses(after, flag, false) == 0 and countUses(from, flag, true) == 0
 		end
+		-- A flag declaration that opens a loop's body is the loop's own per-pass flag, not this wrapper's.
+		local shadowed = false
+		if flag ~= nil and not opensLoopBody and outer[flag] then
+			local after: { Item } = table.move(list, index + 1, #list, 1, {})
+			shadowed = countUses(after, flag, false) > 0
+		end
 		table.insert(wrappers, {
 			flag = flag,
 			declLine = if before ~= nil then before.line + 1 else 0,
 			repeatLine = item.line + 1,
 			dead = dead,
+			shadowed = shadowed,
 			continues = continues,
 			breaks = breaks,
 			loose = classified,
 			post = post,
 		})
 	end
-	local function visit(list: { Item })
+	-- `outer` holds the escape flags declared in the blocks around `list` before the statement that holds it, and
+	-- `loopBody` says whether `list` is the body of a loop (a transfer wrapper is not one).
+	local function visit(list: { Item }, outer: { [string]: boolean }, loopBody: boolean)
+		local here: { [string]: boolean } = table.clone(outer)
+		local opening = loopBody
 		for index, item in list do
 			if isWrapper(item) then
-				describe(list, index)
+				describe(list, index, outer, opening)
 			end
 			for _, arm in item.arms do
-				visit(arm.items)
+				visit(arm.items, here, item.kind == "loop" or (item.kind == "repeat" and not isWrapper(item)))
 			end
 			for _, fn in item.nested do
 				for _, arm in fn.arms do
-					visit(arm.items)
+					visit(arm.items, here, false)
 				end
+			end
+			local declared = if item.kind == "simple" then string.match(textOf(item), "^local (__lifter_escape_[%w_]+) = false$") else nil
+			if declared ~= nil then
+				here[declared] = true
+			else
+				opening = false
 			end
 		end
 	end
-	visit(items)
+	visit(items, {}, false)
 	return wrappers
 end
 
@@ -469,6 +493,7 @@ for index = first, #process.args do
 	texts += 1
 	local forwarding = 0
 	local dead = 0
+	local shadowed = 0
 	for _, wrapper in audit(fs.readFile(path)) do
 		if forwardsOnly(wrapper) then
 			forwarding += 1
@@ -482,11 +507,17 @@ for index = first, #process.args do
 				print(`{path} dead-flag {wrapper.declLine} {wrapper.flag}`)
 			end
 		end
+		if wrapper.flag ~= nil and wrapper.shadowed then
+			shadowed += 1
+			if not counts then
+				print(`{path} shadowed-flag {wrapper.declLine} {wrapper.flag}`)
+			end
+		end
 	end
 	if counts then
-		print(`{path} forwarding={forwarding} dead={dead}`)
+		print(`{path} forwarding={forwarding} dead={dead} shadowed={shadowed}`)
 	end
-	findings += forwarding + dead
+	findings += forwarding + dead + shadowed
 end
 if not counts then
 	assert(findings == 0, `{findings} transfer wrapper findings in {texts} texts`)

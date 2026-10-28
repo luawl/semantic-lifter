@@ -4277,3 +4277,27 @@ test "a native numeric for omits only a literal integer unit step" {
     defer allocator.free(unit);
     try std.testing.expect(std.mem.endsWith(u8, try onlyForLine(unit), " = 1, 3 do"));
 }
+
+// The worker of a post-tested loop whose body leaves through a loop boundary's side exit once the structure feedback
+// has split the loop: the side exit is written under the loop body's transfer wrapper, so it leaves by the loop exit's
+// flag, which the loop declares on every pass, and its side region owns escapes to that exit as well. The fixture is
+// the normalized lifted IR, since the side region exists only after the split.
+test "a flagged side exit's side region declares no flag of the loop exit its arm sets after it" {
+    const allocator = std.testing.allocator;
+    var parsed = try lifter.codec.parse(allocator, @embedFile("testdata/side_exit_owned_escape_flag.lifter-ir.json"));
+    defer parsed.deinit();
+    const source = try lifter.emit_luau.emitAllocForTargetWithOptions(allocator, &parsed.value, .standard_luau, .{});
+    defer allocator.free(source);
+    // Written structured, and a consumer reads the loop exit's flag.
+    try std.testing.expect(std.mem.indexOf(u8, source, "__lifter_pc") == null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "if __lifter_escape_4 then") != null);
+    // Below the function's own scope the flag is declared once, by the loop at the top of each pass: the side arm's
+    // set after its side region, and every exit to the loop exit inside that region, reach the flag the consumer reads.
+    var nested_declarations: usize = 0;
+    var text_lines = std.mem.splitScalar(u8, source, '\n');
+    while (text_lines.next()) |line| {
+        const trimmed = std.mem.trimStart(u8, line, " ");
+        if (std.mem.eql(u8, trimmed, "local __lifter_escape_4 = false") and line.len - trimmed.len > 2) nested_declarations += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), nested_declarations);
+}

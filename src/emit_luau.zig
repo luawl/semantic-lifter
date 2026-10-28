@@ -1045,7 +1045,8 @@ fn emitRegionWithPredeclaredBlock(
             structured_escape.regionHasLoopBoundaryExitTo(region, target));
     // The stop's flag is declared only where this region's own text sets it: after the region only the consumer of a
     // region that continues at its stop reads it, which needs such a set, and a side arm that sets it after its side
-    // region writes that region with the side target predeclared.
+    // region (a side escape, or a side exit carried by the loop exit's flag) writes that region with the side target
+    // predeclared.
     if (!has_predeclared_stop_flag and structured_escape.regionWritesOwnedEscape(region)) {
         try emitEscapeFlagDeclaration(output, allocator, program, emission_plan, target, region_indent);
     }
@@ -4201,7 +4202,19 @@ fn emitLoopBoundaryArmImpl(
         .side_exit => |side_exit| {
             const entry = program.blocks[side_exit.entry_edge.target.index()];
             try emitEdgeParametersUnlessConsumed(output, allocator, program, emission_plan, scopes, entry, side_exit.entry_edge.arguments, indent, true, place_aliases);
-            try emitRegion(output, allocator, program, emission_plan, scopes, side_exit.region, indent, place_aliases);
+            // Where this arm sets the loop exit's flag after the side region, the side region declares no flag of that
+            // name: the set, and every exit set inside the region, must reach the flag of the loop that owns the exit.
+            try emitRegionPredeclared(
+                output,
+                allocator,
+                program,
+                emission_plan,
+                scopes,
+                side_exit.region,
+                indent,
+                place_aliases,
+                if (exit_via_flag) side_exit.region.stop else null,
+            );
             if (!regionAlwaysFunctionTerminates(program, side_exit.region)) {
                 // A side exit whose `break` a transfer wrapper would capture leaves by the loop exit's flag, which each
                 // wrapper on the way forwards to the loop (`structure.markFlaggedContinues`).
