@@ -639,6 +639,33 @@ function SourceRuntimeOracle.run(caseName: string, source: string, exported: any
 			received = table.pack(...)
 		end)
 		assert(received.n == 2 and received[1] == 1 and received[2] == 0 and final == 11, "a place read before a call changed its value")
+
+	elseif
+		caseName == "source-frontend-numeric-for-unit-step"
+		or caseName == "source-frontend-numeric-for-unit-step-direct-locals"
+	then
+		assert(string.find(source, "for i = 1, #items do", 1, true) ~= nil, "a native numeric for kept its literal unit step")
+		assert(string.find(source, ", 1 do", 1, true) == nil, "a literal unit step was printed")
+		assert(
+			exported({ 1, 2, 3 }, function(value: number): number
+				return value * 10
+			end) == 60,
+			"omitting the unit step changed the loop"
+		)
+		assert(
+			exported({}, function(value: number): number
+				return value
+			end) == 0,
+			"omitting the unit step changed the empty loop"
+		)
+	elseif caseName == "source-frontend-numeric-for-step-controls" then
+		assert(string.find(source, ", first, -1 do", 1, true) ~= nil, "a negative constant step was dropped")
+		assert(string.find(source, ", last, 2 do", 1, true) ~= nil, "a constant step other than one was dropped")
+		assert(string.find(source, ", last, step do", 1, true) ~= nil, "a non-constant step was dropped")
+		local down, odd, given = exported(1, 3, 1)
+		assert(down == 321 and odd == 4 and given == 6, "a numeric for step control changed its values")
+		local emptyDown, emptyOdd, emptyGiven = exported(3, 1, 1)
+		assert(emptyDown == 0 and emptyOdd == 0 and emptyGiven == 0, "a numeric for step control entered an empty loop")
 	elseif caseName == "source-frontend-typed-block" then
 		assert(exported(7) == 7, "source frontend changed typed block runtime behavior")
 	elseif caseName == "source-frontend-numeric-for" then

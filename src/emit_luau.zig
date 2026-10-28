@@ -2573,9 +2573,40 @@ fn emitNumericForOpen(
     try render.valueUseScalar(output, allocator, program, valuePlan(emission_plan, place_aliases), numeric.initial_arguments[0]);
     try output.appendSlice(allocator, ", ");
     try render.valueUseScalar(output, allocator, program, valuePlan(emission_plan, place_aliases), numeric.initial_arguments[1]);
-    try output.appendSlice(allocator, ", ");
-    try render.valueUseScalar(output, allocator, program, valuePlan(emission_plan, place_aliases), numeric.initial_arguments[2]);
+    if (!numericStepIsLiteralOne(program, emission_plan, numeric.initial_arguments[2], place_aliases)) {
+        try output.appendSlice(allocator, ", ");
+        try render.valueUseScalar(output, allocator, program, valuePlan(emission_plan, place_aliases), numeric.initial_arguments[2]);
+    }
     try output.appendSlice(allocator, " do\n");
+}
+
+/// Luau defaults a numeric `for` step to 1 and has a single number type, so a step that the line writes as the
+/// literal integer constant `1` is omitted. `render.valueUseScalar` writes a constant in place of its name only
+/// when the emission plan fuses or inlines it, and this reads the same two fields: a step read from a declared
+/// local keeps its place, so that local stays read. A number constant, another constant or a value is written as
+/// today.
+fn numericStepIsLiteralOne(
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    step: ir.ValueId,
+    place_aliases: []const PlaceAlias,
+) bool {
+    const lexical_value = place_render.resolveValue(step, place_aliases) orelse return false;
+    const resolved = emission_plan.dead.resolveValue(lexical_value);
+    if (resolved.index() >= program.values.len) return false;
+    const instruction_id = switch (program.values[resolved.index()].origin) {
+        .instruction_result => |origin| if (origin.index == 0) origin.instruction else return false,
+        else => return false,
+    };
+    if (instruction_id.index() >= program.instructions.len) return false;
+    if (!emission_plan.fused_values.contains(instruction_id) and !emission_plan.dead.isInlined(instruction_id)) return false;
+    return switch (program.instructions[instruction_id.index()].operation) {
+        .constant => |literal| switch (literal) {
+            .integer => |digits| std.mem.eql(u8, digits, "1"),
+            else => false,
+        },
+        else => false,
+    };
 }
 
 fn emitSemanticNormalizedNumericLoop(

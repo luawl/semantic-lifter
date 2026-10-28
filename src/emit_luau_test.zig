@@ -4098,3 +4098,182 @@ test "a condition block declares the result it first defines as a local before i
     try std.testing.expect(std.mem.indexOf(u8, source, "local result = produce()\nif result then\n") != null);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "produce()"));
 }
+
+/// Emits a native numeric loop from the constant 1 to the constant 3 and returns its source. A literal `step` is a
+/// constant of the entry block; a null `step` is the function's one parameter, `step`, passed in its place. With
+/// `back_edge` the body jumps back to the header with the next index, the normalized limit and step and `false`,
+/// the shape the source frontend writes for `for i = 1, 3 do`: the header has two predecessors, each constant has
+/// one use, and the start, limit and step are written inline at the `for` line. Without it the body returns its
+/// index, as in "acyclic native iteration whose body always returns emits no break after the return": the header's
+/// one predecessor makes its parameters aliases of the constants, which then have two uses each and are written as
+/// locals.
+fn emitNativeNumericLoop(allocator: std.mem.Allocator, comptime step: ?ir.Literal, comptime back_edge: bool) ![]u8 {
+    const proof = ir.EvidenceId.fromIndex(0);
+    const f = ir.FunctionId.fromIndex(0);
+    const b_entry = ir.BlockId.fromIndex(0);
+    const b_header = ir.BlockId.fromIndex(1);
+    const b_body = ir.BlockId.fromIndex(2);
+    const b_exit = ir.BlockId.fromIndex(3);
+    // Instruction ids are dense: the start, the limit, the step (a literal step only), `true`, the header's
+    // `numeric_for_next` and `false` (the back edge only).
+    const step_count: usize = if (step == null) 0 else 1;
+    const i_control = ir.InstructionId.fromIndex(0);
+    const i_limit = ir.InstructionId.fromIndex(1);
+    const i_step = ir.InstructionId.fromIndex(2);
+    const i_true = ir.InstructionId.fromIndex(2 + step_count);
+    const i_next = ir.InstructionId.fromIndex(3 + step_count);
+    const i_false = ir.InstructionId.fromIndex(4 + step_count);
+    const v_control = ir.ValueId.fromIndex(0);
+    const v_limit = ir.ValueId.fromIndex(1);
+    const v_step = ir.ValueId.fromIndex(2);
+    const v_true = ir.ValueId.fromIndex(3);
+    const v_header_control = ir.ValueId.fromIndex(4);
+    const v_header_limit = ir.ValueId.fromIndex(5);
+    const v_header_step = ir.ValueId.fromIndex(6);
+    const v_header_initial = ir.ValueId.fromIndex(7);
+    const v_has = ir.ValueId.fromIndex(8);
+    const v_normalized_limit = ir.ValueId.fromIndex(9);
+    const v_normalized_step = ir.ValueId.fromIndex(10);
+    const v_index = ir.ValueId.fromIndex(11);
+    const v_body_index = ir.ValueId.fromIndex(12);
+    const v_false = ir.ValueId.fromIndex(13);
+    const values = [_]ir.Value{
+        .{ .id = v_control, .function = f, .type = .number, .origin = .{ .instruction_result = .{ .instruction = i_control, .index = 0 } } },
+        .{ .id = v_limit, .function = f, .type = .number, .origin = .{ .instruction_result = .{ .instruction = i_limit, .index = 0 } } },
+        if (step == null)
+            .{ .id = v_step, .function = f, .type = .number, .name_hint = "step", .origin = .{ .parameter = 0 } }
+        else
+            .{ .id = v_step, .function = f, .type = .number, .origin = .{ .instruction_result = .{ .instruction = i_step, .index = 0 } } },
+        .{ .id = v_true, .function = f, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = i_true, .index = 0 } } },
+        .{ .id = v_header_control, .function = f, .origin = .{ .block_parameter = .{ .block = b_header, .index = 0 } } },
+        .{ .id = v_header_limit, .function = f, .origin = .{ .block_parameter = .{ .block = b_header, .index = 1 } } },
+        .{ .id = v_header_step, .function = f, .origin = .{ .block_parameter = .{ .block = b_header, .index = 2 } } },
+        .{ .id = v_header_initial, .function = f, .type = .boolean, .origin = .{ .block_parameter = .{ .block = b_header, .index = 3 } } },
+        .{ .id = v_has, .function = f, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = i_next, .index = 0 } } },
+        .{ .id = v_normalized_limit, .function = f, .type = .number, .origin = .{ .instruction_result = .{ .instruction = i_next, .index = 1 } } },
+        .{ .id = v_normalized_step, .function = f, .type = .number, .origin = .{ .instruction_result = .{ .instruction = i_next, .index = 2 } } },
+        .{ .id = v_index, .function = f, .type = .number, .origin = .{ .instruction_result = .{ .instruction = i_next, .index = 3 } } },
+        .{ .id = v_body_index, .function = f, .type = .number, .origin = .{ .block_parameter = .{ .block = b_body, .index = 0 } } },
+    } ++ (if (back_edge) [_]ir.Value{
+        .{ .id = v_false, .function = f, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = i_false, .index = 0 } } },
+    } else [_]ir.Value{});
+    const instructions = [_]ir.Instruction{
+        .{ .id = i_control, .block = b_entry, .operation = .{ .constant = .{ .integer = "1" } }, .results = &.{v_control}, .effects = .pure, .evidence = &.{proof} },
+        .{ .id = i_limit, .block = b_entry, .operation = .{ .constant = .{ .integer = "3" } }, .results = &.{v_limit}, .effects = .pure, .evidence = &.{proof} },
+    } ++ (if (step) |literal| [_]ir.Instruction{
+        .{ .id = i_step, .block = b_entry, .operation = .{ .constant = literal }, .results = &.{v_step}, .effects = .pure, .evidence = &.{proof} },
+    } else [_]ir.Instruction{}) ++ [_]ir.Instruction{
+        .{ .id = i_true, .block = b_entry, .operation = .{ .constant = .{ .boolean = true } }, .results = &.{v_true}, .effects = .pure, .evidence = &.{proof} },
+        .{
+            .id = i_next,
+            .block = b_header,
+            .operation = .{ .numeric_for_next = .{
+                .control = v_header_control,
+                .limit = v_header_limit,
+                .step = v_header_step,
+                .initial = v_header_initial,
+            } },
+            .results = &.{ v_has, v_normalized_limit, v_normalized_step, v_index },
+            .effects = .numeric_for_next,
+            .evidence = &.{proof},
+        },
+    } ++ (if (back_edge) [_]ir.Instruction{
+        .{ .id = i_false, .block = b_entry, .operation = .{ .constant = .{ .boolean = false } }, .results = &.{v_false}, .effects = .pure, .evidence = &.{proof} },
+    } else [_]ir.Instruction{});
+    const entry_instructions = [_]ir.InstructionId{ i_control, i_limit } ++
+        (if (step == null) [_]ir.InstructionId{} else [_]ir.InstructionId{i_step}) ++
+        [_]ir.InstructionId{i_true} ++
+        (if (back_edge) [_]ir.InstructionId{i_false} else [_]ir.InstructionId{});
+    const blocks = [_]ir.Block{
+        .{
+            .id = b_entry,
+            .function = f,
+            .instructions = &entry_instructions,
+            .terminator = .{ .jump = .{ .target = b_header, .arguments = &.{ v_control, v_limit, v_step, v_true } } },
+            .evidence = &.{proof},
+        },
+        .{
+            .id = b_header,
+            .function = f,
+            .parameters = &.{ v_header_control, v_header_limit, v_header_step, v_header_initial },
+            .instructions = &.{i_next},
+            .terminator = .{ .branch = .{
+                .condition = v_has,
+                .then_edge = .{ .target = b_body, .arguments = &.{v_index} },
+                .else_edge = .{ .target = b_exit },
+            } },
+            .evidence = &.{proof},
+        },
+        .{
+            .id = b_body,
+            .function = f,
+            .parameters = &.{v_body_index},
+            .terminator = if (back_edge)
+                .{ .jump = .{ .target = b_header, .arguments = &.{ v_index, v_normalized_limit, v_normalized_step, v_false } } }
+            else
+                .{ .return_values = &.{v_body_index} },
+            .evidence = &.{proof},
+        },
+        .{ .id = b_exit, .function = f, .terminator = .{ .return_values = &.{} }, .evidence = &.{proof} },
+    };
+    const functions = [_]ir.Function{.{
+        .id = f,
+        .parameters = if (step == null) &.{v_step} else &.{},
+        .blocks = &.{ b_entry, b_header, b_body, b_exit },
+        .entry_block = b_entry,
+        .evidence = &.{proof},
+    }};
+    const evidence = [_]ir.Evidence{.{ .id = proof, .kind = .dynamic_fixture, .locator = "fixture:native-numeric-loop" }};
+    const program: ir.Program = .{
+        .program_id = "native-numeric-loop",
+        .entry_function = f,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+        .evidence = &evidence,
+    };
+    return emitAlloc(allocator, &program);
+}
+
+/// The one line of `source` that, trimmed, starts with `for ` and ends with ` do`.
+fn onlyForLine(source: []const u8) ![]const u8 {
+    var for_line: ?[]const u8 = null;
+    var for_lines: usize = 0;
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t");
+        if (std.mem.startsWith(u8, trimmed, "for ") and std.mem.endsWith(u8, trimmed, " do")) {
+            for_lines += 1;
+            for_line = trimmed;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), for_lines);
+    return for_line.?;
+}
+
+test "a native numeric for omits only a literal integer unit step" {
+    const allocator = std.testing.allocator;
+    // The controls run first. Where the start, limit and step are written inline at the `for` line, a constant step
+    // other than the integer 1 stays in the line.
+    const two = try emitNativeNumericLoop(allocator, .{ .integer = "2" }, true);
+    defer allocator.free(two);
+    try std.testing.expect(std.mem.endsWith(u8, try onlyForLine(two), " = 1, 3, 2 do"));
+    // A number constant is not the literal integer 1, even when its value is one, so it stays as well.
+    const number_one = try emitNativeNumericLoop(allocator, .{ .number = 1.0 }, true);
+    defer allocator.free(number_one);
+    try std.testing.expect(std.mem.endsWith(u8, try onlyForLine(number_one), " = 1, 3, 1 do"));
+    // A step that is not a constant is written as its expression.
+    const parameter = try emitNativeNumericLoop(allocator, null, true);
+    defer allocator.free(parameter);
+    try std.testing.expect(std.mem.endsWith(u8, try onlyForLine(parameter), " = 1, 3, step do"));
+    // A step 1 that the line reads from a declared local keeps its place, so that local stays declared and read.
+    const local_one = try emitNativeNumericLoop(allocator, .{ .integer = "1" }, false);
+    defer allocator.free(local_one);
+    try std.testing.expect(std.mem.endsWith(u8, try onlyForLine(local_one), " = value_0, value_1, value_2 do"));
+    try std.testing.expect(std.mem.indexOf(u8, local_one, "local value_0 = 1\nlocal value_1 = 3\nlocal value_2 = 1\n") != null);
+    // Luau steps by 1 when the step is omitted, so the literal integer 1 written in the line is left out.
+    const unit = try emitNativeNumericLoop(allocator, .{ .integer = "1" }, true);
+    defer allocator.free(unit);
+    try std.testing.expect(std.mem.endsWith(u8, try onlyForLine(unit), " = 1, 3 do"));
+}

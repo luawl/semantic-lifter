@@ -1425,6 +1425,31 @@ pub fn build(b: *std.Build) void {
         "luau/fixtures/fusion_place_read_call_source.luau",
         "source-frontend-fusion-place-read-call",
     );
+    const source_frontend_numeric_for_unit_step_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/numeric_for_unit_step_source.luau",
+        "source-frontend-numeric-for-unit-step",
+    );
+    const source_frontend_numeric_for_unit_step_direct_locals_conformance = addLuauSourceConformanceForTarget(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/numeric_for_unit_step_source.luau",
+        "source-frontend-numeric-for-unit-step-direct-locals",
+        "direct-locals-luau",
+    );
+    const source_frontend_numeric_for_step_controls_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/numeric_for_step_controls_source.luau",
+        "source-frontend-numeric-for-step-controls",
+    );
     const source_frontend_typed_block_conformance = addLuauSourceConformance(
         b,
         exe,
@@ -2591,6 +2616,9 @@ pub fn build(b: *std.Build) void {
     source_frontend_fusion_two_tostring_conformance.addTo(conformance_step);
     source_frontend_fusion_no_open_pack_conformance.addTo(conformance_step);
     source_frontend_fusion_place_read_call_conformance.addTo(conformance_step);
+    source_frontend_numeric_for_unit_step_conformance.addTo(conformance_step);
+    source_frontend_numeric_for_unit_step_direct_locals_conformance.addTo(conformance_step);
+    source_frontend_numeric_for_step_controls_conformance.addTo(conformance_step);
     source_frontend_typed_block_conformance.addTo(conformance_step);
     source_frontend_numeric_for_conformance.addTo(conformance_step);
     source_frontend_generic_for_conformance.addTo(conformance_step);
