@@ -1369,19 +1369,19 @@ test "capture-free runtime value proofs bind incoming block arguments" {
     try std.testing.expect(!std.mem.eql(u8, first, changed_effect));
 }
 
-test "wide normalized constants remain inside proof dependency digests" {
+test "normalized constants of a declared width beyond 64 bits remain inside proof dependency digests" {
     const fixture = @import("fixtures.zig").arithmetic_module;
     var values = fixture.values;
     values[fixture.v_factor.index()].type = .{ .kind = .integer, .bit_width = 128, .signed = false };
     var instructions = fixture.instructions;
     instructions[fixture.i_factor.index()].operation = .{ .constant = .{
-        .integer = "340282366920938463463374607431768211455",
+        .integer = "9007199254740992",
     } };
     const bv128: ir.SolverSort = .{ .kind = .bit_vector, .bit_width = 128 };
     const terms = [_]ir.SolverTerm{
         .{ .id = ir.SolverTermId.fromIndex(0), .sort = bv128, .operation = .{ .value = fixture.v_factor } },
         .{ .id = ir.SolverTermId.fromIndex(1), .sort = bv128, .operation = .{ .bit_vector_literal = .{
-            .value = "340282366920938463463374607431768211455",
+            .value = "9007199254740992",
             .bit_width = 128,
         } } },
         .{ .id = ir.SolverTermId.fromIndex(2), .sort = .{ .kind = .boolean }, .operation = .{ .binary = .{
@@ -1398,7 +1398,7 @@ test "wide normalized constants remain inside proof dependency digests" {
 
     const first = try computeAlloc(std.testing.allocator, &program, query, .z3, .proved, &.{}, &.{}, &.{});
     defer std.testing.allocator.free(first);
-    instructions[fixture.i_factor.index()].operation.constant.integer = "340282366920938463463374607431768211454";
+    instructions[fixture.i_factor.index()].operation.constant.integer = "9007199254740991";
     const second = try computeAlloc(std.testing.allocator, &program, query, .z3, .proved, &.{}, &.{}, &.{});
     defer std.testing.allocator.free(second);
     try std.testing.expect(!std.mem.eql(u8, first, second));

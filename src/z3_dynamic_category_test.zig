@@ -689,7 +689,7 @@ test "Z3 refuses unresolved exact dynamic numeric models" {
         .{ .id = ir.ValueId.fromIndex(1), .function = ir.FunctionId.fromIndex(0), .type = .dynamic, .origin = .{ .instruction_result = .{ .instruction = ir.InstructionId.fromIndex(1), .index = 0 } } },
     };
     const instructions = [_]ir.Instruction{
-        .{ .id = ir.InstructionId.fromIndex(0), .block = ir.BlockId.fromIndex(0), .operation = .{ .constant = .{ .integer = "9007199254740993" } }, .results = &.{ir.ValueId.fromIndex(0)}, .effects = .pure },
+        .{ .id = ir.InstructionId.fromIndex(0), .block = ir.BlockId.fromIndex(0), .operation = .{ .constant = .{ .integer = "9007199254740992" } }, .results = &.{ir.ValueId.fromIndex(0)}, .effects = .pure },
         .{ .id = ir.InstructionId.fromIndex(1), .block = ir.BlockId.fromIndex(0), .operation = .{ .constant = .{ .special_number = .nan } }, .results = &.{ir.ValueId.fromIndex(1)}, .effects = .pure },
     };
     const terms = [_]ir.SolverTerm{

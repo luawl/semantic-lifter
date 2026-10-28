@@ -367,7 +367,7 @@ test "environment targets admit arbitrary semantic names but reject raw ambient 
     try std.testing.expect(raw_ambient_report.contains(.invalid_ambient_environment_mode));
 }
 
-test "exact integer text is canonical and readable Luau rejects lossy values" {
+test "exact integer text is canonical and both profiles reject lossy values" {
     const fixtures = lifter.fixtures;
     var instructions = fixtures.arithmetic_module.instructions;
     var program = fixtures.arithmetic_module.program;
@@ -381,11 +381,47 @@ test "exact integer text is canonical and readable Luau rejects lossy values" {
     instructions[2].operation = .{ .constant = .{ .integer = "9007199254740993" } };
     var core_report = try validation.validate(std.testing.allocator, &program, .core);
     defer core_report.deinit();
-    try std.testing.expect(core_report.isClean());
+    try std.testing.expect(core_report.contains(.inexact_luau_integer_literal));
 
     var readable_report = try validation.validate(std.testing.allocator, &program, .readable_luau);
     defer readable_report.deinit();
     try std.testing.expect(readable_report.contains(.inexact_luau_integer_literal));
+}
+
+test "core refuses integer text beyond 2^53 and a number literal carries the value" {
+    const fixture = lifter.fixtures.arithmetic_module;
+    var values = fixture.values;
+    var instructions = fixture.instructions;
+    var program = fixture.program;
+    program.values = &values;
+    program.instructions = &instructions;
+
+    for ([_][]const u8{ "9007199254740993", "-9007199254740993", "9007199254740996", "18446744073709551615" }) |decimal| {
+        instructions[fixture.i_factor.index()].operation = .{ .constant = .{ .integer = decimal } };
+        var core_report = try validation.validate(std.testing.allocator, &program, .core);
+        defer core_report.deinit();
+        try std.testing.expect(core_report.contains(.inexact_luau_integer_literal));
+        var readable_report = try validation.validate(std.testing.allocator, &program, .readable_luau);
+        defer readable_report.deinit();
+        try std.testing.expect(readable_report.contains(.inexact_luau_integer_literal));
+    }
+
+    for ([_][]const u8{ "9007199254740992", "-9007199254740992" }) |decimal| {
+        instructions[fixture.i_factor.index()].operation = .{ .constant = .{ .integer = decimal } };
+        var core_report = try validation.validate(std.testing.allocator, &program, .core);
+        defer core_report.deinit();
+        try std.testing.expect(core_report.isClean());
+        var readable_report = try validation.validate(std.testing.allocator, &program, .readable_luau);
+        defer readable_report.deinit();
+        try std.testing.expect(!readable_report.contains(.inexact_luau_integer_literal));
+    }
+
+    values[fixture.v_factor.index()].type = .number;
+    values[fixture.v_result.index()].type = .number;
+    instructions[fixture.i_factor.index()].operation = .{ .constant = .{ .number = 9007199254740996.0 } };
+    var number_report = try validation.validate(std.testing.allocator, &program, .core);
+    defer number_report.deinit();
+    try std.testing.expect(number_report.isClean());
 }
 
 test "raw non-finite numerals are rejected while tagged special numbers are admitted" {
@@ -1494,22 +1530,28 @@ test "fixed-width integer constants must fit their declared result type" {
     try std.testing.expect(!boundary_report.contains(.operation_result_type_mismatch));
 }
 
-test "core integer constants support declared widths beyond host integers" {
+test "core integer constants support declared widths beyond host integers and refuse text beyond 2^53" {
     const fixture = lifter.fixtures.arithmetic_module;
     var values = fixture.values;
     values[fixture.v_factor.index()].type = .{ .kind = .integer, .bit_width = 128, .signed = false };
     var instructions = fixture.instructions;
-    instructions[fixture.i_factor.index()].operation = .{ .constant = .{
-        .integer = "340282366920938463463374607431768211455",
-    } };
+    instructions[fixture.i_factor.index()].operation = .{ .constant = .{ .integer = "9007199254740992" } };
     var program = fixture.program;
     program.values = &values;
     program.instructions = &instructions;
 
+    var exact_report = try validation.validate(std.testing.allocator, &program, .core);
+    defer exact_report.deinit();
+    try std.testing.expect(exact_report.isClean());
+
+    instructions[fixture.i_factor.index()].operation = .{ .constant = .{
+        .integer = "340282366920938463463374607431768211455",
+    } };
     var core_report = try validation.validate(std.testing.allocator, &program, .core);
     defer core_report.deinit();
     try std.testing.expect(!core_report.contains(.invalid_integer_literal));
     try std.testing.expect(!core_report.contains(.operation_result_type_mismatch));
+    try std.testing.expect(core_report.contains(.inexact_luau_integer_literal));
 
     var readable_report = try validation.validate(std.testing.allocator, &program, .readable_luau);
     defer readable_report.deinit();

@@ -25,12 +25,17 @@ pub fn validate(
                         try report.add(.invalid_integer_literal, instruction.id.index());
                         return;
                     }
-                    if (profile == .readable_luau) {
-                        const value = numerals.parseCanonicalSigned(i64, decimal);
-                        const exact_luau_limit: i64 = 1 << 53;
-                        if (value == null or value.? < -exact_luau_limit or value.? > exact_luau_limit) {
-                            try report.add(.inexact_luau_integer_literal, instruction.id.index());
-                        }
+                    // Integer text is a Luau number under Luau source semantics, so every admission profile
+                    // requires it to be exact as a double; another source semantics states its own rule here.
+                    _ = profile;
+                    switch (program.source_semantics) {
+                        .luau => {
+                            const value = numerals.parseCanonicalSigned(i64, decimal);
+                            const exact_luau_limit: i64 = 1 << 53;
+                            if (value == null or value.? < -exact_luau_limit or value.? > exact_luau_limit) {
+                                try report.add(.inexact_luau_integer_literal, instruction.id.index());
+                            }
+                        },
                     }
                 },
                 .number => |value| if (!std.math.isFinite(value)) {

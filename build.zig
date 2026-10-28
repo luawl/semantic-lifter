@@ -2137,10 +2137,6 @@ pub fn build(b: *std.Build) void {
     evaluator_branch_probe_audit.addFileArg(b.path("luau/fixtures/evaluator_gap_a3_integer_sum_less.lifter-ir.json"));
     evaluator_branch_probe_audit.addFileArg(b.path("luau/fixtures/evaluator_gap_b1_or_nil_equal_claimed.lifter-ir.json"));
     evaluator_branch_probe_audit.addFileArg(b.path("luau/fixtures/evaluator_gap_b5_or_nil_equal_primitive_claimed.lifter-ir.json"));
-    evaluator_branch_probe_audit.addFileArg(b.path("luau/fixtures/evaluator_gap_c1_number_sum_equal_wide_literal.lifter-ir.json"));
-    evaluator_branch_probe_audit.addFileArg(b.path("luau/fixtures/evaluator_gap_c2_number_sum_less_wide_literal.lifter-ir.json"));
-    evaluator_branch_probe_audit.addFileArg(b.path("luau/fixtures/evaluator_gap_c3_all_number_typed_equal_wide.lifter-ir.json"));
-    evaluator_branch_probe_audit.addFileArg(b.path("luau/fixtures/evaluator_gap_c6_number_typed_literal_beyond_2p53.lifter-ir.json"));
     // Re-resolution fixed-point conformance over the recorded nested graph.
     // resolve-ir iterates to a fixed point (src/proof_orchestrator.zig), so re-resolving the resolved
     // IR is byte-idempotent and the resolved IR is already a normalizer fixed point.
@@ -2385,6 +2381,24 @@ pub fn build(b: *std.Build) void {
     conformance_step.dependOn(&legacy_unchecked_preserved_output.step);
     conformance_step.dependOn(&resolve_refusal_audit.step);
     conformance_step.dependOn(&evaluator_branch_probe_audit.step);
+    // Integer text beyond 2^53 is refused at admission in every profile, so resolve-ir stops these probes at its
+    // preflight with the diagnostic at the instruction that holds the text and writes no output.
+    for ([_][3][]const u8{
+        .{ "luau/fixtures/evaluator_gap_c1_number_sum_equal_wide_literal.lifter-ir.json", "evaluator-gap-c1.refused.lifter-ir.json", "diagnostic=inexact_luau_integer_literal entity=4\n" },
+        .{ "luau/fixtures/evaluator_gap_c2_number_sum_less_wide_literal.lifter-ir.json", "evaluator-gap-c2.refused.lifter-ir.json", "diagnostic=inexact_luau_integer_literal entity=4\n" },
+        .{ "luau/fixtures/evaluator_gap_c3_all_number_typed_equal_wide.lifter-ir.json", "evaluator-gap-c3.refused.lifter-ir.json", "diagnostic=inexact_luau_integer_literal entity=4\n" },
+        .{ "luau/fixtures/evaluator_gap_c6_number_typed_literal_beyond_2p53.lifter-ir.json", "evaluator-gap-c6.refused.lifter-ir.json", "diagnostic=inexact_luau_integer_literal entity=1\n" },
+    }) |arm| {
+        const refusal = b.addRunArtifact(exe);
+        if (z3_enabled) refusal.addPathDir(b.pathFromRoot(z3_bin));
+        refusal.addArg("resolve-ir");
+        refusal.addFileArg(b.path(arm[0]));
+        _ = refusal.addOutputFileArg(arm[1]);
+        refusal.addArg("internal");
+        refusal.expectExitCode(1);
+        refusal.expectStdErrMatch(arm[2]);
+        conformance_step.dependOn(&refusal.step);
+    }
     conformance_step.dependOn(&nested_reresolve_audit.step);
     const paired_claim_relevant_uncovered_fact_resolve = b.addRunArtifact(exe);
     if (z3_enabled) paired_claim_relevant_uncovered_fact_resolve.addPathDir(b.pathFromRoot(z3_bin));

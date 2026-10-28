@@ -138,6 +138,12 @@ fn writeStringBytes(writer: anytype, bytes: []const u8) !void {
 pub const Literal = union(enum) {
     nil_value: void,
     boolean: bool,
+    /// A canonical signed decimal. Under `source_semantics = .luau` it lies within -2^53 to 2^53 in every
+    /// admission profile (`inexact_luau_integer_literal` otherwise) and denotes that integer, which is also
+    /// its Luau double. A wider finite value is a `number` literal and an infinite one a `special_number`.
+    /// It is a Luau number, never Luau's experimental `i`-suffixed `integer` type, which the IR does not
+    /// represent. Solver-term `integer_literal` and `bit_vector_literal` are mathematical constants, and
+    /// this bound does not apply to them.
     integer: []const u8,
     number: f64,
     special_number: SpecialNumber,

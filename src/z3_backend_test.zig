@@ -1791,7 +1791,7 @@ test "Z3 never proves an integer fact Luau doubles refute: definition wide liter
         program.solver_terms = &terms;
         var report = try lifter.validate.validate(std.testing.allocator, &program, .core);
         defer report.deinit();
-        try std.testing.expect(report.isClean());
+        try std.testing.expect(report.contains(.inexact_luau_integer_literal));
         var result = try defaultBackend().solve(std.testing.allocator, &program, query);
         defer result.deinit(std.testing.allocator);
         try std.testing.expect(result.resolution != .proved);
