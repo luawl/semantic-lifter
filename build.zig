@@ -1384,6 +1384,47 @@ pub fn build(b: *std.Build) void {
         "source-frontend-repeat-header-exit-while-tail-direct-locals",
         "direct-locals-luau",
     );
+    const source_frontend_fusion_pack_chain_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/fusion_pack_chain_source.luau",
+        "source-frontend-fusion-pack-chain",
+    );
+    const source_frontend_fusion_pack_chain_direct_locals_conformance = addLuauSourceConformanceForTarget(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/fusion_pack_chain_source.luau",
+        "source-frontend-fusion-pack-chain-direct-locals",
+        "direct-locals-luau",
+    );
+    const source_frontend_fusion_two_tostring_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/fusion_two_tostring_source.luau",
+        "source-frontend-fusion-two-tostring",
+    );
+    const source_frontend_fusion_no_open_pack_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/fusion_no_open_pack_source.luau",
+        "source-frontend-fusion-no-open-pack",
+    );
+    const source_frontend_fusion_place_read_call_conformance = addLuauSourceConformance(
+        b,
+        exe,
+        z3_enabled,
+        z3_bin,
+        "luau/fixtures/fusion_place_read_call_source.luau",
+        "source-frontend-fusion-place-read-call",
+    );
     const source_frontend_typed_block_conformance = addLuauSourceConformance(
         b,
         exe,
@@ -2531,6 +2572,11 @@ pub fn build(b: *std.Build) void {
     source_frontend_repeat_header_exit_nested_direct_locals_conformance.addTo(conformance_step);
     source_frontend_repeat_header_exit_while_tail_conformance.addTo(conformance_step);
     source_frontend_repeat_header_exit_while_tail_direct_locals_conformance.addTo(conformance_step);
+    source_frontend_fusion_pack_chain_conformance.addTo(conformance_step);
+    source_frontend_fusion_pack_chain_direct_locals_conformance.addTo(conformance_step);
+    source_frontend_fusion_two_tostring_conformance.addTo(conformance_step);
+    source_frontend_fusion_no_open_pack_conformance.addTo(conformance_step);
+    source_frontend_fusion_place_read_call_conformance.addTo(conformance_step);
     source_frontend_typed_block_conformance.addTo(conformance_step);
     source_frontend_numeric_for_conformance.addTo(conformance_step);
     source_frontend_generic_for_conformance.addTo(conformance_step);

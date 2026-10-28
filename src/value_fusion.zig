@@ -310,11 +310,15 @@ fn gapOperandAtConsumer(
         };
         if (!validId(consumer_id, program.instructions.len) or !validId(consumer_id, consumers.len)) return null;
         const consumer = program.instructions[consumer_id.index()];
-        const result = producerResult(program, packs, dead, place_writes, place_reads, consumer) orelse return null;
-        gap = .{
-            .operand = .{ .value = result },
-            .consumer = consumers[consumer_id.index()] orelse return null,
-        };
+        if (producerResult(program, packs, dead, place_writes, place_reads, consumer)) |result| {
+            gap = .{
+                .operand = .{ .value = result },
+                .consumer = consumers[consumer_id.index()] orelse return null,
+            };
+        } else {
+            const pack_gap = fusedPackGap(program, packs, consumer) orelse return null;
+            gap = .{ .operand = .{ .pack = pack_gap.pack }, .consumer = pack_gap.consumer };
+        }
     }
     return null;
 }

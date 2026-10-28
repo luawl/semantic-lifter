@@ -636,3 +636,195 @@ test "compound RHS fusion follows Luau RHS-before-target-read order" {
     try std.testing.expectEqual(Consumer{ .instruction = binary_id }, read_first_fused.consumer(rhs_id).?);
     try std.testing.expect(compound_update.matchPlace(&program, &read_first_dead, &read_first_writes, &read_first_reads, instructions[binary_id.index()], instructions[write_id.index()]) == null);
 }
+
+test "effectful producers cross a fused open pack at a later hop of the gap walk" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const block_id = ir.BlockId.fromIndex(0);
+
+    // `h(t(g()), x)` with `x` called first: the gap chain `g()`, `t(...)` reaches `h` at an earlier operand than
+    // `x`, so `x` would run after both calls if it fused, and it stays a local.
+    {
+        const x_call = ir.InstructionId.fromIndex(0);
+        const g_call = ir.InstructionId.fromIndex(1);
+        const t_call = ir.InstructionId.fromIndex(2);
+        const h_call = ir.InstructionId.fromIndex(3);
+        const ph = ir.ValueId.fromIndex(0);
+        const pt = ir.ValueId.fromIndex(1);
+        const pg = ir.ValueId.fromIndex(2);
+        const px = ir.ValueId.fromIndex(3);
+        const x = ir.ValueId.fromIndex(4);
+        const t = ir.ValueId.fromIndex(5);
+        const result = ir.ValueId.fromIndex(6);
+        const g_pack = ir.ValuePackId.fromIndex(0);
+        const values = [_]ir.Value{
+            .{ .id = ph, .function = function_id, .type = .function, .origin = .{ .parameter = 0 } },
+            .{ .id = pt, .function = function_id, .type = .function, .origin = .{ .parameter = 1 } },
+            .{ .id = pg, .function = function_id, .type = .function, .origin = .{ .parameter = 2 } },
+            .{ .id = px, .function = function_id, .type = .function, .origin = .{ .parameter = 3 } },
+            .{ .id = x, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = x_call, .index = 0 } } },
+            .{ .id = t, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = t_call, .index = 0 } } },
+            .{ .id = result, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = h_call, .index = 0 } } },
+        };
+        const value_packs = [_]ir.ValuePack{
+            .{ .id = g_pack, .function = function_id, .origin = .{ .instruction_result = g_call } },
+        };
+        const instructions = [_]ir.Instruction{
+            .{ .id = x_call, .block = block_id, .operation = .{ .call = .{ .callee = px, .arguments = &.{}, .result_arity = .{ .fixed = 1 } } }, .results = &.{x}, .effects = .dynamic_call },
+            .{ .id = g_call, .block = block_id, .operation = .{ .call = .{ .callee = pg, .arguments = &.{}, .result_arity = .{ .variadic = {} } } }, .results = &.{}, .pack_result = g_pack, .effects = .dynamic_call },
+            .{ .id = t_call, .block = block_id, .operation = .{ .call = .{ .callee = pt, .arguments = &.{}, .argument_pack = g_pack, .result_arity = .{ .fixed = 1 } } }, .results = &.{t}, .effects = .dynamic_call },
+            .{ .id = h_call, .block = block_id, .operation = .{ .call = .{ .callee = ph, .arguments = &.{ t, x }, .result_arity = .{ .fixed = 1 } } }, .results = &.{result}, .effects = .dynamic_call },
+        };
+        const blocks = [_]ir.Block{.{
+            .id = block_id,
+            .function = function_id,
+            .instructions = &.{ x_call, g_call, t_call, h_call },
+            .terminator = .{ .return_values = &.{result} },
+        }};
+        const functions = [_]ir.Function{.{
+            .id = function_id,
+            .parameters = &.{ ph, pt, pg, px },
+            .blocks = &.{block_id},
+            .entry_block = block_id,
+        }};
+        const program: ir.Program = .{
+            .program_id = "value-fusion-pack-chain-operand-order",
+            .entry_function = function_id,
+            .functions = &functions,
+            .blocks = &blocks,
+            .instructions = &instructions,
+            .values = &values,
+            .value_packs = &value_packs,
+        };
+
+        var plan = try planForTest(std.testing.allocator, &program);
+        defer plan.deinit();
+        try std.testing.expect(plan.consumer(x_call) == null);
+    }
+
+    // `h(f(k(g())), x)` with `x` called first: the gap walk passes the fused open pack of `k(...)` and reaches `h`
+    // at `f`'s operand, which comes before `x`, so `x` still stays a local.
+    {
+        const x_call = ir.InstructionId.fromIndex(0);
+        const g_call = ir.InstructionId.fromIndex(1);
+        const k_call = ir.InstructionId.fromIndex(2);
+        const f_call = ir.InstructionId.fromIndex(3);
+        const h_call = ir.InstructionId.fromIndex(4);
+        const ph = ir.ValueId.fromIndex(0);
+        const pf = ir.ValueId.fromIndex(1);
+        const pk = ir.ValueId.fromIndex(2);
+        const pg = ir.ValueId.fromIndex(3);
+        const px = ir.ValueId.fromIndex(4);
+        const x = ir.ValueId.fromIndex(5);
+        const f = ir.ValueId.fromIndex(6);
+        const result = ir.ValueId.fromIndex(7);
+        const g_pack = ir.ValuePackId.fromIndex(0);
+        const k_pack = ir.ValuePackId.fromIndex(1);
+        const values = [_]ir.Value{
+            .{ .id = ph, .function = function_id, .type = .function, .origin = .{ .parameter = 0 } },
+            .{ .id = pf, .function = function_id, .type = .function, .origin = .{ .parameter = 1 } },
+            .{ .id = pk, .function = function_id, .type = .function, .origin = .{ .parameter = 2 } },
+            .{ .id = pg, .function = function_id, .type = .function, .origin = .{ .parameter = 3 } },
+            .{ .id = px, .function = function_id, .type = .function, .origin = .{ .parameter = 4 } },
+            .{ .id = x, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = x_call, .index = 0 } } },
+            .{ .id = f, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = f_call, .index = 0 } } },
+            .{ .id = result, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = h_call, .index = 0 } } },
+        };
+        const value_packs = [_]ir.ValuePack{
+            .{ .id = g_pack, .function = function_id, .origin = .{ .instruction_result = g_call } },
+            .{ .id = k_pack, .function = function_id, .origin = .{ .instruction_result = k_call } },
+        };
+        const instructions = [_]ir.Instruction{
+            .{ .id = x_call, .block = block_id, .operation = .{ .call = .{ .callee = px, .arguments = &.{}, .result_arity = .{ .fixed = 1 } } }, .results = &.{x}, .effects = .dynamic_call },
+            .{ .id = g_call, .block = block_id, .operation = .{ .call = .{ .callee = pg, .arguments = &.{}, .result_arity = .{ .variadic = {} } } }, .results = &.{}, .pack_result = g_pack, .effects = .dynamic_call },
+            .{ .id = k_call, .block = block_id, .operation = .{ .call = .{ .callee = pk, .arguments = &.{}, .argument_pack = g_pack, .result_arity = .{ .variadic = {} } } }, .results = &.{}, .pack_result = k_pack, .effects = .dynamic_call },
+            .{ .id = f_call, .block = block_id, .operation = .{ .call = .{ .callee = pf, .arguments = &.{}, .argument_pack = k_pack, .result_arity = .{ .fixed = 1 } } }, .results = &.{f}, .effects = .dynamic_call },
+            .{ .id = h_call, .block = block_id, .operation = .{ .call = .{ .callee = ph, .arguments = &.{ f, x }, .result_arity = .{ .fixed = 1 } } }, .results = &.{result}, .effects = .dynamic_call },
+        };
+        const blocks = [_]ir.Block{.{
+            .id = block_id,
+            .function = function_id,
+            .instructions = &.{ x_call, g_call, k_call, f_call, h_call },
+            .terminator = .{ .return_values = &.{result} },
+        }};
+        const functions = [_]ir.Function{.{
+            .id = function_id,
+            .parameters = &.{ ph, pf, pk, pg, px },
+            .blocks = &.{block_id},
+            .entry_block = block_id,
+        }};
+        const program: ir.Program = .{
+            .program_id = "value-fusion-later-pack-hop-operand-order",
+            .entry_function = function_id,
+            .functions = &functions,
+            .blocks = &blocks,
+            .instructions = &instructions,
+            .values = &values,
+            .value_packs = &value_packs,
+        };
+
+        var plan = try planForTest(std.testing.allocator, &program);
+        defer plan.deinit();
+        try std.testing.expect(plan.consumer(x_call) == null);
+    }
+
+    // `callee(inner_callee())` where `callee` and `inner_callee` come from two calls in that order: the gap
+    // `inner_callee`'s call fuses into the open-pack call `inner`, whose pack fuses into `outer`. Luau evaluates the
+    // callee before the arguments, so the walk continues through the pack at its second hop and `callee` fuses.
+    {
+        const producer = ir.InstructionId.fromIndex(0);
+        const gap = ir.InstructionId.fromIndex(1);
+        const inner = ir.InstructionId.fromIndex(2);
+        const outer = ir.InstructionId.fromIndex(3);
+        const p0 = ir.ValueId.fromIndex(0);
+        const p1 = ir.ValueId.fromIndex(1);
+        const callee = ir.ValueId.fromIndex(2);
+        const inner_callee = ir.ValueId.fromIndex(3);
+        const result = ir.ValueId.fromIndex(4);
+        const inner_pack = ir.ValuePackId.fromIndex(0);
+        const values = [_]ir.Value{
+            .{ .id = p0, .function = function_id, .type = .function, .origin = .{ .parameter = 0 } },
+            .{ .id = p1, .function = function_id, .type = .function, .origin = .{ .parameter = 1 } },
+            .{ .id = callee, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = producer, .index = 0 } } },
+            .{ .id = inner_callee, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = gap, .index = 0 } } },
+            .{ .id = result, .function = function_id, .origin = .{ .instruction_result = .{ .instruction = outer, .index = 0 } } },
+        };
+        const value_packs = [_]ir.ValuePack{
+            .{ .id = inner_pack, .function = function_id, .origin = .{ .instruction_result = inner } },
+        };
+        const instructions = [_]ir.Instruction{
+            .{ .id = producer, .block = block_id, .operation = .{ .call = .{ .callee = p0, .arguments = &.{}, .result_arity = .{ .fixed = 1 } } }, .results = &.{callee}, .effects = .dynamic_call },
+            .{ .id = gap, .block = block_id, .operation = .{ .call = .{ .callee = p1, .arguments = &.{}, .result_arity = .{ .fixed = 1 } } }, .results = &.{inner_callee}, .effects = .dynamic_call },
+            .{ .id = inner, .block = block_id, .operation = .{ .call = .{ .callee = inner_callee, .arguments = &.{}, .result_arity = .{ .variadic = {} } } }, .results = &.{}, .pack_result = inner_pack, .effects = .dynamic_call },
+            .{ .id = outer, .block = block_id, .operation = .{ .call = .{ .callee = callee, .arguments = &.{}, .argument_pack = inner_pack, .result_arity = .{ .fixed = 1 } } }, .results = &.{result}, .effects = .dynamic_call },
+        };
+        const blocks = [_]ir.Block{.{
+            .id = block_id,
+            .function = function_id,
+            .instructions = &.{ producer, gap, inner, outer },
+            .terminator = .{ .return_values = &.{result} },
+        }};
+        const functions = [_]ir.Function{.{
+            .id = function_id,
+            .parameters = &.{ p0, p1 },
+            .blocks = &.{block_id},
+            .entry_block = block_id,
+        }};
+        const program: ir.Program = .{
+            .program_id = "value-fusion-later-pack-hop",
+            .entry_function = function_id,
+            .functions = &functions,
+            .blocks = &blocks,
+            .instructions = &instructions,
+            .values = &values,
+            .value_packs = &value_packs,
+        };
+
+        var packs = try pack_plan.Plan.init(std.testing.allocator, &program);
+        defer packs.deinit();
+        try std.testing.expectEqual(pack_plan.InstructionRole{ .fused_invocation_producer = outer }, packs.role(inner));
+        var plan = try planForTest(std.testing.allocator, &program);
+        defer plan.deinit();
+        try std.testing.expectEqual(@as(?Consumer, Consumer{ .instruction = inner }), plan.consumer(gap));
+        try std.testing.expectEqual(@as(?Consumer, Consumer{ .instruction = outer }), plan.consumer(producer));
+    }
+}

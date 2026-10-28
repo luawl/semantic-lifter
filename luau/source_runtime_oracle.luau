@@ -594,6 +594,51 @@ function SourceRuntimeOracle.run(caseName: string, source: string, exported: any
 				"a generic-for initializer read only by its header lost its fusion, or one read outside it kept it"
 			)
 		end
+
+	elseif
+		caseName == "source-frontend-fusion-pack-chain"
+		or caseName == "source-frontend-fusion-pack-chain-direct-locals"
+	then
+		assert(
+			string.find(source, "sink(tostring(math.floor(x)))", 1, true) ~= nil,
+			"a producer did not fuse through a fused open pack at a later hop"
+		)
+		assert(string.find(source, "local tostring_", 1, true) == nil, "a global read stayed a local before a fused open-pack chain")
+		local received: any = nil
+		exported(function(value: any)
+			received = value
+		end, 3.7)
+		assert(received == "3", "a fused open-pack chain changed its value")
+	elseif caseName == "source-frontend-fusion-two-tostring" then
+		assert(
+			string.find(source, "sink(tostring(a), tostring(b))", 1, true) ~= nil,
+			"a producer did not fuse past an open last argument"
+		)
+		local received: any = nil
+		exported(function(...: any)
+			received = table.pack(...)
+		end, 1, 2)
+		assert(received.n == 2 and received[1] == "1" and received[2] == "2", "a fused open last argument changed its values")
+	elseif caseName == "source-frontend-fusion-no-open-pack" then
+		assert(
+			string.find(source, "sink(tostring(math.floor(x) + 0), 1)", 1, true) ~= nil,
+			"a fusion chain without an open pack changed"
+		)
+		local received: any = nil
+		exported(function(...: any)
+			received = table.pack(...)
+		end, 3.7)
+		assert(received.n == 2 and received[1] == "3" and received[2] == 1, "a fusion chain without an open pack changed its values")
+	elseif caseName == "source-frontend-fusion-place-read-call" then
+		assert(
+			string.find(source, "local count_%d+ = count") ~= nil,
+			"a place read before a call that writes the place did not stay a local"
+		)
+		local received: any = nil
+		local final = exported(function(...: any)
+			received = table.pack(...)
+		end)
+		assert(received.n == 2 and received[1] == 1 and received[2] == 0 and final == 11, "a place read before a call changed its value")
 	elseif caseName == "source-frontend-typed-block" then
 		assert(exported(7) == 7, "source frontend changed typed block runtime behavior")
 	elseif caseName == "source-frontend-numeric-for" then
