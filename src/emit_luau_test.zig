@@ -4301,3 +4301,325 @@ test "a flagged side exit's side region declares no flag of the loop exit its ar
     }
     try std.testing.expectEqual(@as(usize, 1), nested_declarations);
 }
+
+/// A worker whose loop allocates `cell` on every pass (the place's origin is the pass's own write of the value
+/// `next_value` returns), hands `record` a closure that captures it, and, when `read_after` holds, returns `cell`
+/// after the loop. The IR gives every pass a fresh cell, so each recorded closure keeps its own pass's value.
+fn capturedLoopCellModule(comptime read_after: bool) type {
+    return struct {
+        const proof = ir.EvidenceId.fromIndex(0);
+        const entry_function = ir.FunctionId.fromIndex(0);
+        const worker_function = ir.FunctionId.fromIndex(1);
+        const getter_function = ir.FunctionId.fromIndex(2);
+        const entry_block = ir.BlockId.fromIndex(0);
+        const worker_entry = ir.BlockId.fromIndex(1);
+        const loop_header = ir.BlockId.fromIndex(2);
+        const loop_body = ir.BlockId.fromIndex(3);
+        const loop_exit = ir.BlockId.fromIndex(4);
+        const getter_block = ir.BlockId.fromIndex(5);
+        const export_id = ir.InstructionId.fromIndex(0);
+        const next_id = ir.InstructionId.fromIndex(1);
+        const allocate_id = ir.InstructionId.fromIndex(2);
+        const closure_id = ir.InstructionId.fromIndex(3);
+        const record_id = ir.InstructionId.fromIndex(4);
+        const get_id = ir.InstructionId.fromIndex(5);
+        const read_after_id = ir.InstructionId.fromIndex(6);
+        const exported_worker = ir.ValueId.fromIndex(0);
+        const next_callback = ir.ValueId.fromIndex(1);
+        const record_callback = ir.ValueId.fromIndex(2);
+        const continue_loop = ir.ValueId.fromIndex(3);
+        const iteration = ir.ValueId.fromIndex(4);
+        const getter = ir.ValueId.fromIndex(5);
+        const captured_value = ir.ValueId.fromIndex(6);
+        const last_cell = ir.ValueId.fromIndex(7);
+        const cell = ir.PlaceId.fromIndex(0);
+        const captured_cell = ir.PlaceId.fromIndex(1);
+        const capture = ir.CaptureId.fromIndex(0);
+
+        const all_values = [_]ir.Value{
+            .{ .id = exported_worker, .function = entry_function, .type = .function, .name_hint = "worker", .origin = .{ .instruction_result = .{ .instruction = export_id, .index = 0 } } },
+            .{ .id = next_callback, .function = worker_function, .type = .function, .name_hint = "next_value", .origin = .{ .parameter = 0 } },
+            .{ .id = record_callback, .function = worker_function, .type = .function, .name_hint = "record", .origin = .{ .parameter = 1 } },
+            .{ .id = continue_loop, .function = worker_function, .type = .boolean, .name_hint = "continue_loop", .origin = .{ .instruction_result = .{ .instruction = next_id, .index = 0 } } },
+            .{ .id = iteration, .function = worker_function, .type = .integer, .name_hint = "iteration", .origin = .{ .instruction_result = .{ .instruction = next_id, .index = 1 } } },
+            .{ .id = getter, .function = worker_function, .type = .function, .name_hint = "getter", .origin = .{ .instruction_result = .{ .instruction = closure_id, .index = 0 } } },
+            .{ .id = captured_value, .function = getter_function, .type = .integer, .name_hint = "captured_value", .origin = .{ .instruction_result = .{ .instruction = get_id, .index = 0 } } },
+            .{ .id = last_cell, .function = worker_function, .type = .integer, .name_hint = "last_cell", .origin = .{ .instruction_result = .{ .instruction = read_after_id, .index = 0 } } },
+        };
+        const places = [_]ir.Place{
+            .{ .id = cell, .function = worker_function, .type = .integer, .name_hint = "cell", .origin = .{ .instruction = allocate_id }, .evidence = &.{proof} },
+            .{ .id = captured_cell, .function = getter_function, .type = .integer, .name_hint = "captured_cell", .origin = .{ .capture = capture }, .evidence = &.{proof} },
+        };
+        const captures = [_]ir.Capture{.{
+            .id = capture,
+            .function = getter_function,
+            .kind = .{ .shared_place = captured_cell },
+            .evidence = &.{proof},
+        }};
+        const all_instructions = [_]ir.Instruction{
+            .{ .id = export_id, .block = entry_block, .operation = .{ .function_ref = worker_function }, .results = &.{exported_worker}, .effects = .pure, .evidence = &.{proof} },
+            .{ .id = next_id, .block = loop_body, .operation = .{ .call = .{ .callee = next_callback, .arguments = &.{}, .result_arity = .{ .fixed = 2 } } }, .results = &.{ continue_loop, iteration }, .effects = .dynamic_call, .evidence = &.{proof} },
+            .{ .id = allocate_id, .block = loop_body, .operation = .{ .place_write = .{ .place = cell, .value = iteration } }, .results = &.{}, .effects = .place_write, .evidence = &.{proof} },
+            .{ .id = closure_id, .block = loop_body, .operation = .{ .make_closure = .{ .function = getter_function, .bindings = &.{.{ .place = cell }} } }, .results = &.{getter}, .effects = .pure, .evidence = &.{proof} },
+            .{ .id = record_id, .block = loop_body, .operation = .{ .call = .{ .callee = record_callback, .arguments = &.{getter}, .result_arity = .{ .fixed = 0 } } }, .results = &.{}, .effects = .dynamic_call, .evidence = &.{proof} },
+            .{ .id = get_id, .block = getter_block, .operation = .{ .place_read = captured_cell }, .results = &.{captured_value}, .effects = .place_read, .evidence = &.{proof} },
+            .{ .id = read_after_id, .block = loop_exit, .operation = .{ .place_read = cell }, .results = &.{last_cell}, .effects = .place_read, .evidence = &.{proof} },
+        };
+        const blocks = [_]ir.Block{
+            .{ .id = entry_block, .function = entry_function, .instructions = &.{export_id}, .terminator = .{ .return_values = &.{exported_worker} }, .evidence = &.{proof} },
+            .{ .id = worker_entry, .function = worker_function, .terminator = .{ .jump = .{ .target = loop_header } }, .evidence = &.{proof} },
+            .{ .id = loop_header, .function = worker_function, .terminator = .{ .jump = .{ .target = loop_body } }, .evidence = &.{proof} },
+            .{ .id = loop_body, .function = worker_function, .instructions = &.{ next_id, allocate_id, closure_id, record_id }, .terminator = .{ .branch = .{
+                .condition = continue_loop,
+                .then_edge = .{ .target = loop_header },
+                .else_edge = .{ .target = loop_exit },
+            } }, .evidence = &.{proof} },
+            .{ .id = loop_exit, .function = worker_function, .instructions = if (read_after) &.{read_after_id} else &.{}, .terminator = .{ .return_values = if (read_after) &.{last_cell} else &.{} }, .evidence = &.{proof} },
+            .{ .id = getter_block, .function = getter_function, .instructions = &.{get_id}, .terminator = .{ .return_values = &.{captured_value} }, .evidence = &.{proof} },
+        };
+        const functions = [_]ir.Function{
+            .{ .id = entry_function, .name_hint = "chunk", .blocks = &.{entry_block}, .entry_block = entry_block, .evidence = &.{proof} },
+            .{ .id = worker_function, .name_hint = "worker", .parameters = &.{ next_callback, record_callback }, .local_places = &.{cell}, .blocks = &.{ worker_entry, loop_header, loop_body, loop_exit }, .entry_block = worker_entry, .evidence = &.{proof} },
+            .{ .id = getter_function, .name_hint = "getter", .lexical_parent = worker_function, .captures = &.{capture}, .blocks = &.{getter_block}, .entry_block = getter_block, .evidence = &.{proof} },
+        };
+        const evidence = [_]ir.Evidence{.{ .id = proof, .kind = .dynamic_fixture, .locator = "fixture:captured-loop-cell" }};
+        const program: ir.Program = .{
+            .program_id = "captured-loop-cell",
+            .entry_function = entry_function,
+            .functions = &functions,
+            .blocks = &blocks,
+            .instructions = all_instructions[0..if (read_after) all_instructions.len else all_instructions.len - 1],
+            .values = all_values[0..if (read_after) all_values.len else all_values.len - 1],
+            .places = &places,
+            .captures = &captures,
+            .evidence = &evidence,
+        };
+    };
+}
+
+test "a closure-captured loop cell read after its loop keeps one cell per pass" {
+    const module = capturedLoopCellModule(true);
+    const source = try emitAlloc(std.testing.allocator, &module.program);
+    defer std.testing.allocator.free(source);
+    errdefer std.debug.print("{s}\n", .{source});
+    // Each pass's write declares its cell or fills a fresh box; an assignment to one local declared before the loop
+    // would hand every recorded closure the last pass's cell.
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    while (lines.next()) |line| {
+        try std.testing.expect(!std.mem.eql(u8, std.mem.trimStart(u8, line, " "), "cell = iteration"));
+    }
+    try std.testing.expect(std.mem.indexOf(u8, source, "cell = { iteration }") != null);
+}
+
+test "a closure-captured loop cell used only inside its loop is declared at its write" {
+    const module = capturedLoopCellModule(false);
+    const source = try emitAlloc(std.testing.allocator, &module.program);
+    defer std.testing.allocator.free(source);
+    errdefer std.debug.print("{s}\n", .{source});
+    try std.testing.expect(std.mem.indexOf(u8, source, "local __lifter_pc") == null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "local cell = iteration\n") != null);
+}
+
+/// A worker whose loop allocates `cell` on every pass (the place's origin is the pass's own write of the value
+/// `next_value` returns) and makes the closure that captures it only after that loop, hands the closure to `record`
+/// and returns `cell` after its last loop. With `nested` false the allocating loop is the worker's only loop, so the
+/// closure is made once, after the last pass. With `nested` true the allocating loop is the inner loop of an outer
+/// loop that runs while `record` returns true, so a closure is made in every outer pass, each over that pass's cell.
+fn capturedCellAfterLoopModule(comptime nested: bool) type {
+    return struct {
+        const proof = ir.EvidenceId.fromIndex(0);
+        const entry_function = ir.FunctionId.fromIndex(0);
+        const worker_function = ir.FunctionId.fromIndex(1);
+        const getter_function = ir.FunctionId.fromIndex(2);
+        const entry_block = ir.BlockId.fromIndex(0);
+        const worker_entry = ir.BlockId.fromIndex(1);
+        const loop_header = ir.BlockId.fromIndex(2);
+        const loop_body = ir.BlockId.fromIndex(3);
+        const after_loop = ir.BlockId.fromIndex(4);
+        const worker_exit = ir.BlockId.fromIndex(5);
+        const getter_block = ir.BlockId.fromIndex(6);
+        const export_id = ir.InstructionId.fromIndex(0);
+        const next_id = ir.InstructionId.fromIndex(1);
+        const allocate_id = ir.InstructionId.fromIndex(2);
+        const closure_id = ir.InstructionId.fromIndex(3);
+        const record_id = ir.InstructionId.fromIndex(4);
+        const get_id = ir.InstructionId.fromIndex(5);
+        const read_after_id = ir.InstructionId.fromIndex(6);
+        const exported_worker = ir.ValueId.fromIndex(0);
+        const next_callback = ir.ValueId.fromIndex(1);
+        const record_callback = ir.ValueId.fromIndex(2);
+        const continue_loop = ir.ValueId.fromIndex(3);
+        const iteration = ir.ValueId.fromIndex(4);
+        const getter = ir.ValueId.fromIndex(5);
+        const continue_outer = ir.ValueId.fromIndex(6);
+        const captured_value = ir.ValueId.fromIndex(7);
+        const last_cell = ir.ValueId.fromIndex(8);
+        const cell = ir.PlaceId.fromIndex(0);
+        const captured_cell = ir.PlaceId.fromIndex(1);
+        const capture = ir.CaptureId.fromIndex(0);
+
+        const values = [_]ir.Value{
+            .{ .id = exported_worker, .function = entry_function, .type = .function, .name_hint = "worker", .origin = .{ .instruction_result = .{ .instruction = export_id, .index = 0 } } },
+            .{ .id = next_callback, .function = worker_function, .type = .function, .name_hint = "next_value", .origin = .{ .parameter = 0 } },
+            .{ .id = record_callback, .function = worker_function, .type = .function, .name_hint = "record", .origin = .{ .parameter = 1 } },
+            .{ .id = continue_loop, .function = worker_function, .type = .boolean, .name_hint = "continue_loop", .origin = .{ .instruction_result = .{ .instruction = next_id, .index = 0 } } },
+            .{ .id = iteration, .function = worker_function, .type = .integer, .name_hint = "iteration", .origin = .{ .instruction_result = .{ .instruction = next_id, .index = 1 } } },
+            .{ .id = getter, .function = worker_function, .type = .function, .name_hint = "getter", .origin = .{ .instruction_result = .{ .instruction = closure_id, .index = 0 } } },
+            .{ .id = continue_outer, .function = worker_function, .type = .boolean, .name_hint = "continue_outer", .origin = .{ .instruction_result = .{ .instruction = record_id, .index = 0 } } },
+            .{ .id = captured_value, .function = getter_function, .type = .integer, .name_hint = "captured_value", .origin = .{ .instruction_result = .{ .instruction = get_id, .index = 0 } } },
+            .{ .id = last_cell, .function = worker_function, .type = .integer, .name_hint = "last_cell", .origin = .{ .instruction_result = .{ .instruction = read_after_id, .index = 0 } } },
+        };
+        const places = [_]ir.Place{
+            .{ .id = cell, .function = worker_function, .type = .integer, .name_hint = "cell", .origin = .{ .instruction = allocate_id }, .evidence = &.{proof} },
+            .{ .id = captured_cell, .function = getter_function, .type = .integer, .name_hint = "captured_cell", .origin = .{ .capture = capture }, .evidence = &.{proof} },
+        };
+        const captures = [_]ir.Capture{.{
+            .id = capture,
+            .function = getter_function,
+            .kind = .{ .shared_place = captured_cell },
+            .evidence = &.{proof},
+        }};
+        const instructions = [_]ir.Instruction{
+            .{ .id = export_id, .block = entry_block, .operation = .{ .function_ref = worker_function }, .results = &.{exported_worker}, .effects = .pure, .evidence = &.{proof} },
+            .{ .id = next_id, .block = loop_body, .operation = .{ .call = .{ .callee = next_callback, .arguments = &.{}, .result_arity = .{ .fixed = 2 } } }, .results = &.{ continue_loop, iteration }, .effects = .dynamic_call, .evidence = &.{proof} },
+            .{ .id = allocate_id, .block = loop_body, .operation = .{ .place_write = .{ .place = cell, .value = iteration } }, .results = &.{}, .effects = .place_write, .evidence = &.{proof} },
+            .{ .id = closure_id, .block = after_loop, .operation = .{ .make_closure = .{ .function = getter_function, .bindings = &.{.{ .place = cell }} } }, .results = &.{getter}, .effects = .pure, .evidence = &.{proof} },
+            .{ .id = record_id, .block = after_loop, .operation = .{ .call = .{ .callee = record_callback, .arguments = &.{getter}, .result_arity = .{ .fixed = 1 } } }, .results = &.{continue_outer}, .effects = .dynamic_call, .evidence = &.{proof} },
+            .{ .id = get_id, .block = getter_block, .operation = .{ .place_read = captured_cell }, .results = &.{captured_value}, .effects = .place_read, .evidence = &.{proof} },
+            .{ .id = read_after_id, .block = worker_exit, .operation = .{ .place_read = cell }, .results = &.{last_cell}, .effects = .place_read, .evidence = &.{proof} },
+        };
+        // The allocating loop: the body loops to itself as the inner loop of an outer loop headed by `loop_header`,
+        // or back to `loop_header` as the worker's only loop.
+        const loop_back = if (nested) loop_body else loop_header;
+        const after_terminator: ir.Terminator = if (nested) .{ .branch = .{
+            .condition = continue_outer,
+            .then_edge = .{ .target = loop_header },
+            .else_edge = .{ .target = worker_exit },
+        } } else .{ .jump = .{ .target = worker_exit } };
+        const blocks = [_]ir.Block{
+            .{ .id = entry_block, .function = entry_function, .instructions = &.{export_id}, .terminator = .{ .return_values = &.{exported_worker} }, .evidence = &.{proof} },
+            .{ .id = worker_entry, .function = worker_function, .terminator = .{ .jump = .{ .target = loop_header } }, .evidence = &.{proof} },
+            .{ .id = loop_header, .function = worker_function, .terminator = .{ .jump = .{ .target = loop_body } }, .evidence = &.{proof} },
+            .{ .id = loop_body, .function = worker_function, .instructions = &.{ next_id, allocate_id }, .terminator = .{ .branch = .{
+                .condition = continue_loop,
+                .then_edge = .{ .target = loop_back },
+                .else_edge = .{ .target = after_loop },
+            } }, .evidence = &.{proof} },
+            .{ .id = after_loop, .function = worker_function, .instructions = &.{ closure_id, record_id }, .terminator = after_terminator, .evidence = &.{proof} },
+            .{ .id = worker_exit, .function = worker_function, .instructions = &.{read_after_id}, .terminator = .{ .return_values = &.{last_cell} }, .evidence = &.{proof} },
+            .{ .id = getter_block, .function = getter_function, .instructions = &.{get_id}, .terminator = .{ .return_values = &.{captured_value} }, .evidence = &.{proof} },
+        };
+        const functions = [_]ir.Function{
+            .{ .id = entry_function, .name_hint = "chunk", .blocks = &.{entry_block}, .entry_block = entry_block, .evidence = &.{proof} },
+            .{ .id = worker_function, .name_hint = "worker", .parameters = &.{ next_callback, record_callback }, .local_places = &.{cell}, .blocks = &.{ worker_entry, loop_header, loop_body, after_loop, worker_exit }, .entry_block = worker_entry, .evidence = &.{proof} },
+            .{ .id = getter_function, .name_hint = "getter", .lexical_parent = worker_function, .captures = &.{capture}, .blocks = &.{getter_block}, .entry_block = getter_block, .evidence = &.{proof} },
+        };
+        const evidence = [_]ir.Evidence{.{ .id = proof, .kind = .dynamic_fixture, .locator = "fixture:captured-cell-after-loop" }};
+        const program: ir.Program = .{
+            .program_id = "captured-cell-after-loop",
+            .entry_function = entry_function,
+            .functions = &functions,
+            .blocks = &blocks,
+            .instructions = &instructions,
+            .values = &values,
+            .places = &places,
+            .captures = &captures,
+            .evidence = &evidence,
+        };
+    };
+}
+
+test "a loop cell whose closure is made only after its loop keeps the structured layout" {
+    const module = capturedCellAfterLoopModule(false);
+    const source = try emitAlloc(std.testing.allocator, &module.program);
+    defer std.testing.allocator.free(source);
+    errdefer std.debug.print("{s}\n", .{source});
+    // The closure is made once, after the last pass, so the one local the loop assigns holds the cell it captures.
+    try std.testing.expect(std.mem.indexOf(u8, source, "local __lifter_pc") == null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "cell = { iteration }") == null);
+}
+
+test "a loop cell captured after an inner loop inside an outer loop keeps one cell per pass" {
+    const module = capturedCellAfterLoopModule(true);
+    const source = try emitAlloc(std.testing.allocator, &module.program);
+    defer std.testing.allocator.free(source);
+    errdefer std.debug.print("{s}\n", .{source});
+    // A closure is made in every outer pass, after the inner loop; an assignment to one local declared before the
+    // outer loop would hand every recorded closure the last outer pass's cell.
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    while (lines.next()) |line| {
+        try std.testing.expect(!std.mem.eql(u8, std.mem.trimStart(u8, line, " "), "cell = iteration"));
+    }
+    try std.testing.expect(std.mem.indexOf(u8, source, "cell = { iteration }") != null);
+}
+
+/// A function that writes `state` and returns it, and a block no edge reaches that writes `unused` and returns it:
+/// the shape `resolve-ir` leaves when code follows a loop that only `return` leaves. Both places are in the
+/// function's `local_places`; the name plan names the places that the instructions of reachable blocks use, so
+/// `unused` has no name.
+const unreachable_block_place = struct {
+    const proof = ir.EvidenceId.fromIndex(0);
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const unreached = ir.BlockId.fromIndex(1);
+    const initial_id = ir.InstructionId.fromIndex(0);
+    const write_id = ir.InstructionId.fromIndex(1);
+    const read_id = ir.InstructionId.fromIndex(2);
+    const unused_initial_id = ir.InstructionId.fromIndex(3);
+    const unused_write_id = ir.InstructionId.fromIndex(4);
+    const unused_read_id = ir.InstructionId.fromIndex(5);
+    const initial = ir.ValueId.fromIndex(0);
+    const result = ir.ValueId.fromIndex(1);
+    const unused_initial = ir.ValueId.fromIndex(2);
+    const unused_result = ir.ValueId.fromIndex(3);
+    const state = ir.PlaceId.fromIndex(0);
+    const unused = ir.PlaceId.fromIndex(1);
+    const values = [_]ir.Value{
+        .{ .id = initial, .function = function_id, .type = .integer, .origin = .{ .instruction_result = .{ .instruction = initial_id, .index = 0 } } },
+        .{ .id = result, .function = function_id, .type = .integer, .name_hint = "result", .origin = .{ .instruction_result = .{ .instruction = read_id, .index = 0 } } },
+        .{ .id = unused_initial, .function = function_id, .type = .integer, .origin = .{ .instruction_result = .{ .instruction = unused_initial_id, .index = 0 } } },
+        .{ .id = unused_result, .function = function_id, .type = .integer, .origin = .{ .instruction_result = .{ .instruction = unused_read_id, .index = 0 } } },
+    };
+    const places = [_]ir.Place{
+        .{ .id = state, .function = function_id, .type = .integer, .name_hint = "state", .origin = .{ .local = 0 }, .evidence = &.{proof} },
+        .{ .id = unused, .function = function_id, .type = .integer, .name_hint = "unused", .origin = .{ .local = 1 }, .evidence = &.{proof} },
+    };
+    const instructions = [_]ir.Instruction{
+        .{ .id = initial_id, .block = entry, .operation = .{ .constant = .{ .integer = "7" } }, .results = &.{initial}, .effects = .pure, .evidence = &.{proof} },
+        .{ .id = write_id, .block = entry, .operation = .{ .place_write = .{ .place = state, .value = initial } }, .results = &.{}, .effects = .place_write, .evidence = &.{proof} },
+        .{ .id = read_id, .block = entry, .operation = .{ .place_read = state }, .results = &.{result}, .effects = .place_read, .evidence = &.{proof} },
+        .{ .id = unused_initial_id, .block = unreached, .operation = .{ .constant = .{ .integer = "0" } }, .results = &.{unused_initial}, .effects = .pure, .evidence = &.{proof} },
+        .{ .id = unused_write_id, .block = unreached, .operation = .{ .place_write = .{ .place = unused, .value = unused_initial } }, .results = &.{}, .effects = .place_write, .evidence = &.{proof} },
+        .{ .id = unused_read_id, .block = unreached, .operation = .{ .place_read = unused }, .results = &.{unused_result}, .effects = .place_read, .evidence = &.{proof} },
+    };
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .instructions = &.{ initial_id, write_id, read_id }, .terminator = .{ .return_values = &.{result} }, .evidence = &.{proof} },
+        .{ .id = unreached, .function = function_id, .instructions = &.{ unused_initial_id, unused_write_id, unused_read_id }, .terminator = .{ .return_values = &.{unused_result} }, .evidence = &.{proof} },
+    };
+    const functions = [_]ir.Function{.{ .id = function_id, .blocks = &.{ entry, unreached }, .entry_block = entry, .local_places = &.{ state, unused }, .evidence = &.{proof} }};
+    const evidence = [_]ir.Evidence{.{ .id = proof, .kind = .dynamic_fixture, .locator = "fixture:unreachable-block-place" }};
+    const program: ir.Program = .{
+        .program_id = "unreachable-block-place",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+        .places = &places,
+        .evidence = &evidence,
+    };
+};
+
+test "the dispatcher layout declares no place that only an unreachable block uses" {
+    const source = try lifter.emit_luau.emitAllocForTargetWithOptions(
+        std.testing.allocator,
+        &unreachable_block_place.program,
+        .standard_luau,
+        .{ .force_dispatcher = true },
+    );
+    defer std.testing.allocator.free(source);
+    errdefer std.debug.print("{s}\n", .{source});
+    try std.testing.expect(std.mem.indexOf(u8, source, "local __lifter_pc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "state") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "unused") == null);
+}

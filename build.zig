@@ -2633,6 +2633,21 @@ pub fn build(b: *std.Build) void {
     source_frontend_repeat_continue_queue_drain_parameter_test_conformance.addTo(conformance_step);
     source_frontend_repeat_continue_queue_drain_derived_local_conformance.addTo(conformance_step);
     conformance_step.dependOn(&side_exit_owned_escape_flag_runtime.step);
+    // Author-written source programs whose loop body declares a local the loop allocates on every pass and whose loop
+    // is left only by an arm that reads or writes that local, which the structured layout writes after the loop.
+    // Closures stored in earlier passes capture the local, so the text must keep one local per pass; the last program
+    // captures it in no closure. Each lifts, resolves, validates, emits and runs on both targets, and returns what its
+    // source returns on the 45-point worker grid.
+    const loop_local_exit_arm_sources = [_]struct { path: []const u8, name: []const u8 }{
+        .{ .path = "luau/fixtures/captured_loop_cell_exit_arm_source.luau", .name = "source-frontend-captured-loop-cell-exit-arm" },
+        .{ .path = "luau/fixtures/captured_loop_cell_repeat_exit_write_source.luau", .name = "source-frontend-captured-loop-cell-repeat-exit-write" },
+        .{ .path = "luau/fixtures/captured_loop_cell_generic_for_outer_source.luau", .name = "source-frontend-captured-loop-cell-generic-for-outer" },
+        .{ .path = "luau/fixtures/uncaptured_loop_local_exit_arm_source.luau", .name = "source-frontend-uncaptured-loop-local-exit-arm" },
+    };
+    for (loop_local_exit_arm_sources) |fixture| {
+        addLuauSourceConformanceForTarget(b, exe, z3_enabled, z3_bin, fixture.path, fixture.name, "standard-luau").addTo(conformance_step);
+        addLuauSourceConformanceForTarget(b, exe, z3_enabled, z3_bin, fixture.path, b.fmt("{s}-direct-locals", .{fixture.name}), "direct-locals-luau").addTo(conformance_step);
+    }
     // A post-tested loop whose body begins with an `if` and whose tail continues from two `elseif` arms before a
     // compound `until`: resolve-ir's query loop forwards one arm past an empty join that another entry still reaches,
     // and the final structure feedback then splits that join's own jump. Validation replays the forwarding record

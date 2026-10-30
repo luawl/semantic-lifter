@@ -486,7 +486,13 @@ fn emitFunctionBody(
         std.debug.print("emit function={} stage=root_declarations error={s}\n", .{ function.id.index(), @errorName(err) });
         return err;
     };
-    emitRegion(output, allocator, program, emission_plan, &scopes, plan.root, indent, place_aliases) catch |err| {
+    // A plan that would declare a closure-captured loop cell once for every pass is refused like a region it cannot
+    // write (`capturedCellSharedAcrossPasses`): the dispatcher layout below gives each pass its own cell.
+    const structured: (EmitError || std.mem.Allocator.Error)!void = if (scopes.capturedCellSharedAcrossPasses())
+        error.UnsupportedControlFlow
+    else
+        emitRegion(output, allocator, program, emission_plan, &scopes, plan.root, indent, place_aliases);
+    structured catch |err| {
         if (err == error.UnsupportedControlFlow) {
             output.items.len = body_start;
             // From here on the function is written in the dispatcher layout: its mark makes the emission entry
@@ -714,7 +720,10 @@ fn emitArbitraryCfgDeclarations(
         // once per activation; the allocating origin write reassigns it to a fresh box per execution.
         // Declared at its allocation, inside the allocating block's leaf.
         if (scopes.arbitraryLeafDeclaresPlace(place_id)) continue;
-        const name = emission_plan.names.place(place_id) orelse return error.UnsupportedOperation;
+        // The name plan names every place that an instruction of a reachable block uses, and this layout writes
+        // only reachable blocks: a place left unnamed is used only by unreachable code, which no statement writes,
+        // so it needs no declaration.
+        const name = emission_plan.names.place(place_id) orelse continue;
         if (scopes.placeMovedLiteralInitializer(place_id)) |literal| {
             try flushBareDeclarations(output, allocator, &bare_count);
             try output.appendSlice(allocator, indent);

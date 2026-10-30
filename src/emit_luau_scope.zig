@@ -439,6 +439,71 @@ pub const Plan = struct {
         return place_id.index() < self.arbitrary_per_execution_cell_places.len and self.arbitrary_per_execution_cell_places[place_id.index()];
     }
 
+    /// Structured layout: a closure-captured loop cell must stay one declaration per pass. An instruction-origin
+    /// place gets a fresh cell from every execution of its allocating write; its declaration scope is the common
+    /// ancestor of that write and its uses (`addPlaceUse`). When that scope encloses loops around the write, every
+    /// pass of those loops assigns one local declared before them, and a live `make_closure` of this function that
+    /// binds the place inside the outermost of them captures that one local in every pass. Whether some place of this
+    /// function is so: the writer then does not use this plan, and the dispatcher layout gives every execution of the
+    /// write a fresh cell (`findArbitraryLeafPlaces`). A closure made only after those loops captures the cell of
+    /// their last pass, which the one local holds.
+    pub fn capturedCellSharedAcrossPasses(self: *const Plan) bool {
+        if (self.arbitrary_cfg) return false;
+        for (self.function.local_places) |place_id| {
+            const loop = self.outermostLoopSharingDeclaration(place_id);
+            if (loop != invalid_scope and self.placeBoundByClosureInLoop(place_id, loop)) return true;
+        }
+        return false;
+    }
+
+    // The outermost loop node around an instruction-origin place's allocating write whose statement the place's
+    // declaration precedes, so that every pass of it assigns one local; invalid_scope when the write declares the
+    // place or the declaration lies inside the innermost loop around the write.
+    fn outermostLoopSharingDeclaration(self: *const Plan, place_id: ir.PlaceId) ScopeId {
+        if (place_id.index() >= self.program.places.len or place_id.index() >= self.place_scopes.len) return invalid_scope;
+        const allocation = switch (self.program.places[place_id.index()].origin) {
+            .instruction => |instruction_id| instruction_id,
+            .local, .capture => return invalid_scope,
+        };
+        if (allocation.index() >= self.program.instructions.len or allocation.index() >= self.instruction_scopes.len or
+            self.dead.contains(allocation)) return invalid_scope;
+        const place_scope = self.place_scopes[place_id.index()];
+        const allocation_scope = self.instruction_scopes[allocation.index()];
+        if (place_scope == invalid_scope or allocation_scope == invalid_scope or place_scope == allocation_scope) return invalid_scope;
+        var outermost: ScopeId = invalid_scope;
+        var loop = self.innermostLoopAround(allocation);
+        while (loop != invalid_scope and self.mergeScopes(place_scope, loop) == place_scope) : (loop = self.loop_hosts[loop]) {
+            outermost = loop;
+        }
+        return outermost;
+    }
+
+    // A `while` header runs once per pass in its loop node's own scope; any other instruction runs in the body of the
+    // loop its scope's host names.
+    fn innermostLoopAround(self: *const Plan, instruction_id: ir.InstructionId) ScopeId {
+        if (instruction_id.index() >= self.program.instructions.len or instruction_id.index() >= self.instruction_scopes.len) return invalid_scope;
+        const block_id = self.program.instructions[instruction_id.index()].block;
+        if (block_id.index() >= self.block_scopes.len) return invalid_scope;
+        if (self.loop_header_blocks[block_id.index()]) return self.block_scopes[block_id.index()];
+        const scope = self.instruction_scopes[instruction_id.index()];
+        return if (scope == invalid_scope) invalid_scope else self.loop_hosts[scope];
+    }
+
+    fn placeBoundByClosureInLoop(self: *const Plan, place_id: ir.PlaceId, loop: ScopeId) bool {
+        for (self.function.blocks) |block_id| {
+            if (block_id.index() >= self.program.blocks.len) continue;
+            for (self.program.blocks[block_id.index()].instructions) |instruction_id| {
+                if (instruction_id.index() >= self.program.instructions.len or self.dead.contains(instruction_id)) continue;
+                if (!closureBindsPlace(self.program.instructions[instruction_id.index()].operation, place_id)) continue;
+                var around = self.innermostLoopAround(instruction_id);
+                while (around != invalid_scope) : (around = self.loop_hosts[around]) {
+                    if (around == loop) return true;
+                }
+            }
+        }
+        return false;
+    }
+
     pub fn placeMovedLiteralInitializer(self: *const Plan, place_id: ir.PlaceId) ?ir.Literal {
         if (place_id.index() >= self.moved_literal_initializers.len) return null;
         return if (self.moved_literal_initializers[place_id.index()]) |initializer| initializer.literal else null;

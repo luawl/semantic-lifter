@@ -2072,6 +2072,96 @@ function SourceRuntimeOracle.run(caseName: string, source: string, exported: any
 			end
 		end
 	elseif
+		caseName == "source-frontend-captured-loop-cell-exit-arm"
+		or caseName == "source-frontend-captured-loop-cell-exit-arm-direct-locals"
+		or caseName == "source-frontend-captured-loop-cell-repeat-exit-write"
+		or caseName == "source-frontend-captured-loop-cell-repeat-exit-write-direct-locals"
+		or caseName == "source-frontend-captured-loop-cell-generic-for-outer"
+		or caseName == "source-frontend-captured-loop-cell-generic-for-outer-direct-locals"
+		or caseName == "source-frontend-uncaptured-loop-local-exit-arm"
+		or caseName == "source-frontend-uncaptured-loop-local-exit-arm-direct-locals"
+	then
+		-- A worker whose loop body declares a local that the loop allocates on every pass, in a loop left only by an arm
+		-- that reads or writes that local. Closures stored in earlier passes are called after the loop, so the worker
+		-- returns what its source returns on the 45-point grid only when each pass keeps its own local. The uncaptured
+		-- worker's local is read by no closure, so one local for every pass holds the same values; its text stays
+		-- structured (no dispatcher pc name; __lifter_pcall is the protected-call local, not the pc).
+		local program = string.gsub(caseName, "%-direct%-locals$", "")
+		if program == "source-frontend-uncaptured-loop-local-exit-arm" then
+			local _, pcNames = string.gsub(source, "__lifter_pc", "")
+			local _, pcallNames = string.gsub(source, "__lifter_pcall", "")
+			assert(
+				pcNames == pcallNames,
+				`{caseName} was written in the dispatcher layout ({pcNames - pcallNames} __lifter_pc names)`
+			)
+		end
+		local byProgram: { [string]: { string } } = {
+			["source-frontend-captured-loop-cell-exit-arm"] = {
+				"2,168,14", "3,1196,20", "5,58818,32", "5,58818,32", "4,8398,26",
+				"2,168,14", "3,1196,20", "5,58818,32", "5,58818,32", "4,8398,26",
+				"2,168,14", "3,1196,20", "5,58818,32", "5,58818,32", "4,8398,26",
+				"2,168,14", "3,1196,20", "5,58818,32", "5,58818,32", "4,8398,26",
+				"2,168,14", "3,1196,20", "5,58818,32", "5,58818,32", "4,8398,26",
+				"2,168,14", "3,1196,20", "5,58818,32", "5,58818,32", "4,8398,26",
+				"2,282,16", "2,282,16", "2,282,16", "2,282,16", "2,282,16",
+				"2,168,14", "3,1196,20", "5,58818,32", "5,58818,32", "4,8398,26",
+				"2,168,14", "3,1196,20", "5,58818,32", "5,58818,32", "4,8398,26",
+			},
+			["source-frontend-captured-loop-cell-repeat-exit-write"] = {
+				"4,8498", "4,8498", "4,8498", "4,19702", "4,19702",
+				"4,8498", "4,8498", "4,8498", "4,19702", "4,19702",
+				"4,8498", "4,8498", "4,8498", "4,19702", "4,19702",
+				"4,8498", "4,8498", "4,8498", "4,19702", "4,19702",
+				"4,8498", "4,8498", "4,8498", "4,19702", "4,19702",
+				"4,8498", "4,8498", "4,8498", "4,19702", "4,19702",
+				"2,382", "2,382", "2,382", "2,610", "2,610",
+				"4,8498", "4,8498", "4,8498", "4,19702", "4,19702",
+				"4,8498", "4,8498", "4,8498", "4,19702", "4,19702",
+			},
+			["source-frontend-captured-loop-cell-generic-for-outer"] = {
+				"3,2397596,23", "3,2397596,23", "3,2397596,23", "3,2397596,23", "3,2397596,23",
+				"3,2397596,23", "3,2397596,23", "3,2397596,23", "3,2397596,23", "3,2397596,23",
+				"3,2397596,23", "3,2397596,23", "3,2397596,23", "3,2397596,23", "3,2397596,23",
+				"3,2397596,23", "3,2397596,23", "3,2397596,23", "3,2397596,23", "3,2397596,23",
+				"3,2397596,23", "3,2397596,23", "3,2397596,23", "3,2397596,23", "3,2397596,23",
+				"3,2397596,23", "3,2397596,23", "3,2397596,23", "3,2397596,23", "3,2397596,23",
+				"1,958,11", "1,958,11", "1,958,11", "1,958,11", "1,958,11",
+				"3,2397596,23", "3,2397596,23", "3,2397596,23", "3,2397596,23", "3,2397596,23",
+				"3,2397596,23", "3,2397596,23", "3,2397596,23", "3,2397596,23", "3,2397596,23",
+			},
+			["source-frontend-uncaptured-loop-local-exit-arm"] = {
+				"2,84,14", "3,598,20", "5,29409,32", "5,29409,32", "4,4199,26",
+				"2,84,14", "3,598,20", "5,29409,32", "5,29409,32", "4,4199,26",
+				"2,84,14", "3,598,20", "5,29409,32", "5,29409,32", "4,4199,26",
+				"2,84,14", "3,598,20", "5,29409,32", "5,29409,32", "4,4199,26",
+				"2,84,14", "3,598,20", "5,29409,32", "5,29409,32", "4,4199,26",
+				"2,84,14", "3,598,20", "5,29409,32", "5,29409,32", "4,4199,26",
+				"2,141,16", "2,141,16", "2,141,16", "2,141,16", "2,141,16",
+				"2,84,14", "3,598,20", "5,29409,32", "5,29409,32", "4,4199,26",
+				"2,84,14", "3,598,20", "5,29409,32", "5,29409,32", "4,4199,26",
+			},
+		}
+		local want = byProgram[program]
+		local index = 0
+		for _, selector in { 0, 1, -2, 3, 2.5, "x", 4, 10, 11 } :: { any } do
+			for _, budget in { 0, 1, 3, 7, 10 } do
+				index += 1
+				local results = table.pack(pcall(exported, selector, budget))
+				local got = "error"
+				if results[1] then
+					local shown: { string } = {}
+					for position = 2, results.n do
+						table.insert(shown, tostring(results[position]))
+					end
+					got = table.concat(shown, ",")
+				end
+				assert(
+					got == want[index],
+					`{caseName} returned {got} for ({tostring(selector)}, {budget}), its source returns {want[index]}`
+				)
+			end
+		end
+	elseif
 		caseName == "source-frontend-empty-boundary-clone-continue"
 		or caseName == "source-frontend-empty-boundary-clone-continue-nonlocal"
 		or caseName == "source-frontend-empty-boundary-clone-continue-inner-loop"
