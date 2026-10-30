@@ -13995,3 +13995,22 @@ test "transparent collapse forwards the entry of an empty repeat body and keeps 
     try std.testing.expectEqual(body, rewrite_list.items[0].from.target);
     try std.testing.expectEqual(latch, rewrite_list.items[0].to.target);
 }
+
+// The worker of a repeat loop whose head runs an `if` and whose tail continues from two arms, as resolve-ir hands it to
+// the final declining normalization: the query loop forwarded edge 9.branch_else past the empty join 18 to block 19
+// (rewrite 6, before the feedback), while block 17 still enters 18. The feedback's split takes 18's jump to a clone
+// of 19, so rewrite 6 replays on the program the feedback returns only when validation reads 18's jump as the split
+// found it.
+test "admitted normalization returns no rewrite validation refuses after a split takes a forwarder's jump" {
+    const parsed = try std.json.parseFromSlice(ir.Program, std.testing.allocator, @embedFile("testdata/feedback_split_forwarder_jump.lifter-ir.json"), .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const work = arena.allocator();
+    try std.testing.expectEqual(@as(?usize, null), try validate_proofs.firstRefusedEdgeRewrite(work, &parsed.value, 0));
+    const admitted = try normalizeAdmittedWithScratchInArena(work, work, &parsed.value);
+    try std.testing.expectEqual(@as(?usize, null), try validate_proofs.firstRefusedEdgeRewrite(work, &admitted.program, 0));
+}

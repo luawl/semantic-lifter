@@ -370,6 +370,17 @@ fn validEdgeRewriteWithHistory(
         },
         .forwarding_jump => blk: {
             if (rewrite.certificate != null or !hasCanonicalRewritePrefix(program, rewrite, rewrite_index, null, history)) return false;
+            // A forwarding record whose source is its own forwarder rewrites an edge that leaves that block and
+            // enters it again. Replayed against the block as it is now, the record would certify a block that
+            // jumps to itself as a jump out of it. The history cannot show what that block held at the record,
+            // so the record is refused.
+            if (rewrite.source == rewrite.from.target) return false;
+            if (forwarderJumpAtRecord(program, rewrite, rewrite_index)) |at_record| break :blk at_record;
+            // Once a later rewrite has moved the forwarder's jump, the forwarder as it is now is not the block the record
+            // was made through. Its jump at the record is read above only for an empty, parameterless forwarder whose
+            // edges carry no arguments; any other such record is refused. With no later rewrite of that jump the
+            // forwarder is as it was at the record, so the replay below is exact.
+            if (jumpRewrittenAfter(program, rewrite.from.target, rewrite_index)) return false;
             break :blk try control_flow.replayForwardingJump(allocator, program, rewrite.from) orelse return false;
         },
         .node_split => blk: {
@@ -467,6 +478,40 @@ fn cloneFoldRenamedValuesAreDead(
         .source_packs = family.source_packs,
         .clone_packs = family.clone_packs,
     });
+}
+
+/// The jump an empty, parameterless forwarder had when a forwarding record through it was made, once a later rewrite
+/// has moved that jump (the structure feedback's node split taking it to a clone, for one): the `from` of the first
+/// later rewrite of the forwarder's own jump. Each rewrite of that jump is validated on its own and in order: it
+/// continues the previous one's `to`, it replays by its own rule, and the last one is the live edge. So that `from` is
+/// the jump the forwarder had at the record, and a forwarder that runs nothing and binds nothing lets the record's arm
+/// go there directly; the jump the forwarder has now says nothing about the record. Null when the forwarder has
+/// parameters or instructions, the record's edge or the later rewrite's `from` carries arguments, that `from` names the
+/// forwarder itself or no block, or no later rewrite moved the jump. The arm refuses a record on the forwarder's own
+/// jump before it asks.
+fn forwarderJumpAtRecord(program: *const ir.Program, rewrite: ir.CfgEdgeRewrite, rewrite_index: usize) ?ir.Edge {
+    if (rewrite_index >= program.edge_rewrites.len) return null;
+    const forwarder_id = rewrite.from.target;
+    if (rewrite.from.arguments.len != 0 or forwarder_id.index() >= program.blocks.len) return null;
+    const forwarder = program.blocks[forwarder_id.index()];
+    if (forwarder.id != forwarder_id or forwarder.parameters.len != 0 or forwarder.instructions.len != 0 or
+        forwarder.terminator != .jump) return null;
+    for (program.edge_rewrites[rewrite_index + 1 ..]) |later| {
+        if (later.source != forwarder_id or later.kind != .jump) continue;
+        if (later.from.arguments.len != 0 or later.from.target == forwarder_id or
+            later.from.target.index() >= program.blocks.len) return null;
+        return .{ .target = later.from.target };
+    }
+    return null;
+}
+
+/// Whether a rewrite after the one at `rewrite_index` moved the jump of `block`.
+fn jumpRewrittenAfter(program: *const ir.Program, block: ir.BlockId, rewrite_index: usize) bool {
+    if (rewrite_index >= program.edge_rewrites.len) return false;
+    for (program.edge_rewrites[rewrite_index + 1 ..]) |later| {
+        if (later.source == block and later.kind == .jump) return true;
+    }
+    return false;
 }
 
 fn validNodeSplitGroup(program: *const ir.Program, rewrite: ir.CfgEdgeRewrite, rewrite_index: usize) bool {
@@ -1721,4 +1766,549 @@ fn validEntity(program: *const ir.Program, entity: ir.EntityRef) bool {
 
 fn validId(id: anytype, length: usize) bool {
     return id.index() < length;
+}
+
+// The shape resolve-ir's final structure feedback leaves: the query loop forwarded the entry's then arm past the empty
+// forwarder 1 to block 2 (rewrite 0); block 1 is still entered by the else arm, and a later node split, the root of its
+// group, took block 1's jump from block 2 to block 2's clone, block 3 (rewrite 1). Rewrite 0 is replayed against the
+// jump block 1 had when it was made, which rewrite 1 names. A jump changed with no later rewrite leaves the record
+// replayed against the forwarder as it is, which refuses it; the jump a forwarder that takes a parameter had at the
+// record is not read once a later rewrite moved it, and a record on the forwarder's own jump is refused outright.
+test "a forwarding record replays through its forwarder's jump as a later split of that jump found it" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const forwarder = ir.BlockId.fromIndex(1);
+    const target = ir.BlockId.fromIndex(2);
+    const clone = ir.BlockId.fromIndex(3);
+    const exit = ir.BlockId.fromIndex(4);
+    const parameter = ir.ValueId.fromIndex(0);
+    const forwarder_parameter = ir.ValueId.fromIndex(1);
+    const evidence_id = ir.EvidenceId.fromIndex(0);
+    const base_blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = parameter,
+            .then_edge = .{ .target = target },
+            .else_edge = .{ .target = forwarder },
+        } }, .evidence = &.{evidence_id} },
+        .{ .id = forwarder, .function = function_id, .terminator = .{ .jump = .{ .target = clone } }, .evidence = &.{evidence_id} },
+        .{ .id = target, .function = function_id, .terminator = .{ .jump = .{ .target = exit } }, .evidence = &.{evidence_id} },
+        .{ .id = clone, .function = function_id, .terminator = .{ .jump = .{ .target = exit } }, .evidence = &.{evidence_id} },
+        .{ .id = exit, .function = function_id, .terminator = .{ .return_values = &.{} }, .evidence = &.{evidence_id} },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .parameters = &.{parameter},
+        .blocks = &.{ entry, forwarder, target, clone, exit },
+        .entry_block = entry,
+        .evidence = &.{evidence_id},
+    }};
+    const values = [_]ir.Value{
+        .{ .id = parameter, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = forwarder_parameter, .function = function_id, .type = .boolean, .origin = .{ .block_parameter = .{ .block = forwarder, .index = 0 } } },
+    };
+    const evidence = [_]ir.Evidence{.{ .id = evidence_id, .kind = .structural_derivation, .locator = "fixture:forwarder-history" }};
+    const forwarded: ir.CfgEdgeRewrite = .{
+        .id = ir.EdgeRewriteId.fromIndex(0),
+        .source = entry,
+        .kind = .branch_then,
+        .from = .{ .target = forwarder },
+        .to = .{ .target = target },
+        .rule = .forwarding_jump,
+    };
+    const split: ir.CfgEdgeRewrite = .{
+        .id = ir.EdgeRewriteId.fromIndex(1),
+        .source = forwarder,
+        .kind = .jump,
+        .from = .{ .target = target },
+        .to = .{ .target = clone },
+        .rule = .node_split,
+        .node_split_group = ir.NodeSplitGroupId.fromIndex(1),
+    };
+    const history = [_]ir.CfgEdgeRewrite{ forwarded, split };
+    var program: ir.Program = .{
+        .program_id = "forwarding-record-forwarder-history",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &base_blocks,
+        .instructions = &.{},
+        .values = &values,
+        .evidence = &evidence,
+        .edge_rewrites = &history,
+    };
+    try std.testing.expect(try validEdgeRewrite(std.testing.allocator, &program, split, 1));
+    try std.testing.expect(try validEdgeRewrite(std.testing.allocator, &program, forwarded, 0));
+    try std.testing.expectEqual(@as(?usize, null), try firstRefusedEdgeRewrite(std.testing.allocator, &program, 0));
+
+    // The forwarder's jump changed with no rewrite recording it: the record replays against the jump as it is.
+    program.edge_rewrites = &.{forwarded};
+    try std.testing.expect(!try validEdgeRewrite(std.testing.allocator, &program, forwarded, 0));
+
+    // The jump a forwarder that takes a parameter had at the record is not read, and rewrite 1 moved it: the record
+    // is refused.
+    var parameterized_blocks = base_blocks;
+    parameterized_blocks[forwarder.index()].parameters = &.{forwarder_parameter};
+    program.blocks = &parameterized_blocks;
+    program.edge_rewrites = &history;
+    try std.testing.expect(!try validEdgeRewrite(std.testing.allocator, &program, forwarded, 0));
+
+    // A record on the forwarder's own jump says the forwarder jumped to itself when the record was made: it is
+    // refused, whatever the later rewrites of that jump say.
+    const own_jump: ir.CfgEdgeRewrite = .{
+        .id = ir.EdgeRewriteId.fromIndex(0),
+        .source = forwarder,
+        .kind = .jump,
+        .from = .{ .target = forwarder },
+        .to = .{ .target = target },
+        .rule = .forwarding_jump,
+    };
+    const own_history = [_]ir.CfgEdgeRewrite{ own_jump, split };
+    program.blocks = &base_blocks;
+    program.edge_rewrites = &own_history;
+    try std.testing.expect(!try validEdgeRewrite(std.testing.allocator, &program, own_jump, 0));
+}
+
+// Once a later rewrite has changed a forwarder's jump, a forwarding record through it is replayed against the jump that
+// rewrite found, never against the jump the forwarder has now: each later rewrite of the jump is replayed on its own,
+// and the current jump says nothing about where the forwarder went when the record was made. A record that names the
+// forwarder's current jump, block 2's clone, is refused. So is a pair of empty blocks 1 and 2 that jump to each other, a
+// loop that never ends, whose records forward each block's jump through the other to the return block: replayed
+// against the jumps the blocks have now both records would hold, and the function would return where its recorded
+// original never does.
+test "a forwarding record is not replayed against its forwarder's current jump once a later rewrite changed that jump" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const forwarder = ir.BlockId.fromIndex(1);
+    const target = ir.BlockId.fromIndex(2);
+    const clone = ir.BlockId.fromIndex(3);
+    const exit = ir.BlockId.fromIndex(4);
+    const parameter = ir.ValueId.fromIndex(0);
+    const evidence_id = ir.EvidenceId.fromIndex(0);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = parameter,
+            .then_edge = .{ .target = clone },
+            .else_edge = .{ .target = forwarder },
+        } }, .evidence = &.{evidence_id} },
+        .{ .id = forwarder, .function = function_id, .terminator = .{ .jump = .{ .target = clone } }, .evidence = &.{evidence_id} },
+        .{ .id = target, .function = function_id, .terminator = .{ .jump = .{ .target = exit } }, .evidence = &.{evidence_id} },
+        .{ .id = clone, .function = function_id, .terminator = .{ .jump = .{ .target = exit } }, .evidence = &.{evidence_id} },
+        .{ .id = exit, .function = function_id, .terminator = .{ .return_values = &.{} }, .evidence = &.{evidence_id} },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .parameters = &.{parameter},
+        .blocks = &.{ entry, forwarder, target, clone, exit },
+        .entry_block = entry,
+        .evidence = &.{evidence_id},
+    }};
+    const values = [_]ir.Value{.{ .id = parameter, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } }};
+    const evidence = [_]ir.Evidence{.{ .id = evidence_id, .kind = .structural_derivation, .locator = "fixture:forwarder-current-jump" }};
+    const names_current: ir.CfgEdgeRewrite = .{
+        .id = ir.EdgeRewriteId.fromIndex(0),
+        .source = entry,
+        .kind = .branch_then,
+        .from = .{ .target = forwarder },
+        .to = .{ .target = clone },
+        .rule = .forwarding_jump,
+    };
+    const split: ir.CfgEdgeRewrite = .{
+        .id = ir.EdgeRewriteId.fromIndex(1),
+        .source = forwarder,
+        .kind = .jump,
+        .from = .{ .target = target },
+        .to = .{ .target = clone },
+        .rule = .node_split,
+        .node_split_group = ir.NodeSplitGroupId.fromIndex(1),
+    };
+    const history = [_]ir.CfgEdgeRewrite{ names_current, split };
+    var program: ir.Program = .{
+        .program_id = "forwarding-record-forwarder-current-jump",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+        .evidence = &evidence,
+        .edge_rewrites = &history,
+    };
+    try std.testing.expect(try validEdgeRewrite(std.testing.allocator, &program, split, 1));
+    try std.testing.expect(!try validEdgeRewrite(std.testing.allocator, &program, names_current, 0));
+    try std.testing.expectEqual(@as(?usize, 0), try firstRefusedEdgeRewrite(std.testing.allocator, &program, 0));
+
+    const first = ir.BlockId.fromIndex(1);
+    const second = ir.BlockId.fromIndex(2);
+    const out = ir.BlockId.fromIndex(3);
+    const cycle_blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = parameter,
+            .then_edge = .{ .target = first },
+            .else_edge = .{ .target = second },
+        } }, .evidence = &.{evidence_id} },
+        .{ .id = first, .function = function_id, .terminator = .{ .jump = .{ .target = out } }, .evidence = &.{evidence_id} },
+        .{ .id = second, .function = function_id, .terminator = .{ .jump = .{ .target = out } }, .evidence = &.{evidence_id} },
+        .{ .id = out, .function = function_id, .terminator = .{ .return_values = &.{} }, .evidence = &.{evidence_id} },
+    };
+    const cycle_functions = [_]ir.Function{.{
+        .id = function_id,
+        .parameters = &.{parameter},
+        .blocks = &.{ entry, first, second, out },
+        .entry_block = entry,
+        .evidence = &.{evidence_id},
+    }};
+    const cycle = [_]ir.CfgEdgeRewrite{
+        .{ .id = ir.EdgeRewriteId.fromIndex(0), .source = first, .kind = .jump, .from = .{ .target = second }, .to = .{ .target = out }, .rule = .forwarding_jump },
+        .{ .id = ir.EdgeRewriteId.fromIndex(1), .source = second, .kind = .jump, .from = .{ .target = first }, .to = .{ .target = out }, .rule = .forwarding_jump },
+    };
+    program.functions = &cycle_functions;
+    program.blocks = &cycle_blocks;
+    program.edge_rewrites = &cycle;
+    try std.testing.expect(try validEdgeRewrite(std.testing.allocator, &program, cycle[1], 1));
+    try std.testing.expectEqual(@as(?usize, 0), try firstRefusedEdgeRewrite(std.testing.allocator, &program, 0));
+}
+
+// A block that jumps to itself, a loop that never ends, forwarded out to the return block on its own jump. A record
+// whose source is its forwarder says the forwarder jumped to itself when the record was made, and no producer forwards
+// through such a block. Replayed against the block as it is now, the record would hold and the function would return
+// where the program the record was made on never does, so the record is refused.
+test "a forwarding record whose source is its own forwarder is refused" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const looping = ir.BlockId.fromIndex(1);
+    const exit = ir.BlockId.fromIndex(2);
+    const parameter = ir.ValueId.fromIndex(0);
+    const evidence_id = ir.EvidenceId.fromIndex(0);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = parameter,
+            .then_edge = .{ .target = looping },
+            .else_edge = .{ .target = exit },
+        } }, .evidence = &.{evidence_id} },
+        .{ .id = looping, .function = function_id, .terminator = .{ .jump = .{ .target = exit } }, .evidence = &.{evidence_id} },
+        .{ .id = exit, .function = function_id, .terminator = .{ .return_values = &.{} }, .evidence = &.{evidence_id} },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .parameters = &.{parameter},
+        .blocks = &.{ entry, looping, exit },
+        .entry_block = entry,
+        .evidence = &.{evidence_id},
+    }};
+    const values = [_]ir.Value{.{ .id = parameter, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } }};
+    const evidence = [_]ir.Evidence{.{ .id = evidence_id, .kind = .structural_derivation, .locator = "fixture:forwarder-own-jump" }};
+    const own_jump: ir.CfgEdgeRewrite = .{
+        .id = ir.EdgeRewriteId.fromIndex(0),
+        .source = looping,
+        .kind = .jump,
+        .from = .{ .target = looping },
+        .to = .{ .target = exit },
+        .rule = .forwarding_jump,
+    };
+    const program: ir.Program = .{
+        .program_id = "forwarding-record-own-jump",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+        .evidence = &evidence,
+        .edge_rewrites = &.{own_jump},
+    };
+    try std.testing.expect(!try validEdgeRewrite(std.testing.allocator, &program, own_jump, 0));
+    try std.testing.expectEqual(@as(?usize, 0), try firstRefusedEdgeRewrite(std.testing.allocator, &program, 0));
+}
+
+// Two blocks that jump to each other, a loop that never ends, the second running one copy: rewrite 0 forwards the first
+// block's jump through the second to the return block, and rewrite 1 forwards the second block's jump through the
+// first. When rewrite 0 was made the second block jumped to the first, which rewrite 1 records; replayed against the
+// second block as it is now, rewrite 0 would hold and the function would return where the program the records were
+// made on never does. The jump a forwarder that runs an instruction had at the record is not read, so a record through
+// it whose jump a later rewrite moved is refused; rewrite 1, whose forwarder's jump no later rewrite moved, replays
+// against its forwarder as it is.
+test "a forwarding record through a block that runs a copy is refused once a later rewrite moved that block's jump" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const first = ir.BlockId.fromIndex(1);
+    const second = ir.BlockId.fromIndex(2);
+    const exit = ir.BlockId.fromIndex(3);
+    const parameter = ir.ValueId.fromIndex(0);
+    const copied = ir.ValueId.fromIndex(1);
+    const copy_id = ir.InstructionId.fromIndex(0);
+    const evidence_id = ir.EvidenceId.fromIndex(0);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = parameter,
+            .then_edge = .{ .target = first },
+            .else_edge = .{ .target = second },
+        } }, .evidence = &.{evidence_id} },
+        .{ .id = first, .function = function_id, .terminator = .{ .jump = .{ .target = exit } }, .evidence = &.{evidence_id} },
+        .{ .id = second, .function = function_id, .instructions = &.{copy_id}, .terminator = .{ .jump = .{ .target = exit } }, .evidence = &.{evidence_id} },
+        .{ .id = exit, .function = function_id, .terminator = .{ .return_values = &.{} }, .evidence = &.{evidence_id} },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .parameters = &.{parameter},
+        .blocks = &.{ entry, first, second, exit },
+        .entry_block = entry,
+        .evidence = &.{evidence_id},
+    }};
+    const values = [_]ir.Value{
+        .{ .id = parameter, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = copied, .function = function_id, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = copy_id, .index = 0 } } },
+    };
+    const instructions = [_]ir.Instruction{.{
+        .id = copy_id,
+        .block = second,
+        .operation = .{ .copy = parameter },
+        .results = &.{copied},
+        .effects = .pure,
+        .evidence = &.{evidence_id},
+    }};
+    const evidence = [_]ir.Evidence{.{ .id = evidence_id, .kind = .structural_derivation, .locator = "fixture:forwarder-with-copy" }};
+    const cycle = [_]ir.CfgEdgeRewrite{
+        .{ .id = ir.EdgeRewriteId.fromIndex(0), .source = first, .kind = .jump, .from = .{ .target = second }, .to = .{ .target = exit }, .rule = .forwarding_jump },
+        .{ .id = ir.EdgeRewriteId.fromIndex(1), .source = second, .kind = .jump, .from = .{ .target = first }, .to = .{ .target = exit }, .rule = .forwarding_jump },
+    };
+    const program: ir.Program = .{
+        .program_id = "forwarding-record-forwarder-with-copy",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+        .evidence = &evidence,
+        .edge_rewrites = &cycle,
+    };
+    try std.testing.expect(!try validEdgeRewrite(std.testing.allocator, &program, cycle[0], 0));
+    try std.testing.expect(try validEdgeRewrite(std.testing.allocator, &program, cycle[1], 1));
+    try std.testing.expectEqual(@as(?usize, 0), try firstRefusedEdgeRewrite(std.testing.allocator, &program, 0));
+}
+
+// A block that jumps to itself and a block before it, both forwarded to the return block: rewrite 0 forwards the first
+// block's jump through the looping block, and rewrite 1 forwards the looping block's own jump. When rewrite 0 was made
+// the looping block jumped to itself, which rewrite 1 records. Rewrite 1 is refused as a record whose source is its
+// forwarder, and rewrite 0, whose forwarder's jump a later rewrite moved from an edge that names the forwarder itself,
+// is refused as well: that jump at the record is not read.
+test "a forwarding record through a block that jumped to itself is refused" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const before = ir.BlockId.fromIndex(1);
+    const looping = ir.BlockId.fromIndex(2);
+    const exit = ir.BlockId.fromIndex(3);
+    const parameter = ir.ValueId.fromIndex(0);
+    const evidence_id = ir.EvidenceId.fromIndex(0);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = parameter,
+            .then_edge = .{ .target = before },
+            .else_edge = .{ .target = exit },
+        } }, .evidence = &.{evidence_id} },
+        .{ .id = before, .function = function_id, .terminator = .{ .jump = .{ .target = exit } }, .evidence = &.{evidence_id} },
+        .{ .id = looping, .function = function_id, .terminator = .{ .jump = .{ .target = exit } }, .evidence = &.{evidence_id} },
+        .{ .id = exit, .function = function_id, .terminator = .{ .return_values = &.{} }, .evidence = &.{evidence_id} },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .parameters = &.{parameter},
+        .blocks = &.{ entry, before, looping, exit },
+        .entry_block = entry,
+        .evidence = &.{evidence_id},
+    }};
+    const values = [_]ir.Value{.{ .id = parameter, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } }};
+    const evidence = [_]ir.Evidence{.{ .id = evidence_id, .kind = .structural_derivation, .locator = "fixture:forwarder-jumped-to-itself" }};
+    const history = [_]ir.CfgEdgeRewrite{
+        .{ .id = ir.EdgeRewriteId.fromIndex(0), .source = before, .kind = .jump, .from = .{ .target = looping }, .to = .{ .target = exit }, .rule = .forwarding_jump },
+        .{ .id = ir.EdgeRewriteId.fromIndex(1), .source = looping, .kind = .jump, .from = .{ .target = looping }, .to = .{ .target = exit }, .rule = .forwarding_jump },
+    };
+    const program: ir.Program = .{
+        .program_id = "forwarding-record-forwarder-jumped-to-itself",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+        .evidence = &evidence,
+        .edge_rewrites = &history,
+    };
+    try std.testing.expect(!try validEdgeRewrite(std.testing.allocator, &program, history[1], 1));
+    try std.testing.expect(!try validEdgeRewrite(std.testing.allocator, &program, history[0], 0));
+    try std.testing.expectEqual(@as(?usize, 0), try firstRefusedEdgeRewrite(std.testing.allocator, &program, 0));
+}
+
+// Two blocks that jump to each other, the second taking a parameter that the first block's jump binds: rewrite 0
+// forwards the second block's jump through the first, empty and parameterless, to the return block, and rewrite 1
+// forwards the first block's jump through the second. When rewrite 0 was made the first block jumped to the second
+// with an argument, which rewrite 1 records; that jump at the record is not read, so rewrite 0 is refused, while
+// rewrite 1, whose forwarder's jump no later rewrite moved, replays against its forwarder as it is.
+test "a forwarding record is refused once a later rewrite moved its forwarder's jump from an edge with arguments" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const first = ir.BlockId.fromIndex(1);
+    const second = ir.BlockId.fromIndex(2);
+    const exit = ir.BlockId.fromIndex(3);
+    const parameter = ir.ValueId.fromIndex(0);
+    const second_parameter = ir.ValueId.fromIndex(1);
+    const evidence_id = ir.EvidenceId.fromIndex(0);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = parameter,
+            .then_edge = .{ .target = first },
+            .else_edge = .{ .target = second, .arguments = &.{parameter} },
+        } }, .evidence = &.{evidence_id} },
+        .{ .id = first, .function = function_id, .terminator = .{ .jump = .{ .target = exit } }, .evidence = &.{evidence_id} },
+        .{ .id = second, .function = function_id, .parameters = &.{second_parameter}, .terminator = .{ .jump = .{ .target = exit } }, .evidence = &.{evidence_id} },
+        .{ .id = exit, .function = function_id, .terminator = .{ .return_values = &.{} }, .evidence = &.{evidence_id} },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .parameters = &.{parameter},
+        .blocks = &.{ entry, first, second, exit },
+        .entry_block = entry,
+        .evidence = &.{evidence_id},
+    }};
+    const values = [_]ir.Value{
+        .{ .id = parameter, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = second_parameter, .function = function_id, .type = .boolean, .origin = .{ .block_parameter = .{ .block = second, .index = 0 } } },
+    };
+    const evidence = [_]ir.Evidence{.{ .id = evidence_id, .kind = .structural_derivation, .locator = "fixture:forwarder-jump-with-arguments" }};
+    const cycle = [_]ir.CfgEdgeRewrite{
+        .{ .id = ir.EdgeRewriteId.fromIndex(0), .source = second, .kind = .jump, .from = .{ .target = first }, .to = .{ .target = exit }, .rule = .forwarding_jump },
+        .{ .id = ir.EdgeRewriteId.fromIndex(1), .source = first, .kind = .jump, .from = .{ .target = second, .arguments = &.{parameter} }, .to = .{ .target = exit }, .rule = .forwarding_jump },
+    };
+    const program: ir.Program = .{
+        .program_id = "forwarding-record-forwarder-jump-with-arguments",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+        .evidence = &evidence,
+        .edge_rewrites = &cycle,
+    };
+    try std.testing.expect(!try validEdgeRewrite(std.testing.allocator, &program, cycle[0], 0));
+    try std.testing.expect(try validEdgeRewrite(std.testing.allocator, &program, cycle[1], 1));
+    try std.testing.expectEqual(@as(?usize, 0), try firstRefusedEdgeRewrite(std.testing.allocator, &program, 0));
+}
+
+// The first test's two records beside a loop of two blocks, the second running one copy, each forwarded through the
+// other to the return block (rewrites 2 and 3, the copy test's records). Rewrites 0 and 1 hold; rewrite 2, through the
+// block that runs a copy, whose jump rewrite 3 moved, is refused, so a program whose records say it loops once the
+// target is reached is not published as one that returns.
+test "a forwarding record replayed at its forwarder's jump does not admit a loop forwarded out through a block that runs a copy" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const forwarder = ir.BlockId.fromIndex(1);
+    const target = ir.BlockId.fromIndex(2);
+    const clone = ir.BlockId.fromIndex(3);
+    const first = ir.BlockId.fromIndex(4);
+    const second = ir.BlockId.fromIndex(5);
+    const exit = ir.BlockId.fromIndex(6);
+    const parameter = ir.ValueId.fromIndex(0);
+    const copied = ir.ValueId.fromIndex(1);
+    const copy_id = ir.InstructionId.fromIndex(0);
+    const evidence_id = ir.EvidenceId.fromIndex(0);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = parameter,
+            .then_edge = .{ .target = target },
+            .else_edge = .{ .target = forwarder },
+        } }, .evidence = &.{evidence_id} },
+        .{ .id = forwarder, .function = function_id, .terminator = .{ .jump = .{ .target = clone } }, .evidence = &.{evidence_id} },
+        .{ .id = target, .function = function_id, .terminator = .{ .jump = .{ .target = first } }, .evidence = &.{evidence_id} },
+        .{ .id = clone, .function = function_id, .terminator = .{ .jump = .{ .target = first } }, .evidence = &.{evidence_id} },
+        .{ .id = first, .function = function_id, .terminator = .{ .jump = .{ .target = exit } }, .evidence = &.{evidence_id} },
+        .{ .id = second, .function = function_id, .instructions = &.{copy_id}, .terminator = .{ .jump = .{ .target = exit } }, .evidence = &.{evidence_id} },
+        .{ .id = exit, .function = function_id, .terminator = .{ .return_values = &.{} }, .evidence = &.{evidence_id} },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .parameters = &.{parameter},
+        .blocks = &.{ entry, forwarder, target, clone, first, second, exit },
+        .entry_block = entry,
+        .evidence = &.{evidence_id},
+    }};
+    const values = [_]ir.Value{
+        .{ .id = parameter, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+        .{ .id = copied, .function = function_id, .type = .boolean, .origin = .{ .instruction_result = .{ .instruction = copy_id, .index = 0 } } },
+    };
+    const instructions = [_]ir.Instruction{.{
+        .id = copy_id,
+        .block = second,
+        .operation = .{ .copy = parameter },
+        .results = &.{copied},
+        .effects = .pure,
+        .evidence = &.{evidence_id},
+    }};
+    const evidence = [_]ir.Evidence{.{ .id = evidence_id, .kind = .structural_derivation, .locator = "fixture:forwarder-history-beside-copy-loop" }};
+    const history = [_]ir.CfgEdgeRewrite{
+        .{ .id = ir.EdgeRewriteId.fromIndex(0), .source = entry, .kind = .branch_then, .from = .{ .target = forwarder }, .to = .{ .target = target }, .rule = .forwarding_jump },
+        .{ .id = ir.EdgeRewriteId.fromIndex(1), .source = forwarder, .kind = .jump, .from = .{ .target = target }, .to = .{ .target = clone }, .rule = .node_split, .node_split_group = ir.NodeSplitGroupId.fromIndex(1) },
+        .{ .id = ir.EdgeRewriteId.fromIndex(2), .source = first, .kind = .jump, .from = .{ .target = second }, .to = .{ .target = exit }, .rule = .forwarding_jump },
+        .{ .id = ir.EdgeRewriteId.fromIndex(3), .source = second, .kind = .jump, .from = .{ .target = first }, .to = .{ .target = exit }, .rule = .forwarding_jump },
+    };
+    const program: ir.Program = .{
+        .program_id = "forwarding-record-history-beside-copy-loop",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &instructions,
+        .values = &values,
+        .evidence = &evidence,
+        .edge_rewrites = &history,
+    };
+    const refused = try firstRefusedEdgeRewrite(std.testing.allocator, &program, 0);
+    try std.testing.expect(refused != null);
+}
+
+// The first test's two records beside a block that jumps to itself, forwarded out to the return block on its own jump
+// (rewrite 2, the own-source test's record). Rewrites 0 and 1 hold; rewrite 2 is refused as a record whose source is
+// its forwarder, so a program whose records say it loops once the target is reached is not published as one that
+// returns.
+test "a forwarding record replayed at its forwarder's jump does not admit a block that jumps to itself forwarded out" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const entry = ir.BlockId.fromIndex(0);
+    const forwarder = ir.BlockId.fromIndex(1);
+    const target = ir.BlockId.fromIndex(2);
+    const clone = ir.BlockId.fromIndex(3);
+    const looping = ir.BlockId.fromIndex(4);
+    const exit = ir.BlockId.fromIndex(5);
+    const parameter = ir.ValueId.fromIndex(0);
+    const evidence_id = ir.EvidenceId.fromIndex(0);
+    const blocks = [_]ir.Block{
+        .{ .id = entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = parameter,
+            .then_edge = .{ .target = target },
+            .else_edge = .{ .target = forwarder },
+        } }, .evidence = &.{evidence_id} },
+        .{ .id = forwarder, .function = function_id, .terminator = .{ .jump = .{ .target = clone } }, .evidence = &.{evidence_id} },
+        .{ .id = target, .function = function_id, .terminator = .{ .jump = .{ .target = looping } }, .evidence = &.{evidence_id} },
+        .{ .id = clone, .function = function_id, .terminator = .{ .jump = .{ .target = looping } }, .evidence = &.{evidence_id} },
+        .{ .id = looping, .function = function_id, .terminator = .{ .jump = .{ .target = exit } }, .evidence = &.{evidence_id} },
+        .{ .id = exit, .function = function_id, .terminator = .{ .return_values = &.{} }, .evidence = &.{evidence_id} },
+    };
+    const functions = [_]ir.Function{.{
+        .id = function_id,
+        .parameters = &.{parameter},
+        .blocks = &.{ entry, forwarder, target, clone, looping, exit },
+        .entry_block = entry,
+        .evidence = &.{evidence_id},
+    }};
+    const values = [_]ir.Value{.{ .id = parameter, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } }};
+    const evidence = [_]ir.Evidence{.{ .id = evidence_id, .kind = .structural_derivation, .locator = "fixture:forwarder-history-beside-own-jump" }};
+    const history = [_]ir.CfgEdgeRewrite{
+        .{ .id = ir.EdgeRewriteId.fromIndex(0), .source = entry, .kind = .branch_then, .from = .{ .target = forwarder }, .to = .{ .target = target }, .rule = .forwarding_jump },
+        .{ .id = ir.EdgeRewriteId.fromIndex(1), .source = forwarder, .kind = .jump, .from = .{ .target = target }, .to = .{ .target = clone }, .rule = .node_split, .node_split_group = ir.NodeSplitGroupId.fromIndex(1) },
+        .{ .id = ir.EdgeRewriteId.fromIndex(2), .source = looping, .kind = .jump, .from = .{ .target = looping }, .to = .{ .target = exit }, .rule = .forwarding_jump },
+    };
+    const program: ir.Program = .{
+        .program_id = "forwarding-record-history-beside-own-jump",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+        .evidence = &evidence,
+        .edge_rewrites = &history,
+    };
+    const refused = try firstRefusedEdgeRewrite(std.testing.allocator, &program, 0);
+    try std.testing.expect(refused != null);
 }

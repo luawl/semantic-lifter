@@ -2633,6 +2633,13 @@ pub fn build(b: *std.Build) void {
     source_frontend_repeat_continue_queue_drain_parameter_test_conformance.addTo(conformance_step);
     source_frontend_repeat_continue_queue_drain_derived_local_conformance.addTo(conformance_step);
     conformance_step.dependOn(&side_exit_owned_escape_flag_runtime.step);
+    // A post-tested loop whose body begins with an `if` and whose tail continues from two `elseif` arms before a
+    // compound `until`: resolve-ir's query loop forwards one arm past an empty join that another entry still reaches,
+    // and the final structure feedback then splits that join's own jump. Validation replays the forwarding record
+    // against the join's jump as the split found it, so the worker lifts, resolves, validates and emits on both targets
+    // and returns what its source returns on its grid.
+    addLuauSourceConformanceForTarget(b, exe, z3_enabled, z3_bin, "luau/fixtures/repeat_head_if_two_arm_continue_source.luau", "source-frontend-repeat-head-if-two-arm-continue", "standard-luau").addTo(conformance_step);
+    addLuauSourceConformanceForTarget(b, exe, z3_enabled, z3_bin, "luau/fixtures/repeat_head_if_two_arm_continue_source.luau", "source-frontend-repeat-head-if-two-arm-continue-direct-locals", "direct-locals-luau").addTo(conformance_step);
     conformance_step.dependOn(repeat_loop_dispatcher);
     source_frontend_compound_conformance.addTo(conformance_step);
     source_frontend_if_expression_conformance.addTo(conformance_step);

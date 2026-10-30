@@ -2034,6 +2034,44 @@ function SourceRuntimeOracle.run(caseName: string, source: string, exported: any
 			end
 		end
 	elseif
+		caseName == "source-frontend-repeat-head-if-two-arm-continue"
+		or caseName == "source-frontend-repeat-head-if-two-arm-continue-direct-locals"
+	then
+		-- A post-tested loop whose body begins with an `if` on the selector and whose tail continues from two `elseif`
+		-- arms before a compound `until`. The worker returns what the source returns on 45 rows, an error where the
+		-- source raises one; the selectors include the head `if`'s 1000 and the budgets one above 1000. The layout is not
+		-- pinned.
+		local rows: { string } = {
+			"5", "5", "5", "1", "1",
+			"5", "5", "5", "1", "1",
+			"5", "5", "5", "1", "1",
+			"10", "10", "0", "0", "0",
+			"5", "5", "5", "1", "1",
+			"5", "5", "5", "1", "1",
+			"8", "8", "8", "4", "2",
+			"1001", "1001", "1001", "1001", "1001",
+			"5", "5", "5", "1", "1",
+		}
+		local row = 0
+		for _, selector in { 0, 1, -2, 3, 2.5, "x", 4, 1000, 11 } :: { any } do
+			for _, budget in { 0, 1, 3, 7, 1001 } do
+				row += 1
+				local packed = table.pack(pcall(exported, selector, budget))
+				local got = "error"
+				if packed[1] then
+					local parts: { string } = {}
+					for index = 2, packed.n do
+						table.insert(parts, tostring(packed[index]))
+					end
+					got = table.concat(parts, ",")
+				end
+				assert(
+					got == rows[row],
+					`{caseName} returned {got} for ({tostring(selector)}, {budget}), the source returns {rows[row]}`
+				)
+			end
+		end
+	elseif
 		caseName == "source-frontend-empty-boundary-clone-continue"
 		or caseName == "source-frontend-empty-boundary-clone-continue-nonlocal"
 		or caseName == "source-frontend-empty-boundary-clone-continue-inner-loop"
