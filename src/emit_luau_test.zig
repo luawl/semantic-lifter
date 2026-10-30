@@ -4623,3 +4623,367 @@ test "the dispatcher layout declares no place that only an unreachable block use
     try std.testing.expect(std.mem.indexOf(u8, source, "state") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "unused") == null);
 }
+
+/// A worker of three callbacks whose `repeat` loop takes the pass's value from `next_value`, hands `record` a closure
+/// that returns it and the value itself (two reads, so the value is a local declared at its instruction), and holds
+/// `filler` pure constants nothing reads (each a candidate value of the value-storage count; the dead-code plan drops
+/// them from the text); the latch leaves the loop when `keep_going` returns true. Past 120 candidate values the
+/// standard target keeps the worker's values in its storage table.
+fn storageLoopClosureModule(comptime filler: usize) type {
+    return struct {
+        const proof = ir.EvidenceId.fromIndex(0);
+        const chunk_function = ir.FunctionId.fromIndex(0);
+        const worker_function = ir.FunctionId.fromIndex(1);
+        const getter_function = ir.FunctionId.fromIndex(2);
+        const capture = ir.CaptureId.fromIndex(0);
+        const block = ir.BlockId.fromIndex;
+        const instruction = ir.InstructionId.fromIndex;
+        const value = ir.ValueId.fromIndex;
+        // Instructions: 0 the export, 1 next_value(), 2 the closure, 3 record(getter, iteration), 4 .. 3 + filler the
+        // constants, keep_going() in the latch. Values: 0 the export, 1-3 the parameters, 4 iteration, 5 getter, 6 keep,
+        // 7 the getter's captured value, 8 .. 7 + filler the constants.
+        const keep_id = instruction(4 + filler);
+
+        const values = list: {
+            @setEvalBranchQuota(20_000);
+            var all: [8 + filler]ir.Value = undefined;
+            all[0] = .{ .id = value(0), .function = chunk_function, .type = .function, .name_hint = "worker", .origin = .{ .instruction_result = .{ .instruction = instruction(0), .index = 0 } } };
+            all[1] = .{ .id = value(1), .function = worker_function, .type = .function, .name_hint = "next_value", .origin = .{ .parameter = 0 } };
+            all[2] = .{ .id = value(2), .function = worker_function, .type = .function, .name_hint = "record", .origin = .{ .parameter = 1 } };
+            all[3] = .{ .id = value(3), .function = worker_function, .type = .function, .name_hint = "keep_going", .origin = .{ .parameter = 2 } };
+            all[4] = .{ .id = value(4), .function = worker_function, .type = .integer, .name_hint = "iteration", .origin = .{ .instruction_result = .{ .instruction = instruction(1), .index = 0 } } };
+            all[5] = .{ .id = value(5), .function = worker_function, .type = .function, .name_hint = "getter", .origin = .{ .instruction_result = .{ .instruction = instruction(2), .index = 0 } } };
+            all[6] = .{ .id = value(6), .function = worker_function, .type = .boolean, .name_hint = "keep", .origin = .{ .instruction_result = .{ .instruction = keep_id, .index = 0 } } };
+            all[7] = .{ .id = value(7), .function = getter_function, .type = .integer, .name_hint = "captured_iteration", .origin = .{ .capture = capture } };
+            for (0..filler) |k| all[8 + k] = .{ .id = value(8 + k), .function = worker_function, .type = .integer, .origin = .{ .instruction_result = .{ .instruction = instruction(4 + k), .index = 0 } } };
+            break :list all;
+        };
+        const instructions = list: {
+            @setEvalBranchQuota(20_000);
+            var all: [5 + filler]ir.Instruction = undefined;
+            all[0] = .{ .id = instruction(0), .block = block(0), .operation = .{ .function_ref = worker_function }, .results = &.{value(0)}, .effects = .pure, .evidence = &.{proof} };
+            all[1] = .{ .id = instruction(1), .block = block(2), .operation = .{ .call = .{ .callee = value(1), .arguments = &.{}, .result_arity = .{ .fixed = 1 } } }, .results = &.{value(4)}, .effects = .dynamic_call, .evidence = &.{proof} };
+            all[2] = .{ .id = instruction(2), .block = block(2), .operation = .{ .make_closure = .{ .function = getter_function, .bindings = &.{.{ .value = value(4) }} } }, .results = &.{value(5)}, .effects = .pure, .evidence = &.{proof} };
+            all[3] = .{ .id = instruction(3), .block = block(2), .operation = .{ .call = .{ .callee = value(2), .arguments = &.{ value(5), value(4) }, .result_arity = .{ .fixed = 0 } } }, .results = &.{}, .effects = .dynamic_call, .evidence = &.{proof} };
+            for (0..filler) |k| all[4 + k] = .{ .id = instruction(4 + k), .block = block(2), .operation = .{ .constant = .{ .integer = "1" } }, .results = &.{value(8 + k)}, .effects = .pure, .evidence = &.{proof} };
+            all[4 + filler] = .{ .id = keep_id, .block = block(3), .operation = .{ .call = .{ .callee = value(3), .arguments = &.{}, .result_arity = .{ .fixed = 1 } } }, .results = &.{value(6)}, .effects = .dynamic_call, .evidence = &.{proof} };
+            break :list all;
+        };
+        const body_instructions = list: {
+            var ids: [3 + filler]ir.InstructionId = undefined;
+            for (&ids, 0..) |*id, k| id.* = instruction(1 + k);
+            break :list ids;
+        };
+        const blocks = [_]ir.Block{
+            .{ .id = block(0), .function = chunk_function, .instructions = &.{instruction(0)}, .terminator = .{ .return_values = &.{value(0)} }, .evidence = &.{proof} },
+            .{ .id = block(1), .function = worker_function, .terminator = .{ .jump = .{ .target = block(2) } }, .evidence = &.{proof} },
+            .{ .id = block(2), .function = worker_function, .instructions = &body_instructions, .terminator = .{ .jump = .{ .target = block(3) } }, .evidence = &.{proof} },
+            .{ .id = block(3), .function = worker_function, .instructions = &.{keep_id}, .terminator = .{ .branch = .{ .condition = value(6), .then_edge = .{ .target = block(4) }, .else_edge = .{ .target = block(2) } } }, .evidence = &.{proof} },
+            .{ .id = block(4), .function = worker_function, .terminator = .{ .return_values = &.{} }, .evidence = &.{proof} },
+            .{ .id = block(5), .function = getter_function, .terminator = .{ .return_values = &.{value(7)} }, .evidence = &.{proof} },
+        };
+        const functions = [_]ir.Function{
+            .{ .id = chunk_function, .name_hint = "chunk", .blocks = &.{block(0)}, .entry_block = block(0), .evidence = &.{proof} },
+            .{ .id = worker_function, .name_hint = "worker", .parameters = &.{ value(1), value(2), value(3) }, .blocks = &.{ block(1), block(2), block(3), block(4) }, .entry_block = block(1), .evidence = &.{proof} },
+            .{ .id = getter_function, .name_hint = "getter", .lexical_parent = worker_function, .captures = &.{capture}, .blocks = &.{block(5)}, .entry_block = block(5), .evidence = &.{proof} },
+        };
+        const captures = [_]ir.Capture{.{ .id = capture, .function = getter_function, .kind = .{ .immutable_value = value(7) }, .evidence = &.{proof} }};
+        const evidence = [_]ir.Evidence{.{ .id = proof, .kind = .dynamic_fixture, .locator = "fixture:storage-loop-closure" }};
+        const program: ir.Program = .{
+            .program_id = "storage-loop-closure",
+            .entry_function = chunk_function,
+            .functions = &functions,
+            .blocks = &blocks,
+            .instructions = &instructions,
+            .values = &values,
+            .captures = &captures,
+            .evidence = &evidence,
+        };
+    };
+}
+
+test "a closure made in a pass of a value-storage loop reads that pass's value, not its storage slot" {
+    const module = storageLoopClosureModule(120);
+    const source = try emitAlloc(std.testing.allocator, &module.program);
+    defer std.testing.allocator.free(source);
+    errdefer std.debug.print("{s}\n", .{source});
+    // Over 120 candidate values the worker's values live in its storage table; every pass writes the slot of
+    // `iteration` again, so a closure that read that slot when it is called would return the last pass's value.
+    try std.testing.expect(std.mem.indexOf(u8, source, "local __lifter_value_storage = {}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "local __lifter_pc") == null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "return __lifter_value_storage[") == null);
+}
+
+test "a closure made in a pass of a loop without value storage reads the pass's local" {
+    const module = storageLoopClosureModule(8);
+    const source = try emitAlloc(std.testing.allocator, &module.program);
+    defer std.testing.allocator.free(source);
+    errdefer std.debug.print("{s}\n", .{source});
+    try std.testing.expect(std.mem.indexOf(u8, source, "__lifter_value_storage") == null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "local __lifter_pc") == null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "local iteration = next_value()\n") != null);
+}
+
+/// A worker of two callbacks that takes `scale` from `make_scale`, makes `inner` (a function that returns `scale`) and
+/// hands `record` both (two reads, so `scale` is a local declared at its instruction). The worker holds
+/// `outer_filler` and `inner` holds `inner_filler` pure constants nothing reads (candidate values of the
+/// value-storage count, dropped from the text): past 120 each function gets a storage table.
+fn nestedStorageModule(comptime outer_filler: usize, comptime inner_filler: usize) type {
+    return struct {
+        const proof = ir.EvidenceId.fromIndex(0);
+        const chunk_function = ir.FunctionId.fromIndex(0);
+        const worker_function = ir.FunctionId.fromIndex(1);
+        const inner_function = ir.FunctionId.fromIndex(2);
+        const capture = ir.CaptureId.fromIndex(0);
+        const block = ir.BlockId.fromIndex;
+        const instruction = ir.InstructionId.fromIndex;
+        const value = ir.ValueId.fromIndex;
+        // Instructions: 0 the export, 1 make_scale(), 2 the closure, 3 record(inner, scale), 4 .. 3 + outer_filler the
+        // worker's constants, then inner_filler constants in `inner`. Values: 0 the export, 1-2 the parameters,
+        // 3 scale, 4 inner, 5 inner's captured scale, then the worker's and inner's constants.
+        const values = list: {
+            @setEvalBranchQuota(40_000);
+            var all: [6 + outer_filler + inner_filler]ir.Value = undefined;
+            all[0] = .{ .id = value(0), .function = chunk_function, .type = .function, .name_hint = "worker", .origin = .{ .instruction_result = .{ .instruction = instruction(0), .index = 0 } } };
+            all[1] = .{ .id = value(1), .function = worker_function, .type = .function, .name_hint = "make_scale", .origin = .{ .parameter = 0 } };
+            all[2] = .{ .id = value(2), .function = worker_function, .type = .function, .name_hint = "record", .origin = .{ .parameter = 1 } };
+            all[3] = .{ .id = value(3), .function = worker_function, .type = .integer, .name_hint = "scale", .origin = .{ .instruction_result = .{ .instruction = instruction(1), .index = 0 } } };
+            all[4] = .{ .id = value(4), .function = worker_function, .type = .function, .name_hint = "inner", .origin = .{ .instruction_result = .{ .instruction = instruction(2), .index = 0 } } };
+            all[5] = .{ .id = value(5), .function = inner_function, .type = .integer, .name_hint = "captured_scale", .origin = .{ .capture = capture } };
+            for (0..outer_filler) |k| all[6 + k] = .{ .id = value(6 + k), .function = worker_function, .type = .integer, .origin = .{ .instruction_result = .{ .instruction = instruction(4 + k), .index = 0 } } };
+            for (0..inner_filler) |k| all[6 + outer_filler + k] = .{ .id = value(6 + outer_filler + k), .function = inner_function, .type = .integer, .origin = .{ .instruction_result = .{ .instruction = instruction(4 + outer_filler + k), .index = 0 } } };
+            break :list all;
+        };
+        const instructions = list: {
+            @setEvalBranchQuota(40_000);
+            var all: [4 + outer_filler + inner_filler]ir.Instruction = undefined;
+            all[0] = .{ .id = instruction(0), .block = block(0), .operation = .{ .function_ref = worker_function }, .results = &.{value(0)}, .effects = .pure, .evidence = &.{proof} };
+            all[1] = .{ .id = instruction(1), .block = block(1), .operation = .{ .call = .{ .callee = value(1), .arguments = &.{}, .result_arity = .{ .fixed = 1 } } }, .results = &.{value(3)}, .effects = .dynamic_call, .evidence = &.{proof} };
+            all[2] = .{ .id = instruction(2), .block = block(1), .operation = .{ .make_closure = .{ .function = inner_function, .bindings = &.{.{ .value = value(3) }} } }, .results = &.{value(4)}, .effects = .pure, .evidence = &.{proof} };
+            all[3] = .{ .id = instruction(3), .block = block(1), .operation = .{ .call = .{ .callee = value(2), .arguments = &.{ value(4), value(3) }, .result_arity = .{ .fixed = 0 } } }, .results = &.{}, .effects = .dynamic_call, .evidence = &.{proof} };
+            for (0..outer_filler) |k| all[4 + k] = .{ .id = instruction(4 + k), .block = block(1), .operation = .{ .constant = .{ .integer = "1" } }, .results = &.{value(6 + k)}, .effects = .pure, .evidence = &.{proof} };
+            for (0..inner_filler) |k| all[4 + outer_filler + k] = .{ .id = instruction(4 + outer_filler + k), .block = block(2), .operation = .{ .constant = .{ .integer = "2" } }, .results = &.{value(6 + outer_filler + k)}, .effects = .pure, .evidence = &.{proof} };
+            break :list all;
+        };
+        const worker_instructions = list: {
+            var ids: [3 + outer_filler]ir.InstructionId = undefined;
+            for (&ids, 0..) |*id, k| id.* = instruction(1 + k);
+            break :list ids;
+        };
+        const inner_instructions = list: {
+            var ids: [inner_filler]ir.InstructionId = undefined;
+            for (&ids, 0..) |*id, k| id.* = instruction(4 + outer_filler + k);
+            break :list ids;
+        };
+        const blocks = [_]ir.Block{
+            .{ .id = block(0), .function = chunk_function, .instructions = &.{instruction(0)}, .terminator = .{ .return_values = &.{value(0)} }, .evidence = &.{proof} },
+            .{ .id = block(1), .function = worker_function, .instructions = &worker_instructions, .terminator = .{ .return_values = &.{} }, .evidence = &.{proof} },
+            .{ .id = block(2), .function = inner_function, .instructions = &inner_instructions, .terminator = .{ .return_values = &.{value(5)} }, .evidence = &.{proof} },
+        };
+        const functions = [_]ir.Function{
+            .{ .id = chunk_function, .name_hint = "chunk", .blocks = &.{block(0)}, .entry_block = block(0), .evidence = &.{proof} },
+            .{ .id = worker_function, .name_hint = "worker", .parameters = &.{ value(1), value(2) }, .blocks = &.{block(1)}, .entry_block = block(1), .evidence = &.{proof} },
+            .{ .id = inner_function, .name_hint = "inner", .lexical_parent = worker_function, .captures = &.{capture}, .blocks = &.{block(2)}, .entry_block = block(2), .evidence = &.{proof} },
+        };
+        const captures = [_]ir.Capture{.{ .id = capture, .function = inner_function, .kind = .{ .immutable_value = value(5) }, .evidence = &.{proof} }};
+        const evidence = [_]ir.Evidence{.{ .id = proof, .kind = .dynamic_fixture, .locator = "fixture:nested-storage" }};
+        const program: ir.Program = .{
+            .program_id = "nested-storage",
+            .entry_function = chunk_function,
+            .functions = &functions,
+            .blocks = &blocks,
+            .instructions = &instructions,
+            .values = &values,
+            .captures = &captures,
+            .evidence = &evidence,
+        };
+    };
+}
+
+test "a function nested in a value-storage function reads a captured value through no table it declares itself" {
+    const module = nestedStorageModule(121, 121);
+    const source = try emitAlloc(std.testing.allocator, &module.program);
+    defer std.testing.allocator.free(source);
+    errdefer std.debug.print("{s}\n", .{source});
+    // Both functions hold value storage, so each declares a table. Inside `inner`, `scale` (value 3) must not be read
+    // as slot 3 of the table `inner` declared itself: that table is empty, and the read would be nil. The worker's own
+    // reads of its slot 3 after `inner` are right, so only `inner`'s body is searched: from its header to the first
+    // `end` at the header line's indentation.
+    const outer_declaration = std.mem.indexOf(u8, source, "local __lifter_value_storage") orelse return error.TestUnexpectedResult;
+    const inner_header = std.mem.indexOfPos(u8, source, outer_declaration, "function()\n") orelse return error.TestUnexpectedResult;
+    const header_line = if (std.mem.lastIndexOfScalar(u8, source[0..inner_header], '\n')) |newline| newline + 1 else 0;
+    var indent_len: usize = 0;
+    while (source[header_line + indent_len] == ' ') indent_len += 1;
+    const closing = try std.fmt.allocPrint(std.testing.allocator, "\n{s}end", .{source[header_line .. header_line + indent_len]});
+    defer std.testing.allocator.free(closing);
+    const inner_end = std.mem.indexOfPos(u8, source, inner_header, closing) orelse return error.TestUnexpectedResult;
+    const inner_body = source[inner_header..inner_end];
+    const inner_declaration = std.mem.indexOf(u8, inner_body, "local __lifter_value_storage") orelse return error.TestUnexpectedResult;
+    const name_start = inner_declaration + "local ".len;
+    const name_end = std.mem.indexOfPos(u8, inner_body, name_start, " = {}") orelse return error.TestUnexpectedResult;
+    const slot = try std.fmt.allocPrint(std.testing.allocator, "{s}[3]", .{inner_body[name_start..name_end]});
+    defer std.testing.allocator.free(slot);
+    try std.testing.expect(std.mem.indexOfPos(u8, inner_body, name_end, slot) == null);
+}
+
+test "a function nested in a value-storage function without storage of its own declares no table" {
+    const module = nestedStorageModule(121, 8);
+    const source = try emitAlloc(std.testing.allocator, &module.program);
+    defer std.testing.allocator.free(source);
+    errdefer std.debug.print("{s}\n", .{source});
+    const outer_declaration = std.mem.indexOf(u8, source, "local __lifter_value_storage") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOfPos(u8, source, outer_declaration + 1, "local __lifter_value_storage") == null);
+}
+
+/// Where a closure's creating statement writes the closure, in `creatingStatementModule`.
+const CreatingStatementForm = enum { value, place, table, key };
+
+/// A worker `worker(seed, t, k)` that calls `seed` once and makes a closure that returns the call's result. The result
+/// has one use, the closure's capture, so `emitClosure` writes it as a copy, `local <captured> = seed()`, inside the
+/// `do` block that also holds the statement creating the closure; that statement's destination carries the result's
+/// name hint: `.value` the closure's own result, called right after (`local f = seed()`, `local f = function() return
+/// f end`, `return f()`); `.place` a local the worker writes and reads (`local x = function() return x end`, `return
+/// x()`); `.table` the parameter `t` as the store's table (`t.get = function() return t end`, the result hinted `t`);
+/// `.key` the parameter `k` as the store's key (`t[k] = function() return k end`, the result hinted `k`).
+fn creatingStatementModule(comptime form: CreatingStatementForm) type {
+    return struct {
+        const proof = ir.EvidenceId.fromIndex(0);
+        const chunk_function = ir.FunctionId.fromIndex(0);
+        const worker_function = ir.FunctionId.fromIndex(1);
+        const getter_function = ir.FunctionId.fromIndex(2);
+        const capture = ir.CaptureId.fromIndex(0);
+        const local_place = ir.PlaceId.fromIndex(0);
+        const block = ir.BlockId.fromIndex;
+        const instruction = ir.InstructionId.fromIndex;
+        const value = ir.ValueId.fromIndex;
+        const hint = switch (form) {
+            .value => "f",
+            .place => "x",
+            .table => "t",
+            .key => "k",
+        };
+        // Values: 0 the export, 1-3 the parameters `seed`, `t` and `k`, 4 the getter's captured value, 5 `seed()`,
+        // 6 the closure, then `.value` 7 the closure's call, `.place` 7 the local's read and 8 its call, `.table` 7
+        // the key "get". Instructions: 0 the export, 1 `seed()`, 2 the closure, then the form's.
+        const head_values = [_]ir.Value{
+            .{ .id = value(0), .function = chunk_function, .type = .function, .name_hint = "worker", .origin = .{ .instruction_result = .{ .instruction = instruction(0), .index = 0 } } },
+            .{ .id = value(1), .function = worker_function, .type = .function, .name_hint = "seed", .origin = .{ .parameter = 0 } },
+            .{ .id = value(2), .function = worker_function, .type = .dynamic, .name_hint = "t", .origin = .{ .parameter = 1 } },
+            .{ .id = value(3), .function = worker_function, .type = .dynamic, .name_hint = "k", .origin = .{ .parameter = 2 } },
+            .{ .id = value(4), .function = getter_function, .type = .dynamic, .name_hint = hint, .origin = .{ .capture = capture } },
+            .{ .id = value(5), .function = worker_function, .type = .dynamic, .name_hint = hint, .origin = .{ .instruction_result = .{ .instruction = instruction(1), .index = 0 } } },
+            .{ .id = value(6), .function = worker_function, .type = .function, .name_hint = hint, .origin = .{ .instruction_result = .{ .instruction = instruction(2), .index = 0 } } },
+        };
+        const values: []const ir.Value = switch (form) {
+            .value => &(head_values ++ [_]ir.Value{
+                .{ .id = value(7), .function = worker_function, .type = .dynamic, .name_hint = "result", .origin = .{ .instruction_result = .{ .instruction = instruction(3), .index = 0 } } },
+            }),
+            .place => &(head_values ++ [_]ir.Value{
+                .{ .id = value(7), .function = worker_function, .type = .function, .name_hint = "x", .origin = .{ .instruction_result = .{ .instruction = instruction(4), .index = 0 } } },
+                .{ .id = value(8), .function = worker_function, .type = .dynamic, .name_hint = "result", .origin = .{ .instruction_result = .{ .instruction = instruction(5), .index = 0 } } },
+            }),
+            .table => &(head_values ++ [_]ir.Value{
+                .{ .id = value(7), .function = worker_function, .type = .string, .name_hint = "field_key", .origin = .{ .instruction_result = .{ .instruction = instruction(3), .index = 0 } } },
+            }),
+            .key => &head_values,
+        };
+        const head_instructions = [_]ir.Instruction{
+            .{ .id = instruction(0), .block = block(0), .operation = .{ .function_ref = worker_function }, .results = &.{value(0)}, .effects = .pure, .evidence = &.{proof} },
+            .{ .id = instruction(1), .block = block(1), .operation = .{ .call = .{ .callee = value(1), .arguments = &.{}, .result_arity = .{ .fixed = 1 } } }, .results = &.{value(5)}, .effects = .dynamic_call, .evidence = &.{proof} },
+            .{ .id = instruction(2), .block = block(1), .operation = .{ .make_closure = .{ .function = getter_function, .bindings = &.{.{ .value = value(5) }} } }, .results = &.{value(6)}, .effects = .pure, .evidence = &.{proof} },
+        };
+        const instructions: []const ir.Instruction = switch (form) {
+            .value => &(head_instructions ++ [_]ir.Instruction{
+                .{ .id = instruction(3), .block = block(1), .operation = .{ .call = .{ .callee = value(6), .arguments = &.{}, .result_arity = .{ .fixed = 1 } } }, .results = &.{value(7)}, .effects = .dynamic_call, .evidence = &.{proof} },
+            }),
+            .place => &(head_instructions ++ [_]ir.Instruction{
+                .{ .id = instruction(3), .block = block(1), .operation = .{ .place_write = .{ .place = local_place, .value = value(6) } }, .results = &.{}, .effects = .place_write, .evidence = &.{proof} },
+                .{ .id = instruction(4), .block = block(1), .operation = .{ .place_read = local_place }, .results = &.{value(7)}, .effects = .place_read, .evidence = &.{proof} },
+                .{ .id = instruction(5), .block = block(1), .operation = .{ .call = .{ .callee = value(7), .arguments = &.{}, .result_arity = .{ .fixed = 1 } } }, .results = &.{value(8)}, .effects = .dynamic_call, .evidence = &.{proof} },
+            }),
+            .table => &(head_instructions ++ [_]ir.Instruction{
+                .{ .id = instruction(3), .block = block(1), .operation = .{ .constant = .{ .string = "get" } }, .results = &.{value(7)}, .effects = .pure, .evidence = &.{proof} },
+                .{ .id = instruction(4), .block = block(1), .operation = .{ .table_set = .{ .table = value(2), .key = value(7), .value = value(6) } }, .results = &.{}, .effects = .semantic_table_write, .evidence = &.{proof} },
+            }),
+            .key => &(head_instructions ++ [_]ir.Instruction{
+                .{ .id = instruction(3), .block = block(1), .operation = .{ .table_set = .{ .table = value(2), .key = value(3), .value = value(6) } }, .results = &.{}, .effects = .semantic_table_write, .evidence = &.{proof} },
+            }),
+        };
+        const worker_instructions: []const ir.InstructionId = switch (form) {
+            .value => &.{ instruction(1), instruction(2), instruction(3) },
+            .place => &.{ instruction(1), instruction(2), instruction(3), instruction(4), instruction(5) },
+            .table => &.{ instruction(1), instruction(2), instruction(3), instruction(4) },
+            .key => &.{ instruction(1), instruction(2), instruction(3) },
+        };
+        const worker_returns: []const ir.ValueId = switch (form) {
+            .value => &.{value(7)},
+            .place => &.{value(8)},
+            .table, .key => &.{},
+        };
+        const blocks = [_]ir.Block{
+            .{ .id = block(0), .function = chunk_function, .instructions = &.{instruction(0)}, .terminator = .{ .return_values = &.{value(0)} }, .evidence = &.{proof} },
+            .{ .id = block(1), .function = worker_function, .instructions = worker_instructions, .terminator = .{ .return_values = worker_returns }, .evidence = &.{proof} },
+            .{ .id = block(2), .function = getter_function, .terminator = .{ .return_values = &.{value(4)} }, .evidence = &.{proof} },
+        };
+        const places: []const ir.Place = switch (form) {
+            .place => &.{.{ .id = local_place, .function = worker_function, .type = .function, .name_hint = "x", .origin = .{ .local = 0 }, .evidence = &.{proof} }},
+            .value, .table, .key => &.{},
+        };
+        const functions = [_]ir.Function{
+            .{ .id = chunk_function, .name_hint = "chunk", .blocks = &.{block(0)}, .entry_block = block(0), .evidence = &.{proof} },
+            .{ .id = worker_function, .name_hint = "worker", .parameters = &.{ value(1), value(2), value(3) }, .blocks = &.{block(1)}, .entry_block = block(1), .local_places = if (form == .place) &.{local_place} else &.{}, .evidence = &.{proof} },
+            .{ .id = getter_function, .name_hint = "getter", .lexical_parent = worker_function, .captures = &.{capture}, .blocks = &.{block(2)}, .entry_block = block(2), .evidence = &.{proof} },
+        };
+        const captures = [_]ir.Capture{.{ .id = capture, .function = getter_function, .kind = .{ .immutable_value = value(4) }, .evidence = &.{proof} }};
+        const evidence = [_]ir.Evidence{.{ .id = proof, .kind = .dynamic_fixture, .locator = "fixture:creating-statement" }};
+        const program: ir.Program = .{
+            .program_id = "creating-statement",
+            .entry_function = chunk_function,
+            .functions = &functions,
+            .blocks = &blocks,
+            .instructions = instructions,
+            .values = values,
+            .places = places,
+            .captures = &captures,
+            .evidence = &evidence,
+        };
+    };
+}
+
+test "a closure's copy is named apart from the result its creating statement assigns" {
+    const module = creatingStatementModule(.value);
+    const source = try emitAlloc(std.testing.allocator, &module.program);
+    defer std.testing.allocator.free(source);
+    errdefer std.debug.print("{s}\n", .{source});
+    // The closure's result `f_2` is declared above the copy's block and assigned inside it; a copy named `f_2` would
+    // take the assignment, and `f_2()` after the block would call nil.
+    try std.testing.expect(std.mem.indexOf(u8, source, "f_2 = function()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "local f_2 = ") == null);
+}
+
+test "a closure's copy is named apart from the local its creating statement assigns" {
+    const module = creatingStatementModule(.place);
+    const source = try emitAlloc(std.testing.allocator, &module.program);
+    defer std.testing.allocator.free(source);
+    errdefer std.debug.print("{s}\n", .{source});
+    try std.testing.expect(std.mem.indexOf(u8, source, "x = function()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "local x = ") == null);
+}
+
+test "a closure's copy is named apart from the table its creating statement stores into" {
+    const module = creatingStatementModule(.table);
+    const source = try emitAlloc(std.testing.allocator, &module.program);
+    defer std.testing.allocator.free(source);
+    errdefer std.debug.print("{s}\n", .{source});
+    try std.testing.expect(std.mem.indexOf(u8, source, "t.get = function()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "local t = ") == null);
+}
+
+test "a closure's copy is named apart from the key its creating statement stores under" {
+    const module = creatingStatementModule(.key);
+    const source = try emitAlloc(std.testing.allocator, &module.program);
+    defer std.testing.allocator.free(source);
+    errdefer std.debug.print("{s}\n", .{source});
+    try std.testing.expect(std.mem.indexOf(u8, source, "t[k] = function()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "local k = ") == null);
+}

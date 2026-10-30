@@ -51,9 +51,17 @@ pub const Options = struct {
 
 const StableCaptureValues = struct {
     scopes: *const emission_scope.Plan,
+    emission: *const EmissionPlan,
 
+    /// A closure aliases a captured value, reading the source's name when it is called, only when that name is one
+    /// binding per execution of the value's definition. A value kept in value storage is not: its name is one slot of
+    /// the storage table of the function that defines it, a cell that every later execution of the definition
+    /// overwrites, and a function on the capture chain that has value storage of its own declares its own table under
+    /// the same name, in which that slot is nil. Such a capture is copied into a local when the closure is made. A
+    /// change that lets a closure alias a value kept in value storage again must still refuse the alias whenever a
+    /// function on the capture chain declares its own table.
     pub fn contains(self: StableCaptureValues, value_id: ir.ValueId) bool {
-        return self.scopes.valueHasStableLexicalBinding(value_id);
+        return self.scopes.valueHasStableLexicalBinding(value_id) and !self.emission.names.valueUsesStorage(value_id);
     }
 
     pub fn isBoxedPlace(self: StableCaptureValues, place_id: ir.PlaceId) bool {
@@ -7195,7 +7203,7 @@ fn emitClosure(
         target,
         closure,
         parent_place_aliases,
-        StableCaptureValues{ .scopes = scopes },
+        StableCaptureValues{ .scopes = scopes, .emission = emission_plan },
     ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.InvalidClosureBinding => {

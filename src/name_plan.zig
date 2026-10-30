@@ -24,14 +24,19 @@ pub const Plan = struct {
         var scope = try readable_scope.Scope.init(allocator, program);
         defer scope.deinit();
         const runtime_plan = luau_runtime.Plan.init(.standard_luau, program, &scope);
-        return initWithRuntime(allocator, program, &scope, runtime_plan);
+        return initWithRuntime(allocator, program, &scope, runtime_plan, {});
     }
 
+    /// `creating_statements` is how the emitter writes each closure's creating statement: a struct of pointers to
+    /// its plans `dead`, `fused_values`, `place_reads`, `place_writes` and `closure_stores`, or `{}` for a plan no
+    /// closure is written from. With it, a closure's captured values are named apart from every name that statement
+    /// writes or reads after the copies (`reserveCreatingStatementNames`).
     pub fn initWithRuntime(
         allocator: std.mem.Allocator,
         program: *const ir.Program,
         scope: *const readable_scope.Scope,
         runtime_plan: luau_runtime.Plan,
+        creating_statements: anytype,
     ) !Plan {
         const values = try allocator.alloc([]const u8, program.values.len);
         errdefer allocator.free(values);
@@ -149,6 +154,28 @@ pub const Plan = struct {
                 plan.value_storage_name = try uniqueName(allocator, &used, "__lifter_value_storage");
             }
         }
+        // A function body that keeps a place in place storage declares and indexes this table, and a closure's
+        // creating statement declares a boxed cell's snapshot `local <cell> = <holder>` before the function it makes:
+        // the emitter writes these names into function bodies for its own use. They are chosen here, before any
+        // function is named, as the value-storage table is, so that they sit in every function's name space and no
+        // local, parameter or copy of any function takes them.
+        if (std.mem.indexOfScalar(bool, plan.storage_places, true) != null) {
+            plan.storage_name = try uniqueName(allocator, &used, "__lifter_place_storage");
+        }
+        // A boxed per-execution cell is captured by snapshot — the child reads its own
+        // `local <cell> = <holder>` through `[1]`. A shared_place capture's captured place that no reachable
+        // instruction of its function uses is named by no function; it is named here instead, so that the snapshot
+        // binding and the terminal boxed-place alias resolve it. A non-boxed shared_place capture keeps the plain
+        // `.place` alias and never reads this name.
+        for (program.captures) |capture_item| switch (capture_item.kind) {
+            .shared_place => |captured| {
+                if (captured.index() >= plan.places.len or runtime_places[captured.index()] or plan.places[captured.index()].len != 0) continue;
+                const hint = try std.fmt.allocPrint(allocator, "cell_{d}", .{captured.index()});
+                defer allocator.free(hint);
+                plan.places[captured.index()] = try uniqueName(allocator, &used, hint);
+            },
+            .immutable_value => {},
+        };
         for (program.functions) |function_item| {
             const fallback = try std.fmt.allocPrint(allocator, "fn_{d}", .{function_item.id.index()});
             defer allocator.free(fallback);
@@ -168,28 +195,13 @@ pub const Plan = struct {
                 if (function_item.lexical_parent) |parent| {
                     if (parent.index() >= assigned_functions.len or !assigned_functions[parent.index()]) continue;
                 }
-                try plan.assignFunction(program, scope, runtime_places, &used, function_item);
+                try plan.assignFunction(program, scope, runtime_places, &used, function_item, creating_statements);
                 assigned_functions[function_item.id.index()] = true;
                 remaining -= 1;
                 made_progress = true;
             }
             if (!made_progress) unreachable;
         }
-        plan.storage_name = try uniqueName(allocator, &used, "__lifter_place_storage");
-        // A boxed per-execution cell is captured by snapshot — the child reads its own
-        // `local <cell> = <holder>` through `[1]`. Name each shared_place capture's captured place (capture
-        // origin, otherwise unnamed) so the snapshot binding and the terminal boxed-place alias resolve it.
-        // Assigned last, so no earlier name moves; a non-boxed shared_place capture keeps the plain `.place`
-        // alias and never reads this name, so no existing output changes.
-        for (program.captures) |capture_item| switch (capture_item.kind) {
-            .shared_place => |captured| {
-                if (captured.index() >= plan.places.len or plan.places[captured.index()].len != 0) continue;
-                const hint = try std.fmt.allocPrint(allocator, "cell_{d}", .{captured.index()});
-                defer allocator.free(hint);
-                plan.places[captured.index()] = try uniqueName(allocator, &used, hint);
-            },
-            .immutable_value => {},
-        };
         return plan;
     }
 
@@ -303,6 +315,7 @@ pub const Plan = struct {
         runtime_places: []const bool,
         global_symbols: *const std.StringHashMapUnmanaged(void),
         function_item: ir.Function,
+        creating_statements: anytype,
     ) !void {
         var used: std.StringHashMapUnmanaged(void) = .empty;
         defer used.deinit(self.allocator);
@@ -313,15 +326,23 @@ pub const Plan = struct {
         }
 
         try self.reserveClosureSources(program, scope, &used, function_item.id);
-        for (function_item.parameters) |value_id| if (scope.value(value_id)) try self.assignValue(program, &used, value_id);
+        // `emitClosure` writes each capture it copies as `local <captured value's name> = <source>` inside the `do`
+        // block of the statement that creates this function, and that statement still writes or reads its own names
+        // after the copies (its destination, the table and key it stores into, the later copies' sources). A
+        // captured value therefore takes none of them; every other name of this function may.
+        var creating_names: std.StringHashMapUnmanaged(void) = .empty;
+        defer creating_names.deinit(self.allocator);
+        try self.reserveCreatingStatementNames(program, scope, creating_statements, &creating_names, function_item.id);
+        for (function_item.parameters) |value_id| if (scope.value(value_id)) try self.assignValue(program, &used, null, value_id);
         for (program.places) |place_item| {
             if (place_item.function == function_item.id and place_item.id.index() < runtime_places.len and runtime_places[place_item.id.index()]) {
-                try self.assignPlace(program, &used, place_item.id);
+                try self.assignPlace(program, &used, null, place_item.id);
             }
         }
         for (program.values) |value_item| {
             if (value_item.function == function_item.id and scope.value(value_item.id) and self.values[value_item.id.index()].len == 0) {
-                try self.assignValue(program, &used, value_item.id);
+                const avoided: ?*const std.StringHashMapUnmanaged(void) = if (value_item.origin == .capture) &creating_names else null;
+                try self.assignValue(program, &used, avoided, value_item.id);
             }
         }
         for (program.value_packs) |pack| {
@@ -329,9 +350,32 @@ pub const Plan = struct {
                 try self.assignValuePack(&used, pack.id);
             }
         }
+        // `emitClosure` writes each boxed cell this function captures as the snapshot `local <captured place's name> =
+        // <holder>` in the same `do` block, before the statement's destination. A captured place whose name meets one
+        // of the statement's names takes another here, after every other name of this function is chosen, so no other
+        // name moves (a captured place the closure aliases is never written, so its new name changes no text).
+        var replaced: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer {
+            for (replaced.items) |name| self.allocator.free(name);
+            replaced.deinit(self.allocator);
+        }
+        for (program.places) |place_item| {
+            if (place_item.function != function_item.id or place_item.origin != .capture) continue;
+            const name = self.places[place_item.id.index()];
+            if (name.len == 0 or !creating_names.contains(name)) continue;
+            try replaced.append(self.allocator, name);
+            self.places[place_item.id.index()] = "";
+            try self.assignPlace(program, &used, &creating_names, place_item.id);
+        }
     }
 
-    fn assignValue(self: *Plan, program: *const ir.Program, used: *std.StringHashMapUnmanaged(void), value_id: ir.ValueId) !void {
+    fn assignValue(
+        self: *Plan,
+        program: *const ir.Program,
+        used: *std.StringHashMapUnmanaged(void),
+        avoided: ?*const std.StringHashMapUnmanaged(void),
+        value_id: ir.ValueId,
+    ) !void {
         if (value_id.index() >= program.values.len or self.values[value_id.index()].len != 0) return;
         if (self.valueUsesStorage(value_id)) {
             const storage_name = self.valueStorageName() orelse return error.OutOfMemory;
@@ -343,17 +387,23 @@ pub const Plan = struct {
         defer self.allocator.free(fallback);
         const base = if (value_item.name_hint) |hint| try sanitized(self.allocator, hint) else fallback;
         defer if (value_item.name_hint != null) self.allocator.free(base);
-        self.values[value_id.index()] = try uniqueName(self.allocator, used, base);
+        self.values[value_id.index()] = try uniqueNameAvoiding(self.allocator, used, avoided, base);
     }
 
-    fn assignPlace(self: *Plan, program: *const ir.Program, used: *std.StringHashMapUnmanaged(void), place_id: ir.PlaceId) !void {
+    fn assignPlace(
+        self: *Plan,
+        program: *const ir.Program,
+        used: *std.StringHashMapUnmanaged(void),
+        avoided: ?*const std.StringHashMapUnmanaged(void),
+        place_id: ir.PlaceId,
+    ) !void {
         if (place_id.index() >= program.places.len or self.places[place_id.index()].len != 0) return;
         const place_item = program.places[place_id.index()];
         const fallback = try std.fmt.allocPrint(self.allocator, "place_{d}", .{place_id.index()});
         defer self.allocator.free(fallback);
         const base = if (place_item.name_hint) |hint| try sanitized(self.allocator, hint) else fallback;
         defer if (place_item.name_hint != null) self.allocator.free(base);
-        self.places[place_id.index()] = try uniqueName(self.allocator, used, base);
+        self.places[place_id.index()] = try uniqueNameAvoiding(self.allocator, used, avoided, base);
     }
 
     fn assignValuePack(self: *Plan, used: *std.StringHashMapUnmanaged(void), pack_id: ir.ValuePackId) !void {
@@ -442,6 +492,122 @@ pub const Plan = struct {
                     }
                 },
                 else => {},
+            }
+        }
+    }
+
+    /// The names each statement that creates `target` writes or reads after the copies `emitClosure` writes for its
+    /// captures, in the function that runs it: every copy's source (`render.valueUseScalar`, a later copy's after the
+    /// earlier copies), then the destination — the table and key of a fused closure store
+    /// (`render.valueUsePostfix`, `render.semanticValueIndexSuffix`) or the environment value of a fused environment
+    /// store, the place of a fused place write (`lexical.emitPlaceName`), or else the closure's own result
+    /// (`render.valueName`). Names every function reserves (globals, runtime helpers, external bindings, the
+    /// value-storage and place-storage tables, the snapshot names `cell_<n>`) need no entry here.
+    fn reserveCreatingStatementNames(
+        self: *const Plan,
+        program: *const ir.Program,
+        scope: *const readable_scope.Scope,
+        statements: anytype,
+        names: *std.StringHashMapUnmanaged(void),
+        target: ir.FunctionId,
+    ) std.mem.Allocator.Error!void {
+        if (@TypeOf(statements) == void) return;
+        const remaining = program.values.len + program.places.len + program.functions.len + 1;
+        for (program.instructions) |instruction| {
+            if (!scope.instruction(instruction.id)) continue;
+            const closure = switch (instruction.operation) {
+                .make_closure => |made| made,
+                else => continue,
+            };
+            if (closure.function != target) continue;
+            for (closure.bindings) |binding| switch (binding) {
+                .value => |value_id| try self.reserveWrittenValue(program, scope, statements, names, value_id, remaining),
+                .place => {},
+            };
+            if (statements.closure_stores.consumerForProducer(instruction.id)) |store_id| {
+                if (store_id.index() >= program.instructions.len) continue;
+                switch (program.instructions[store_id.index()].operation) {
+                    .table_set => |store| {
+                        try self.reserveWrittenValue(program, scope, statements, names, store.table, remaining);
+                        try self.reserveWrittenValue(program, scope, statements, names, store.key, remaining);
+                    },
+                    .environment_set => |store| switch (store.target) {
+                        .ambient => {},
+                        .value => |environment| try self.reserveWrittenValue(program, scope, statements, names, environment, remaining),
+                    },
+                    else => {},
+                }
+            } else if (statements.place_writes.consumerForProducer(instruction.id)) |write_id| {
+                if (write_id.index() >= program.instructions.len) continue;
+                switch (program.instructions[write_id.index()].operation) {
+                    .place_write => |write| try self.reservePlaceSource(program, scope, names, write.place, remaining),
+                    else => {},
+                }
+            } else {
+                for (instruction.results) |result| try self.reserveValueSource(program, scope, names, result, remaining);
+            }
+        }
+    }
+
+    /// The names `render.valueUseScalar` writes for a value in the function that holds it: the name of the value the
+    /// dead-code plan resolves it to (and, for a capture, the names of the sources it may be written as), and, when
+    /// that value is a fused or inlined instruction's result or a fused place read, the names of its operands in turn.
+    fn reserveWrittenValue(
+        self: *const Plan,
+        program: *const ir.Program,
+        scope: *const readable_scope.Scope,
+        statements: anytype,
+        names: *std.StringHashMapUnmanaged(void),
+        value_id: ir.ValueId,
+        remaining: usize,
+    ) std.mem.Allocator.Error!void {
+        if (remaining == 0 or value_id.index() >= program.values.len) return;
+        const resolved = statements.dead.resolveValue(value_id);
+        if (resolved.index() >= program.values.len) return;
+        try self.reserveValueSource(program, scope, names, resolved, remaining);
+        const instruction_id = switch (program.values[resolved.index()].origin) {
+            .instruction_result => |origin| if (origin.index == 0) origin.instruction else return,
+            else => return,
+        };
+        if (instruction_id.index() >= program.instructions.len) return;
+        const operation = program.instructions[instruction_id.index()].operation;
+        if (statements.place_reads.contains(instruction_id)) {
+            switch (operation) {
+                .place_read => |place_id| try self.reservePlaceSource(program, scope, names, place_id, remaining),
+                else => {},
+            }
+            return;
+        }
+        if (!statements.fused_values.contains(instruction_id) and !statements.dead.isInlined(instruction_id)) return;
+        try self.reserveWrittenOperands(program, scope, statements, names, operation, remaining - 1);
+    }
+
+    /// The operands of an instruction written as an expression, each as `reserveWrittenValue` reserves it; a value
+    /// pack operand also through its producer, which a fused call writes in its argument list.
+    fn reserveWrittenOperands(
+        self: *const Plan,
+        program: *const ir.Program,
+        scope: *const readable_scope.Scope,
+        statements: anytype,
+        names: *std.StringHashMapUnmanaged(void),
+        operation: ir.Operation,
+        remaining: usize,
+    ) std.mem.Allocator.Error!void {
+        if (remaining == 0) return;
+        var operands: OperandList = .{ .allocator = self.allocator };
+        defer operands.deinit();
+        runtime_uses.visitOperationUses(operation, &operands);
+        if (operands.failed) return error.OutOfMemory;
+        for (operands.values.items) |operand| try self.reserveWrittenValue(program, scope, statements, names, operand, remaining);
+        for (operands.places.items) |place_id| try self.reservePlaceSource(program, scope, names, place_id, remaining);
+        for (operands.packs.items) |pack_id| {
+            if (pack_id.index() >= program.value_packs.len) continue;
+            if (self.valuePack(pack_id)) |name| try names.put(self.allocator, name, {});
+            switch (program.value_packs[pack_id.index()].origin) {
+                .instruction_result => |producer| if (producer.index() < program.instructions.len) {
+                    try self.reserveWrittenOperands(program, scope, statements, names, program.instructions[producer.index()].operation, remaining - 1);
+                },
+                .varargs => {},
             }
         }
     }
@@ -576,6 +742,39 @@ const PlaceCollector = struct {
     }
 };
 
+/// The operands `runtime_uses.visitOperationUses` names for one operation, kept so that each can be walked in turn.
+const OperandList = struct {
+    allocator: std.mem.Allocator,
+    values: std.ArrayList(ir.ValueId) = .empty,
+    places: std.ArrayList(ir.PlaceId) = .empty,
+    packs: std.ArrayList(ir.ValuePackId) = .empty,
+    failed: bool = false,
+
+    fn deinit(self: *OperandList) void {
+        self.values.deinit(self.allocator);
+        self.places.deinit(self.allocator);
+        self.packs.deinit(self.allocator);
+    }
+
+    pub fn value(self: *OperandList, value_id: ir.ValueId) void {
+        self.values.append(self.allocator, value_id) catch {
+            self.failed = true;
+        };
+    }
+
+    pub fn pack(self: *OperandList, pack_id: ir.ValuePackId) void {
+        self.packs.append(self.allocator, pack_id) catch {
+            self.failed = true;
+        };
+    }
+
+    pub fn place(self: *OperandList, place_id: ir.PlaceId) void {
+        self.places.append(self.allocator, place_id) catch {
+            self.failed = true;
+        };
+    }
+};
+
 fn findCaptureIndex(captures: []const ir.CaptureId, target: ir.CaptureId) ?usize {
     for (captures, 0..) |capture_id, index| if (capture_id == target) return index;
     return null;
@@ -589,22 +788,37 @@ fn entryNeedsShiftedVarargs(program: *const ir.Program) bool {
 }
 
 fn uniqueName(allocator: std.mem.Allocator, used: *std.StringHashMapUnmanaged(void), raw_base: []const u8) ![]const u8 {
+    return uniqueNameAvoiding(allocator, used, null, raw_base);
+}
+
+/// `uniqueName` that also passes over every name in `avoided`, which it does not add to `used`.
+fn uniqueNameAvoiding(
+    allocator: std.mem.Allocator,
+    used: *std.StringHashMapUnmanaged(void),
+    avoided: ?*const std.StringHashMapUnmanaged(void),
+    raw_base: []const u8,
+) ![]const u8 {
     const base = if (luau_syntax.isIdentifier(raw_base)) try allocator.dupe(u8, raw_base) else try sanitized(allocator, raw_base);
     errdefer allocator.free(base);
-    if (!used.contains(base)) {
+    if (!nameTaken(used, avoided, base)) {
         try used.put(allocator, base, {});
         return base;
     }
     var suffix: usize = 2;
     while (true) : (suffix += 1) {
         const candidate = try std.fmt.allocPrint(allocator, "{s}_{d}", .{ base, suffix });
-        if (!used.contains(candidate)) {
+        if (!nameTaken(used, avoided, candidate)) {
             allocator.free(base);
             try used.put(allocator, candidate, {});
             return candidate;
         }
         allocator.free(candidate);
     }
+}
+
+fn nameTaken(used: *const std.StringHashMapUnmanaged(void), avoided: ?*const std.StringHashMapUnmanaged(void), name: []const u8) bool {
+    if (used.contains(name)) return true;
+    return if (avoided) |names| names.contains(name) else false;
 }
 
 fn sanitized(allocator: std.mem.Allocator, hint: []const u8) ![]u8 {

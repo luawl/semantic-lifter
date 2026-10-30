@@ -25,9 +25,13 @@ const stage_trace = @import("stage_trace.zig");
 
 const StableCaptureValues = struct {
     scopes: *const emission_scope.Plan,
+    emission: *const emission_planning.Plan,
 
+    /// In step with the emitter's `StableCaptureValues`: a value kept in value storage is copied into a local when the
+    /// closure is made, never aliased (its slot is one cell that every execution of the definition overwrites), so the
+    /// certificate charges the copy's local where the emitter writes it.
     pub fn contains(self: StableCaptureValues, value_id: ir.ValueId) bool {
-        return self.scopes.valueHasStableLexicalBinding(value_id);
+        return self.scopes.valueHasStableLexicalBinding(value_id) and !self.emission.names.valueUsesStorage(value_id);
     }
 
     pub fn isBoxedPlace(self: StableCaptureValues, place_id: ir.PlaceId) bool {
@@ -182,8 +186,11 @@ fn validatePrepared(
         }
         try syntax_depths.recordFunction(function, &structured, &scopes);
         try jump_budget_validation.validate(report, program, readable, &emission, function, &structured);
+        // The upvalue certificate models each capture as the emitter writes it: an alias only where the emitter's
+        // wrapper allows one, and a copy for a value kept in value storage.
+        const stable_captures = StableCaptureValues{ .scopes = &scopes, .emission = &emission };
         for (program.values) |value| {
-            if (value.function == function.id and scopes.valueHasStableLexicalBinding(value.id)) {
+            if (value.function == function.id and stable_captures.contains(value.id)) {
                 stable_values[value.id.index()] = true;
             }
         }
@@ -313,7 +320,7 @@ fn peakClosureSnapshotLocals(
                 program.functions[closure.function.index()],
                 closure,
                 &.{},
-                StableCaptureValues{ .scopes = scopes },
+                StableCaptureValues{ .scopes = scopes, .emission = emission },
             ) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.InvalidClosureBinding => continue,
@@ -599,7 +606,7 @@ fn hostPressure(
                 program.functions[closure.function.index()],
                 closure,
                 &.{},
-                StableCaptureValues{ .scopes = scopes },
+                StableCaptureValues{ .scopes = scopes, .emission = emission },
             ) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.InvalidClosureBinding => unreachable,
@@ -2004,7 +2011,7 @@ const ItemPricing = struct {
             self.program.functions[closure.function.index()],
             closure,
             &.{},
-            StableCaptureValues{ .scopes = self.scopes },
+            StableCaptureValues{ .scopes = self.scopes, .emission = self.emission },
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.InvalidClosureBinding => return null,

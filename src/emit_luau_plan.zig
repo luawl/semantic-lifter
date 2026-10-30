@@ -95,7 +95,15 @@ pub const Plan = struct {
             runtime.require(.table_unpack);
             break;
         }
-        var names = try name_plan.Plan.initWithRuntime(allocator, program, &scope, runtime);
+        // The closures' creating statements, as `emitClosure` writes them from these plans: their captured values are
+        // named apart from the names each statement uses after its copies.
+        var names = try name_plan.Plan.initWithRuntime(allocator, program, &scope, runtime, .{
+            .dead = &dead,
+            .fused_values = &fused_values,
+            .place_reads = &place_reads,
+            .place_writes = &place_writes,
+            .closure_stores = &closure_stores,
+        });
         errdefer names.deinit();
         const state = try allocator.create(EmitState);
         errdefer allocator.destroy(state);

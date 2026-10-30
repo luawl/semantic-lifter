@@ -2648,6 +2648,59 @@ pub fn build(b: *std.Build) void {
         addLuauSourceConformanceForTarget(b, exe, z3_enabled, z3_bin, fixture.path, fixture.name, "standard-luau").addTo(conformance_step);
         addLuauSourceConformanceForTarget(b, exe, z3_enabled, z3_bin, fixture.path, b.fmt("{s}-direct-locals", .{fixture.name}), "direct-locals-luau").addTo(conformance_step);
     }
+    // Author-written workers over 120 candidate values, whose values the standard target keeps in a storage table.
+    // The first makes a closure in each pass of a numeric for loop over a local that the pass reads again; the second
+    // makes a function with a storage table of its own that reads a value its maker computed right before making it.
+    // Each lifts, resolves, validates, emits and runs on both targets, and returns what its source returns on the
+    // 45-point worker grid.
+    const value_storage_capture_sources = [_]struct { path: []const u8, name: []const u8 }{
+        .{ .path = "luau/fixtures/value_storage_loop_closure_source.luau", .name = "source-frontend-value-storage-loop-closure" },
+        .{ .path = "luau/fixtures/value_storage_nested_function_source.luau", .name = "source-frontend-value-storage-nested-function" },
+    };
+    for (value_storage_capture_sources) |fixture| {
+        addLuauSourceConformanceForTarget(b, exe, z3_enabled, z3_bin, fixture.path, fixture.name, "standard-luau").addTo(conformance_step);
+        addLuauSourceConformanceForTarget(b, exe, z3_enabled, z3_bin, fixture.path, b.fmt("{s}-direct-locals", .{fixture.name}), "direct-locals-luau").addTo(conformance_step);
+    }
+    // Author-written workers whose closure is created by a statement that also names something called like the
+    // value the closure captures: a local the statement assigns, the table it stores into, the key it stores under.
+    // The closure copies its capture inside the statement's `do` block, under a name the statement does not use.
+    // The first keeps no storage table (its capture has one use, so it is copied); the others hold over 120
+    // candidate values, so their captures are values kept in a storage table. Each lifts, resolves, validates,
+    // emits and runs on both targets, and returns what its source returns on the 45-point worker grid.
+    const closure_copy_name_sources = [_]struct { path: []const u8, name: []const u8 }{
+        .{ .path = "luau/fixtures/closure_captures_shadowed_local_source.luau", .name = "source-frontend-closure-captures-shadowed-local" },
+        .{ .path = "luau/fixtures/value_storage_wrapper_closure_source.luau", .name = "source-frontend-value-storage-wrapper-closure" },
+        .{ .path = "luau/fixtures/value_storage_closure_parameter_table_source.luau", .name = "source-frontend-value-storage-closure-parameter-table" },
+        .{ .path = "luau/fixtures/value_storage_closure_loop_key_source.luau", .name = "source-frontend-value-storage-closure-loop-key" },
+    };
+    // The dispatcher layout of each resolved IR, which copies every capture, runs through the same case.
+    for (closure_copy_name_sources) |fixture| {
+        const standard = addLuauSourceConformanceForTarget(b, exe, z3_enabled, z3_bin, fixture.path, fixture.name, "standard-luau");
+        standard.addTo(conformance_step);
+        conformance_step.dependOn(addDispatcherRuntimeConformance(b, exe, z3_enabled, z3_bin, fixture.name, standard.resolved_ir));
+        addLuauSourceConformanceForTarget(b, exe, z3_enabled, z3_bin, fixture.path, b.fmt("{s}-direct-locals", .{fixture.name}), "direct-locals-luau").addTo(conformance_step);
+    }
+    // Author-written workers that spell a local, a parameter or a captured value like a name the emitter writes into
+    // a function body for its own use: the place-storage table, in the first four, which keep places in place storage
+    // on the standard target (a block local captured by a closure, a parameter, and a captured value kept in value
+    // storage, made in a multiple assignment and in a multiple `local`); the name of the copy a closure takes of a
+    // loop local, in the last two, which store the closure into an outer local or table named like that local with the
+    // suffix _2. Each lifts, resolves, validates, emits and runs on both targets, and its resolved IR's dispatcher
+    // layout runs too; each returns what its source returns on the 45-point worker grid.
+    const internal_name_sources = [_]struct { path: []const u8, name: []const u8 }{
+        .{ .path = "luau/fixtures/closure_captures_local_named_like_place_table_source.luau", .name = "source-frontend-closure-captures-local-named-like-place-table" },
+        .{ .path = "luau/fixtures/parameter_named_like_place_table_source.luau", .name = "source-frontend-parameter-named-like-place-table" },
+        .{ .path = "luau/fixtures/value_storage_capture_named_like_place_table_source.luau", .name = "source-frontend-value-storage-capture-named-like-place-table" },
+        .{ .path = "luau/fixtures/value_storage_local_capture_named_like_place_table_source.luau", .name = "source-frontend-value-storage-local-capture-named-like-place-table" },
+        .{ .path = "luau/fixtures/captured_loop_cell_stored_into_suffixed_local_source.luau", .name = "source-frontend-captured-loop-cell-stored-into-suffixed-local" },
+        .{ .path = "luau/fixtures/captured_loop_cell_stored_into_suffixed_table_source.luau", .name = "source-frontend-captured-loop-cell-stored-into-suffixed-table" },
+    };
+    for (internal_name_sources) |fixture| {
+        const standard = addLuauSourceConformanceForTarget(b, exe, z3_enabled, z3_bin, fixture.path, fixture.name, "standard-luau");
+        standard.addTo(conformance_step);
+        conformance_step.dependOn(addDispatcherRuntimeConformance(b, exe, z3_enabled, z3_bin, fixture.name, standard.resolved_ir));
+        addLuauSourceConformanceForTarget(b, exe, z3_enabled, z3_bin, fixture.path, b.fmt("{s}-direct-locals", .{fixture.name}), "direct-locals-luau").addTo(conformance_step);
+    }
     // A post-tested loop whose body begins with an `if` and whose tail continues from two `elseif` arms before a
     // compound `until`: resolve-ir's query loop forwards one arm past an empty join that another entry still reaches,
     // and the final structure feedback then splits that join's own jump. Validation replays the forwarding record

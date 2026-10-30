@@ -2162,6 +2162,271 @@ function SourceRuntimeOracle.run(caseName: string, source: string, exported: any
 			end
 		end
 	elseif
+		caseName == "source-frontend-value-storage-loop-closure"
+		or caseName == "source-frontend-value-storage-loop-closure-direct-locals"
+		or caseName == "source-frontend-value-storage-nested-function"
+		or caseName == "source-frontend-value-storage-nested-function-direct-locals"
+	then
+		-- Workers over 120 candidate values, whose values the standard target keeps in a storage table. The loop
+		-- worker's closures, made in each pass of a numeric for loop over a local that the pass reads again, run after
+		-- the loop, so each returns its own pass's local only when the closure copies the local when it is made; the
+		-- nested worker's function holds a storage table of its own and reads a value its maker computed right before
+		-- making it. On the standard target the text keeps its storage table, so the case keeps covering that path.
+		local program = string.gsub(caseName, "%-direct%-locals$", "")
+		if program == caseName then
+			assert(
+				string.find(source, "local __lifter_value_storage = {}", 1, true) ~= nil,
+				`{caseName} keeps no value-storage table`
+			)
+		end
+		local byProgram: { [string]: { string } } = {
+			["source-frontend-value-storage-loop-closure"] = {
+				"0,0,0,43", "0,0,0,43", "0,0,0,45", "0,0,0,45", "0,0,0,44",
+				"6,18,6,43", "6,18,6,43", "15,179,15,45", "15,179,15,45", "10,58,10,44",
+				"-12,-36,-12,43", "-12,-36,-12,43", "-30,-358,-30,45", "-30,-358,-30,45", "-20,-116,-20,44",
+				"18,54,18,43", "18,54,18,43", "45,537,45,45", "45,537,45,45", "30,174,30,44",
+				"15,45,15,43", "15,45,15,43", "37.5,447.5,37.5,45", "37.5,447.5,37.5,45", "25,145,25,44",
+				"60,180,60,43", "60,180,60,43", "150,1790,150,45", "150,1790,150,45", "100,580,100,44",
+				"24,72,24,43", "24,72,24,43", "60,716,60,45", "60,716,60,45", "40,232,40,44",
+				"60,180,60,43", "60,180,60,43", "150,1790,150,45", "150,1790,150,45", "100,580,100,44",
+				"66,198,66,43", "66,198,66,43", "165,1969,165,45", "165,1969,165,45", "110,638,110,44",
+			},
+			["source-frontend-value-storage-nested-function"] = {
+				"86,78,2,9,44", "82,76,2,7,43", "90,80,2,11,45", "86,78,2,9,44", "78,74,2,5,42",
+				"92,86,2,12,44", "88,84,2,10,43", "96,88,2,14,45", "92,86,2,12,44", "84,82,2,8,42",
+				"74,62,2,3,44", "70,60,2,1,43", "78,64,2,5,45", "74,62,2,3,44", "66,58,2,-1,42",
+				"104,102,2,18,44", "100,100,2,16,43", "108,104,2,20,45", "104,102,2,18,44", "96,98,2,14,42",
+				"101,98,2,16.5,44", "97,96,2,14.5,43", "105,100,2,18.5,45", "101,98,2,16.5,44", "93,94,2,12.5,42",
+				"92,86,2,12,44", "88,84,2,10,43", "96,88,2,14,45", "92,86,2,12,44", "84,82,2,8,42",
+				"110,110,2,21,44", "106,108,2,19,43", "114,112,2,23,45", "110,110,2,21,44", "102,106,2,17,42",
+				"146,158,2,39,44", "142,156,2,37,43", "150,160,2,41,45", "146,158,2,39,44", "138,154,2,35,42",
+				"152,166,2,42,44", "148,164,2,40,43", "156,168,2,44,45", "152,166,2,42,44", "144,162,2,38,42",
+			},
+		}
+		local want = byProgram[program]
+		local index = 0
+		for _, selector in { 0, 1, -2, 3, 2.5, "x", 4, 10, 11 } :: { any } do
+			for _, budget in { 0, 1, 3, 7, 10 } do
+				index += 1
+				local results = table.pack(pcall(exported, selector, budget))
+				local got = "error"
+				if results[1] then
+					local shown: { string } = {}
+					for position = 2, results.n do
+						table.insert(shown, tostring(results[position]))
+					end
+					got = table.concat(shown, ",")
+				end
+				assert(
+					got == want[index],
+					`{caseName} returned {got} for ({tostring(selector)}, {budget}), its source returns {want[index]}`
+				)
+			end
+		end
+	elseif
+		caseName == "source-frontend-closure-captures-shadowed-local"
+		or caseName == "source-frontend-closure-captures-shadowed-local-direct-locals"
+		or caseName == "source-frontend-value-storage-wrapper-closure"
+		or caseName == "source-frontend-value-storage-wrapper-closure-direct-locals"
+		or caseName == "source-frontend-value-storage-closure-parameter-table"
+		or caseName == "source-frontend-value-storage-closure-parameter-table-direct-locals"
+		or caseName == "source-frontend-value-storage-closure-loop-key"
+		or caseName == "source-frontend-value-storage-closure-loop-key-direct-locals"
+	then
+		-- Workers whose closure is created by a statement that also names something called like the value the closure
+		-- captures: a local the statement assigns (the first, and the wrapper, which then calls its own name), the
+		-- parameter it stores into, the loop key it stores under. The closure copies its capture inside the statement's
+		-- `do` block, so the statement must still reach its own local, table and key. The three value-storage workers
+		-- keep their storage table on the standard target, so the case keeps covering the copy of a stored value.
+		local program = string.gsub(caseName, "%-direct%-locals$", "")
+		if program == caseName and program ~= "source-frontend-closure-captures-shadowed-local" then
+			assert(
+				string.find(source, "local __lifter_value_storage = {}", 1, true) ~= nil,
+				`{caseName} keeps no value-storage table`
+			)
+		end
+		local byProgram: { [string]: { string } } = {
+			["source-frontend-closure-captures-shadowed-local"] = {
+				"10", "40", "100", "220", "310",
+				"10", "40", "100", "220", "310",
+				"10", "40", "100", "220", "310",
+				"10", "40", "100", "220", "310",
+				"10", "40", "100", "220", "310",
+				"10", "40", "100", "220", "310",
+				"10", "40", "100", "220", "310",
+				"10", "40", "100", "220", "310",
+				"10", "40", "100", "220", "310",
+			},
+			["source-frontend-value-storage-wrapper-closure"] = {
+				"106,2,40", "107,3,41", "109,5,43", "113,9,47", "116,12,50",
+				"106,2,40", "107,3,41", "109,5,43", "113,9,47", "116,12,50",
+				"106,2,40", "107,3,41", "109,5,43", "113,9,47", "116,12,50",
+				"106,2,40", "107,3,41", "109,5,43", "113,9,47", "116,12,50",
+				"106,2,40", "107,3,41", "109,5,43", "113,9,47", "116,12,50",
+				"106,2,40", "107,3,41", "109,5,43", "113,9,47", "116,12,50",
+				"106,2,40", "107,3,41", "109,5,43", "113,9,47", "116,12,50",
+				"106,2,40", "107,3,41", "109,5,43", "113,9,47", "116,12,50",
+				"106,2,40", "107,3,41", "109,5,43", "113,9,47", "116,12,50",
+			},
+			["source-frontend-value-storage-closure-parameter-table"] = {
+				"13,3,40", "13,3,40", "13,3,40", "13,3,40", "13,3,40",
+				"46,6,41", "46,6,41", "46,6,41", "46,6,41", "46,6,41",
+				"-53,-3,38", "-53,-3,38", "-53,-3,38", "-53,-3,38", "-53,-3,38",
+				"112,12,43", "112,12,43", "112,12,43", "112,12,43", "112,12,43",
+				"95.5,10.5,42.5", "95.5,10.5,42.5", "95.5,10.5,42.5", "95.5,10.5,42.5", "95.5,10.5,42.5",
+				"79,9,42", "79,9,42", "79,9,42", "79,9,42", "79,9,42",
+				"145,15,44", "145,15,44", "145,15,44", "145,15,44", "145,15,44",
+				"343,33,50", "343,33,50", "343,33,50", "343,33,50", "343,33,50",
+				"376,36,51", "376,36,51", "376,36,51", "376,36,51", "376,36,51",
+			},
+			["source-frontend-value-storage-closure-loop-key"] = {
+				"6,3,46", "4,2,44", "8,4,48", "8,4,48", "6,3,46",
+				"18,3,58", "10,2,50", "28,4,68", "28,4,68", "18,3,58",
+				"-18,3,22", "-8,2,32", "-32,4,8", "-32,4,8", "-18,3,22",
+				"42,3,82", "22,2,62", "68,4,108", "68,4,108", "42,3,82",
+				"36,3,76", "19,2,59", "58,4,98", "58,4,98", "36,3,76",
+				"66,3,106", "34,2,74", "108,4,148", "108,4,148", "66,3,106",
+				"54,3,94", "28,2,68", "88,4,128", "88,4,128", "54,3,94",
+				"126,3,166", "64,2,104", "208,4,248", "208,4,248", "126,3,166",
+				"138,3,178", "70,2,110", "228,4,268", "228,4,268", "138,3,178",
+			},
+		}
+		local want = byProgram[program]
+		local index = 0
+		for _, selector in { 0, 1, -2, 3, 2.5, "x", 4, 10, 11 } :: { any } do
+			for _, budget in { 0, 1, 3, 7, 10 } do
+				index += 1
+				local results = table.pack(pcall(exported, selector, budget))
+				local got = "error"
+				if results[1] then
+					local shown: { string } = {}
+					for position = 2, results.n do
+						table.insert(shown, tostring(results[position]))
+					end
+					got = table.concat(shown, ",")
+				end
+				assert(
+					got == want[index],
+					`{caseName} returned {got} for ({tostring(selector)}, {budget}), its source returns {want[index]}`
+				)
+			end
+		end
+	elseif
+		caseName == "source-frontend-closure-captures-local-named-like-place-table"
+		or caseName == "source-frontend-closure-captures-local-named-like-place-table-direct-locals"
+		or caseName == "source-frontend-parameter-named-like-place-table"
+		or caseName == "source-frontend-parameter-named-like-place-table-direct-locals"
+		or caseName == "source-frontend-value-storage-capture-named-like-place-table"
+		or caseName == "source-frontend-value-storage-capture-named-like-place-table-direct-locals"
+		or caseName == "source-frontend-value-storage-local-capture-named-like-place-table"
+		or caseName == "source-frontend-value-storage-local-capture-named-like-place-table-direct-locals"
+		or caseName == "source-frontend-captured-loop-cell-stored-into-suffixed-local"
+		or caseName == "source-frontend-captured-loop-cell-stored-into-suffixed-local-direct-locals"
+		or caseName == "source-frontend-captured-loop-cell-stored-into-suffixed-table"
+		or caseName == "source-frontend-captured-loop-cell-stored-into-suffixed-table-direct-locals"
+	then
+		-- Workers that spell a local, a parameter or a captured value like a name the emitter writes into a function
+		-- body for its own use: the place-storage table (the first four, which keep places in place storage on the
+		-- standard target), or the name of the copy a closure takes of a loop local (the last two, which store the
+		-- closure into an outer local or table named like that local with the suffix _2). The text keeps each of those
+		-- names apart from the program's own. On the standard target the first four keep their place-storage table, so
+		-- the case keeps covering a name that table could take.
+		local program = string.gsub(caseName, "%-direct%-locals$", "")
+		if program == caseName and string.find(program, "named%-like%-place%-table$") ~= nil then
+			assert(
+				string.find(source, "local __lifter_place_storage = {}", 1, true) ~= nil,
+				`{caseName} keeps no place-storage table`
+			)
+		end
+		local byProgram: { [string]: { string } } = {
+			["source-frontend-closure-captures-local-named-like-place-table"] = {
+				"16,0!,45", "16,0!,45", "16,0!,45", "16,0!,45", "16,0!,45",
+				"37,1!,46", "37,1!,46", "37,1!,46", "37,1!,46", "37,1!,46",
+				"-26,-3!,43", "-26,-3!,43", "-26,-3!,43", "-26,-3!,43", "-26,-3!,43",
+				"79,4!,48", "79,4!,48", "79,4!,48", "79,4!,48", "79,4!,48",
+				"68.5,3!,47.5", "68.5,3!,47.5", "68.5,3!,47.5", "68.5,3!,47.5", "68.5,3!,47.5",
+				"79,4!,48", "79,4!,48", "79,4!,48", "79,4!,48", "79,4!,48",
+				"100,6!,49", "100,6!,49", "100,6!,49", "100,6!,49", "100,6!,49",
+				"226,15!,55", "226,15!,55", "226,15!,55", "226,15!,55", "226,15!,55",
+				"247,16!,56", "247,16!,56", "247,16!,56", "247,16!,56", "247,16!,56",
+			},
+			["source-frontend-parameter-named-like-place-table"] = {
+				"16,0!,45", "16,0!,45", "16,0!,45", "16,0!,45", "16,0!,45",
+				"37,1!,46", "37,1!,46", "37,1!,46", "37,1!,46", "37,1!,46",
+				"-26,-3!,43", "-26,-3!,43", "-26,-3!,43", "-26,-3!,43", "-26,-3!,43",
+				"79,4!,48", "79,4!,48", "79,4!,48", "79,4!,48", "79,4!,48",
+				"68.5,3!,47.5", "68.5,3!,47.5", "68.5,3!,47.5", "68.5,3!,47.5", "68.5,3!,47.5",
+				"79,4!,48", "79,4!,48", "79,4!,48", "79,4!,48", "79,4!,48",
+				"100,6!,49", "100,6!,49", "100,6!,49", "100,6!,49", "100,6!,49",
+				"226,15!,55", "226,15!,55", "226,15!,55", "226,15!,55", "226,15!,55",
+				"247,16!,56", "247,16!,56", "247,16!,56", "247,16!,56", "247,16!,56",
+			},
+			["source-frontend-value-storage-capture-named-like-place-table"] = {
+				"1,2,45", "1,2,45", "1,2,45", "1,2,45", "1,2,45",
+				"4,5,46", "4,5,46", "4,5,46", "4,5,46", "4,5,46",
+				"-5,-4,43", "-5,-4,43", "-5,-4,43", "-5,-4,43", "-5,-4,43",
+				"10,11,48", "10,11,48", "10,11,48", "10,11,48", "10,11,48",
+				"8.5,9.5,47.5", "8.5,9.5,47.5", "8.5,9.5,47.5", "8.5,9.5,47.5", "8.5,9.5,47.5",
+				"10,11,48", "10,11,48", "10,11,48", "10,11,48", "10,11,48",
+				"13,14,49", "13,14,49", "13,14,49", "13,14,49", "13,14,49",
+				"31,32,55", "31,32,55", "31,32,55", "31,32,55", "31,32,55",
+				"34,35,56", "34,35,56", "34,35,56", "34,35,56", "34,35,56",
+			},
+			["source-frontend-value-storage-local-capture-named-like-place-table"] = {
+				"8,2,45", "8,2,45", "8,2,45", "8,2,45", "8,2,45",
+				"12,8,46", "12,8,46", "12,8,46", "12,8,46", "12,8,46",
+				"0,-10,43", "0,-10,43", "0,-10,43", "0,-10,43", "0,-10,43",
+				"20,20,48", "20,20,48", "20,20,48", "20,20,48", "20,20,48",
+				"18,17,47.5", "18,17,47.5", "18,17,47.5", "18,17,47.5", "18,17,47.5",
+				"20,20,48", "20,20,48", "20,20,48", "20,20,48", "20,20,48",
+				"24,26,49", "24,26,49", "24,26,49", "24,26,49", "24,26,49",
+				"48,62,55", "48,62,55", "48,62,55", "48,62,55", "48,62,55",
+				"52,68,56", "52,68,56", "52,68,56", "52,68,56", "52,68,56",
+			},
+			["source-frontend-captured-loop-cell-stored-into-suffixed-local"] = {
+				"5,1", "5,1", "5,1", "5,1", "5,1",
+				"58,2", "58,2", "58,2", "58,2", "58,2",
+				"482,3", "482,3", "482,3", "482,3", "482,3",
+				"3854,4", "3854,4", "3854,4", "3854,4", "3854,4",
+				"514,3.5", "514,3.5", "514,3.5", "514,3.5", "514,3.5",
+				"482,3", "482,3", "482,3", "482,3", "482,3",
+				"5,1", "5,1", "5,1", "5,1", "5,1",
+				"482,3", "482,3", "482,3", "482,3", "482,3",
+				"3854,4", "3854,4", "3854,4", "3854,4", "3854,4",
+			},
+			["source-frontend-captured-loop-cell-stored-into-suffixed-table"] = {
+				"7,1", "7,1", "7,1", "7,1", "7,1",
+				"80,2", "80,2", "80,2", "80,2", "80,2",
+				"642,3", "642,3", "642,3", "642,3", "642,3",
+				"4990,4", "4990,4", "4990,4", "4990,4", "4990,4",
+				"674,3.5", "674,3.5", "674,3.5", "674,3.5", "674,3.5",
+				"642,3", "642,3", "642,3", "642,3", "642,3",
+				"7,1", "7,1", "7,1", "7,1", "7,1",
+				"642,3", "642,3", "642,3", "642,3", "642,3",
+				"4990,4", "4990,4", "4990,4", "4990,4", "4990,4",
+			},
+		}
+		local want = byProgram[program]
+		local index = 0
+		for _, selector in { 0, 1, -2, 3, 2.5, "x", 4, 10, 11 } :: { any } do
+			for _, budget in { 0, 1, 3, 7, 10 } do
+				index += 1
+				local results = table.pack(pcall(exported, selector, budget))
+				local got = "error"
+				if results[1] then
+					local shown: { string } = {}
+					for position = 2, results.n do
+						table.insert(shown, tostring(results[position]))
+					end
+					got = table.concat(shown, ",")
+				end
+				assert(
+					got == want[index],
+					`{caseName} returned {got} for ({tostring(selector)}, {budget}), its source returns {want[index]}`
+				)
+			end
+		end
+	elseif
 		caseName == "source-frontend-empty-boundary-clone-continue"
 		or caseName == "source-frontend-empty-boundary-clone-continue-nonlocal"
 		or caseName == "source-frontend-empty-boundary-clone-continue-inner-loop"

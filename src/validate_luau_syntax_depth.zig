@@ -20,9 +20,13 @@ const Site = struct {
 
 const StableCaptureValues = struct {
     scopes: *const emission_scope.Plan,
+    emission: *const emission_planning.Plan,
 
+    /// In step with the emitter's `StableCaptureValues`: a value kept in value storage is copied into a local when the
+    /// closure is made, never aliased (its slot is one cell that every execution of the definition overwrites), so the
+    /// `do` block around the copy is counted where the emitter writes it.
     pub fn contains(self: StableCaptureValues, value_id: ir.ValueId) bool {
-        return self.scopes.valueHasStableLexicalBinding(value_id);
+        return self.scopes.valueHasStableLexicalBinding(value_id) and !self.emission.names.valueUsesStorage(value_id);
     }
 
     pub fn isBoxedPlace(self: StableCaptureValues, place_id: ir.PlaceId) bool {
@@ -544,7 +548,7 @@ const Recorder = struct {
                 self.plan.program.functions[closure.function.index()],
                 closure,
                 &.{},
-                StableCaptureValues{ .scopes = self.scopes },
+                StableCaptureValues{ .scopes = self.scopes, .emission = self.plan.emission },
             ) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.InvalidClosureBinding => unreachable,
