@@ -2708,6 +2708,81 @@ pub fn build(b: *std.Build) void {
     // and returns what its source returns on its grid.
     addLuauSourceConformanceForTarget(b, exe, z3_enabled, z3_bin, "luau/fixtures/repeat_head_if_two_arm_continue_source.luau", "source-frontend-repeat-head-if-two-arm-continue", "standard-luau").addTo(conformance_step);
     addLuauSourceConformanceForTarget(b, exe, z3_enabled, z3_bin, "luau/fixtures/repeat_head_if_two_arm_continue_source.luau", "source-frontend-repeat-head-if-two-arm-continue-direct-locals", "direct-locals-luau").addTo(conformance_step);
+    // Programs whose function the planner records with a branch that has no join and ends the region holding it, one
+    // of whose arms leaves past that region's stop: by a loop test that continues there, through an `until` test the
+    // region reaches only past it, or by an escape the arm owns further down. A text that ends such an arm runs the
+    // region's stop, or the loop's next pass, so the function is written in the dispatcher layout. Three source
+    // programs lift, resolve, validate, emit and run on the standard target: a post-tested loop whose `continue` sits two
+    // `if`s deep and whose `if` chain is followed by more code before a compound `until`; a worker whose `elseif` arm
+    // continues past the code after its `if` chain; a worker whose `break` leaves through statements of its own while
+    // one arm of the body computes the `until` test. On the direct-locals target the first runs too, and the other two
+    // are refused, their dispatcher layout over the local budget. The third's structured text never returns and the
+    // runtime oracle has no timeout, so the structure audit runs before its runtime steps.
+    const joinless_arm_sources = [_]struct { path: []const u8, name: []const u8, direct_locals_refused: bool, audited: bool }{
+        .{ .path = "luau/fixtures/repeat_continue_past_if_chain_tail_source.luau", .name = "source-frontend-repeat-continue-past-if-chain-tail", .direct_locals_refused = false, .audited = false },
+        .{ .path = "luau/fixtures/repeat_elseif_continue_past_if_chain_tail_source.luau", .name = "source-frontend-repeat-elseif-continue-past-if-chain-tail", .direct_locals_refused = true, .audited = false },
+        .{ .path = "luau/fixtures/repeat_side_exit_break_until_in_one_arm_source.luau", .name = "source-frontend-repeat-side-exit-break-until-in-one-arm", .direct_locals_refused = true, .audited = true },
+    };
+    for (joinless_arm_sources) |fixture| {
+        const standard = addLuauSourceConformanceForTarget(b, exe, z3_enabled, z3_bin, fixture.path, fixture.name, "standard-luau");
+        standard.addTo(conformance_step);
+        if (fixture.audited) {
+            const audit = addStructureAstAudit(b, fixture.name, standard.generated_luau);
+            audit.expectStdOutMatch("class=dispatcher-present");
+            standard.runtime.dependOn(&audit.step);
+            standard.source_runtime.?.dependOn(&audit.step);
+            conformance_step.dependOn(&audit.step);
+        }
+        if (fixture.direct_locals_refused) {
+            const engine = if (z3_enabled) "z3" else "internal";
+            conformance_step.dependOn(addRegionFallbackRefusal(b, exe, z3_enabled, z3_bin, "emit-luau-solved", standard.resolved_ir, b.fmt("{s}-direct-locals.generated.luau", .{fixture.name}), &.{ engine, "direct-locals-luau" }, true));
+        } else {
+            addLuauSourceConformanceForTarget(b, exe, z3_enabled, z3_bin, fixture.path, b.fmt("{s}-direct-locals", .{fixture.name}), "direct-locals-luau").addTo(conformance_step);
+        }
+    }
+    // The research route of a worker whose `until` test one arm of the body computes while the other arm falls through
+    // to it: plain normalize-ir, then the automatic layout of its output on the standard target, compiled and run. Its
+    // structured text never returns, so the structure audit of the same layout runs before the runtime step.
+    const until_join_name = "source-frontend-until-condition-join-in-other-arm";
+    const until_join_ir = addLuauSourceIr(b, "luau/fixtures/until_condition_join_in_other_arm_source.luau", null, until_join_name);
+    const until_join_normalize = b.addRunArtifact(exe);
+    if (z3_enabled) until_join_normalize.addPathDir(b.pathFromRoot(z3_bin));
+    until_join_normalize.addArg("normalize-ir");
+    until_join_normalize.addFileArg(until_join_ir);
+    const until_join_normalized = until_join_normalize.addOutputFileArg(until_join_name ++ ".normalized.lifter-ir.json");
+    until_join_normalize.expectExitCode(0);
+    const until_join_layout = b.addRunArtifact(exe);
+    if (z3_enabled) until_join_layout.addPathDir(b.pathFromRoot(z3_bin));
+    until_join_layout.addArg("emit-readable-luau-strategy");
+    until_join_layout.addFileArg(until_join_normalized);
+    const until_join_layout_luau = until_join_layout.addOutputFileArg(until_join_name ++ ".audited.luau");
+    until_join_layout.addArgs(&.{ "standard-luau", "automatic" });
+    until_join_layout.expectExitCode(0);
+    const until_join_audit = addStructureAstAudit(b, until_join_name, until_join_layout_luau);
+    until_join_audit.expectStdOutMatch("class=dispatcher-present");
+    const until_join_runtime = addAutomaticRuntimeConformance(b, exe, z3_enabled, z3_bin, until_join_name, until_join_normalized);
+    until_join_runtime.dependOn(&until_join_audit.step);
+    conformance_step.dependOn(&until_join_audit.step);
+    conformance_step.dependOn(until_join_runtime);
+    // Lifter IRs of the same shapes, each resolved, validated, emitted on the standard target and run: a post-tested loop
+    // whose `break` arm tests the selector again and jumps into the empty arm of a later `if`; and a worker whose loop
+    // leaves through an escape to the return block a later loop exits to as well, owned by an arm one region down or by
+    // a loop boundary's body region. The last two's structured texts never return, so the audit runs first.
+    const joinless_arm_irs = [_]struct { path: []const u8, name: []const u8, audited: bool }{
+        .{ .path = "luau/fixtures/loop_test_arm_past_holding_stop.lifter-ir.json", .name = "loop-test-arm-past-holding-stop", .audited = false },
+        .{ .path = "luau/fixtures/escape_to_shared_return_block_local_places.lifter-ir.json", .name = "escape-to-shared-return-block-local-places", .audited = true },
+        .{ .path = "luau/fixtures/escape_in_loop_boundary_body_to_shared_return_block.lifter-ir.json", .name = "escape-in-loop-boundary-body-to-shared-return-block", .audited = true },
+    };
+    for (joinless_arm_irs) |fixture| {
+        const arm = addSerializedConformance(b, exe, z3_enabled, z3_bin, fixture.name, b.path(fixture.path));
+        arm.addTo(conformance_step);
+        if (fixture.audited) {
+            const audit = addStructureAstAudit(b, fixture.name, arm.generated_luau);
+            audit.expectStdOutMatch("class=dispatcher-present");
+            arm.runtime.dependOn(&audit.step);
+            conformance_step.dependOn(&audit.step);
+        }
+    }
     conformance_step.dependOn(repeat_loop_dispatcher);
     source_frontend_compound_conformance.addTo(conformance_step);
     source_frontend_if_expression_conformance.addTo(conformance_step);

@@ -1392,6 +1392,13 @@ fn emitRegionBodyWithPredeclaredBlock(
                     }
                 } else if (node_index + 1 != region.nodes.len) {
                     return error.UnsupportedControlFlow;
+                } else if (structured_escape.joinlessBranchArmLeavesPastStop(program, region, branch_plan)) {
+                    // This branch ends the region, so an arm whose text ends continues at the region's stop, while the
+                    // plan sends that arm to its own stop past it, by a way the planner's reaches-join test does not
+                    // model (a loop test's continue edge, an empty forwarder, an escape owned below the arm). The text
+                    // would run the region's stop, or the loop's next pass, instead of the arm's stop. Refuse:
+                    // emitFunctionBody re-emits the function flat.
+                    return error.UnsupportedControlFlow;
                 }
 
                 branch_emission: {

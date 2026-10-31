@@ -2427,6 +2427,121 @@ function SourceRuntimeOracle.run(caseName: string, source: string, exported: any
 			end
 		end
 	elseif
+		caseName == "source-frontend-repeat-continue-past-if-chain-tail"
+		or caseName == "source-frontend-repeat-continue-past-if-chain-tail-direct-locals"
+		or caseName == "source-frontend-repeat-elseif-continue-past-if-chain-tail"
+		or caseName == "source-frontend-repeat-side-exit-break-until-in-one-arm"
+		or caseName == "source-frontend-until-condition-join-in-other-arm"
+		or caseName == "loop-test-arm-past-holding-stop"
+		or caseName == "escape-to-shared-return-block-local-places"
+		or caseName == "escape-in-loop-boundary-body-to-shared-return-block"
+	then
+		-- Workers whose function the planner records with a branch that has no join and ends the region holding it, one of
+		-- whose arms leaves past that region's stop: by a loop test that continues there, through an `until` test the
+		-- region reaches only past it, or by an escape the arm owns further down. Each returns what its program returns on
+		-- 45 rows: its source program, or, for a lifter IR, the dispatcher text, which writes every edge as the IR has it.
+		-- The layout is not pinned here.
+		local program = string.gsub(caseName, "%-direct%-locals$", "")
+		local byProgram: { [string]: { string } } = {
+			["source-frontend-repeat-continue-past-if-chain-tail"] = {
+				"101,1", "101,1", "104,2", "104,2", "104,2",
+				"101,1", "101,1", "104,2", "104,2", "104,2",
+				"101,1", "101,1", "104,2", "104,2", "104,2",
+				"101,1", "101,1", "0,1", "0,1", "0,1",
+				"101,1", "101,1", "104,2", "104,2", "104,2",
+				"101,1", "101,1", "104,2", "104,2", "104,2",
+				"101,1", "101,1", "4,2", "4,2", "4,2",
+				"101,1", "101,1", "104,2", "104,2", "104,2",
+				"101,1", "101,1", "104,2", "104,2", "104,2",
+			},
+			["source-frontend-repeat-elseif-continue-past-if-chain-tail"] = {
+				"114,16286,11", "114,16286,11", "100,489971,24", "100,489971,24", "105,0,1",
+				"114,16286,11", "114,16286,11", "100,489971,24", "100,489971,24", "105,0,1",
+				"114,16286,11", "114,16286,11", "100,489971,24", "100,489971,24", "105,0,1",
+				"113,16286,11", "113,16286,11", "104,0,1", "104,0,1", "104,0,1",
+				"114,16286,11", "114,16286,11", "100,489971,24", "100,489971,24", "105,0,1",
+				"114,16286,11", "114,16286,11", "100,489971,24", "100,489971,24", "105,0,1",
+				"114,16286,11", "114,16286,11", "100,489971,24", "100,489971,24", "105,0,1",
+				"114,16286,11", "114,16286,11", "100,489971,24", "100,489971,24", "105,0,1",
+				"114,16286,11", "114,16286,11", "100,489971,24", "100,489971,24", "105,0,1",
+			},
+			["source-frontend-repeat-side-exit-break-until-in-one-arm"] = {
+				"103,582694,5", "103,582694,5", "106,582694,6", "101,532978,29", "101,410292,29",
+				"103,582694,5", "103,582694,5", "106,582694,6", "101,41791,29", "101,582694,29",
+				"103,582694,5", "103,582694,5", "106,582694,6", "101,41791,29", "101,582694,29",
+				"103,212222,17", "103,212222,17", "106,212222,18", "101,855736,29", "101,212222,29",
+				"103,582694,5", "103,582694,5", "106,582694,6", "101,41791,29", "101,582694,29",
+				"103,582694,5", "103,582694,5", "106,582694,6", "101,41791,29", "101,582694,29",
+				"106,660748,10", "106,660748,10", "106,660748,10", "101,41791,29", "101,582694,29",
+				"103,582694,5", "103,582694,5", "106,582694,6", "101,41791,29", "101,582694,29",
+				"103,582694,5", "103,582694,5", "106,582694,6", "101,41791,29", "101,582694,29",
+			},
+			["source-frontend-until-condition-join-in-other-arm"] = {
+				"102,0,1", "102,0,1", "102,0,1", "103,0,9", "103,0,2",
+				"102,0,1", "102,0,1", "102,0,1", "103,0,9", "103,0,2",
+				"102,0,1", "102,0,1", "102,0,1", "103,0,9", "103,0,2",
+				"102,0,1", "102,0,1", "102,0,1", "103,0,9", "103,0,2",
+				"102,0,1", "102,0,1", "102,0,1", "103,0,9", "103,0,2",
+				"102,0,1", "102,0,1", "102,0,1", "103,0,9", "103,0,2",
+				"102,0,1", "102,0,1", "102,0,1", "103,0,9", "103,0,2",
+				"102,0,1", "102,0,1", "102,0,1", "103,0,9", "103,0,2",
+				"102,0,1", "102,0,1", "102,0,1", "103,0,9", "103,0,2",
+			},
+			["loop-test-arm-past-holding-stop"] = {
+				"106,48", "106,48", "106,48", "101,3", "101,3",
+				"106,21", "106,21", "106,21", "102,3", "102,3",
+				"106,21", "106,21", "106,21", "102,3", "102,3",
+				"106,21", "106,21", "106,21", "102,3", "102,3",
+				"106,21", "106,21", "106,21", "102,3", "102,3",
+				"106,21", "106,21", "106,21", "102,3", "102,3",
+				"110,18", "110,18", "106,18", "105,4", "102,0",
+				"106,21", "106,21", "106,21", "102,3", "102,3",
+				"106,21", "106,21", "106,21", "102,3", "102,3",
+			},
+			["escape-to-shared-return-block-local-places"] = {
+				"106,78432", "106,78432", "106,78432", "101,3", "101,3",
+				"106,171", "106,171", "106,171", "102,3", "102,3",
+				"106,171", "106,171", "106,171", "102,3", "102,3",
+				"106,171", "106,171", "106,171", "102,3", "102,3",
+				"106,171", "106,171", "106,171", "102,3", "102,3",
+				"106,171", "106,171", "106,171", "102,3", "102,3",
+				"102,nil", "102,nil", "102,nil", "102,nil", "102,8",
+				"106,171", "106,171", "106,171", "102,3", "102,3",
+				"106,171", "106,171", "106,171", "102,3", "102,3",
+			},
+			["escape-in-loop-boundary-body-to-shared-return-block"] = {
+				"106,78432", "106,78432", "106,78432", "101,3", "101,3",
+				"106,171", "106,171", "106,171", "102,3", "102,3",
+				"106,171", "106,171", "106,171", "102,3", "102,3",
+				"106,171", "106,171", "106,171", "102,3", "102,3",
+				"106,171", "106,171", "106,171", "102,3", "102,3",
+				"106,171", "106,171", "106,171", "102,3", "102,3",
+				"103,nil", "103,nil", "103,nil", "103,nil", "102,8",
+				"106,171", "106,171", "106,171", "102,3", "102,3",
+				"106,171", "106,171", "106,171", "102,3", "102,3",
+			},
+		}
+		local want = byProgram[program]
+		local index = 0
+		for _, selector in { 0, 1, -2, 3, 2.5, "x", 4, 10, 11 } :: { any } do
+			for _, budget in { 0, 1, 3, 7, 10 } do
+				index += 1
+				local results = table.pack(pcall(exported, selector, budget))
+				local got = "error"
+				if results[1] then
+					local shown: { string } = {}
+					for position = 2, results.n do
+						table.insert(shown, tostring(results[position]))
+					end
+					got = table.concat(shown, ",")
+				end
+				assert(
+					got == want[index],
+					`{caseName} returned {got} for ({tostring(selector)}, {budget}), its program returns {want[index]}`
+				)
+			end
+		end
+	elseif
 		caseName == "source-frontend-empty-boundary-clone-continue"
 		or caseName == "source-frontend-empty-boundary-clone-continue-nonlocal"
 		or caseName == "source-frontend-empty-boundary-clone-continue-inner-loop"

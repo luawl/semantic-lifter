@@ -4987,3 +4987,29 @@ test "a closure's copy is named apart from the key its creating statement stores
     try std.testing.expect(std.mem.indexOf(u8, source, "t[k] = function()") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "local k = ") == null);
 }
+
+// The worker of a post-tested loop whose `break` arm tests the selector again and jumps into the empty arm of a later
+// `if`, once the structure feedback has split it (the fixture is the resolved IR): the planner records that test's
+// branch with no join, as the last node of the region that holds it, and the arm whose loop test continues at the later
+// `if`'s join stops past that region's stop. Leaving the branch runs the region's stop, so the structured text would run
+// the later `if` the arm skips; the function is written in the dispatcher layout.
+test "a branch arm whose loop test continues past its holding region's stop is written in the dispatcher layout" {
+    const allocator = std.testing.allocator;
+    var parsed = try lifter.codec.parse(allocator, @embedFile("testdata/loop_test_arm_past_holding_stop_resolved.lifter-ir.json"));
+    defer parsed.deinit();
+    const source = try lifter.emit_luau.emitAllocForTargetWithOptions(allocator, &parsed.value, .standard_luau, .{});
+    defer allocator.free(source);
+    try std.testing.expect(std.mem.indexOf(u8, source, "local __lifter_pc") != null);
+}
+
+// The control: a post-tested loop whose `if` arm stops at the `until` test, which the region holding the arm's branch
+// reaches through an empty block that jumps there. Leaving the branch runs that block and then the arm's stop, as the
+// plan does, so the function stays structured.
+test "a branch arm whose stop its holding region's stop jumps to stays structured" {
+    const allocator = std.testing.allocator;
+    var parsed = try lifter.codec.parse(allocator, @embedFile("testdata/joinless_arm_stop_reached_from_holding_stop.lifter-ir.json"));
+    defer parsed.deinit();
+    const source = try lifter.emit_luau.emitAllocForTargetWithOptions(allocator, &parsed.value, .standard_luau, .{});
+    defer allocator.free(source);
+    try std.testing.expect(std.mem.indexOf(u8, source, "__lifter_pc") == null);
+}

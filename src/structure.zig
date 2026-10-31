@@ -15,6 +15,7 @@ const shared_control_shape = @import("shared_control_shape.zig");
 const structural_overlap = @import("structural_overlap.zig");
 const luau_runtime = @import("luau_runtime.zig");
 const stage_trace = @import("stage_trace.zig");
+const transparent_stop = @import("transparent_stop.zig");
 
 pub const BuildError = error{UnsupportedShape} || std.mem.Allocator.Error;
 
@@ -967,6 +968,78 @@ pub fn regionHasUnflaggedLoopExitBreak(program: *const ir.Program, region: *cons
         if (nodeHasUnflaggedLoopExitBreak(program, node)) return true;
     }
     return false;
+}
+
+/// Whether `branch`, a branch with no join and the last node of `holder`, has an arm whose text can end at a stop
+/// past `holder`'s. The readable writer continues after such a branch at `holder`'s stop, so an arm whose text ends
+/// continues there; the plan sends the arm to its own stop, the join the general branch path found, which the
+/// planner's reaches-join test (`regionFallsThroughTo`, `regionOwnsEscape`) did not see the arm reach: a loop test
+/// whose continue edge is the arm's stop, an empty forwarder that became the arm's stop, or an escape to the stop
+/// owned at any depth below the arm, by a join-less arm or a loop boundary's body region (`regionEscapesTo` stops at
+/// every nested region with that stop). The structured text would run `holder`'s stop, or the loop's next pass,
+/// instead of the arm's stop, so the writer refuses the branch and the function is written in the dispatcher layout.
+/// An arm whose stop is `holder`'s, or reaches it or is reached from it through empty blocks that jump with no
+/// arguments, ends where its text ends.
+pub fn joinlessBranchArmLeavesPastStop(program: *const ir.Program, holder: *const Region, branch: Branch) bool {
+    if (branch.join != null) return false;
+    return armLeavesPastStop(program, branch.then_region, holder.stop) or
+        armLeavesPastStop(program, branch.else_region, holder.stop);
+}
+
+fn armLeavesPastStop(program: *const ir.Program, arm: *const Region, holding_stop: ?ir.BlockId) bool {
+    const arm_stop = arm.stop orelse return false;
+    if (holding_stop) |stop| {
+        if (arm_stop == stop) return false;
+        if (forwardsWithoutArguments(program, arm_stop, stop) or forwardsWithoutArguments(program, stop, arm_stop)) return false;
+    }
+    return regionTextMayEnd(program, arm);
+}
+
+/// Whether `from` reaches `to` through empty blocks that jump with no arguments (`transparent_stop.validateEdge`).
+fn forwardsWithoutArguments(program: *const ir.Program, from: ir.BlockId, to: ir.BlockId) bool {
+    const edge = transparent_stop.validateEdge(program, from, to) catch return false;
+    return edge.arguments.len == 0;
+}
+
+/// Whether the readable writer's text of `region` can end, so that the text after it runs next: a transfer wrapper
+/// around the region catches an escape to its stop (`regionWritesOwnedEscape`), the clone boundary's escape
+/// projection onto the region's own stop is written as its end, or no projection ends the region and its last node
+/// can finish without a jump of its own: a block that does not return, a branch, a loop, a loop test whose continue
+/// edge the writer writes as nothing, a loop boundary whose body region ends and exits to this region's stop, or a
+/// side escape that falls through to the region's end. It errs towards true: its caller only refuses more.
+fn regionTextMayEnd(program: *const ir.Program, region: *const Region) bool {
+    if (regionWritesOwnedEscape(region)) return true;
+    if (region.escape_projection) |projection| return region.stop != null and projection.target == region.stop.?;
+    if (region.terminal_projection != null or region.continue_projection != null) return false;
+    if (region.nodes.len == 0 or region.stop_forwarding != null) return true;
+    return switch (region.nodes[region.nodes.len - 1]) {
+        .block => |block_id| block_id.index() >= program.blocks.len or switch (program.blocks[block_id.index()].terminator) {
+            .return_values, .return_pack, .return_expanded, .throw_error, .unreachable_block => false,
+            .jump, .branch => true,
+        },
+        .branch => |branch| branch.join != null or regionTextMayEnd(program, branch.then_region) or
+            regionTextMayEnd(program, branch.else_region),
+        .loop, .latch_loop, .loop_control, .loop_terminal => true,
+        .infinite_loop => |loop| loop.exit != null or loop.shared_side_exit != null,
+        .loop_boundary => |control| (regionTextMayEnd(program, control.body_region) and
+            loopBoundaryBodyExitsToStop(program, region, control)) or regionSideEscapeFallsThrough(region),
+    };
+}
+
+/// Whether a loop boundary's body region exits to `region`'s stop, where the writer ends the boundary's `if`, rather
+/// than to the loop's next pass; a body the writer cannot place counts as exiting to the stop.
+fn loopBoundaryBodyExitsToStop(program: *const ir.Program, region: *const Region, control: LoopBoundaryControl) bool {
+    const body = control.body_region;
+    const exit = transparent_stop.validateLoopBoundaryBody(
+        program,
+        region.stop,
+        region.loop_exit,
+        region.continue_target,
+        body.stop,
+        body.loop_exit,
+        body.continue_target,
+    ) catch return true;
+    return exit == .parent_stop;
 }
 
 /// Returns the distinct loop-boundary exit targets in a structured region.

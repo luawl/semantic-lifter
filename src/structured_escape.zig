@@ -38,6 +38,10 @@ pub fn regionHasUnflaggedLoopExitBreak(program: *const ir.Program, region: *cons
     return structure.regionHasUnflaggedLoopExitBreak(program, region);
 }
 
+pub fn joinlessBranchArmLeavesPastStop(program: *const ir.Program, holder: *const structure.Region, branch: structure.Branch) bool {
+    return structure.joinlessBranchArmLeavesPastStop(program, holder, branch);
+}
+
 pub fn loopBoundaryExitTargetsAlloc(
     allocator: std.mem.Allocator,
     region: *const structure.Region,
