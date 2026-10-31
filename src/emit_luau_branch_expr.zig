@@ -5,6 +5,7 @@ const emission_scope = @import("emit_luau_scope.zig");
 const emission_planning = @import("emit_luau_plan.zig");
 const render = @import("emit_luau_expr.zig");
 const place_render = @import("emit_luau_place.zig");
+const runtime_uses = @import("runtime_uses.zig");
 
 pub const Plan = struct {
     target: ir.ValueId,
@@ -428,6 +429,14 @@ fn absorbConditionProducer(
     if (!operationIsAbsorbable(instruction.operation)) return null;
     const instruction_scope = scopes.instructionScope(instruction.id) orelse return null;
     if (scopes.declarationCount(instruction_scope) != 0) return null;
+    // A block over `max_segment_instructions` rendered statements is written as `do` segments, and the composition is
+    // written after the last segment closes. There it can misread only a local that the producer's segment declares,
+    // since every other operand is declared in a scope that encloses the segment or kept in a storage table that the
+    // function declares at its head. So a producer that reads such a local, itself or through a value written inline,
+    // stays in its segment, assigned to the condition's local, which the scope plan declares at the branch node and the
+    // composition reads by name; any other producer is absorbed.
+    if (scopes.blockScope(structured.block) != instruction_scope and
+        readsSegmentDeclaration(program, emission_plan, scopes, instruction.operation, instruction_scope)) return null;
 
     if (structured.block.index() >= program.blocks.len) return null;
     const block = program.blocks[structured.block.index()];
@@ -444,6 +453,105 @@ fn absorbConditionProducer(
     if (!found) return null;
     return .{ .value = condition, .instruction = instruction.id };
 }
+
+/// Whether `operation`, written inline, reads a local that `segment` declares: a value, place or pack whose scope is
+/// `segment` and that no storage table holds. Each operand is followed through the values the emitter writes inline
+/// (fused values, inlined copies, fused place reads and the invocations that fill an argument pack) to the values it
+/// reads by name, as the scope plan's `collectUses` charges a rendered use; a walk deeper than the program's
+/// instruction count answers true.
+fn readsSegmentDeclaration(
+    program: *const ir.Program,
+    emission_plan: *const emission_planning.Plan,
+    scopes: *const emission_scope.Plan,
+    operation: ir.Operation,
+    segment: emission_scope.ScopeId,
+) bool {
+    var found = false;
+    runtime_uses.visitOperationUses(operation, SegmentReadVisitor{
+        .program = program,
+        .emission_plan = emission_plan,
+        .scopes = scopes,
+        .segment = segment,
+        .remaining = program.instructions.len +| 1,
+        .found = &found,
+    });
+    return found;
+}
+
+const SegmentReadVisitor = struct {
+    program: *const ir.Program,
+    emission_plan: *const emission_planning.Plan,
+    scopes: *const emission_scope.Plan,
+    segment: emission_scope.ScopeId,
+    remaining: usize,
+    found: *bool,
+
+    pub fn value(self: SegmentReadVisitor, value_id: ir.ValueId) void {
+        if (self.found.*) return;
+        if (self.remaining == 0) {
+            self.found.* = true;
+            return;
+        }
+        const resolved = self.emission_plan.dead.resolveValue(value_id);
+        if (resolved.index() >= self.program.values.len) return;
+        const value_info = self.program.values[resolved.index()];
+        if (value_info.function != self.scopes.function.id) return;
+        switch (value_info.origin) {
+            .instruction_result => |origin| if (origin.index == 0 and origin.instruction.index() < self.program.instructions.len) {
+                const producer = self.program.instructions[origin.instruction.index()];
+                if (self.emission_plan.fused_values.contains(producer.id) or self.emission_plan.dead.isInlined(producer.id)) {
+                    runtime_uses.visitOperationUses(producer.operation, self.deeper());
+                    return;
+                }
+                if (self.emission_plan.place_reads.contains(producer.id)) {
+                    switch (producer.operation) {
+                        .place_read => |place_id| self.place(place_id),
+                        else => {},
+                    }
+                    return;
+                }
+            },
+            else => {},
+        }
+        // A value the target keeps in value storage is read through the function's storage table, which the function
+        // declares at its head, so every segment sees it.
+        if (self.emission_plan.names.valueUsesStorage(resolved)) return;
+        if (self.scopes.valueScope(resolved) == self.segment) self.found.* = true;
+    }
+
+    pub fn pack(self: SegmentReadVisitor, pack_id: ir.ValuePackId) void {
+        if (self.found.*) return;
+        if (self.remaining == 0) {
+            self.found.* = true;
+            return;
+        }
+        if (pack_id.index() >= self.program.value_packs.len) return;
+        const pack_info = self.program.value_packs[pack_id.index()];
+        if (pack_info.function != self.scopes.function.id) return;
+        const producer_id = switch (pack_info.origin) {
+            .varargs => return,
+            .instruction_result => |instruction_id| instruction_id,
+        };
+        if (producer_id.index() >= self.program.instructions.len) return;
+        if (self.emission_plan.packs.role(producer_id) == .stored_invocation_producer) {
+            if (self.scopes.packScope(pack_id) == self.segment) self.found.* = true;
+            return;
+        }
+        runtime_uses.visitOperationUses(self.program.instructions[producer_id.index()].operation, self.deeper());
+    }
+
+    pub fn place(self: SegmentReadVisitor, place_id: ir.PlaceId) void {
+        // A place kept in place storage is read through the function's place storage table, declared at its head.
+        if (self.emission_plan.names.placeUsesStorage(place_id)) return;
+        if (self.scopes.placeScope(place_id) == self.segment) self.found.* = true;
+    }
+
+    fn deeper(self: SegmentReadVisitor) SegmentReadVisitor {
+        var next = self;
+        next.remaining -= 1;
+        return next;
+    }
+};
 
 fn operationIsAbsorbable(operation: ir.Operation) bool {
     return switch (operation) {

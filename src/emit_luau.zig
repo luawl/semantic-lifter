@@ -490,7 +490,7 @@ fn emitFunctionBody(
         if (containsBlockId(root_escape_targets, target)) continue;
         try emitEscapeFlagDeclaration(output, allocator, program, emission_plan, target, indent);
     }
-    emitScopeDeclarations(output, allocator, program, emission_plan, &scopes, scopes.rootScope(), indent) catch |err| {
+    emitScopeDeclarations(output, allocator, program, emission_plan, &scopes, scopes.rootScope(), indent, null) catch |err| {
         std.debug.print("emit function={} stage=root_declarations error={s}\n", .{ function.id.index(), @errorName(err) });
         return err;
     };
@@ -908,7 +908,7 @@ fn emitBlockInstructionsWithDeclaration(output: *std.ArrayList(u8), allocator: s
                 try output.appendSlice(allocator, indent);
                 try output.appendSlice(allocator, "do\n");
                 allocated_indent = try allocDeeperIndent(allocator, indent);
-                try emitScopeDeclarations(output, allocator, program, emission_plan, scopes, scope, allocated_indent.?);
+                try emitScopeDeclarations(output, allocator, program, emission_plan, scopes, scope, allocated_indent.?, composition);
             }
             const segment_indent = allocated_indent orelse indent;
             for (block.instructions[index..end]) |instruction_id| {
@@ -1192,11 +1192,12 @@ fn emitRegionBodyWithPredeclaredBlock(
                 scopes,
                 group,
                 allocated_group_indent orelse region_indent,
+                composition,
             );
         }
         const node_scope = scopes.nodeScope(node) orelse return error.UnsupportedControlFlow;
         const indent = allocated_group_indent orelse region_indent;
-        try emitScopeDeclarations(output, allocator, program, emission_plan, scopes, node_scope, indent);
+        try emitScopeDeclarations(output, allocator, program, emission_plan, scopes, node_scope, indent, composition);
         trace_stage = "node_emit";
         switch (node.*) {
             .block => |block_id| {
@@ -4408,6 +4409,7 @@ fn emitScopeDeclarations(
     scopes: *const emission_scope.Plan,
     scope: emission_scope.ScopeId,
     indent: []const u8,
+    composition: ?*const branch_expression.Composition,
 ) !void {
     var bare_count: usize = 0;
     for (scopes.function.local_places) |place_id| {
@@ -4451,6 +4453,12 @@ fn emitScopeDeclarations(
             scopes.valueDeclaredAtInstruction(value.id) or
             scopes.valueDeclaredAtSyntheticSite(value.id) or
             scopes.valueSuppressedByControl(value.id)) continue;
+        // A value the composition writes inline in place of its name (`isOverridden`: an absorbed condition, whose
+        // producer is skipped where it stands) is read by no statement, so it declares no local, as the register
+        // certificate's rooted count (`writesInline`) prices none for it.
+        if (composition) |value_composition| {
+            if (value_composition.isOverridden(value.id)) continue;
+        }
         const name = emission_plan.names.value(value.id) orelse return error.UnsupportedOperation;
         try appendBareDeclaration(output, allocator, indent, name, &bare_count);
     }

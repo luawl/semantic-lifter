@@ -2542,6 +2542,82 @@ function SourceRuntimeOracle.run(caseName: string, source: string, exported: any
 			end
 		end
 	elseif
+		caseName == "source-frontend-segment-operand-or-exit"
+		or caseName == "source-frontend-segment-operand-or-exit-direct-locals"
+		or caseName == "source-frontend-segment-operand-return-and"
+		or caseName == "source-frontend-segment-operand-return-and-direct-locals"
+		or caseName == "source-frontend-segment-operand-equality-exit"
+		or caseName == "source-frontend-segment-operand-equality-exit-direct-locals"
+	then
+		-- Workers with a block of more than 32 statements, which the text writes as `do` segments, that computes in its
+		-- last segment an operand of the `or` or `and` its branch tests; the composition is written after the segment
+		-- closes, so each worker returns what its source returns on the 45-point grid only when that composition reads
+		-- no local of the segment. The text stays structured and keeps its `do` segments, so the case keeps covering an
+		-- operand declared in a segment.
+		local _, pcNames = string.gsub(source, "__lifter_pc", "")
+		local _, pcallNames = string.gsub(source, "__lifter_pcall", "")
+		assert(
+			pcNames == pcallNames,
+			`{caseName} was written in the dispatcher layout ({pcNames - pcallNames} __lifter_pc names)`
+		)
+		assert(string.find(source, "\n%s*do\n") ~= nil, `{caseName} writes no do segment`)
+		local program = string.gsub(caseName, "%-direct%-locals$", "")
+		local byProgram: { [string]: { string } } = {
+			["source-frontend-segment-operand-or-exit"] = {
+				"2,76,38", "1,38,38", "2,76,38", "2,76,38", "2,76,38",
+				"3,114,38", "1,38,38", "3,114,38", "3,114,38", "3,114,38",
+				"3,114,38", "1,38,38", "3,114,38", "3,114,38", "3,114,38",
+				"2,76,38", "1,38,38", "2,76,38", "2,76,38", "2,76,38",
+				"5,190,38", "1,38,38", "3,114,38", "5,190,38", "5,190,38",
+				"2,76,38", "1,38,38", "2,76,38", "2,76,38", "2,76,38",
+				"3,114,38", "1,38,38", "3,114,38", "3,114,38", "3,114,38",
+				"3,114,38", "1,38,38", "3,114,38", "3,114,38", "3,114,38",
+				"4,152,38", "1,38,38", "3,114,38", "4,152,38", "4,152,38",
+			},
+			["source-frontend-segment-operand-return-and"] = {
+				"false,39", "false,39", "false,39", "false,39", "false,39",
+				"false,39", "false,39", "false,39", "false,39", "false,39",
+				"false,39", "false,39", "false,39", "false,39", "false,39",
+				"true,39", "true,39", "false,39", "true,39", "true,39",
+				"true,39", "false,39", "false,39", "false,39", "false,39",
+				"false,39", "false,39", "false,39", "false,39", "false,39",
+				"true,39", "true,39", "false,39", "true,39", "true,39",
+				"true,39", "true,39", "false,39", "true,39", "true,39",
+				"true,39", "true,39", "false,39", "true,39", "true,39",
+			},
+			["source-frontend-segment-operand-equality-exit"] = {
+				"2,10,74", "1,5,37", "2,10,74", "2,10,74", "2,10,74",
+				"3,15,111", "1,5,37", "3,15,111", "3,15,111", "3,15,111",
+				"3,15,111", "1,5,37", "3,15,111", "3,15,111", "3,15,111",
+				"2,10,74", "1,5,37", "2,10,74", "2,10,74", "2,10,74",
+				"21,0,777", "1,5,37", "3,15,111", "7,35,259", "10,50,370",
+				"2,10,74", "1,5,37", "2,10,74", "2,10,74", "2,10,74",
+				"3,15,111", "1,5,37", "3,15,111", "3,15,111", "3,15,111",
+				"3,15,111", "1,5,37", "3,15,111", "3,15,111", "3,15,111",
+				"4,20,148", "1,5,37", "3,15,111", "4,20,148", "4,20,148",
+			},
+		}
+		local want = byProgram[program]
+		local index = 0
+		for _, selector in { 0, 1, -2, 3, 2.5, "x", 4, 10, 11 } :: { any } do
+			for _, budget in { 0, 1, 3, 7, 10 } do
+				index += 1
+				local results = table.pack(pcall(exported, selector, budget))
+				local got = "error"
+				if results[1] then
+					local shown: { string } = {}
+					for position = 2, results.n do
+						table.insert(shown, tostring(results[position]))
+					end
+					got = table.concat(shown, ",")
+				end
+				assert(
+					got == want[index],
+					`{caseName} returned {got} for ({tostring(selector)}, {budget}), its source returns {want[index]}`
+				)
+			end
+		end
+	elseif
 		caseName == "source-frontend-empty-boundary-clone-continue"
 		or caseName == "source-frontend-empty-boundary-clone-continue-nonlocal"
 		or caseName == "source-frontend-empty-boundary-clone-continue-inner-loop"

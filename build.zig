@@ -2783,6 +2783,21 @@ pub fn build(b: *std.Build) void {
             conformance_step.dependOn(&audit.step);
         }
     }
+    // Author-written workers with a block of more than 32 statements, which the text writes as `do` segments, that
+    // computes in its last segment an operand of the `or` or `and` its branch tests: a loop body that leaves the loop
+    // on `total >= 2 + s % 3 or b == total`, straight-line code that returns `s >= limit and b ~= 3`, and a loop body
+    // that leaves on `limit == total or b == total`. The composition is written after the segment closes. Each lifts,
+    // resolves, validates, emits and runs on both targets, and returns what its source returns on the 45-point worker
+    // grid.
+    const segment_operand_sources = [_]struct { path: []const u8, name: []const u8 }{
+        .{ .path = "luau/fixtures/segment_operand_or_exit_source.luau", .name = "source-frontend-segment-operand-or-exit" },
+        .{ .path = "luau/fixtures/segment_operand_return_and_source.luau", .name = "source-frontend-segment-operand-return-and" },
+        .{ .path = "luau/fixtures/segment_operand_equality_exit_source.luau", .name = "source-frontend-segment-operand-equality-exit" },
+    };
+    for (segment_operand_sources) |fixture| {
+        addLuauSourceConformanceForTarget(b, exe, z3_enabled, z3_bin, fixture.path, fixture.name, "standard-luau").addTo(conformance_step);
+        addLuauSourceConformanceForTarget(b, exe, z3_enabled, z3_bin, fixture.path, b.fmt("{s}-direct-locals", .{fixture.name}), "direct-locals-luau").addTo(conformance_step);
+    }
     conformance_step.dependOn(repeat_loop_dispatcher);
     source_frontend_compound_conformance.addTo(conformance_step);
     source_frontend_if_expression_conformance.addTo(conformance_step);

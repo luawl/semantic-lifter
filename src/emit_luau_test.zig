@@ -5013,3 +5013,141 @@ test "a branch arm whose stop its holding region's stop jumps to stays structure
     defer allocator.free(source);
     try std.testing.expect(std.mem.indexOf(u8, source, "__lifter_pc") == null);
 }
+
+/// A worker of a callback `note` and two numbers `s` and `b` whose entry block calls `note()` `filler` times, then
+/// computes `limit = 2 + b % 3`, calls `note(limit)` and returns `s >= limit and b ~= 3` (`s >= b and b ~= 3` when
+/// `reads_limit` is false): the `and` joins in a block that returns its parameter, so its composition is written into
+/// that return. Past 32 rendered statements the entry block is written as `do` segments, and `limit`, read only in the
+/// last one, is declared there. The right arm also computes `spare` constants that nothing reads: past 120 values the
+/// standard target keeps the worker's values in the storage table it declares at its head.
+fn segmentConditionModule(comptime filler: usize, comptime reads_limit: bool, comptime spare: usize) type {
+    return struct {
+        const proof = ir.EvidenceId.fromIndex(0);
+        const chunk_function = ir.FunctionId.fromIndex(0);
+        const worker_function = ir.FunctionId.fromIndex(1);
+        const block = ir.BlockId.fromIndex;
+        const instruction = ir.InstructionId.fromIndex;
+        const value = ir.ValueId.fromIndex;
+        // Instructions: 0 the export, 1 .. filler the calls note(), then 3, b % 3, 2, limit, note(limit) and the
+        // condition in the entry block, and 3, b ~= 3 and the spare constants in the right arm. Values: 0 the export,
+        // 1-3 the parameters, 4-7 the constants and the arithmetic up to limit, 8 the condition, 9 and 10 the right
+        // arm, 11 the result, then the spare constants.
+        const first = filler + 1;
+        const compared = if (reads_limit) value(7) else value(3);
+
+        const values = list: {
+            @setEvalBranchQuota(20_000);
+            var all: [12 + spare]ir.Value = undefined;
+            all[0] = .{ .id = value(0), .function = chunk_function, .type = .function, .name_hint = "worker", .origin = .{ .instruction_result = .{ .instruction = instruction(0), .index = 0 } } };
+            all[1] = .{ .id = value(1), .function = worker_function, .type = .function, .name_hint = "note", .origin = .{ .parameter = 0 } };
+            all[2] = .{ .id = value(2), .function = worker_function, .name_hint = "s", .origin = .{ .parameter = 1 } };
+            all[3] = .{ .id = value(3), .function = worker_function, .name_hint = "b", .origin = .{ .parameter = 2 } };
+            all[4] = .{ .id = value(4), .function = worker_function, .type = .integer, .origin = .{ .instruction_result = .{ .instruction = instruction(first), .index = 0 } } };
+            all[5] = .{ .id = value(5), .function = worker_function, .origin = .{ .instruction_result = .{ .instruction = instruction(first + 1), .index = 0 } } };
+            all[6] = .{ .id = value(6), .function = worker_function, .type = .integer, .origin = .{ .instruction_result = .{ .instruction = instruction(first + 2), .index = 0 } } };
+            all[7] = .{ .id = value(7), .function = worker_function, .name_hint = "limit", .origin = .{ .instruction_result = .{ .instruction = instruction(first + 3), .index = 0 } } };
+            all[8] = .{ .id = value(8), .function = worker_function, .name_hint = "reached", .origin = .{ .instruction_result = .{ .instruction = instruction(first + 5), .index = 0 } } };
+            all[9] = .{ .id = value(9), .function = worker_function, .type = .integer, .origin = .{ .instruction_result = .{ .instruction = instruction(first + 6), .index = 0 } } };
+            all[10] = .{ .id = value(10), .function = worker_function, .origin = .{ .instruction_result = .{ .instruction = instruction(first + 7), .index = 0 } } };
+            all[11] = .{ .id = value(11), .function = worker_function, .name_hint = "result", .origin = .{ .block_parameter = .{ .block = block(3), .index = 0 } } };
+            for (0..spare) |k| all[12 + k] = .{ .id = value(12 + k), .function = worker_function, .type = .integer, .origin = .{ .instruction_result = .{ .instruction = instruction(first + 8 + k), .index = 0 } } };
+            break :list all;
+        };
+        const instructions = list: {
+            @setEvalBranchQuota(20_000);
+            var all: [first + 8 + spare]ir.Instruction = undefined;
+            all[0] = .{ .id = instruction(0), .block = block(0), .operation = .{ .function_ref = worker_function }, .results = &.{value(0)}, .effects = .pure, .evidence = &.{proof} };
+            for (1..first) |k| all[k] = .{ .id = instruction(k), .block = block(1), .operation = .{ .call = .{ .callee = value(1), .arguments = &.{}, .result_arity = .{ .fixed = 0 } } }, .results = &.{}, .effects = .dynamic_call, .evidence = &.{proof} };
+            all[first] = .{ .id = instruction(first), .block = block(1), .operation = .{ .constant = .{ .integer = "3" } }, .results = &.{value(4)}, .effects = .pure, .evidence = &.{proof} };
+            all[first + 1] = .{ .id = instruction(first + 1), .block = block(1), .operation = .{ .binary = .{ .operator = .modulo, .left = value(3), .right = value(4) } }, .results = &.{value(5)}, .effects = .dynamic_call, .evidence = &.{proof} };
+            all[first + 2] = .{ .id = instruction(first + 2), .block = block(1), .operation = .{ .constant = .{ .integer = "2" } }, .results = &.{value(6)}, .effects = .pure, .evidence = &.{proof} };
+            all[first + 3] = .{ .id = instruction(first + 3), .block = block(1), .operation = .{ .binary = .{ .operator = .add, .left = value(6), .right = value(5) } }, .results = &.{value(7)}, .effects = .dynamic_call, .evidence = &.{proof} };
+            all[first + 4] = .{ .id = instruction(first + 4), .block = block(1), .operation = .{ .call = .{ .callee = value(1), .arguments = &.{value(7)}, .result_arity = .{ .fixed = 0 } } }, .results = &.{}, .effects = .dynamic_call, .evidence = &.{proof} };
+            all[first + 5] = .{ .id = instruction(first + 5), .block = block(1), .operation = .{ .binary = .{ .operator = .greater_equal, .left = value(2), .right = compared } }, .results = &.{value(8)}, .effects = .dynamic_call, .evidence = &.{proof} };
+            all[first + 6] = .{ .id = instruction(first + 6), .block = block(2), .operation = .{ .constant = .{ .integer = "3" } }, .results = &.{value(9)}, .effects = .pure, .evidence = &.{proof} };
+            all[first + 7] = .{ .id = instruction(first + 7), .block = block(2), .operation = .{ .binary = .{ .operator = .not_equal, .left = value(3), .right = value(9) } }, .results = &.{value(10)}, .effects = .dynamic_call, .evidence = &.{proof} };
+            for (0..spare) |k| all[first + 8 + k] = .{ .id = instruction(first + 8 + k), .block = block(2), .operation = .{ .constant = .{ .integer = "7" } }, .results = &.{value(12 + k)}, .effects = .pure, .evidence = &.{proof} };
+            break :list all;
+        };
+        const entry_instructions = list: {
+            var ids: [first + 5]ir.InstructionId = undefined;
+            for (&ids, 0..) |*id, k| id.* = instruction(1 + k);
+            break :list ids;
+        };
+        const arm_instructions = list: {
+            var ids: [2 + spare]ir.InstructionId = undefined;
+            for (&ids, 0..) |*id, k| id.* = instruction(first + 6 + k);
+            break :list ids;
+        };
+        const blocks = [_]ir.Block{
+            .{ .id = block(0), .function = chunk_function, .instructions = &.{instruction(0)}, .terminator = .{ .return_values = &.{value(0)} }, .evidence = &.{proof} },
+            .{ .id = block(1), .function = worker_function, .instructions = &entry_instructions, .terminator = .{ .branch = .{ .condition = value(8), .then_edge = .{ .target = block(2) }, .else_edge = .{ .target = block(3), .arguments = &.{value(8)} } } }, .evidence = &.{proof} },
+            .{ .id = block(2), .function = worker_function, .instructions = &arm_instructions, .terminator = .{ .jump = .{ .target = block(3), .arguments = &.{value(10)} } }, .evidence = &.{proof} },
+            .{ .id = block(3), .function = worker_function, .parameters = &.{value(11)}, .terminator = .{ .return_values = &.{value(11)} }, .evidence = &.{proof} },
+        };
+        const functions = [_]ir.Function{
+            .{ .id = chunk_function, .name_hint = "chunk", .blocks = &.{block(0)}, .entry_block = block(0), .evidence = &.{proof} },
+            .{ .id = worker_function, .name_hint = "worker", .parameters = &.{ value(1), value(2), value(3) }, .blocks = &.{ block(1), block(2), block(3) }, .entry_block = block(1), .evidence = &.{proof} },
+        };
+        const evidence = [_]ir.Evidence{.{ .id = proof, .kind = .dynamic_fixture, .locator = "fixture:segment-condition" }};
+        const program: ir.Program = .{
+            .program_id = "segment-condition",
+            .entry_function = chunk_function,
+            .functions = &functions,
+            .blocks = &blocks,
+            .instructions = &instructions,
+            .values = &values,
+            .evidence = &evidence,
+        };
+    };
+}
+
+test "a condition producer in the last do segment of its block is assigned there and read by name after it" {
+    const module = segmentConditionModule(40, true, 0);
+    const source = try emitAlloc(std.testing.allocator, &module.program);
+    defer std.testing.allocator.free(source);
+    errdefer std.debug.print("{s}\n", .{source});
+    // Over 32 rendered statements the entry block is written as `do` segments and `limit` is declared in the last
+    // one; the `and` is written into the return after that segment closes, so it reads the condition by name.
+    try std.testing.expect(std.mem.indexOf(u8, source, "local __lifter_pc") == null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "  do\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "reached = s >= limit\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "return reached and b ~= 3\n") != null);
+}
+
+test "a condition producer in a block without do segments is written into its composition" {
+    const module = segmentConditionModule(8, true, 0);
+    const source = try emitAlloc(std.testing.allocator, &module.program);
+    defer std.testing.allocator.free(source);
+    errdefer std.debug.print("{s}\n", .{source});
+    try std.testing.expect(std.mem.indexOf(u8, source, "local __lifter_pc") == null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "  do\n") == null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "return s >= limit and b ~= 3\n") != null);
+}
+
+test "a condition producer in a do segment that reads a value kept in value storage is written into its composition" {
+    const module = segmentConditionModule(40, true, 121);
+    const source = try emitAlloc(std.testing.allocator, &module.program);
+    defer std.testing.allocator.free(source);
+    errdefer std.debug.print("{s}\n", .{source});
+    // Past 120 values the standard target keeps `limit` in the storage table the worker declares at its head, so the
+    // producer `s >= limit`, written into the return after the last segment closes, reads it through that table.
+    try std.testing.expect(std.mem.indexOf(u8, source, "local __lifter_pc") == null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "local __lifter_value_storage = {}\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "  do\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "__lifter_value_storage[7] = 2 + b % 3\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "return s >= __lifter_value_storage[7] and b ~= 3\n") != null);
+}
+
+test "a condition producer written into its composition from a do segment declares no local" {
+    const module = segmentConditionModule(40, false, 0);
+    const source = try emitAlloc(std.testing.allocator, &module.program);
+    defer std.testing.allocator.free(source);
+    errdefer std.debug.print("{s}\n", .{source});
+    // The producer `s >= b` reads only parameters, so it is written into the return after the last segment closes;
+    // its condition is named nowhere, and no local is declared for it.
+    try std.testing.expect(std.mem.indexOf(u8, source, "local __lifter_pc") == null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "  do\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "return s >= b and b ~= 3\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "reached") == null);
+}

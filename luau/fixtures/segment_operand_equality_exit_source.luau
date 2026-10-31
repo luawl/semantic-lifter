@@ -1,0 +1,60 @@
+local function worker(selector, budget)
+    local s = tonumber(selector) or 0
+    local b = tonumber(budget) or 0
+    local log = {}
+    local function note(tag)
+        log[#log + 1] = tag
+    end
+    local total = 0
+    local last = 0
+    while true do
+        total = total + 1
+        note(1)
+        note(2)
+        note(3)
+        note(4)
+        note(5)
+        note(6)
+        note(7)
+        note(8)
+        note(9)
+        note(10)
+        note(11)
+        note(12)
+        note(13)
+        note(14)
+        note(15)
+        note(16)
+        note(17)
+        note(18)
+        note(19)
+        note(20)
+        note(21)
+        note(22)
+        note(23)
+        note(24)
+        note(25)
+        note(26)
+        note(27)
+        note(28)
+        note(29)
+        note(30)
+        note(31)
+        note(32)
+        note(33)
+        note(34)
+        note(35)
+        note(36)
+        local limit = 2 + s % 3
+        note(limit)
+        if limit == total or b == total then
+            last = total * 5
+            break
+        end
+        if total > 20 then
+            break
+        end
+    end
+    return total, last, #log
+end
+return worker
