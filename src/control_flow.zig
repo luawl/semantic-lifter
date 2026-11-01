@@ -155,13 +155,17 @@ pub fn applyProvedBranchesWithState(
     for (blocks, program.blocks) |*block, original| {
         block.* = original;
         if (!scope.block(original.id)) continue;
+        // The resolver passes `program.edge_rewrites` as `rewrites.items`, whose buffer `appendRewrite` below can move
+        // and free; the edges are specialized against the round's input records, read through the live list.
+        var input = program.*;
+        input.edge_rewrites = rewrites.items[0..original_rewrite_count];
         switch (original.terminator) {
             .jump => |edge| {
                 // A rewritten jump is still owned by its authenticated
                 // lineage. Do not discover a new forwarding substitution on
                 // that witness.
                 if (isRewriteWitness(rewrites.items, original.id)) continue;
-                const specialized = try specializeEdge(allocator, program, edge_decisions.items, rewrites.items, .{ .source = original.id, .kind = .jump, .target = edge.target }, edge);
+                const specialized = try specializeEdge(allocator, &input, edge_decisions.items, rewrites.items, .{ .source = original.id, .kind = .jump, .target = edge.target }, edge);
                 block.terminator = .{ .jump = specialized.edge };
                 specialized_count += @intFromBool(specialized.changed);
                 if (specialized.changed) try appendRewrite(allocator, rewrites, original.id, .jump, edge, specialized);
@@ -179,7 +183,7 @@ pub fn applyProvedBranchesWithState(
                 if (isRewriteWitness(rewrites.items, original.id)) continue;
                 var then_specialized = try specializeEdge(
                     allocator,
-                    program,
+                    &input,
                     edge_decisions.items,
                     rewrites.items,
                     .{ .source = original.id, .kind = .branch_then, .target = branch.then_edge.target },
@@ -187,7 +191,7 @@ pub fn applyProvedBranchesWithState(
                 );
                 var else_specialized = try specializeEdge(
                     allocator,
-                    program,
+                    &input,
                     edge_decisions.items,
                     rewrites.items,
                     .{ .source = original.id, .kind = .branch_else, .target = branch.else_edge.target },
@@ -1941,6 +1945,122 @@ test "forwarding jumps persist replayable copy-chain parameter substitution" {
     const retained_result = try applyProvedBranches(arena.allocator(), &retained);
     try std.testing.expectEqual(@as(usize, 0), retained_result.specialized_edges);
     try std.testing.expectEqual(forwarding_id, retained.blocks[entry_id.index()].terminator.jump.target);
+}
+
+/// Forwards every call to `child`, and first fills a freed buffer with 0xA5 through a volatile pointer, so the fill is
+/// written in every build mode (`Allocator.free` fills a freed buffer with `undefined`, which only Debug and
+/// ReleaseSafe write, and the arena never hands that buffer out again).
+const PoisonOnFree = struct {
+    child: std.mem.Allocator,
+
+    fn allocator(self: *PoisonOnFree) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *PoisonOnFree = @ptrCast(@alignCast(ctx));
+        return self.child.rawAlloc(len, alignment, ret_addr);
+    }
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *PoisonOnFree = @ptrCast(@alignCast(ctx));
+        return self.child.rawResize(memory, alignment, new_len, ret_addr);
+    }
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *PoisonOnFree = @ptrCast(@alignCast(ctx));
+        return self.child.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *PoisonOnFree = @ptrCast(@alignCast(ctx));
+        const bytes: []volatile u8 = memory;
+        for (bytes) |*byte| byte.* = 0xA5;
+        self.child.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+test "a later block's second forwarding hop reads the round's rewrite records after an earlier block's append moves the rewrite list" {
+    // The resolver passes `program.edge_rewrites` as `rewrites.items`. An earlier block's forwarding rewrite grows that
+    // list, which moves it to a new buffer and frees the old one; a later block's second forwarding hop needs the
+    // recorded rewrite to find the path to its constraint, which is scoped on the root edge. Read from the freed
+    // buffer, the record is lost and the hop is not forwarded.
+    const function_id = ir.FunctionId.fromIndex(0);
+    const b_entry = ir.BlockId.fromIndex(0);
+    const b_first = ir.BlockId.fromIndex(1);
+    const b_second = ir.BlockId.fromIndex(2);
+    const b_hop = ir.BlockId.fromIndex(3);
+    const b_relay = ir.BlockId.fromIndex(4);
+    const b_root = ir.BlockId.fromIndex(5);
+    const b_exit = ir.BlockId.fromIndex(6);
+    const input = ir.ValueId.fromIndex(0);
+    const blocks = [_]ir.Block{
+        .{ .id = b_entry, .function = function_id, .terminator = .{ .branch = .{
+            .condition = input,
+            .then_edge = .{ .target = b_first },
+            .else_edge = .{ .target = b_second },
+        } } },
+        // The round's first forwardable edge, b_first -> b_hop -> b_exit; its rewrite is appended first.
+        .{ .id = b_first, .function = function_id, .terminator = .{ .jump = .{ .target = b_hop } } },
+        // Forwarded once already (b_root -> b_relay, the recorded rewrite below); its second hop, b_relay -> b_exit,
+        // reaches the constraint scoped on the root edge only through that record.
+        .{ .id = b_second, .function = function_id, .terminator = .{ .jump = .{ .target = b_relay } } },
+        .{ .id = b_hop, .function = function_id, .terminator = .{ .jump = .{ .target = b_exit } } },
+        .{ .id = b_relay, .function = function_id, .terminator = .{ .jump = .{ .target = b_exit } } },
+        .{ .id = b_root, .function = function_id, .terminator = .{ .jump = .{ .target = b_relay } } },
+        .{ .id = b_exit, .function = function_id, .terminator = .{ .return_values = &.{input} } },
+    };
+    const values = [_]ir.Value{
+        .{ .id = input, .function = function_id, .type = .boolean, .origin = .{ .parameter = 0 } },
+    };
+    const evidence_id = ir.EvidenceId.fromIndex(0);
+    const evidence = [_]ir.Evidence{.{ .id = evidence_id, .kind = .frontend_proof, .locator = "fixture:moved-rewrite-list" }};
+    const terms = [_]ir.SolverTerm{.{ .id = ir.SolverTermId.fromIndex(0), .sort = .{ .kind = .boolean }, .operation = .{ .value = input } }};
+    const constraints = [_]ir.Constraint{
+        .{ .id = ir.ConstraintId.fromIndex(0), .predicate = ir.SolverTermId.fromIndex(0), .evidence = &.{evidence_id}, .scope = .{ .edge = .{ .source = b_first, .kind = .jump, .target = b_hop } } },
+        .{ .id = ir.ConstraintId.fromIndex(1), .predicate = ir.SolverTermId.fromIndex(0), .evidence = &.{evidence_id}, .scope = .{ .edge = .{ .source = b_second, .kind = .jump, .target = b_root } } },
+    };
+    const recorded: ir.CfgEdgeRewrite = .{
+        .id = ir.EdgeRewriteId.fromIndex(0),
+        .source = b_second,
+        .kind = .jump,
+        .from = .{ .target = b_root },
+        .to = .{ .target = b_relay },
+        .rule = .forwarding_jump,
+    };
+    var program: ir.Program = .{
+        .program_id = "moved-rewrite-list",
+        .entry_function = function_id,
+        .functions = &.{.{
+            .id = function_id,
+            .parameters = &.{input},
+            .blocks = &.{ b_entry, b_first, b_second, b_hop, b_relay, b_root, b_exit },
+            .entry_block = b_entry,
+        }},
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &values,
+        .evidence = &evidence,
+        .solver_terms = &terms,
+        .constraints = &constraints,
+    };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var poison: PoisonOnFree = .{ .child = arena.allocator() };
+    const allocator = poison.allocator();
+    // The resolver's shape: a list at full capacity whose items the program aliases.
+    var rewrites: std.ArrayList(ir.CfgEdgeRewrite) = .empty;
+    try rewrites.ensureTotalCapacityPrecise(allocator, 1);
+    rewrites.appendAssumeCapacity(recorded);
+    program.edge_rewrites = rewrites.items;
+    // Allocated after the list, so the list cannot grow in place.
+    const next_blocks = try allocator.alloc(ir.Block, program.blocks.len);
+
+    const result = try applyProvedBranchesWithState(allocator, &program, next_blocks, &rewrites);
+    try std.testing.expectEqual(@as(usize, 2), result.specialized_edges);
+    try std.testing.expectEqual(b_exit, program.blocks[b_first.index()].terminator.jump.target);
+    try std.testing.expectEqual(b_exit, program.blocks[b_second.index()].terminator.jump.target);
+    try std.testing.expectEqual(@as(usize, 3), program.edge_rewrites.len);
+    try std.testing.expectEqual(b_second, program.edge_rewrites[2].source);
+    try std.testing.expectEqual(b_relay, program.edge_rewrites[2].from.target);
+    try std.testing.expectEqual(b_exit, program.edge_rewrites[2].to.target);
 }
 
 test "forwarding jumps substitute a root defined on the dominator path from the target to the forwarder" {
