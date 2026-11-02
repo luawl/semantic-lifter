@@ -80,9 +80,23 @@ pub fn maxOwnedDepth(region: *const structure.Region) usize {
 fn maxRegionDepth(region: *const structure.Region, depth: usize) usize {
     const nested_depth = depth + @intFromBool(regionOwnsEscape(region));
     var maximum = nested_depth;
+    // An infinite loop with a shared side exit declares one flag per entry before its `while true do`, at this
+    // region's level (`emitInfiniteLoop`): each is a register through the loop's body, its side regions and the
+    // region's later nodes, whatever flag of the same name a region in the body declares again.
+    var side_flags: usize = 0;
     // A loop that declares its owned exit's flag at the top of each pass holds one more flag through its body.
-    for (region.nodes) |node| maximum = @max(maximum, maxNodeDepth(node, nested_depth + @intFromBool(loopOwnedExitFlag(region, node) != null)));
+    for (region.nodes) |node| {
+        side_flags += sharedSideFlagCount(node);
+        maximum = @max(maximum, maxNodeDepth(node, nested_depth + side_flags + @intFromBool(loopOwnedExitFlag(region, node) != null)));
+    }
     return maximum;
+}
+
+fn sharedSideFlagCount(node: structure.Node) usize {
+    return switch (node) {
+        .infinite_loop => |loop| if (loop.shared_side_exit) |side_exit| side_exit.entries.len else 0,
+        else => 0,
+    };
 }
 
 fn maxNodeDepth(node: structure.Node, depth: usize) usize {
@@ -94,9 +108,10 @@ fn maxNodeDepth(node: structure.Node, depth: usize) usize {
         ),
         .loop => |loop| maxRegionDepth(loop.body_region, depth),
         .latch_loop => |loop| maxRegionDepth(loop.body_region, depth),
+        // `depth` already holds the loop's side-exit flags (`maxRegionDepth`).
         .infinite_loop => |loop| @max(
             maxRegionDepth(loop.body_region, depth),
-            if (loop.shared_side_exit) |side_exit| maxSharedSideExitDepth(side_exit, depth + 1) else depth,
+            if (loop.shared_side_exit) |side_exit| maxSharedSideExitDepth(side_exit, depth) else depth,
         ),
         .loop_boundary => |control| maximum: {
             var value = maxRegionDepth(control.body_region, depth);

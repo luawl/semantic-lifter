@@ -3313,3 +3313,58 @@ test "a post-tested loop in an if arm whose tail is the arm stop stays structure
     try std.testing.expect(boundary.boundary == .side_exit);
     try std.testing.expectEqual(arm_tail, boundary.boundary.side_exit.entry_edge.target);
 }
+
+test "a shared side exit's flags are counted through the infinite loop's body" {
+    // The plan of a repeat (`repeat i = i + 1 if i == n then p = p + 100 break end until <test>`, then
+    // `p = p + 1`, inside a while body): an infinite loop whose side exit enters the block after it. The writer
+    // declares the entry's flag before `while true do` (`emitInfiniteLoop`), the header's flag at the top of each pass
+    // (the body owns the until test's continue, carried by flag) and the else arm's stop flag before its wrapper: the
+    // arm's flag has the side flag's name and shadows it, and both are registers at the until test.
+    const exit = ir.BlockId.fromIndex(3);
+    const header = ir.BlockId.fromIndex(6);
+    const latch = ir.BlockId.fromIndex(7);
+    const side_entry = ir.BlockId.fromIndex(8);
+    const second_entry = ir.BlockId.fromIndex(12);
+    var then_nodes = [_]lifter.structure.Node{.{ .block = ir.BlockId.fromIndex(9) }};
+    var then_region: lifter.structure.Region = .{ .nodes = &then_nodes, .stop = side_entry, .loop_exit = exit };
+    var continue_region: lifter.structure.Region = .{ .nodes = &.{}, .stop = header, .loop_exit = exit, .continue_target = header };
+    var else_nodes = [_]lifter.structure.Node{
+        .{ .block = ir.BlockId.fromIndex(10) },
+        .{ .loop_boundary = .{
+            .block = latch,
+            .body_edge = .{ .target = header },
+            .body_region = &continue_region,
+            .boundary = .{ .escape = .{ .target = side_entry } },
+            .body_on_true = false,
+            .continue_via_flag = true,
+        } },
+    };
+    var else_region: lifter.structure.Region = .{ .nodes = &else_nodes, .stop = side_entry, .loop_exit = exit };
+    var body_nodes = [_]lifter.structure.Node{.{ .branch = .{
+        .block = header,
+        .then_region = &then_region,
+        .else_region = &else_region,
+        .join = side_entry,
+    } }};
+    var body: lifter.structure.Region = .{ .nodes = &body_nodes, .stop = header, .loop_exit = exit, .continue_target = header };
+    var side_nodes = [_]lifter.structure.Node{.{ .block = side_entry }};
+    var side_region: lifter.structure.Region = .{ .nodes = &side_nodes, .stop = exit, .loop_exit = null };
+    var second_nodes = [_]lifter.structure.Node{.{ .block = second_entry }};
+    var second_region: lifter.structure.Region = .{ .nodes = &second_nodes, .stop = exit, .loop_exit = null };
+    var entries = [_]lifter.structure.SharedSideEntry{
+        .{ .entry = side_entry, .region = &side_region },
+        .{ .entry = second_entry, .region = &second_region },
+    };
+    var root_nodes = [_]lifter.structure.Node{
+        .{ .infinite_loop = .{ .header = header, .body_region = &body, .exit = exit, .shared_side_exit = .{ .entries = entries[0..1] } } },
+        .{ .block = exit },
+    };
+    const root: lifter.structure.Region = .{ .nodes = &root_nodes, .stop = null, .loop_exit = null };
+    try std.testing.expect(lifter.structured_escape.regionOwnsEscape(&body));
+    try std.testing.expect(lifter.structured_escape.regionOwnsEscape(&else_region));
+    // The side flag, the header's flag and the else arm's flag: three registers at the until test.
+    try std.testing.expectEqual(@as(usize, 3), lifter.structured_escape.maxOwnedDepth(&root));
+    // Each entry of a shared side exit is its own flag, declared before the loop.
+    root_nodes[0].infinite_loop.shared_side_exit = .{ .entries = &entries };
+    try std.testing.expectEqual(@as(usize, 4), lifter.structured_escape.maxOwnedDepth(&root));
+}

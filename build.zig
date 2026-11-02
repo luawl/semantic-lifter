@@ -3756,8 +3756,9 @@ fn addDispatcherGenericBudgetConformance(
 // step past a boundary its certificate once left out: a dispatcher-layout closure's snapshot locals above the flat
 // locals (the register total and the 200-local count), a branch composition stored into a storage slot, a wrapped
 // loop body's `until true` above the body's locals (in one group, and in two `do` groups inside a loop), a list of
-// storage slots, a loop's `while true`, a storage slot's compound, binary and plain stores, and the call frames under a
-// comparison, a return, a local, a branch, a call statement, an upvalue store and a place's declaration; luau-compile
+// storage slots, a loop's `while true`, a storage slot's compound, binary and plain stores, the call frames under a
+// comparison, a return, a local, a branch, a call statement, an upvalue store and a place's declaration, and an
+// infinite loop's shared side-exit flag, declared before its `while true do`, through the loop's body; luau-compile
 // rejects each one's emitted text at -O0 or at the default level, and the readable admission refuses it with the
 // diagnostic beside it (the emitter writes no output, so the output argument is an empty seed file). One step smaller,
 // each boundary source is admitted, emitted, and compiled at -O0 and at the default level.
@@ -3770,6 +3771,7 @@ fn addRegisterChargeConformance(
 ) void {
     const temporary = "diagnostic=unsupported_readable_temporary_register_pressure entity=1\n";
     const temporary_root = "diagnostic=unsupported_readable_temporary_register_pressure entity=0\n";
+    const temporary_worker = "diagnostic=unsupported_readable_temporary_register_pressure entity=2\n";
     for ([_][4][]const u8{
         .{ "luau/fixtures/register_charge_flat_closure_call_source.luau", "register-charge-flat-closure-call", "dispatcher", temporary },
         .{ "luau/fixtures/register_charge_flat_closure_snapshots_source.luau", "register-charge-flat-closure-snapshots", "dispatcher", "diagnostic=unsupported_readable_register_pressure entity=1\n" },
@@ -3793,6 +3795,7 @@ fn addRegisterChargeConformance(
         .{ "luau/fixtures/register_charge_call_statement_source.luau", "register-charge-call-statement", "automatic", temporary_root },
         .{ "luau/fixtures/register_charge_upvalue_binary_call_source.luau", "register-charge-upvalue-binary-call", "automatic", temporary },
         .{ "luau/fixtures/register_charge_place_binary_call_source.luau", "register-charge-place-binary-call", "automatic", temporary_root },
+        .{ "luau/fixtures/register_charge_side_exit_flag_source.luau", "register-charge-side-exit-flag", "automatic", temporary_worker },
     }) |refused| {
         const resolved = addGenericBudgetResolvedIr(b, exe, z3_enabled, z3_bin, refused[0], refused[1]);
         conformance_step.dependOn(addRegisterChargeRefusal(b, exe, z3_enabled, z3_bin, resolved, refused[1], refused[2], refused[3]));
@@ -3826,6 +3829,7 @@ fn addRegisterChargeConformance(
         .{ "luau/fixtures/register_charge_return_binary_call_boundary_source.luau", "register-charge-return-binary-call-boundary", "automatic" },
         .{ "luau/fixtures/register_charge_upvalue_binary_call_boundary_source.luau", "register-charge-upvalue-binary-call-boundary", "automatic" },
         .{ "luau/fixtures/register_charge_return_or_constant_boundary_source.luau", "register-charge-return-or-constant-boundary", "automatic" },
+        .{ "luau/fixtures/register_charge_side_exit_flag_boundary_source.luau", "register-charge-side-exit-flag-boundary", "automatic" },
     }) |boundary| {
         const resolved = addGenericBudgetResolvedIr(b, exe, z3_enabled, z3_bin, boundary[0], boundary[1]);
         const emit = b.addRunArtifact(exe);
