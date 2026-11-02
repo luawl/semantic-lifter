@@ -2951,6 +2951,20 @@ pub fn build(b: *std.Build) void {
         addLuauSourceConformanceForTarget(b, exe, z3_enabled, z3_bin, fixture.path, fixture.name, "standard-luau").addTo(conformance_step);
         addLuauSourceConformanceForTarget(b, exe, z3_enabled, z3_bin, fixture.path, b.fmt("{s}-direct-locals", .{fixture.name}), "direct-locals-luau").addTo(conformance_step);
     }
+    // Author-written workers whose loop's one exit arm ends in a nested `repeat` that returns on one test and breaks
+    // on another, then leaves the loop with `break`: the arm's region ends in the returning block, and the nested
+    // loop's other exits leave the region's transfer wrapper at its stop, so the arm writes its `break` after the
+    // region. The loop is a `while` with a condition in the first and a `repeat ... until` with a condition in the
+    // second. Each lifts, resolves, validates, emits and runs on both targets, stays structured, and returns what its
+    // source returns on the 45-point worker grid.
+    const side_exit_nested_escape_sources = [_]struct { path: []const u8, name: []const u8 }{
+        .{ .path = "luau/fixtures/side_exit_nested_escape_while_source.luau", .name = "source-frontend-side-exit-nested-escape-while" },
+        .{ .path = "luau/fixtures/side_exit_nested_escape_until_source.luau", .name = "source-frontend-side-exit-nested-escape-until" },
+    };
+    for (side_exit_nested_escape_sources) |fixture| {
+        addLuauSourceConformanceForTarget(b, exe, z3_enabled, z3_bin, fixture.path, fixture.name, "standard-luau").addTo(conformance_step);
+        addLuauSourceConformanceForTarget(b, exe, z3_enabled, z3_bin, fixture.path, b.fmt("{s}-direct-locals", .{fixture.name}), "direct-locals-luau").addTo(conformance_step);
+    }
     conformance_step.dependOn(repeat_loop_dispatcher);
     source_frontend_compound_conformance.addTo(conformance_step);
     source_frontend_if_expression_conformance.addTo(conformance_step);

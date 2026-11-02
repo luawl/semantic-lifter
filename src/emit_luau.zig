@@ -2103,6 +2103,10 @@ fn validatedContinueProjectionAlloc(
 }
 
 fn regionAlwaysFunctionTerminates(program: *const ir.Program, region: *const structure.Region) bool {
+    // A region that leaves by its stop's flag for an escape it owns is written inside a transfer wrapper whose end
+    // that escape reaches (`regionWritesOwnedEscape`, as `structure.regionTextMayEnd` reads it): its text can end at
+    // its stop whatever its last node, so the writer must not leave out the transfer that follows it.
+    if (structured_escape.regionWritesOwnedEscape(region)) return false;
     if (region.terminal_projection != null) return true;
     if (region.escape_projection != null) return false;
     if (region.nodes.len == 0) return false;
@@ -5078,6 +5082,61 @@ test "a side region declares no flag of the side target its arm sets after it" {
     defer falls_through.deinit(allocator);
     try emitLoopBoundaryArmImpl(&falls_through, allocator, &program, &plan, &scopes, boundary, true, false, "    ", &.{});
     try std.testing.expectEqualStrings(wrapped_side_region, falls_through.items);
+}
+
+test "a side region whose last block returns can end at its stop when an escape it owns leaves its wrapper there" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const arm = ir.BlockId.fromIndex(0);
+    const returning = ir.BlockId.fromIndex(1);
+    const stop = ir.BlockId.fromIndex(2);
+    const function_blocks = [_]ir.BlockId{ arm, returning, stop };
+    const blocks = [_]ir.Block{
+        .{ .id = arm, .function = function_id, .terminator = .{ .jump = .{ .target = returning } } },
+        .{ .id = returning, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = stop, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const functions = [_]ir.Function{.{ .id = function_id, .blocks = &function_blocks, .entry_block = arm }};
+    const program: ir.Program = .{
+        .program_id = "side-exit-owned-escape",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &.{},
+    };
+    // A branch whose then arm leaves for the side region's stop by its escape projection (the shape of a nested loop
+    // whose `break` leaves past the returning block), then the returning block as the side region's last node.
+    var escaping_arm = structure.Region{ .nodes = &.{}, .stop = returning, .loop_exit = null, .escape_projection = .{ .target = stop, .edge = null } };
+    var plain_arm = structure.Region{ .nodes = &.{}, .stop = returning, .loop_exit = null };
+    var escaping_nodes = [_]structure.Node{
+        .{ .branch = .{ .block = arm, .then_region = &escaping_arm, .else_region = &plain_arm, .join = returning } },
+        .{ .block = returning },
+    };
+    const escaping_region = structure.Region{ .nodes = &escaping_nodes, .stop = stop, .loop_exit = null };
+    // The region is written in a transfer wrapper that the escape leaves at its `until true`, the region's stop ...
+    try std.testing.expect(structured_escape.regionWritesOwnedEscape(&escaping_region));
+    // ... so its text can end there, and the side-exit arm must write its `break` after it.
+    try std.testing.expect(!regionAlwaysFunctionTerminates(&program, &escaping_region));
+
+    // The same when the region's last node is a branch with no join whose arms both return.
+    var returning_arm_nodes = [_]structure.Node{.{ .block = returning }};
+    var returning_arm = structure.Region{ .nodes = &returning_arm_nodes, .stop = null, .loop_exit = null };
+    var branch_tail_nodes = [_]structure.Node{
+        .{ .branch = .{ .block = arm, .then_region = &escaping_arm, .else_region = &plain_arm, .join = returning } },
+        .{ .branch = .{ .block = returning, .then_region = &returning_arm, .else_region = &returning_arm, .join = null } },
+    };
+    const branch_tail_region = structure.Region{ .nodes = &branch_tail_nodes, .stop = stop, .loop_exit = null };
+    try std.testing.expect(structured_escape.regionWritesOwnedEscape(&branch_tail_region));
+    try std.testing.expect(!regionAlwaysFunctionTerminates(&program, &branch_tail_region));
+
+    // Without the escape the region always returns, and the arm writes no `break`.
+    var returning_nodes = [_]structure.Node{
+        .{ .branch = .{ .block = arm, .then_region = &plain_arm, .else_region = &plain_arm, .join = returning } },
+        .{ .block = returning },
+    };
+    const returning_region = structure.Region{ .nodes = &returning_nodes, .stop = stop, .loop_exit = null };
+    try std.testing.expect(!structured_escape.regionWritesOwnedEscape(&returning_region));
+    try std.testing.expect(regionAlwaysFunctionTerminates(&program, &returning_region));
 }
 
 test "a region whose wrapper would only forward a flag is written without it, and a wrapper declares no flag nothing sets" {

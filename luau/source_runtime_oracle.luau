@@ -2855,6 +2855,67 @@ function SourceRuntimeOracle.run(caseName: string, source: string, exported: any
 			end
 		end
 	elseif
+		caseName == "source-frontend-side-exit-nested-escape-while"
+		or caseName == "source-frontend-side-exit-nested-escape-while-direct-locals"
+		or caseName == "source-frontend-side-exit-nested-escape-until"
+		or caseName == "source-frontend-side-exit-nested-escape-until-direct-locals"
+	then
+		-- Workers whose loop's one exit arm ends in a nested `repeat` that returns on one test and breaks on another,
+		-- then leaves the loop with `break`. The nested loop's break and its until exit leave the arm's region past its
+		-- returning block, so each worker returns what its source returns on the 45-point grid only when the text writes
+		-- the arm's `break` after that region. The text stays structured, so the case keeps covering the side exit's arm.
+		local _, pcNames = string.gsub(source, "__lifter_pc", "")
+		local _, pcallNames = string.gsub(source, "__lifter_pcall", "")
+		assert(
+			pcNames == pcallNames,
+			`{caseName} was written in the dispatcher layout ({pcNames - pcallNames} __lifter_pc names)`
+		)
+		local program = string.gsub(caseName, "%-direct%-locals$", "")
+		local byProgram: { [string]: { string } } = {
+			["source-frontend-side-exit-nested-escape-while"] = {
+				"7,2,", "10,3,kb", "16,5,kb", "28,9,", "37,12,",
+				"-1,4,", "-1,4,", "-1,4,", "-1,4,", "-1,4,",
+				"7,2,", "10,3,kb", "16,5,kb", "28,9,", "37,12,",
+				"-3,7,", "10,3,kb", "-3,10,", "-3,10,", "-3,10,",
+				"7,2,", "10,3,kb", "16,5,kb", "28,9,", "37,12,",
+				"7,2,", "10,3,kb", "16,5,kb", "28,9,", "37,12,",
+				"7,2,", "10,3,kb", "13,4,kb", "13,4,", "13,4,",
+				"7,2,", "10,3,kb", "16,5,kb", "28,9,", "31,10,",
+				"7,2,", "10,3,kb", "16,5,kb", "28,9,", "34,11,",
+			},
+			["source-frontend-side-exit-nested-escape-until"] = {
+				"7,2,", "10,3,kb", "16,5,kb", "28,9,", "37,12,",
+				"-1,4,", "-1,4,", "-1,4,", "-1,4,", "-1,4,",
+				"7,2,", "10,3,kb", "16,5,kb", "28,9,", "37,12,",
+				"-3,7,", "10,3,kb", "-3,10,", "-3,10,", "-3,10,",
+				"7,2,", "10,3,kb", "16,5,kb", "28,9,", "37,12,",
+				"7,2,", "10,3,kb", "16,5,kb", "28,9,", "37,12,",
+				"7,2,", "10,3,kb", "13,4,kb", "13,4,", "13,4,",
+				"7,2,", "10,3,kb", "16,5,kb", "28,9,", "31,10,",
+				"7,2,", "10,3,kb", "16,5,kb", "28,9,", "34,11,",
+			},
+		}
+		local want = byProgram[program]
+		local index = 0
+		for _, selector in { 0, 1, -2, 3, 2.5, "x", 4, 10, 11 } :: { any } do
+			for _, budget in { 0, 1, 3, 7, 10 } do
+				index += 1
+				local results = table.pack(pcall(exported, selector, budget))
+				local got = "error"
+				if results[1] then
+					local shown: { string } = {}
+					for position = 2, results.n do
+						table.insert(shown, tostring(results[position]))
+					end
+					got = table.concat(shown, ",")
+				end
+				assert(
+					got == want[index],
+					`{caseName} returned {got} for ({tostring(selector)}, {budget}), its source returns {want[index]}`
+				)
+			end
+		end
+	elseif
 		caseName == "source-frontend-empty-boundary-clone-continue"
 		or caseName == "source-frontend-empty-boundary-clone-continue-nonlocal"
 		or caseName == "source-frontend-empty-boundary-clone-continue-inner-loop"

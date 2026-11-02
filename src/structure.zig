@@ -18517,6 +18517,10 @@ fn sharedSideExitHasUnflaggedLoopExitBreak(program: *const ir.Program, side_exit
 /// it reports. A lockstep copy, like the one in
 /// src/validate_luau_syntax_depth.zig; the three must change together.
 fn regionAlwaysFunctionTerminates(program: *const ir.Program, region: *const Region) bool {
+    // A region that leaves by its stop's flag for an escape it owns is written inside a transfer wrapper whose end
+    // that escape reaches (`regionWritesOwnedEscape`, as `structure.regionTextMayEnd` reads it): its text can end at
+    // its stop whatever its last node, so the writer must not leave out the transfer that follows it.
+    if (regionWritesOwnedEscape(region)) return false;
     if (region.terminal_projection != null) return true;
     if (region.escape_projection != null) return false;
     if (region.nodes.len == 0) return false;
@@ -18534,6 +18538,60 @@ fn nodeAlwaysFunctionTerminates(program: *const ir.Program, node: Node) bool {
             regionAlwaysFunctionTerminates(program, branch.else_region),
         else => false,
     };
+}
+
+test "the structurer's termination copy reads a region that writes an escape it owns as able to end at its stop" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const arm = ir.BlockId.fromIndex(0);
+    const returning = ir.BlockId.fromIndex(1);
+    const stop = ir.BlockId.fromIndex(2);
+    const function_blocks = [_]ir.BlockId{ arm, returning, stop };
+    const blocks = [_]ir.Block{
+        .{ .id = arm, .function = function_id, .terminator = .{ .jump = .{ .target = returning } } },
+        .{ .id = returning, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = stop, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const functions = [_]ir.Function{.{ .id = function_id, .blocks = &function_blocks, .entry_block = arm }};
+    const program: ir.Program = .{
+        .program_id = "side-exit-owned-escape",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &.{},
+    };
+    // The emitter's region: a branch whose then arm leaves for the region's stop by its escape projection, then the
+    // returning block as the last node. `markLoopBoundaryExit` and `nodeHasUnflaggedLoopExitBreak` model the side-exit
+    // arm's `break` after such a region with this copy, so it answers as the emitter's does.
+    var escaping_arm = Region{ .nodes = &.{}, .stop = returning, .loop_exit = null, .escape_projection = .{ .target = stop, .edge = null } };
+    var plain_arm = Region{ .nodes = &.{}, .stop = returning, .loop_exit = null };
+    var escaping_nodes = [_]Node{
+        .{ .branch = .{ .block = arm, .then_region = &escaping_arm, .else_region = &plain_arm, .join = returning } },
+        .{ .block = returning },
+    };
+    const escaping_region = Region{ .nodes = &escaping_nodes, .stop = stop, .loop_exit = null };
+    try std.testing.expect(regionWritesOwnedEscape(&escaping_region));
+    try std.testing.expect(!regionAlwaysFunctionTerminates(&program, &escaping_region));
+
+    // The same when the region's last node is a branch with no join whose arms both return.
+    var returning_arm_nodes = [_]Node{.{ .block = returning }};
+    var returning_arm = Region{ .nodes = &returning_arm_nodes, .stop = null, .loop_exit = null };
+    var branch_tail_nodes = [_]Node{
+        .{ .branch = .{ .block = arm, .then_region = &escaping_arm, .else_region = &plain_arm, .join = returning } },
+        .{ .branch = .{ .block = returning, .then_region = &returning_arm, .else_region = &returning_arm, .join = null } },
+    };
+    const branch_tail_region = Region{ .nodes = &branch_tail_nodes, .stop = stop, .loop_exit = null };
+    try std.testing.expect(regionWritesOwnedEscape(&branch_tail_region));
+    try std.testing.expect(!regionAlwaysFunctionTerminates(&program, &branch_tail_region));
+
+    // Without the escape the region always returns.
+    var returning_nodes = [_]Node{
+        .{ .branch = .{ .block = arm, .then_region = &plain_arm, .else_region = &plain_arm, .join = returning } },
+        .{ .block = returning },
+    };
+    const returning_region = Region{ .nodes = &returning_nodes, .stop = stop, .loop_exit = null };
+    try std.testing.expect(!regionWritesOwnedEscape(&returning_region));
+    try std.testing.expect(regionAlwaysFunctionTerminates(&program, &returning_region));
 }
 
 fn collectLoopBoundaryExitTargets(

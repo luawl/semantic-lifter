@@ -577,6 +577,10 @@ const Recorder = struct {
 };
 
 fn regionAlwaysFunctionTerminates(program: *const ir.Program, region: *const structure.Region) bool {
+    // A region that leaves by its stop's flag for an escape it owns is written inside a transfer wrapper whose end
+    // that escape reaches (`regionWritesOwnedEscape`, as `structure.regionTextMayEnd` reads it): its text can end at
+    // its stop whatever its last node, so the writer must not leave out the transfer that follows it.
+    if (structure.regionWritesOwnedEscape(region)) return false;
     if (region.terminal_projection != null) return true;
     if (region.nodes.len == 0) return false;
     return nodeAlwaysFunctionTerminates(program, region.nodes[region.nodes.len - 1]);
@@ -597,4 +601,58 @@ fn nodeAlwaysFunctionTerminates(program: *const ir.Program, node: structure.Node
 
 fn saturatingAdd(left: usize, right: usize) usize {
     return std.math.add(usize, left, right) catch std.math.maxInt(usize);
+}
+
+test "the depth model's termination copy reads a region that writes an escape it owns as able to end at its stop" {
+    const function_id = ir.FunctionId.fromIndex(0);
+    const arm = ir.BlockId.fromIndex(0);
+    const returning = ir.BlockId.fromIndex(1);
+    const stop = ir.BlockId.fromIndex(2);
+    const function_blocks = [_]ir.BlockId{ arm, returning, stop };
+    const blocks = [_]ir.Block{
+        .{ .id = arm, .function = function_id, .terminator = .{ .jump = .{ .target = returning } } },
+        .{ .id = returning, .function = function_id, .terminator = .{ .return_values = &.{} } },
+        .{ .id = stop, .function = function_id, .terminator = .{ .return_values = &.{} } },
+    };
+    const functions = [_]ir.Function{.{ .id = function_id, .blocks = &function_blocks, .entry_block = arm }};
+    const program: ir.Program = .{
+        .program_id = "side-exit-owned-escape",
+        .entry_function = function_id,
+        .functions = &functions,
+        .blocks = &blocks,
+        .instructions = &.{},
+        .values = &.{},
+    };
+    // The emitter's region: a branch whose then arm leaves for the region's stop by its escape projection, then the
+    // returning block as the last node. The depth model of a branch with no join whose arms both end the function
+    // (`Recorder.visitBranch`) asks this copy, so it answers as the emitter's does.
+    var escaping_arm = structure.Region{ .nodes = &.{}, .stop = returning, .loop_exit = null, .escape_projection = .{ .target = stop, .edge = null } };
+    var plain_arm = structure.Region{ .nodes = &.{}, .stop = returning, .loop_exit = null };
+    var escaping_nodes = [_]structure.Node{
+        .{ .branch = .{ .block = arm, .then_region = &escaping_arm, .else_region = &plain_arm, .join = returning } },
+        .{ .block = returning },
+    };
+    const escaping_region = structure.Region{ .nodes = &escaping_nodes, .stop = stop, .loop_exit = null };
+    try std.testing.expect(structure.regionWritesOwnedEscape(&escaping_region));
+    try std.testing.expect(!regionAlwaysFunctionTerminates(&program, &escaping_region));
+
+    // The same when the region's last node is a branch with no join whose arms both return.
+    var returning_arm_nodes = [_]structure.Node{.{ .block = returning }};
+    var returning_arm = structure.Region{ .nodes = &returning_arm_nodes, .stop = null, .loop_exit = null };
+    var branch_tail_nodes = [_]structure.Node{
+        .{ .branch = .{ .block = arm, .then_region = &escaping_arm, .else_region = &plain_arm, .join = returning } },
+        .{ .branch = .{ .block = returning, .then_region = &returning_arm, .else_region = &returning_arm, .join = null } },
+    };
+    const branch_tail_region = structure.Region{ .nodes = &branch_tail_nodes, .stop = stop, .loop_exit = null };
+    try std.testing.expect(structure.regionWritesOwnedEscape(&branch_tail_region));
+    try std.testing.expect(!regionAlwaysFunctionTerminates(&program, &branch_tail_region));
+
+    // Without the escape the region always returns.
+    var returning_nodes = [_]structure.Node{
+        .{ .branch = .{ .block = arm, .then_region = &plain_arm, .else_region = &plain_arm, .join = returning } },
+        .{ .block = returning },
+    };
+    const returning_region = structure.Region{ .nodes = &returning_nodes, .stop = stop, .loop_exit = null };
+    try std.testing.expect(!structure.regionWritesOwnedEscape(&returning_region));
+    try std.testing.expect(regionAlwaysFunctionTerminates(&program, &returning_region));
 }
