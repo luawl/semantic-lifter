@@ -1,0 +1,8505 @@
+{
+  "blocks": [
+    {
+      "evidence": [
+        0
+      ],
+      "function": 0,
+      "id": 0,
+      "instructions": [
+        118,
+        119,
+        120
+      ],
+      "name_hint": "entry",
+      "parameters": [],
+      "terminator": {
+        "return_values": [
+          285
+        ]
+      }
+    },
+    {
+      "evidence": [
+        3
+      ],
+      "function": 1,
+      "id": 1,
+      "instructions": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9
+      ],
+      "name_hint": "entry",
+      "parameters": [],
+      "terminator": {
+        "branch": {
+          "condition": 180,
+          "else_edge": {
+            "arguments": [],
+            "target": 2
+          },
+          "then_edge": {
+            "arguments": [],
+            "target": 3
+          }
+        }
+      }
+    },
+    {
+      "evidence": [
+        16
+      ],
+      "function": 1,
+      "id": 2,
+      "instructions": [
+        10
+      ],
+      "name_hint": "logical_right",
+      "parameters": [],
+      "terminator": {
+        "jump": {
+          "arguments": [
+            182
+          ],
+          "target": 4
+        }
+      }
+    },
+    {
+      "evidence": [
+        17
+      ],
+      "function": 1,
+      "id": 3,
+      "instructions": [],
+      "name_hint": "logical_short",
+      "parameters": [],
+      "terminator": {
+        "jump": {
+          "arguments": [
+            180
+          ],
+          "target": 4
+        }
+      }
+    },
+    {
+      "evidence": [
+        17
+      ],
+      "function": 1,
+      "id": 4,
+      "instructions": [
+        11,
+        12
+      ],
+      "name_hint": "logical_join",
+      "parameters": [
+        181
+      ],
+      "terminator": {
+        "jump": {
+          "arguments": [],
+          "target": 5
+        }
+      }
+    },
+    {
+      "evidence": [
+        20
+      ],
+      "function": 1,
+      "id": 5,
+      "instructions": [
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21
+      ],
+      "name_hint": "repeat_body",
+      "parameters": [],
+      "terminator": {
+        "branch": {
+          "condition": 192,
+          "else_edge": {
+            "arguments": [],
+            "target": 9
+          },
+          "then_edge": {
+            "arguments": [],
+            "target": 8
+          }
+        }
+      }
+    },
+    {
+      "evidence": [
+        21
+      ],
+      "function": 1,
+      "id": 6,
+      "instructions": [
+        103,
+        104,
+        105
+      ],
+      "name_hint": "repeat_latch",
+      "parameters": [],
+      "terminator": {
+        "branch": {
+          "condition": 271,
+          "else_edge": {
+            "arguments": [],
+            "target": 5
+          },
+          "then_edge": {
+            "arguments": [],
+            "target": 7
+          }
+        }
+      }
+    },
+    {
+      "evidence": [
+        21
+      ],
+      "function": 1,
+      "id": 7,
+      "instructions": [
+        106,
+        107,
+        108,
+        109,
+        110,
+        111,
+        112,
+        113,
+        114,
+        115,
+        116,
+        117
+      ],
+      "name_hint": "repeat_exit",
+      "parameters": [],
+      "terminator": {
+        "return_values": [
+          272,
+          273,
+          275,
+          277,
+          279,
+          281,
+          283
+        ]
+      }
+    },
+    {
+      "evidence": [
+        30
+      ],
+      "function": 1,
+      "id": 8,
+      "instructions": [
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28
+      ],
+      "name_hint": "then",
+      "parameters": [],
+      "terminator": {
+        "branch": {
+          "condition": 198,
+          "else_edge": {
+            "arguments": [],
+            "target": 10
+          },
+          "then_edge": {
+            "arguments": [],
+            "target": 11
+          }
+        }
+      }
+    },
+    {
+      "evidence": [
+        31
+      ],
+      "function": 1,
+      "id": 9,
+      "instructions": [
+        36,
+        37,
+        38,
+        39,
+        40,
+        41,
+        42,
+        43,
+        44,
+        45,
+        46,
+        47,
+        48,
+        49,
+        50,
+        51,
+        52,
+        53,
+        54,
+        55,
+        56,
+        57,
+        58,
+        59,
+        60,
+        61,
+        62,
+        63,
+        64,
+        65,
+        66,
+        67,
+        68,
+        69,
+        70,
+        71,
+        72,
+        73,
+        74
+      ],
+      "name_hint": "else",
+      "parameters": [],
+      "terminator": {
+        "jump": {
+          "arguments": [],
+          "target": 16
+        }
+      }
+    },
+    {
+      "evidence": [
+        39
+      ],
+      "function": 1,
+      "id": 10,
+      "instructions": [],
+      "name_hint": "logical_right",
+      "parameters": [],
+      "terminator": {
+        "jump": {
+          "arguments": [
+            1
+          ],
+          "target": 12
+        }
+      }
+    },
+    {
+      "evidence": [
+        40
+      ],
+      "function": 1,
+      "id": 11,
+      "instructions": [],
+      "name_hint": "logical_short",
+      "parameters": [],
+      "terminator": {
+        "jump": {
+          "arguments": [
+            198
+          ],
+          "target": 12
+        }
+      }
+    },
+    {
+      "evidence": [
+        40
+      ],
+      "function": 1,
+      "id": 12,
+      "instructions": [
+        29,
+        30,
+        31
+      ],
+      "name_hint": "logical_join",
+      "parameters": [
+        199
+      ],
+      "terminator": {
+        "branch": {
+          "condition": 201,
+          "else_edge": {
+            "arguments": [],
+            "target": 14
+          },
+          "then_edge": {
+            "arguments": [],
+            "target": 13
+          }
+        }
+      }
+    },
+    {
+      "evidence": [
+        44
+      ],
+      "function": 1,
+      "id": 13,
+      "instructions": [],
+      "name_hint": "then",
+      "parameters": [],
+      "terminator": {
+        "jump": {
+          "arguments": [],
+          "target": 6
+        }
+      }
+    },
+    {
+      "evidence": [
+        45
+      ],
+      "function": 1,
+      "id": 14,
+      "instructions": [],
+      "name_hint": "else",
+      "parameters": [],
+      "terminator": {
+        "jump": {
+          "arguments": [],
+          "target": 15
+        }
+      }
+    },
+    {
+      "evidence": [
+        45
+      ],
+      "function": 1,
+      "id": 15,
+      "instructions": [
+        32,
+        33,
+        34,
+        35
+      ],
+      "name_hint": "join",
+      "parameters": [],
+      "terminator": {
+        "jump": {
+          "arguments": [],
+          "target": 16
+        }
+      }
+    },
+    {
+      "evidence": [
+        89
+      ],
+      "function": 1,
+      "id": 16,
+      "instructions": [
+        75,
+        76,
+        77,
+        78,
+        79,
+        80,
+        81,
+        82,
+        83,
+        84,
+        85,
+        86,
+        87,
+        88,
+        89,
+        90,
+        91,
+        92,
+        93,
+        94,
+        95
+      ],
+      "name_hint": "join",
+      "parameters": [],
+      "terminator": {
+        "jump": {
+          "arguments": [],
+          "target": 17
+        }
+      }
+    },
+    {
+      "evidence": [
+        89
+      ],
+      "function": 1,
+      "id": 17,
+      "instructions": [
+        96,
+        97,
+        98,
+        99,
+        100,
+        101,
+        102
+      ],
+      "name_hint": "join_tail",
+      "parameters": [],
+      "terminator": {
+        "jump": {
+          "arguments": [],
+          "target": 6
+        }
+      }
+    }
+  ],
+  "captures": [],
+  "certificates": [],
+  "claims": [],
+  "constraints": [],
+  "edge_rewrites": [],
+  "entry_bindings": [],
+  "entry_function": 0,
+  "evidence": [
+    {
+      "id": 0,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:0,0 - 40,0"
+    },
+    {
+      "id": 1,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:1,15 - 1,21"
+    },
+    {
+      "id": 2,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:1,0 - 38,3"
+    },
+    {
+      "id": 3,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:1,963 - 38,0"
+    },
+    {
+      "id": 4,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:2,13 - 2,15"
+    },
+    {
+      "id": 5,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:3,5 - 3,6"
+    },
+    {
+      "id": 6,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:3,10 - 3,11"
+    },
+    {
+      "id": 7,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:3,1 - 3,11"
+    },
+    {
+      "id": 8,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:4,15 - 4,16"
+    },
+    {
+      "id": 9,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:4,7 - 4,12"
+    },
+    {
+      "id": 10,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:4,1 - 4,16"
+    },
+    {
+      "id": 11,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:5,15 - 5,16"
+    },
+    {
+      "id": 12,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:5,7 - 5,12"
+    },
+    {
+      "id": 13,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:5,1 - 5,16"
+    },
+    {
+      "id": 14,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:6,18 - 6,26"
+    },
+    {
+      "id": 15,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:6,18 - 6,36"
+    },
+    {
+      "id": 16,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:6,40 - 6,41"
+    },
+    {
+      "id": 17,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:6,18 - 6,41"
+    },
+    {
+      "id": 18,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:6,45 - 6,46"
+    },
+    {
+      "id": 19,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:6,17 - 6,46"
+    },
+    {
+      "id": 20,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:7,7 - 36,1"
+    },
+    {
+      "id": 21,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:7,1 - 36,17"
+    },
+    {
+      "id": 22,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:8,11 - 8,12"
+    },
+    {
+      "id": 23,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:8,2 - 8,7"
+    },
+    {
+      "id": 24,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:8,2 - 8,12"
+    },
+    {
+      "id": 25,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:9,13 - 9,14"
+    },
+    {
+      "id": 26,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:9,5 - 9,10"
+    },
+    {
+      "id": 27,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:9,5 - 9,14"
+    },
+    {
+      "id": 28,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:9,18 - 9,19"
+    },
+    {
+      "id": 29,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:9,5 - 9,19"
+    },
+    {
+      "id": 30,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:9,24 - 16,2"
+    },
+    {
+      "id": 31,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:16,6 - 25,2"
+    },
+    {
+      "id": 32,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:10,19 - 10,20"
+    },
+    {
+      "id": 33,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:10,11 - 10,16"
+    },
+    {
+      "id": 34,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:10,11 - 10,20"
+    },
+    {
+      "id": 35,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:10,3 - 10,20"
+    },
+    {
+      "id": 36,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:11,7 - 11,10"
+    },
+    {
+      "id": 37,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:11,25 - 11,27"
+    },
+    {
+      "id": 38,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:11,15 - 11,27"
+    },
+    {
+      "id": 39,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:11,32 - 11,38"
+    },
+    {
+      "id": 40,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:11,14 - 11,38"
+    },
+    {
+      "id": 41,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:11,3 - 11,38"
+    },
+    {
+      "id": 42,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:12,6 - 12,11"
+    },
+    {
+      "id": 43,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:12,6 - 12,23"
+    },
+    {
+      "id": 44,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:12,28 - 14,3"
+    },
+    {
+      "id": 45,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:12,3 - 14,6"
+    },
+    {
+      "id": 46,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:15,19 - 15,20"
+    },
+    {
+      "id": 47,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:15,11 - 15,16"
+    },
+    {
+      "id": 48,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:15,11 - 15,20"
+    },
+    {
+      "id": 49,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:15,3 - 15,20"
+    },
+    {
+      "id": 50,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:17,22 - 17,23"
+    },
+    {
+      "id": 51,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:17,14 - 17,19"
+    },
+    {
+      "id": 52,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:17,14 - 17,23"
+    },
+    {
+      "id": 53,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:18,22 - 18,23"
+    },
+    {
+      "id": 54,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:18,14 - 18,19"
+    },
+    {
+      "id": 55,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:18,14 - 18,23"
+    },
+    {
+      "id": 56,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:19,22 - 19,23"
+    },
+    {
+      "id": 57,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:19,14 - 19,19"
+    },
+    {
+      "id": 58,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:19,14 - 19,23"
+    },
+    {
+      "id": 59,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:20,22 - 20,23"
+    },
+    {
+      "id": 60,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:20,14 - 20,19"
+    },
+    {
+      "id": 61,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:20,14 - 20,23"
+    },
+    {
+      "id": 62,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:21,22 - 21,23"
+    },
+    {
+      "id": 63,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:21,14 - 21,19"
+    },
+    {
+      "id": 64,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:21,14 - 21,23"
+    },
+    {
+      "id": 65,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:22,22 - 22,23"
+    },
+    {
+      "id": 66,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:22,14 - 22,19"
+    },
+    {
+      "id": 67,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:22,14 - 22,23"
+    },
+    {
+      "id": 68,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:23,22 - 23,23"
+    },
+    {
+      "id": 69,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:23,14 - 23,19"
+    },
+    {
+      "id": 70,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:23,14 - 23,23"
+    },
+    {
+      "id": 71,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:24,7 - 24,8"
+    },
+    {
+      "id": 72,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:24,16 - 24,17"
+    },
+    {
+      "id": 73,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:24,12 - 24,18"
+    },
+    {
+      "id": 74,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:24,22 - 24,29"
+    },
+    {
+      "id": 75,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:24,22 - 24,34"
+    },
+    {
+      "id": 76,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:24,22 - 24,39"
+    },
+    {
+      "id": 77,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:24,22 - 24,44"
+    },
+    {
+      "id": 78,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:24,22 - 24,49"
+    },
+    {
+      "id": 79,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:24,22 - 24,54"
+    },
+    {
+      "id": 80,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:24,12 - 24,55"
+    },
+    {
+      "id": 81,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:24,59 - 24,66"
+    },
+    {
+      "id": 82,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:24,59 - 24,71"
+    },
+    {
+      "id": 83,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:24,59 - 24,76"
+    },
+    {
+      "id": 84,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:24,59 - 24,81"
+    },
+    {
+      "id": 85,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:24,59 - 24,86"
+    },
+    {
+      "id": 86,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:24,59 - 24,91"
+    },
+    {
+      "id": 87,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:24,12 - 24,92"
+    },
+    {
+      "id": 88,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:24,3 - 24,92"
+    },
+    {
+      "id": 89,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:9,2 - 25,5"
+    },
+    {
+      "id": 90,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:26,23 - 26,25"
+    },
+    {
+      "id": 91,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:26,15 - 26,20"
+    },
+    {
+      "id": 92,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:26,15 - 26,25"
+    },
+    {
+      "id": 93,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:26,28 - 26,33"
+    },
+    {
+      "id": 94,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:26,15 - 26,33"
+    },
+    {
+      "id": 95,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:27,20 - 27,21"
+    },
+    {
+      "id": 96,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:27,13 - 27,21"
+    },
+    {
+      "id": 97,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:28,20 - 28,21"
+    },
+    {
+      "id": 98,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:28,13 - 28,21"
+    },
+    {
+      "id": 99,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:29,20 - 29,21"
+    },
+    {
+      "id": 100,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:29,13 - 29,21"
+    },
+    {
+      "id": 101,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:30,20 - 30,21"
+    },
+    {
+      "id": 102,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:30,13 - 30,21"
+    },
+    {
+      "id": 103,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:31,20 - 31,21"
+    },
+    {
+      "id": 104,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:31,13 - 31,21"
+    },
+    {
+      "id": 105,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:32,20 - 32,21"
+    },
+    {
+      "id": 106,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:32,13 - 32,21"
+    },
+    {
+      "id": 107,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:33,20 - 33,21"
+    },
+    {
+      "id": 108,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:33,13 - 33,21"
+    },
+    {
+      "id": 109,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:34,20 - 34,21"
+    },
+    {
+      "id": 110,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:34,13 - 34,21"
+    },
+    {
+      "id": 111,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:35,6 - 35,7"
+    },
+    {
+      "id": 112,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:35,11 - 35,15"
+    },
+    {
+      "id": 113,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:35,11 - 35,19"
+    },
+    {
+      "id": 114,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:35,11 - 35,83"
+    },
+    {
+      "id": 115,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:35,2 - 35,83"
+    },
+    {
+      "id": 116,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:36,16 - 36,17"
+    },
+    {
+      "id": 117,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:36,7 - 36,12"
+    },
+    {
+      "id": 118,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:36,7 - 36,17"
+    },
+    {
+      "id": 119,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:37,8 - 37,13"
+    },
+    {
+      "id": 120,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:37,15 - 37,20"
+    },
+    {
+      "id": 121,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:37,26 - 37,27"
+    },
+    {
+      "id": 122,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:37,22 - 37,28"
+    },
+    {
+      "id": 123,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:37,34 - 37,35"
+    },
+    {
+      "id": 124,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:37,30 - 37,36"
+    },
+    {
+      "id": 125,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:37,42 - 37,43"
+    },
+    {
+      "id": 126,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:37,38 - 37,44"
+    },
+    {
+      "id": 127,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:37,50 - 37,53"
+    },
+    {
+      "id": 128,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:37,46 - 37,54"
+    },
+    {
+      "id": 129,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:37,60 - 37,64"
+    },
+    {
+      "id": 130,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:37,56 - 37,65"
+    },
+    {
+      "id": 131,
+      "kind": "source_span",
+      "locator": "source:repeated_tail_split_chain_locals_172.luau:39,7 - 39,13"
+    }
+  ],
+  "external_bindings": [],
+  "functions": [
+    {
+      "blocks": [
+        0
+      ],
+      "captures": [],
+      "entry_block": 0,
+      "evidence": [
+        0
+      ],
+      "id": 0,
+      "is_variadic": true,
+      "local_places": [
+        0
+      ],
+      "name_hint": "chunk",
+      "parameters": [],
+      "vararg_pack": 0
+    },
+    {
+      "blocks": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17
+      ],
+      "captures": [],
+      "entry_block": 1,
+      "evidence": [
+        2
+      ],
+      "id": 1,
+      "is_variadic": false,
+      "lexical_parent": 0,
+      "local_places": [
+        1,
+        2
+      ],
+      "name_hint": "worker",
+      "parameters": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35,
+        36,
+        37,
+        38,
+        39,
+        40,
+        41,
+        42,
+        43,
+        44,
+        45,
+        46,
+        47,
+        48,
+        49,
+        50,
+        51,
+        52,
+        53,
+        54,
+        55,
+        56,
+        57,
+        58,
+        59,
+        60,
+        61,
+        62,
+        63,
+        64,
+        65,
+        66,
+        67,
+        68,
+        69,
+        70,
+        71,
+        72,
+        73,
+        74,
+        75,
+        76,
+        77,
+        78,
+        79,
+        80,
+        81,
+        82,
+        83,
+        84,
+        85,
+        86,
+        87,
+        88,
+        89,
+        90,
+        91,
+        92,
+        93,
+        94,
+        95,
+        96,
+        97,
+        98,
+        99,
+        100,
+        101,
+        102,
+        103,
+        104,
+        105,
+        106,
+        107,
+        108,
+        109,
+        110,
+        111,
+        112,
+        113,
+        114,
+        115,
+        116,
+        117,
+        118,
+        119,
+        120,
+        121,
+        122,
+        123,
+        124,
+        125,
+        126,
+        127,
+        128,
+        129,
+        130,
+        131,
+        132,
+        133,
+        134,
+        135,
+        136,
+        137,
+        138,
+        139,
+        140,
+        141,
+        142,
+        143,
+        144,
+        145,
+        146,
+        147,
+        148,
+        149,
+        150,
+        151,
+        152,
+        153,
+        154,
+        155,
+        156,
+        157,
+        158,
+        159,
+        160,
+        161,
+        162,
+        163,
+        164,
+        165,
+        166,
+        167,
+        168,
+        169,
+        170,
+        171,
+        172,
+        173
+      ]
+    }
+  ],
+  "instructions": [
+    {
+      "block": 1,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": true,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": true
+      },
+      "evidence": [
+        4
+      ],
+      "id": 0,
+      "operation": {
+        "make_table_literal": {
+          "fields": []
+        }
+      },
+      "results": [
+        174
+      ]
+    },
+    {
+      "block": 1,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        5
+      ],
+      "id": 1,
+      "operation": {
+        "constant": {
+          "integer": "3"
+        }
+      },
+      "results": [
+        175
+      ]
+    },
+    {
+      "block": 1,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        6
+      ],
+      "id": 2,
+      "operation": {
+        "constant": {
+          "integer": "0"
+        }
+      },
+      "results": [
+        176
+      ]
+    },
+    {
+      "block": 1,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": true,
+        "may_throw": true,
+        "may_yield": true,
+        "precision": "conservative",
+        "reads_memory": true,
+        "writes_memory": true
+      },
+      "evidence": [
+        7
+      ],
+      "id": 3,
+      "operation": {
+        "table_set": {
+          "key": 175,
+          "mode": "semantic",
+          "table": 174,
+          "value": 176
+        }
+      },
+      "results": []
+    },
+    {
+      "block": 1,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        8
+      ],
+      "id": 4,
+      "operation": {
+        "constant": {
+          "integer": "0"
+        }
+      },
+      "results": [
+        177
+      ]
+    },
+    {
+      "block": 1,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": true
+      },
+      "evidence": [
+        10
+      ],
+      "id": 5,
+      "operation": {
+        "place_write": {
+          "place": 1,
+          "value": 177
+        }
+      },
+      "results": []
+    },
+    {
+      "block": 1,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        11
+      ],
+      "id": 6,
+      "operation": {
+        "constant": {
+          "integer": "0"
+        }
+      },
+      "results": [
+        178
+      ]
+    },
+    {
+      "block": 1,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": true
+      },
+      "evidence": [
+        13
+      ],
+      "id": 7,
+      "operation": {
+        "place_write": {
+          "place": 2,
+          "value": 178
+        }
+      },
+      "results": []
+    },
+    {
+      "block": 1,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": true,
+        "may_throw": true,
+        "may_yield": true,
+        "precision": "conservative",
+        "reads_memory": true,
+        "writes_memory": true
+      },
+      "evidence": [
+        14
+      ],
+      "id": 8,
+      "operation": {
+        "environment_get": {
+          "mode": "semantic",
+          "name": "tonumber",
+          "target": {
+            "ambient": {}
+          }
+        }
+      },
+      "results": [
+        179
+      ]
+    },
+    {
+      "block": 1,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": true,
+        "may_throw": true,
+        "may_yield": true,
+        "precision": "conservative",
+        "reads_memory": true,
+        "writes_memory": true
+      },
+      "evidence": [
+        15
+      ],
+      "id": 9,
+      "operation": {
+        "call": {
+          "arguments": [
+            0
+          ],
+          "callee": 179,
+          "result_arity": {
+            "fixed": 1
+          }
+        }
+      },
+      "results": [
+        180
+      ]
+    },
+    {
+      "block": 2,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        16
+      ],
+      "id": 10,
+      "operation": {
+        "constant": {
+          "integer": "0"
+        }
+      },
+      "results": [
+        182
+      ]
+    },
+    {
+      "block": 4,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        18
+      ],
+      "id": 11,
+      "operation": {
+        "constant": {
+          "integer": "2"
+        }
+      },
+      "results": [
+        183
+      ]
+    },
+    {
+      "block": 4,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": true,
+        "may_throw": true,
+        "may_yield": true,
+        "precision": "conservative",
+        "reads_memory": true,
+        "writes_memory": true
+      },
+      "evidence": [
+        19
+      ],
+      "id": 12,
+      "operation": {
+        "binary": {
+          "left": 181,
+          "mode": "semantic",
+          "operator": "multiply",
+          "right": 183
+        }
+      },
+      "results": [
+        184
+      ]
+    },
+    {
+      "block": 5,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        22
+      ],
+      "id": 13,
+      "operation": {
+        "constant": {
+          "integer": "1"
+        }
+      },
+      "results": [
+        185
+      ]
+    },
+    {
+      "block": 5,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": true,
+        "writes_memory": false
+      },
+      "evidence": [
+        23
+      ],
+      "id": 14,
+      "operation": {
+        "place_read": 1
+      },
+      "results": [
+        186
+      ]
+    },
+    {
+      "block": 5,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        24
+      ],
+      "id": 15,
+      "operation": {
+        "binary": {
+          "left": 186,
+          "mode": "semantic",
+          "operator": "add",
+          "right": 185
+        }
+      },
+      "results": [
+        187
+      ]
+    },
+    {
+      "block": 5,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": true
+      },
+      "evidence": [
+        24
+      ],
+      "id": 16,
+      "operation": {
+        "place_write": {
+          "place": 1,
+          "value": 187
+        }
+      },
+      "results": []
+    },
+    {
+      "block": 5,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        25
+      ],
+      "id": 17,
+      "operation": {
+        "constant": {
+          "integer": "2"
+        }
+      },
+      "results": [
+        188
+      ]
+    },
+    {
+      "block": 5,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": true,
+        "writes_memory": false
+      },
+      "evidence": [
+        26
+      ],
+      "id": 18,
+      "operation": {
+        "place_read": 1
+      },
+      "results": [
+        189
+      ]
+    },
+    {
+      "block": 5,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        27
+      ],
+      "id": 19,
+      "operation": {
+        "binary": {
+          "left": 189,
+          "mode": "semantic",
+          "operator": "modulo",
+          "right": 188
+        }
+      },
+      "results": [
+        190
+      ]
+    },
+    {
+      "block": 5,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        28
+      ],
+      "id": 20,
+      "operation": {
+        "constant": {
+          "integer": "1"
+        }
+      },
+      "results": [
+        191
+      ]
+    },
+    {
+      "block": 5,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        29
+      ],
+      "id": 21,
+      "operation": {
+        "binary": {
+          "left": 190,
+          "mode": "semantic",
+          "operator": "equal",
+          "right": 191
+        }
+      },
+      "results": [
+        192
+      ]
+    },
+    {
+      "block": 8,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        32
+      ],
+      "id": 22,
+      "operation": {
+        "constant": {
+          "integer": "1"
+        }
+      },
+      "results": [
+        193
+      ]
+    },
+    {
+      "block": 8,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": true,
+        "writes_memory": false
+      },
+      "evidence": [
+        33
+      ],
+      "id": 23,
+      "operation": {
+        "place_read": 2
+      },
+      "results": [
+        194
+      ]
+    },
+    {
+      "block": 8,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        34
+      ],
+      "id": 24,
+      "operation": {
+        "binary": {
+          "left": 194,
+          "mode": "semantic",
+          "operator": "add",
+          "right": 193
+        }
+      },
+      "results": [
+        195
+      ]
+    },
+    {
+      "block": 8,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": true
+      },
+      "evidence": [
+        35
+      ],
+      "id": 25,
+      "operation": {
+        "place_write": {
+          "place": 2,
+          "value": 195
+        }
+      },
+      "results": []
+    },
+    {
+      "block": 8,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        36
+      ],
+      "id": 26,
+      "operation": {
+        "constant": {
+          "integer": "102"
+        }
+      },
+      "results": [
+        196
+      ]
+    },
+    {
+      "block": 8,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        37
+      ],
+      "id": 27,
+      "operation": {
+        "constant": {
+          "integer": "30"
+        }
+      },
+      "results": [
+        197
+      ]
+    },
+    {
+      "block": 8,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": true,
+        "may_throw": true,
+        "may_yield": true,
+        "precision": "conservative",
+        "reads_memory": true,
+        "writes_memory": true
+      },
+      "evidence": [
+        38
+      ],
+      "id": 28,
+      "operation": {
+        "binary": {
+          "left": 184,
+          "mode": "semantic",
+          "operator": "greater",
+          "right": 197
+        }
+      },
+      "results": [
+        198
+      ]
+    },
+    {
+      "block": 12,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": true,
+        "may_throw": true,
+        "may_yield": true,
+        "precision": "conservative",
+        "reads_memory": true,
+        "writes_memory": true
+      },
+      "evidence": [
+        41
+      ],
+      "id": 29,
+      "operation": {
+        "table_set": {
+          "key": 196,
+          "mode": "semantic",
+          "table": 174,
+          "value": 199
+        }
+      },
+      "results": []
+    },
+    {
+      "block": 12,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": true,
+        "writes_memory": false
+      },
+      "evidence": [
+        42
+      ],
+      "id": 30,
+      "operation": {
+        "place_read": 1
+      },
+      "results": [
+        200
+      ]
+    },
+    {
+      "block": 12,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": true,
+        "may_throw": true,
+        "may_yield": true,
+        "precision": "conservative",
+        "reads_memory": true,
+        "writes_memory": true
+      },
+      "evidence": [
+        43
+      ],
+      "id": 31,
+      "operation": {
+        "binary": {
+          "left": 200,
+          "mode": "semantic",
+          "operator": "equal",
+          "right": 0
+        }
+      },
+      "results": [
+        201
+      ]
+    },
+    {
+      "block": 15,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        46
+      ],
+      "id": 32,
+      "operation": {
+        "constant": {
+          "integer": "2"
+        }
+      },
+      "results": [
+        202
+      ]
+    },
+    {
+      "block": 15,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": true,
+        "writes_memory": false
+      },
+      "evidence": [
+        47
+      ],
+      "id": 33,
+      "operation": {
+        "place_read": 2
+      },
+      "results": [
+        203
+      ]
+    },
+    {
+      "block": 15,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        48
+      ],
+      "id": 34,
+      "operation": {
+        "binary": {
+          "left": 203,
+          "mode": "semantic",
+          "operator": "add",
+          "right": 202
+        }
+      },
+      "results": [
+        204
+      ]
+    },
+    {
+      "block": 15,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": true
+      },
+      "evidence": [
+        49
+      ],
+      "id": 35,
+      "operation": {
+        "place_write": {
+          "place": 2,
+          "value": 204
+        }
+      },
+      "results": []
+    },
+    {
+      "block": 9,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        50
+      ],
+      "id": 36,
+      "operation": {
+        "constant": {
+          "integer": "1"
+        }
+      },
+      "results": [
+        205
+      ]
+    },
+    {
+      "block": 9,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": true,
+        "writes_memory": false
+      },
+      "evidence": [
+        51
+      ],
+      "id": 37,
+      "operation": {
+        "place_read": 1
+      },
+      "results": [
+        206
+      ]
+    },
+    {
+      "block": 9,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        52
+      ],
+      "id": 38,
+      "operation": {
+        "binary": {
+          "left": 206,
+          "mode": "semantic",
+          "operator": "add",
+          "right": 205
+        }
+      },
+      "results": [
+        207
+      ]
+    },
+    {
+      "block": 9,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        53
+      ],
+      "id": 39,
+      "operation": {
+        "constant": {
+          "integer": "2"
+        }
+      },
+      "results": [
+        208
+      ]
+    },
+    {
+      "block": 9,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": true,
+        "writes_memory": false
+      },
+      "evidence": [
+        54
+      ],
+      "id": 40,
+      "operation": {
+        "place_read": 1
+      },
+      "results": [
+        209
+      ]
+    },
+    {
+      "block": 9,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        55
+      ],
+      "id": 41,
+      "operation": {
+        "binary": {
+          "left": 209,
+          "mode": "semantic",
+          "operator": "add",
+          "right": 208
+        }
+      },
+      "results": [
+        210
+      ]
+    },
+    {
+      "block": 9,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        56
+      ],
+      "id": 42,
+      "operation": {
+        "constant": {
+          "integer": "3"
+        }
+      },
+      "results": [
+        211
+      ]
+    },
+    {
+      "block": 9,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": true,
+        "writes_memory": false
+      },
+      "evidence": [
+        57
+      ],
+      "id": 43,
+      "operation": {
+        "place_read": 1
+      },
+      "results": [
+        212
+      ]
+    },
+    {
+      "block": 9,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        58
+      ],
+      "id": 44,
+      "operation": {
+        "binary": {
+          "left": 212,
+          "mode": "semantic",
+          "operator": "add",
+          "right": 211
+        }
+      },
+      "results": [
+        213
+      ]
+    },
+    {
+      "block": 9,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        59
+      ],
+      "id": 45,
+      "operation": {
+        "constant": {
+          "integer": "4"
+        }
+      },
+      "results": [
+        214
+      ]
+    },
+    {
+      "block": 9,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": true,
+        "writes_memory": false
+      },
+      "evidence": [
+        60
+      ],
+      "id": 46,
+      "operation": {
+        "place_read": 1
+      },
+      "results": [
+        215
+      ]
+    },
+    {
+      "block": 9,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        61
+      ],
+      "id": 47,
+      "operation": {
+        "binary": {
+          "left": 215,
+          "mode": "semantic",
+          "operator": "add",
+          "right": 214
+        }
+      },
+      "results": [
+        216
+      ]
+    },
+    {
+      "block": 9,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        62
+      ],
+      "id": 48,
+      "operation": {
+        "constant": {
+          "integer": "5"
+        }
+      },
+      "results": [
+        217
+      ]
+    },
+    {
+      "block": 9,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": true,
+        "writes_memory": false
+      },
+      "evidence": [
+        63
+      ],
+      "id": 49,
+      "operation": {
+        "place_read": 1
+      },
+      "results": [
+        218
+      ]
+    },
+    {
+      "block": 9,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        64
+      ],
+      "id": 50,
+      "operation": {
+        "binary": {
+          "left": 218,
+          "mode": "semantic",
+          "operator": "add",
+          "right": 217
+        }
+      },
+      "results": [
+        219
+      ]
+    },
+    {
+      "block": 9,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        65
+      ],
+      "id": 51,
+      "operation": {
+        "constant": {
+          "integer": "6"
+        }
+      },
+      "results": [
+        220
+      ]
+    },
+    {
+      "block": 9,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": true,
+        "writes_memory": false
+      },
+      "evidence": [
+        66
+      ],
+      "id": 52,
+      "operation": {
+        "place_read": 1
+      },
+      "results": [
+        221
+      ]
+    },
+    {
+      "block": 9,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        67
+      ],
+      "id": 53,
+      "operation": {
+        "binary": {
+          "left": 221,
+          "mode": "semantic",
+          "operator": "add",
+          "right": 220
+        }
+      },
+      "results": [
+        222
+      ]
+    },
+    {
+      "block": 9,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        68
+      ],
+      "id": 54,
+      "operation": {
+        "constant": {
+          "integer": "7"
+        }
+      },
+      "results": [
+        223
+      ]
+    },
+    {
+      "block": 9,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": true,
+        "writes_memory": false
+      },
+      "evidence": [
+        69
+      ],
+      "id": 55,
+      "operation": {
+        "place_read": 1
+      },
+      "results": [
+        224
+      ]
+    },
+    {
+      "block": 9,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        70
+      ],
+      "id": 56,
+      "operation": {
+        "binary": {
+          "left": 224,
+          "mode": "semantic",
+          "operator": "add",
+          "right": 223
+        }
+      },
+      "results": [
+        225
+      ]
+    },
+    {
+      "block": 9,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        71
+      ],
+      "id": 57,
+      "operation": {
+        "constant": {
+          "integer": "3"
+        }
+      },
+      "results": [
+        226
+      ]
+    },
+    {
+      "block": 9,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        72
+      ],
+      "id": 58,
+      "operation": {
+        "constant": {
+          "integer": "3"
+        }
+      },
+      "results": [
+        227
+      ]
+    },
+    {
+      "block": 9,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": true,
+        "may_throw": true,
+        "may_yield": true,
+        "precision": "conservative",
+        "reads_memory": true,
+        "writes_memory": true
+      },
+      "evidence": [
+        73
+      ],
+      "id": 59,
+      "operation": {
+        "table_get": {
+          "key": 227,
+          "mode": "semantic",
+          "table": 174
+        }
+      },
+      "results": [
+        228
+      ]
+    },
+    {
+      "block": 9,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        74
+      ],
+      "id": 60,
+      "operation": {
+        "binary": {
+          "left": 207,
+          "mode": "semantic",
+          "operator": "add",
+          "right": 210
+        }
+      },
+      "results": [
+        229
+      ]
+    },
+    {
+      "block": 9,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        75
+      ],
+      "id": 61,
+      "operation": {
+        "binary": {
+          "left": 229,
+          "mode": "semantic",
+          "operator": "add",
+          "right": 213
+        }
+      },
+      "results": [
+        230
+      ]
+    },
+    {
+      "block": 9,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        76
+      ],
+      "id": 62,
+      "operation": {
+        "binary": {
+          "left": 230,
+          "mode": "semantic",
+          "operator": "add",
+          "right": 216
+        }
+      },
+      "results": [
+        231
+      ]
+    },
+    {
+      "block": 9,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        77
+      ],
+      "id": 63,
+      "operation": {
+        "binary": {
+          "left": 231,
+          "mode": "semantic",
+          "operator": "add",
+          "right": 219
+        }
+      },
+      "results": [
+        232
+      ]
+    },
+    {
+      "block": 9,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        78
+      ],
+      "id": 64,
+      "operation": {
+        "binary": {
+          "left": 232,
+          "mode": "semantic",
+          "operator": "add",
+          "right": 222
+        }
+      },
+      "results": [
+        233
+      ]
+    },
+    {
+      "block": 9,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        79
+      ],
+      "id": 65,
+      "operation": {
+        "binary": {
+          "left": 233,
+          "mode": "semantic",
+          "operator": "add",
+          "right": 225
+        }
+      },
+      "results": [
+        234
+      ]
+    },
+    {
+      "block": 9,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": true,
+        "may_throw": true,
+        "may_yield": true,
+        "precision": "conservative",
+        "reads_memory": true,
+        "writes_memory": true
+      },
+      "evidence": [
+        80
+      ],
+      "id": 66,
+      "operation": {
+        "binary": {
+          "left": 228,
+          "mode": "semantic",
+          "operator": "add",
+          "right": 234
+        }
+      },
+      "results": [
+        235
+      ]
+    },
+    {
+      "block": 9,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        81
+      ],
+      "id": 67,
+      "operation": {
+        "binary": {
+          "left": 207,
+          "mode": "semantic",
+          "operator": "add",
+          "right": 210
+        }
+      },
+      "results": [
+        236
+      ]
+    },
+    {
+      "block": 9,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        82
+      ],
+      "id": 68,
+      "operation": {
+        "binary": {
+          "left": 236,
+          "mode": "semantic",
+          "operator": "add",
+          "right": 213
+        }
+      },
+      "results": [
+        237
+      ]
+    },
+    {
+      "block": 9,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        83
+      ],
+      "id": 69,
+      "operation": {
+        "binary": {
+          "left": 237,
+          "mode": "semantic",
+          "operator": "add",
+          "right": 216
+        }
+      },
+      "results": [
+        238
+      ]
+    },
+    {
+      "block": 9,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        84
+      ],
+      "id": 70,
+      "operation": {
+        "binary": {
+          "left": 238,
+          "mode": "semantic",
+          "operator": "add",
+          "right": 219
+        }
+      },
+      "results": [
+        239
+      ]
+    },
+    {
+      "block": 9,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        85
+      ],
+      "id": 71,
+      "operation": {
+        "binary": {
+          "left": 239,
+          "mode": "semantic",
+          "operator": "add",
+          "right": 222
+        }
+      },
+      "results": [
+        240
+      ]
+    },
+    {
+      "block": 9,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        86
+      ],
+      "id": 72,
+      "operation": {
+        "binary": {
+          "left": 240,
+          "mode": "semantic",
+          "operator": "add",
+          "right": 225
+        }
+      },
+      "results": [
+        241
+      ]
+    },
+    {
+      "block": 9,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": true,
+        "may_throw": true,
+        "may_yield": true,
+        "precision": "conservative",
+        "reads_memory": true,
+        "writes_memory": true
+      },
+      "evidence": [
+        87
+      ],
+      "id": 73,
+      "operation": {
+        "binary": {
+          "left": 235,
+          "mode": "semantic",
+          "operator": "add",
+          "right": 241
+        }
+      },
+      "results": [
+        242
+      ]
+    },
+    {
+      "block": 9,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": true,
+        "may_throw": true,
+        "may_yield": true,
+        "precision": "conservative",
+        "reads_memory": true,
+        "writes_memory": true
+      },
+      "evidence": [
+        88
+      ],
+      "id": 74,
+      "operation": {
+        "table_set": {
+          "key": 226,
+          "mode": "semantic",
+          "table": 174,
+          "value": 242
+        }
+      },
+      "results": []
+    },
+    {
+      "block": 16,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        90
+      ],
+      "id": 75,
+      "operation": {
+        "constant": {
+          "integer": "10"
+        }
+      },
+      "results": [
+        243
+      ]
+    },
+    {
+      "block": 16,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": true,
+        "writes_memory": false
+      },
+      "evidence": [
+        91
+      ],
+      "id": 76,
+      "operation": {
+        "place_read": 1
+      },
+      "results": [
+        244
+      ]
+    },
+    {
+      "block": 16,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        92
+      ],
+      "id": 77,
+      "operation": {
+        "binary": {
+          "left": 244,
+          "mode": "semantic",
+          "operator": "multiply",
+          "right": 243
+        }
+      },
+      "results": [
+        245
+      ]
+    },
+    {
+      "block": 16,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": true,
+        "writes_memory": false
+      },
+      "evidence": [
+        93
+      ],
+      "id": 78,
+      "operation": {
+        "place_read": 2
+      },
+      "results": [
+        246
+      ]
+    },
+    {
+      "block": 16,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        94
+      ],
+      "id": 79,
+      "operation": {
+        "binary": {
+          "left": 245,
+          "mode": "semantic",
+          "operator": "add",
+          "right": 246
+        }
+      },
+      "results": [
+        247
+      ]
+    },
+    {
+      "block": 16,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        95
+      ],
+      "id": 80,
+      "operation": {
+        "constant": {
+          "integer": "1"
+        }
+      },
+      "results": [
+        248
+      ]
+    },
+    {
+      "block": 16,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        96
+      ],
+      "id": 81,
+      "operation": {
+        "binary": {
+          "left": 247,
+          "mode": "semantic",
+          "operator": "add",
+          "right": 248
+        }
+      },
+      "results": [
+        249
+      ]
+    },
+    {
+      "block": 16,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        97
+      ],
+      "id": 82,
+      "operation": {
+        "constant": {
+          "integer": "2"
+        }
+      },
+      "results": [
+        250
+      ]
+    },
+    {
+      "block": 16,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        98
+      ],
+      "id": 83,
+      "operation": {
+        "binary": {
+          "left": 247,
+          "mode": "semantic",
+          "operator": "add",
+          "right": 250
+        }
+      },
+      "results": [
+        251
+      ]
+    },
+    {
+      "block": 16,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        99
+      ],
+      "id": 84,
+      "operation": {
+        "constant": {
+          "integer": "3"
+        }
+      },
+      "results": [
+        252
+      ]
+    },
+    {
+      "block": 16,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        100
+      ],
+      "id": 85,
+      "operation": {
+        "binary": {
+          "left": 247,
+          "mode": "semantic",
+          "operator": "add",
+          "right": 252
+        }
+      },
+      "results": [
+        253
+      ]
+    },
+    {
+      "block": 16,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        101
+      ],
+      "id": 86,
+      "operation": {
+        "constant": {
+          "integer": "4"
+        }
+      },
+      "results": [
+        254
+      ]
+    },
+    {
+      "block": 16,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        102
+      ],
+      "id": 87,
+      "operation": {
+        "binary": {
+          "left": 247,
+          "mode": "semantic",
+          "operator": "add",
+          "right": 254
+        }
+      },
+      "results": [
+        255
+      ]
+    },
+    {
+      "block": 16,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        103
+      ],
+      "id": 88,
+      "operation": {
+        "constant": {
+          "integer": "5"
+        }
+      },
+      "results": [
+        256
+      ]
+    },
+    {
+      "block": 16,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        104
+      ],
+      "id": 89,
+      "operation": {
+        "binary": {
+          "left": 247,
+          "mode": "semantic",
+          "operator": "add",
+          "right": 256
+        }
+      },
+      "results": [
+        257
+      ]
+    },
+    {
+      "block": 16,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        105
+      ],
+      "id": 90,
+      "operation": {
+        "constant": {
+          "integer": "6"
+        }
+      },
+      "results": [
+        258
+      ]
+    },
+    {
+      "block": 16,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        106
+      ],
+      "id": 91,
+      "operation": {
+        "binary": {
+          "left": 247,
+          "mode": "semantic",
+          "operator": "add",
+          "right": 258
+        }
+      },
+      "results": [
+        259
+      ]
+    },
+    {
+      "block": 16,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        107
+      ],
+      "id": 92,
+      "operation": {
+        "constant": {
+          "integer": "7"
+        }
+      },
+      "results": [
+        260
+      ]
+    },
+    {
+      "block": 16,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        108
+      ],
+      "id": 93,
+      "operation": {
+        "binary": {
+          "left": 247,
+          "mode": "semantic",
+          "operator": "add",
+          "right": 260
+        }
+      },
+      "results": [
+        261
+      ]
+    },
+    {
+      "block": 16,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        109
+      ],
+      "id": 94,
+      "operation": {
+        "constant": {
+          "integer": "8"
+        }
+      },
+      "results": [
+        262
+      ]
+    },
+    {
+      "block": 16,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        110
+      ],
+      "id": 95,
+      "operation": {
+        "binary": {
+          "left": 247,
+          "mode": "semantic",
+          "operator": "add",
+          "right": 262
+        }
+      },
+      "results": [
+        263
+      ]
+    },
+    {
+      "block": 17,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        111
+      ],
+      "id": 96,
+      "operation": {
+        "constant": {
+          "integer": "2"
+        }
+      },
+      "results": [
+        264
+      ]
+    },
+    {
+      "block": 17,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": true,
+        "may_throw": true,
+        "may_yield": true,
+        "precision": "conservative",
+        "reads_memory": true,
+        "writes_memory": true
+      },
+      "evidence": [
+        112
+      ],
+      "id": 97,
+      "operation": {
+        "environment_get": {
+          "mode": "semantic",
+          "name": "math",
+          "target": {
+            "ambient": {}
+          }
+        }
+      },
+      "results": [
+        265
+      ]
+    },
+    {
+      "block": 17,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        113
+      ],
+      "id": 98,
+      "operation": {
+        "constant": {
+          "string": "max"
+        }
+      },
+      "results": [
+        266
+      ]
+    },
+    {
+      "block": 17,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": true,
+        "may_throw": true,
+        "may_yield": true,
+        "precision": "conservative",
+        "reads_memory": true,
+        "writes_memory": true
+      },
+      "evidence": [
+        113
+      ],
+      "id": 99,
+      "operation": {
+        "table_get": {
+          "key": 266,
+          "mode": "semantic",
+          "table": 265
+        }
+      },
+      "results": [
+        267
+      ]
+    },
+    {
+      "block": 17,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": true,
+        "may_throw": true,
+        "may_yield": true,
+        "precision": "conservative",
+        "reads_memory": true,
+        "writes_memory": true
+      },
+      "evidence": [
+        114
+      ],
+      "id": 100,
+      "operation": {
+        "call": {
+          "arguments": [
+            249,
+            251,
+            253,
+            255,
+            257,
+            259,
+            261,
+            263,
+            249,
+            251,
+            253,
+            255,
+            257,
+            259,
+            261,
+            263
+          ],
+          "callee": 267,
+          "result_arity": {
+            "variadic": {}
+          }
+        }
+      },
+      "pack_result": 1,
+      "results": []
+    },
+    {
+      "block": 17,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        114
+      ],
+      "id": 101,
+      "operation": {
+        "adjust_pack": 1
+      },
+      "results": [
+        268
+      ]
+    },
+    {
+      "block": 17,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": true,
+        "may_throw": true,
+        "may_yield": true,
+        "precision": "conservative",
+        "reads_memory": true,
+        "writes_memory": true
+      },
+      "evidence": [
+        115
+      ],
+      "id": 102,
+      "operation": {
+        "table_set": {
+          "key": 264,
+          "mode": "semantic",
+          "table": 174,
+          "value": 268
+        }
+      },
+      "results": []
+    },
+    {
+      "block": 6,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        116
+      ],
+      "id": 103,
+      "operation": {
+        "constant": {
+          "integer": "6"
+        }
+      },
+      "results": [
+        269
+      ]
+    },
+    {
+      "block": 6,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": true,
+        "writes_memory": false
+      },
+      "evidence": [
+        117
+      ],
+      "id": 104,
+      "operation": {
+        "place_read": 1
+      },
+      "results": [
+        270
+      ]
+    },
+    {
+      "block": 6,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        118
+      ],
+      "id": 105,
+      "operation": {
+        "binary": {
+          "left": 270,
+          "mode": "semantic",
+          "operator": "greater_equal",
+          "right": 269
+        }
+      },
+      "results": [
+        271
+      ]
+    },
+    {
+      "block": 7,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": true,
+        "writes_memory": false
+      },
+      "evidence": [
+        119
+      ],
+      "id": 106,
+      "operation": {
+        "place_read": 2
+      },
+      "results": [
+        272
+      ]
+    },
+    {
+      "block": 7,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": true,
+        "writes_memory": false
+      },
+      "evidence": [
+        120
+      ],
+      "id": 107,
+      "operation": {
+        "place_read": 1
+      },
+      "results": [
+        273
+      ]
+    },
+    {
+      "block": 7,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        121
+      ],
+      "id": 108,
+      "operation": {
+        "constant": {
+          "integer": "0"
+        }
+      },
+      "results": [
+        274
+      ]
+    },
+    {
+      "block": 7,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": true,
+        "may_throw": true,
+        "may_yield": true,
+        "precision": "conservative",
+        "reads_memory": true,
+        "writes_memory": true
+      },
+      "evidence": [
+        122
+      ],
+      "id": 109,
+      "operation": {
+        "table_get": {
+          "key": 274,
+          "mode": "semantic",
+          "table": 174
+        }
+      },
+      "results": [
+        275
+      ]
+    },
+    {
+      "block": 7,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        123
+      ],
+      "id": 110,
+      "operation": {
+        "constant": {
+          "integer": "2"
+        }
+      },
+      "results": [
+        276
+      ]
+    },
+    {
+      "block": 7,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": true,
+        "may_throw": true,
+        "may_yield": true,
+        "precision": "conservative",
+        "reads_memory": true,
+        "writes_memory": true
+      },
+      "evidence": [
+        124
+      ],
+      "id": 111,
+      "operation": {
+        "table_get": {
+          "key": 276,
+          "mode": "semantic",
+          "table": 174
+        }
+      },
+      "results": [
+        277
+      ]
+    },
+    {
+      "block": 7,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        125
+      ],
+      "id": 112,
+      "operation": {
+        "constant": {
+          "integer": "3"
+        }
+      },
+      "results": [
+        278
+      ]
+    },
+    {
+      "block": 7,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": true,
+        "may_throw": true,
+        "may_yield": true,
+        "precision": "conservative",
+        "reads_memory": true,
+        "writes_memory": true
+      },
+      "evidence": [
+        126
+      ],
+      "id": 113,
+      "operation": {
+        "table_get": {
+          "key": 278,
+          "mode": "semantic",
+          "table": 174
+        }
+      },
+      "results": [
+        279
+      ]
+    },
+    {
+      "block": 7,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        127
+      ],
+      "id": 114,
+      "operation": {
+        "constant": {
+          "integer": "102"
+        }
+      },
+      "results": [
+        280
+      ]
+    },
+    {
+      "block": 7,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": true,
+        "may_throw": true,
+        "may_yield": true,
+        "precision": "conservative",
+        "reads_memory": true,
+        "writes_memory": true
+      },
+      "evidence": [
+        128
+      ],
+      "id": 115,
+      "operation": {
+        "table_get": {
+          "key": 280,
+          "mode": "semantic",
+          "table": 174
+        }
+      },
+      "results": [
+        281
+      ]
+    },
+    {
+      "block": 7,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        129
+      ],
+      "id": 116,
+      "operation": {
+        "constant": {
+          "integer": "3001"
+        }
+      },
+      "results": [
+        282
+      ]
+    },
+    {
+      "block": 7,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": true,
+        "may_throw": true,
+        "may_yield": true,
+        "precision": "conservative",
+        "reads_memory": true,
+        "writes_memory": true
+      },
+      "evidence": [
+        130
+      ],
+      "id": 117,
+      "operation": {
+        "table_get": {
+          "key": 282,
+          "mode": "semantic",
+          "table": 174
+        }
+      },
+      "results": [
+        283
+      ]
+    },
+    {
+      "block": 0,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": false
+      },
+      "evidence": [
+        2
+      ],
+      "id": 118,
+      "operation": {
+        "make_closure": {
+          "bindings": [],
+          "function": 1
+        }
+      },
+      "results": [
+        284
+      ]
+    },
+    {
+      "block": 0,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": false,
+        "writes_memory": true
+      },
+      "evidence": [
+        2
+      ],
+      "id": 119,
+      "operation": {
+        "place_write": {
+          "place": 0,
+          "value": 284
+        }
+      },
+      "results": []
+    },
+    {
+      "block": 0,
+      "claims": [],
+      "effects": {
+        "invokes_unknown_code": false,
+        "may_throw": false,
+        "may_yield": false,
+        "precision": "exact",
+        "reads_memory": true,
+        "writes_memory": false
+      },
+      "evidence": [
+        131
+      ],
+      "id": 120,
+      "operation": {
+        "place_read": 0
+      },
+      "results": [
+        285
+      ]
+    }
+  ],
+  "obligations": [],
+  "places": [
+    {
+      "evidence": [
+        1
+      ],
+      "function": 0,
+      "id": 0,
+      "name_hint": "worker",
+      "origin": {
+        "local": 0
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "function",
+        "signed": false
+      }
+    },
+    {
+      "evidence": [
+        9
+      ],
+      "function": 1,
+      "id": 1,
+      "name_hint": "index",
+      "origin": {
+        "local": 0
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "evidence": [
+        12
+      ],
+      "function": 1,
+      "id": 2,
+      "name_hint": "shown",
+      "origin": {
+        "local": 1
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    }
+  ],
+  "program_id": "source-repeated_tail_split_chain_locals_172",
+  "queries": [],
+  "schema_version": "lifter_ir_v1",
+  "solver_models": [],
+  "solver_terms": [],
+  "source_semantics": "luau",
+  "unsat_cores": [],
+  "value_packs": [
+    {
+      "evidence": [
+        0
+      ],
+      "function": 0,
+      "id": 0,
+      "origin": {
+        "varargs": 0
+      },
+      "shape": {
+        "prefix": [],
+        "tail": "open"
+      }
+    },
+    {
+      "evidence": [
+        114
+      ],
+      "function": 1,
+      "id": 1,
+      "origin": {
+        "instruction_result": 100
+      },
+      "shape": {
+        "prefix": [],
+        "tail": "open"
+      }
+    }
+  ],
+  "values": [
+    {
+      "function": 1,
+      "id": 0,
+      "name_hint": "selector",
+      "origin": {
+        "parameter": 0
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 1,
+      "name_hint": "budget",
+      "origin": {
+        "parameter": 1
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 2,
+      "name_hint": "a1",
+      "origin": {
+        "parameter": 2
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 3,
+      "name_hint": "a2",
+      "origin": {
+        "parameter": 3
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 4,
+      "name_hint": "a3",
+      "origin": {
+        "parameter": 4
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 5,
+      "name_hint": "a4",
+      "origin": {
+        "parameter": 5
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 6,
+      "name_hint": "a5",
+      "origin": {
+        "parameter": 6
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 7,
+      "name_hint": "a6",
+      "origin": {
+        "parameter": 7
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 8,
+      "name_hint": "a7",
+      "origin": {
+        "parameter": 8
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 9,
+      "name_hint": "a8",
+      "origin": {
+        "parameter": 9
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 10,
+      "name_hint": "a9",
+      "origin": {
+        "parameter": 10
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 11,
+      "name_hint": "a10",
+      "origin": {
+        "parameter": 11
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 12,
+      "name_hint": "a11",
+      "origin": {
+        "parameter": 12
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 13,
+      "name_hint": "a12",
+      "origin": {
+        "parameter": 13
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 14,
+      "name_hint": "a13",
+      "origin": {
+        "parameter": 14
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 15,
+      "name_hint": "a14",
+      "origin": {
+        "parameter": 15
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 16,
+      "name_hint": "a15",
+      "origin": {
+        "parameter": 16
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 17,
+      "name_hint": "a16",
+      "origin": {
+        "parameter": 17
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 18,
+      "name_hint": "a17",
+      "origin": {
+        "parameter": 18
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 19,
+      "name_hint": "a18",
+      "origin": {
+        "parameter": 19
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 20,
+      "name_hint": "a19",
+      "origin": {
+        "parameter": 20
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 21,
+      "name_hint": "a20",
+      "origin": {
+        "parameter": 21
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 22,
+      "name_hint": "a21",
+      "origin": {
+        "parameter": 22
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 23,
+      "name_hint": "a22",
+      "origin": {
+        "parameter": 23
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 24,
+      "name_hint": "a23",
+      "origin": {
+        "parameter": 24
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 25,
+      "name_hint": "a24",
+      "origin": {
+        "parameter": 25
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 26,
+      "name_hint": "a25",
+      "origin": {
+        "parameter": 26
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 27,
+      "name_hint": "a26",
+      "origin": {
+        "parameter": 27
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 28,
+      "name_hint": "a27",
+      "origin": {
+        "parameter": 28
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 29,
+      "name_hint": "a28",
+      "origin": {
+        "parameter": 29
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 30,
+      "name_hint": "a29",
+      "origin": {
+        "parameter": 30
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 31,
+      "name_hint": "a30",
+      "origin": {
+        "parameter": 31
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 32,
+      "name_hint": "a31",
+      "origin": {
+        "parameter": 32
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 33,
+      "name_hint": "a32",
+      "origin": {
+        "parameter": 33
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 34,
+      "name_hint": "a33",
+      "origin": {
+        "parameter": 34
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 35,
+      "name_hint": "a34",
+      "origin": {
+        "parameter": 35
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 36,
+      "name_hint": "a35",
+      "origin": {
+        "parameter": 36
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 37,
+      "name_hint": "a36",
+      "origin": {
+        "parameter": 37
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 38,
+      "name_hint": "a37",
+      "origin": {
+        "parameter": 38
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 39,
+      "name_hint": "a38",
+      "origin": {
+        "parameter": 39
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 40,
+      "name_hint": "a39",
+      "origin": {
+        "parameter": 40
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 41,
+      "name_hint": "a40",
+      "origin": {
+        "parameter": 41
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 42,
+      "name_hint": "a41",
+      "origin": {
+        "parameter": 42
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 43,
+      "name_hint": "a42",
+      "origin": {
+        "parameter": 43
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 44,
+      "name_hint": "a43",
+      "origin": {
+        "parameter": 44
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 45,
+      "name_hint": "a44",
+      "origin": {
+        "parameter": 45
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 46,
+      "name_hint": "a45",
+      "origin": {
+        "parameter": 46
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 47,
+      "name_hint": "a46",
+      "origin": {
+        "parameter": 47
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 48,
+      "name_hint": "a47",
+      "origin": {
+        "parameter": 48
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 49,
+      "name_hint": "a48",
+      "origin": {
+        "parameter": 49
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 50,
+      "name_hint": "a49",
+      "origin": {
+        "parameter": 50
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 51,
+      "name_hint": "a50",
+      "origin": {
+        "parameter": 51
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 52,
+      "name_hint": "a51",
+      "origin": {
+        "parameter": 52
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 53,
+      "name_hint": "a52",
+      "origin": {
+        "parameter": 53
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 54,
+      "name_hint": "a53",
+      "origin": {
+        "parameter": 54
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 55,
+      "name_hint": "a54",
+      "origin": {
+        "parameter": 55
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 56,
+      "name_hint": "a55",
+      "origin": {
+        "parameter": 56
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 57,
+      "name_hint": "a56",
+      "origin": {
+        "parameter": 57
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 58,
+      "name_hint": "a57",
+      "origin": {
+        "parameter": 58
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 59,
+      "name_hint": "a58",
+      "origin": {
+        "parameter": 59
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 60,
+      "name_hint": "a59",
+      "origin": {
+        "parameter": 60
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 61,
+      "name_hint": "a60",
+      "origin": {
+        "parameter": 61
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 62,
+      "name_hint": "a61",
+      "origin": {
+        "parameter": 62
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 63,
+      "name_hint": "a62",
+      "origin": {
+        "parameter": 63
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 64,
+      "name_hint": "a63",
+      "origin": {
+        "parameter": 64
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 65,
+      "name_hint": "a64",
+      "origin": {
+        "parameter": 65
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 66,
+      "name_hint": "a65",
+      "origin": {
+        "parameter": 66
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 67,
+      "name_hint": "a66",
+      "origin": {
+        "parameter": 67
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 68,
+      "name_hint": "a67",
+      "origin": {
+        "parameter": 68
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 69,
+      "name_hint": "a68",
+      "origin": {
+        "parameter": 69
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 70,
+      "name_hint": "a69",
+      "origin": {
+        "parameter": 70
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 71,
+      "name_hint": "a70",
+      "origin": {
+        "parameter": 71
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 72,
+      "name_hint": "a71",
+      "origin": {
+        "parameter": 72
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 73,
+      "name_hint": "a72",
+      "origin": {
+        "parameter": 73
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 74,
+      "name_hint": "a73",
+      "origin": {
+        "parameter": 74
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 75,
+      "name_hint": "a74",
+      "origin": {
+        "parameter": 75
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 76,
+      "name_hint": "a75",
+      "origin": {
+        "parameter": 76
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 77,
+      "name_hint": "a76",
+      "origin": {
+        "parameter": 77
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 78,
+      "name_hint": "a77",
+      "origin": {
+        "parameter": 78
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 79,
+      "name_hint": "a78",
+      "origin": {
+        "parameter": 79
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 80,
+      "name_hint": "a79",
+      "origin": {
+        "parameter": 80
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 81,
+      "name_hint": "a80",
+      "origin": {
+        "parameter": 81
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 82,
+      "name_hint": "a81",
+      "origin": {
+        "parameter": 82
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 83,
+      "name_hint": "a82",
+      "origin": {
+        "parameter": 83
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 84,
+      "name_hint": "a83",
+      "origin": {
+        "parameter": 84
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 85,
+      "name_hint": "a84",
+      "origin": {
+        "parameter": 85
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 86,
+      "name_hint": "a85",
+      "origin": {
+        "parameter": 86
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 87,
+      "name_hint": "a86",
+      "origin": {
+        "parameter": 87
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 88,
+      "name_hint": "a87",
+      "origin": {
+        "parameter": 88
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 89,
+      "name_hint": "a88",
+      "origin": {
+        "parameter": 89
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 90,
+      "name_hint": "a89",
+      "origin": {
+        "parameter": 90
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 91,
+      "name_hint": "a90",
+      "origin": {
+        "parameter": 91
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 92,
+      "name_hint": "a91",
+      "origin": {
+        "parameter": 92
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 93,
+      "name_hint": "a92",
+      "origin": {
+        "parameter": 93
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 94,
+      "name_hint": "a93",
+      "origin": {
+        "parameter": 94
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 95,
+      "name_hint": "a94",
+      "origin": {
+        "parameter": 95
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 96,
+      "name_hint": "a95",
+      "origin": {
+        "parameter": 96
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 97,
+      "name_hint": "a96",
+      "origin": {
+        "parameter": 97
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 98,
+      "name_hint": "a97",
+      "origin": {
+        "parameter": 98
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 99,
+      "name_hint": "a98",
+      "origin": {
+        "parameter": 99
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 100,
+      "name_hint": "a99",
+      "origin": {
+        "parameter": 100
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 101,
+      "name_hint": "a100",
+      "origin": {
+        "parameter": 101
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 102,
+      "name_hint": "a101",
+      "origin": {
+        "parameter": 102
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 103,
+      "name_hint": "a102",
+      "origin": {
+        "parameter": 103
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 104,
+      "name_hint": "a103",
+      "origin": {
+        "parameter": 104
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 105,
+      "name_hint": "a104",
+      "origin": {
+        "parameter": 105
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 106,
+      "name_hint": "a105",
+      "origin": {
+        "parameter": 106
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 107,
+      "name_hint": "a106",
+      "origin": {
+        "parameter": 107
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 108,
+      "name_hint": "a107",
+      "origin": {
+        "parameter": 108
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 109,
+      "name_hint": "a108",
+      "origin": {
+        "parameter": 109
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 110,
+      "name_hint": "a109",
+      "origin": {
+        "parameter": 110
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 111,
+      "name_hint": "a110",
+      "origin": {
+        "parameter": 111
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 112,
+      "name_hint": "a111",
+      "origin": {
+        "parameter": 112
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 113,
+      "name_hint": "a112",
+      "origin": {
+        "parameter": 113
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 114,
+      "name_hint": "a113",
+      "origin": {
+        "parameter": 114
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 115,
+      "name_hint": "a114",
+      "origin": {
+        "parameter": 115
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 116,
+      "name_hint": "a115",
+      "origin": {
+        "parameter": 116
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 117,
+      "name_hint": "a116",
+      "origin": {
+        "parameter": 117
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 118,
+      "name_hint": "a117",
+      "origin": {
+        "parameter": 118
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 119,
+      "name_hint": "a118",
+      "origin": {
+        "parameter": 119
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 120,
+      "name_hint": "a119",
+      "origin": {
+        "parameter": 120
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 121,
+      "name_hint": "a120",
+      "origin": {
+        "parameter": 121
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 122,
+      "name_hint": "a121",
+      "origin": {
+        "parameter": 122
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 123,
+      "name_hint": "a122",
+      "origin": {
+        "parameter": 123
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 124,
+      "name_hint": "a123",
+      "origin": {
+        "parameter": 124
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 125,
+      "name_hint": "a124",
+      "origin": {
+        "parameter": 125
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 126,
+      "name_hint": "a125",
+      "origin": {
+        "parameter": 126
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 127,
+      "name_hint": "a126",
+      "origin": {
+        "parameter": 127
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 128,
+      "name_hint": "a127",
+      "origin": {
+        "parameter": 128
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 129,
+      "name_hint": "a128",
+      "origin": {
+        "parameter": 129
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 130,
+      "name_hint": "a129",
+      "origin": {
+        "parameter": 130
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 131,
+      "name_hint": "a130",
+      "origin": {
+        "parameter": 131
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 132,
+      "name_hint": "a131",
+      "origin": {
+        "parameter": 132
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 133,
+      "name_hint": "a132",
+      "origin": {
+        "parameter": 133
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 134,
+      "name_hint": "a133",
+      "origin": {
+        "parameter": 134
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 135,
+      "name_hint": "a134",
+      "origin": {
+        "parameter": 135
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 136,
+      "name_hint": "a135",
+      "origin": {
+        "parameter": 136
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 137,
+      "name_hint": "a136",
+      "origin": {
+        "parameter": 137
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 138,
+      "name_hint": "a137",
+      "origin": {
+        "parameter": 138
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 139,
+      "name_hint": "a138",
+      "origin": {
+        "parameter": 139
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 140,
+      "name_hint": "a139",
+      "origin": {
+        "parameter": 140
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 141,
+      "name_hint": "a140",
+      "origin": {
+        "parameter": 141
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 142,
+      "name_hint": "a141",
+      "origin": {
+        "parameter": 142
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 143,
+      "name_hint": "a142",
+      "origin": {
+        "parameter": 143
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 144,
+      "name_hint": "a143",
+      "origin": {
+        "parameter": 144
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 145,
+      "name_hint": "a144",
+      "origin": {
+        "parameter": 145
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 146,
+      "name_hint": "a145",
+      "origin": {
+        "parameter": 146
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 147,
+      "name_hint": "a146",
+      "origin": {
+        "parameter": 147
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 148,
+      "name_hint": "a147",
+      "origin": {
+        "parameter": 148
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 149,
+      "name_hint": "a148",
+      "origin": {
+        "parameter": 149
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 150,
+      "name_hint": "a149",
+      "origin": {
+        "parameter": 150
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 151,
+      "name_hint": "a150",
+      "origin": {
+        "parameter": 151
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 152,
+      "name_hint": "a151",
+      "origin": {
+        "parameter": 152
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 153,
+      "name_hint": "a152",
+      "origin": {
+        "parameter": 153
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 154,
+      "name_hint": "a153",
+      "origin": {
+        "parameter": 154
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 155,
+      "name_hint": "a154",
+      "origin": {
+        "parameter": 155
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 156,
+      "name_hint": "a155",
+      "origin": {
+        "parameter": 156
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 157,
+      "name_hint": "a156",
+      "origin": {
+        "parameter": 157
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 158,
+      "name_hint": "a157",
+      "origin": {
+        "parameter": 158
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 159,
+      "name_hint": "a158",
+      "origin": {
+        "parameter": 159
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 160,
+      "name_hint": "a159",
+      "origin": {
+        "parameter": 160
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 161,
+      "name_hint": "a160",
+      "origin": {
+        "parameter": 161
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 162,
+      "name_hint": "a161",
+      "origin": {
+        "parameter": 162
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 163,
+      "name_hint": "a162",
+      "origin": {
+        "parameter": 163
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 164,
+      "name_hint": "a163",
+      "origin": {
+        "parameter": 164
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 165,
+      "name_hint": "a164",
+      "origin": {
+        "parameter": 165
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 166,
+      "name_hint": "a165",
+      "origin": {
+        "parameter": 166
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 167,
+      "name_hint": "a166",
+      "origin": {
+        "parameter": 167
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 168,
+      "name_hint": "a167",
+      "origin": {
+        "parameter": 168
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 169,
+      "name_hint": "a168",
+      "origin": {
+        "parameter": 169
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 170,
+      "name_hint": "a169",
+      "origin": {
+        "parameter": 170
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 171,
+      "name_hint": "a170",
+      "origin": {
+        "parameter": 171
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 172,
+      "name_hint": "a171",
+      "origin": {
+        "parameter": 172
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 173,
+      "name_hint": "a172",
+      "origin": {
+        "parameter": 173
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 174,
+      "name_hint": "acc",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 0
+        }
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "table",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 175,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 1
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "integer",
+        "signed": true
+      }
+    },
+    {
+      "function": 1,
+      "id": 176,
+      "name_hint": "assigned_1",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 2
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "integer",
+        "signed": true
+      }
+    },
+    {
+      "function": 1,
+      "id": 177,
+      "name_hint": "index",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 4
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "integer",
+        "signed": true
+      }
+    },
+    {
+      "function": 1,
+      "id": 178,
+      "name_hint": "shown",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 6
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "integer",
+        "signed": true
+      }
+    },
+    {
+      "function": 1,
+      "id": 179,
+      "name_hint": "tonumber",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 8
+        }
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 180,
+      "name_hint": "call_result",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 9
+        }
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 181,
+      "name_hint": "logical_result",
+      "origin": {
+        "block_parameter": {
+          "block": 4,
+          "index": 0
+        }
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 182,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 10
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "integer",
+        "signed": true
+      }
+    },
+    {
+      "function": 1,
+      "id": 183,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 11
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "integer",
+        "signed": true
+      }
+    },
+    {
+      "function": 1,
+      "id": 184,
+      "name_hint": "budget2",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 12
+        }
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 185,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 13
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "integer",
+        "signed": true
+      }
+    },
+    {
+      "function": 1,
+      "id": 186,
+      "name_hint": "index",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 14
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 187,
+      "name_hint": "compound_result",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 15
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 188,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 17
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "integer",
+        "signed": true
+      }
+    },
+    {
+      "function": 1,
+      "id": 189,
+      "name_hint": "index",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 18
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 190,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 19
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 191,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 20
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "integer",
+        "signed": true
+      }
+    },
+    {
+      "function": 1,
+      "id": 192,
+      "name_hint": "condition",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 21
+        }
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "boolean",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 193,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 22
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "integer",
+        "signed": true
+      }
+    },
+    {
+      "function": 1,
+      "id": 194,
+      "name_hint": "shown",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 23
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 195,
+      "name_hint": "assigned_1",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 24
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 196,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 26
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "integer",
+        "signed": true
+      }
+    },
+    {
+      "function": 1,
+      "id": 197,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 27
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "integer",
+        "signed": true
+      }
+    },
+    {
+      "function": 1,
+      "id": 198,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 28
+        }
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "boolean",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 199,
+      "name_hint": "assigned_1",
+      "origin": {
+        "block_parameter": {
+          "block": 12,
+          "index": 0
+        }
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 200,
+      "name_hint": "index",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 30
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 201,
+      "name_hint": "condition",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 31
+        }
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "boolean",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 202,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 32
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "integer",
+        "signed": true
+      }
+    },
+    {
+      "function": 1,
+      "id": 203,
+      "name_hint": "shown",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 33
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 204,
+      "name_hint": "assigned_1",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 34
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 205,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 36
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "integer",
+        "signed": true
+      }
+    },
+    {
+      "function": 1,
+      "id": 206,
+      "name_hint": "index",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 37
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 207,
+      "name_hint": "e1",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 38
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 208,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 39
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "integer",
+        "signed": true
+      }
+    },
+    {
+      "function": 1,
+      "id": 209,
+      "name_hint": "index",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 40
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 210,
+      "name_hint": "e2",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 41
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 211,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 42
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "integer",
+        "signed": true
+      }
+    },
+    {
+      "function": 1,
+      "id": 212,
+      "name_hint": "index",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 43
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 213,
+      "name_hint": "e3",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 44
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 214,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 45
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "integer",
+        "signed": true
+      }
+    },
+    {
+      "function": 1,
+      "id": 215,
+      "name_hint": "index",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 46
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 216,
+      "name_hint": "e4",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 47
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 217,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 48
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "integer",
+        "signed": true
+      }
+    },
+    {
+      "function": 1,
+      "id": 218,
+      "name_hint": "index",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 49
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 219,
+      "name_hint": "e5",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 50
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 220,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 51
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "integer",
+        "signed": true
+      }
+    },
+    {
+      "function": 1,
+      "id": 221,
+      "name_hint": "index",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 52
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 222,
+      "name_hint": "e6",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 53
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 223,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 54
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "integer",
+        "signed": true
+      }
+    },
+    {
+      "function": 1,
+      "id": 224,
+      "name_hint": "index",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 55
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 225,
+      "name_hint": "e7",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 56
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 226,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 57
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "integer",
+        "signed": true
+      }
+    },
+    {
+      "function": 1,
+      "id": 227,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 58
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "integer",
+        "signed": true
+      }
+    },
+    {
+      "function": 1,
+      "id": 228,
+      "name_hint": "field",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 59
+        }
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 229,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 60
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 230,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 61
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 231,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 62
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 232,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 63
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 233,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 64
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 234,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 65
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 235,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 66
+        }
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 236,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 67
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 237,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 68
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 238,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 69
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 239,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 70
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 240,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 71
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 241,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 72
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 242,
+      "name_hint": "assigned_1",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 73
+        }
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 243,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 75
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "integer",
+        "signed": true
+      }
+    },
+    {
+      "function": 1,
+      "id": 244,
+      "name_hint": "index",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 76
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 245,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 77
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 246,
+      "name_hint": "shown",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 78
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 247,
+      "name_hint": "cell",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 79
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 248,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 80
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "integer",
+        "signed": true
+      }
+    },
+    {
+      "function": 1,
+      "id": 249,
+      "name_hint": "v1",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 81
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 250,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 82
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "integer",
+        "signed": true
+      }
+    },
+    {
+      "function": 1,
+      "id": 251,
+      "name_hint": "v2",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 83
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 252,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 84
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "integer",
+        "signed": true
+      }
+    },
+    {
+      "function": 1,
+      "id": 253,
+      "name_hint": "v3",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 85
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 254,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 86
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "integer",
+        "signed": true
+      }
+    },
+    {
+      "function": 1,
+      "id": 255,
+      "name_hint": "v4",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 87
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 256,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 88
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "integer",
+        "signed": true
+      }
+    },
+    {
+      "function": 1,
+      "id": 257,
+      "name_hint": "v5",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 89
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 258,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 90
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "integer",
+        "signed": true
+      }
+    },
+    {
+      "function": 1,
+      "id": 259,
+      "name_hint": "v6",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 91
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 260,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 92
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "integer",
+        "signed": true
+      }
+    },
+    {
+      "function": 1,
+      "id": 261,
+      "name_hint": "v7",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 93
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 262,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 94
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "integer",
+        "signed": true
+      }
+    },
+    {
+      "function": 1,
+      "id": 263,
+      "name_hint": "v8",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 95
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 264,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 96
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "integer",
+        "signed": true
+      }
+    },
+    {
+      "function": 1,
+      "id": 265,
+      "name_hint": "math",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 97
+        }
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 266,
+      "name_hint": "field_key",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 98
+        }
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "string",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 267,
+      "name_hint": "field",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 99
+        }
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 268,
+      "name_hint": "assigned_1",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 101
+        }
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 269,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 103
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "integer",
+        "signed": true
+      }
+    },
+    {
+      "function": 1,
+      "id": 270,
+      "name_hint": "index",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 104
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 271,
+      "name_hint": "until_condition",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 105
+        }
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "boolean",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 272,
+      "name_hint": "shown",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 106
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 273,
+      "name_hint": "index",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 107
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "number",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 274,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 108
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "integer",
+        "signed": true
+      }
+    },
+    {
+      "function": 1,
+      "id": 275,
+      "name_hint": "field",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 109
+        }
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 276,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 110
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "integer",
+        "signed": true
+      }
+    },
+    {
+      "function": 1,
+      "id": 277,
+      "name_hint": "field",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 111
+        }
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 278,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 112
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "integer",
+        "signed": true
+      }
+    },
+    {
+      "function": 1,
+      "id": 279,
+      "name_hint": "field",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 113
+        }
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 280,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 114
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "integer",
+        "signed": true
+      }
+    },
+    {
+      "function": 1,
+      "id": 281,
+      "name_hint": "field",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 115
+        }
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 1,
+      "id": 282,
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 116
+        }
+      },
+      "type": {
+        "bit_width": 64,
+        "kind": "integer",
+        "signed": true
+      }
+    },
+    {
+      "function": 1,
+      "id": 283,
+      "name_hint": "field",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 117
+        }
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "dynamic",
+        "signed": false
+      }
+    },
+    {
+      "function": 0,
+      "id": 284,
+      "name_hint": "worker",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 118
+        }
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "function",
+        "signed": false
+      }
+    },
+    {
+      "function": 0,
+      "id": 285,
+      "name_hint": "worker",
+      "origin": {
+        "instruction_result": {
+          "index": 0,
+          "instruction": 120
+        }
+      },
+      "type": {
+        "bit_width": 0,
+        "kind": "function",
+        "signed": false
+      }
+    }
+  ]
+}

@@ -2618,6 +2618,243 @@ function SourceRuntimeOracle.run(caseName: string, source: string, exported: any
 			end
 		end
 	elseif
+		caseName == "source-frontend-repeated-tail-handler-counter"
+		or caseName == "source-frontend-repeated-tail-handler-counter-direct-locals"
+		or caseName == "source-frontend-repeated-tail-recursive-local"
+		or caseName == "source-frontend-repeated-tail-recursive-local-direct-locals"
+	then
+		-- A worker whose repeat loop holds a continue one if deeper, so the loop's tail is written in both arms of the
+		-- outer if, and whose tail declares a local that its later statements read: a click counter that handlers stored
+		-- in earlier passes bump when they run after the loop, and a local of a recursive function that the recursive call
+		-- re-enters before its read. Each copy of the tail must declare its own local, or the copies share one global.
+		local program = string.gsub(caseName, "%-direct%-locals$", "")
+		local byProgram: { [string]: { string } } = {
+			["source-frontend-repeated-tail-handler-counter"] = {
+				"12,8,12170120,8", "12,8,12170120,8", "12,8,12170120,8", "12,8,12170120,8", "12,8,12170120,8",
+				"10,8,3111147,7", "10,8,3111147,7", "10,8,3111147,7", "10,8,3111147,7", "10,8,3111147,7",
+				"12,8,12170120,8", "12,8,12170120,8", "12,8,12170120,8", "12,8,12170120,8", "12,8,12170120,8",
+				"10,8,1766587,7", "10,8,1766587,7", "10,8,1766587,7", "10,8,1766587,7", "10,8,1766587,7",
+				"12,8,12170120,8", "12,8,12170120,8", "12,8,12170120,8", "12,8,12170120,8", "12,8,12170120,8",
+				"12,8,12170120,8", "12,8,12170120,8", "12,8,12170120,8", "12,8,12170120,8", "12,8,12170120,8",
+				"12,8,12170120,8", "12,8,12170120,8", "12,8,12170120,8", "12,8,12170120,8", "12,8,12170120,8",
+				"12,8,12170120,8", "12,8,12170120,8", "12,8,12170120,8", "12,8,12170120,8", "12,8,12170120,8",
+				"12,8,12170120,8", "12,8,12170120,8", "12,8,12170120,8", "12,8,12170120,8", "12,8,12170120,8",
+			},
+			["source-frontend-repeated-tail-recursive-local"] = {
+				"349,295", "349,295", "349,295", "349,295", "349,295",
+				"351,296", "351,296", "351,296", "351,296", "351,296",
+				"349,295", "349,295", "349,295", "349,295", "349,295",
+				"247,313", "247,313", "247,313", "247,313", "247,313",
+				"349,295", "349,295", "349,295", "349,295", "349,295",
+				"349,295", "349,295", "349,295", "349,295", "349,295",
+				"349,295", "349,295", "349,295", "349,295", "349,295",
+				"349,295", "349,295", "349,295", "349,295", "349,295",
+				"349,295", "349,295", "349,295", "349,295", "349,295",
+			},
+		}
+		local want = byProgram[program]
+		local index = 0
+		for _, selector in { 0, 1, -2, 3, 2.5, "x", 4, 10, 11 } :: { any } do
+			for _, budget in { 0, 1, 3, 7, 10 } do
+				index += 1
+				local results = table.pack(pcall(exported, selector, budget))
+				local got = "error"
+				if results[1] then
+					local shown: { string } = {}
+					for position = 2, results.n do
+						table.insert(shown, tostring(results[position]))
+					end
+					got = table.concat(shown, ",")
+				end
+				assert(
+					got == want[index],
+					`{caseName} returned {got} for ({tostring(selector)}, {budget}), its source returns {want[index]}`
+				)
+			end
+		end
+	elseif
+		caseName == "source-frontend-projected-return-segment-locals"
+		or caseName == "source-frontend-projected-return-segment-locals-direct-locals"
+	then
+		-- A worker whose if holds a repeat loop left by a break, followed by a return block of 120 locals each read twice:
+		-- the loop's exit arm writes the return block again, and that copy must declare the locals the first copy
+		-- declares, or it reads and assigns globals.
+		local want = {
+			"0,0,1,14400", "0,0,1,14400", "0,0,1,14400", "0,0,1,14400", "0,0,1,14400",
+			"100,1,1002,1256641", "100,1,1002,1256641", "100,1,1002,1256641", "100,1,1002,1256641", "100,1,1002,1256641",
+			"0,3,4,15129", "0,3,4,15129", "0,3,4,15129", "0,3,4,15129", "0,3,4,15129",
+			"100,3,1004,1261129", "100,3,1004,1261129", "100,3,1004,1261129", "100,3,1004,1261129", "100,3,1004,1261129",
+			"0,3,4,15129", "0,3,4,15129", "0,3,4,15129", "0,3,4,15129", "0,3,4,15129",
+			"0,3,4,15129", "0,3,4,15129", "0,3,4,15129", "0,3,4,15129", "0,3,4,15129",
+			"0,3,4,15129", "0,3,4,15129", "0,3,4,15129", "0,3,4,15129", "0,3,4,15129",
+			"0,3,4,15129", "0,3,4,15129", "0,3,4,15129", "0,3,4,15129", "0,3,4,15129",
+			"0,3,4,15129", "0,3,4,15129", "0,3,4,15129", "0,3,4,15129", "0,3,4,15129",
+		}
+		local index = 0
+		for _, selector in { 0, 1, -2, 3, 2.5, "x", 4, 10, 11 } :: { any } do
+			for _, budget in { 0, 1, 3, 7, 10 } do
+				index += 1
+				local results = table.pack(pcall(exported, selector, budget))
+				local got = "error"
+				if results[1] then
+					local shown: { string } = {}
+					for position = 2, results.n do
+						table.insert(shown, tostring(results[position]))
+					end
+					got = table.concat(shown, ",")
+				end
+				assert(
+					got == want[index],
+					`{caseName} returned {got} for ({tostring(selector)}, {budget}), its source returns {want[index]}`
+				)
+			end
+		end
+	elseif
+		caseName == "source-frontend-projected-return-shared-locals-direct-locals"
+	then
+		-- A worker of the same shape whose return block declares 94 locals that its last statements read across its
+		-- segments: the loop's exit arm writes the return block again, and that copy must declare them, or it reads and
+		-- assigns globals.
+		local want = {
+			"0,0,1,4465,34", "0,0,1,4465,34", "0,0,1,4465,34", "0,0,1,4465,34", "0,0,1,4465,34",
+			"100,1,1002,98559,1035", "100,1,1002,98559,1035", "100,1,1002,98559,1035", "100,1,1002,98559,1035", "100,1,1002,98559,1035",
+			"0,3,4,4747,37", "0,3,4,4747,37", "0,3,4,4747,37", "0,3,4,4747,37", "0,3,4,4747,37",
+			"100,3,1004,98747,1037", "100,3,1004,98747,1037", "100,3,1004,98747,1037", "100,3,1004,98747,1037", "100,3,1004,98747,1037",
+			"0,3,4,4747,37", "0,3,4,4747,37", "0,3,4,4747,37", "0,3,4,4747,37", "0,3,4,4747,37",
+			"0,3,4,4747,37", "0,3,4,4747,37", "0,3,4,4747,37", "0,3,4,4747,37", "0,3,4,4747,37",
+			"0,3,4,4747,37", "0,3,4,4747,37", "0,3,4,4747,37", "0,3,4,4747,37", "0,3,4,4747,37",
+			"0,3,4,4747,37", "0,3,4,4747,37", "0,3,4,4747,37", "0,3,4,4747,37", "0,3,4,4747,37",
+			"0,3,4,4747,37", "0,3,4,4747,37", "0,3,4,4747,37", "0,3,4,4747,37", "0,3,4,4747,37",
+		}
+		local index = 0
+		for _, selector in { 0, 1, -2, 3, 2.5, "x", 4, 10, 11 } :: { any } do
+			for _, budget in { 0, 1, 3, 7, 10 } do
+				index += 1
+				local results = table.pack(pcall(exported, selector, budget))
+				local got = "error"
+				if results[1] then
+					local shown: { string } = {}
+					for position = 2, results.n do
+						table.insert(shown, tostring(results[position]))
+					end
+					got = table.concat(shown, ",")
+				end
+				assert(
+					got == want[index],
+					`{caseName} returned {got} for ({tostring(selector)}, {budget}), its source returns {want[index]}`
+				)
+			end
+		end
+	elseif
+		caseName == "source-frontend-repeat-continue-tail-cell-segments"
+		or caseName == "source-frontend-repeat-continue-tail-cell-segments-direct-locals"
+	then
+		-- A worker whose repeat loop holds a continue one if deeper, so the loop's tail is written in both arms of the
+		-- outer if, and whose tail, cut into segments, declares a local that a stored closure captures and that the
+		-- tail's last statement bumps. Each copy of the tail must declare its own local, or the closures of the passes
+		-- that take the second copy share one global.
+		local want = {
+			"116,866", "116,866", "116,866", "116,866", "116,866",
+			"87,180", "87,180", "87,180", "87,180", "87,180",
+			"116,866", "116,866", "116,866", "116,866", "116,866",
+			"87,124", "87,124", "87,124", "87,124", "87,124",
+			"116,866", "116,866", "116,866", "116,866", "116,866",
+			"116,866", "116,866", "116,866", "116,866", "116,866",
+			"116,866", "116,866", "116,866", "116,866", "116,866",
+			"116,866", "116,866", "116,866", "116,866", "116,866",
+			"116,866", "116,866", "116,866", "116,866", "116,866",
+		}
+		local index = 0
+		for _, selector in { 0, 1, -2, 3, 2.5, "x", 4, 10, 11 } :: { any } do
+			for _, budget in { 0, 1, 3, 7, 10 } do
+				index += 1
+				local results = table.pack(pcall(exported, selector, budget))
+				local got = "error"
+				if results[1] then
+					local shown: { string } = {}
+					for position = 2, results.n do
+						table.insert(shown, tostring(results[position]))
+					end
+					got = table.concat(shown, ",")
+				end
+				assert(
+					got == want[index],
+					`{caseName} returned {got} for ({tostring(selector)}, {budget}), its source returns {want[index]}`
+				)
+			end
+		end
+	elseif
+		caseName == "source-frontend-repeat-continue-tail-cell-two-passes"
+		or caseName == "source-frontend-repeat-continue-tail-cell-two-passes-direct-locals"
+	then
+		-- The same worker with two passes: one pass takes the tail's second copy, so every call returns the source's
+		-- values whether or not that copy declares its own local; the lexical check tells them apart.
+		local want = {
+			"0,34,17", "0,34,17", "0,34,17", "0,34,17", "0,34,17",
+			"0,17,3", "0,17,3", "0,17,3", "0,17,3", "0,17,3",
+			"0,34,17", "0,34,17", "0,34,17", "0,34,17", "0,34,17",
+			"0,34,17", "0,34,17", "0,34,17", "0,34,17", "0,34,17",
+			"0,34,17", "0,34,17", "0,34,17", "0,34,17", "0,34,17",
+			"0,34,17", "0,34,17", "0,34,17", "0,34,17", "0,34,17",
+			"0,34,17", "0,34,17", "0,34,17", "0,34,17", "0,34,17",
+			"0,34,17", "0,34,17", "0,34,17", "0,34,17", "0,34,17",
+			"0,34,17", "0,34,17", "0,34,17", "0,34,17", "0,34,17",
+		}
+		local index = 0
+		for _, selector in { 0, 1, -2, 3, 2.5, "x", 4, 10, 11 } :: { any } do
+			for _, budget in { 0, 1, 3, 7, 10 } do
+				index += 1
+				local results = table.pack(pcall(exported, selector, budget))
+				local got = "error"
+				if results[1] then
+					local shown: { string } = {}
+					for position = 2, results.n do
+						table.insert(shown, tostring(results[position]))
+					end
+					got = table.concat(shown, ",")
+				end
+				assert(
+					got == want[index],
+					`{caseName} returned {got} for ({tostring(selector)}, {budget}), its source returns {want[index]}`
+				)
+			end
+		end
+	elseif
+		caseName == "source-frontend-repeated-tail-stored-pack-direct-locals"
+	then
+		-- A worker whose loop tail, written in both arms of the outer if, stores a call's three results in three locals:
+		-- each copy must declare the three names, or the second copy writes them as globals.
+		local want = {
+			"12,8,0,4092,39", "12,8,0,4092,39", "12,8,0,4092,39", "12,8,0,4092,39", "12,8,0,4092,39",
+			"11,8,0,3969,36", "11,8,0,3969,36", "11,8,0,3969,36", "11,8,0,3969,36", "11,8,0,3969,36",
+			"12,8,0,4092,39", "12,8,0,4092,39", "12,8,0,4092,39", "12,8,0,4092,39", "12,8,0,4092,39",
+			"11,8,0,3747,36", "11,8,0,3747,36", "11,8,0,3747,36", "11,8,0,3747,36", "11,8,0,3747,36",
+			"12,8,0,4092,39", "12,8,0,4092,39", "12,8,0,4092,39", "12,8,0,4092,39", "12,8,0,4092,39",
+			"12,8,0,4092,39", "12,8,0,4092,39", "12,8,0,4092,39", "12,8,0,4092,39", "12,8,0,4092,39",
+			"12,8,0,4092,39", "12,8,0,4092,39", "12,8,0,4092,39", "12,8,0,4092,39", "12,8,0,4092,39",
+			"12,8,0,4092,39", "12,8,0,4092,39", "12,8,0,4092,39", "12,8,0,4092,39", "12,8,0,4092,39",
+			"12,8,0,4092,39", "12,8,0,4092,39", "12,8,0,4092,39", "12,8,0,4092,39", "12,8,0,4092,39",
+		}
+		local index = 0
+		for _, selector in { 0, 1, -2, 3, 2.5, "x", 4, 10, 11 } :: { any } do
+			for _, budget in { 0, 1, 3, 7, 10 } do
+				index += 1
+				local results = table.pack(pcall(exported, selector, budget))
+				local got = "error"
+				if results[1] then
+					local shown: { string } = {}
+					for position = 2, results.n do
+						table.insert(shown, tostring(results[position]))
+					end
+					got = table.concat(shown, ",")
+				end
+				assert(
+					got == want[index],
+					`{caseName} returned {got} for ({tostring(selector)}, {budget}), its source returns {want[index]}`
+				)
+			end
+		end
+	elseif
 		caseName == "source-frontend-empty-boundary-clone-continue"
 		or caseName == "source-frontend-empty-boundary-clone-continue-nonlocal"
 		or caseName == "source-frontend-empty-boundary-clone-continue-inner-loop"

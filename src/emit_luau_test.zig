@@ -5151,3 +5151,239 @@ test "a condition producer written into its composition from a do segment declar
     try std.testing.expect(std.mem.indexOf(u8, source, "return s >= b and b ~= 3\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "reached") == null);
 }
+
+/// A worker of four callbacks whose loop has the shape a `repeat` loop with a `continue` one `if` deeper lifts to. The
+/// header calls `next_value` for (odd, skip, iteration) and branches on `odd`; an odd pass calls `observe` and branches on
+/// `skip`, whose arm jumps to the latch while the other arm calls `observe` and falls into the tail; an even pass falls
+/// into the tail through an empty block. The latch is the first branch's join, so the structure writes the tail in both
+/// of its arms. The tail allocates `cell` (its origin is the tail's own write of `iteration`), hands `record` a closure
+/// that captures it, calls `observe` `filler` times and adds one to `cell`; the latch calls `keep_going` and leaves the
+/// loop when it returns true. Past 32 rendered statements the tail is split into segments.
+fn repeatedTailCellModule(comptime filler: usize) type {
+    return struct {
+        const proof = ir.EvidenceId.fromIndex(0);
+        const chunk_function = ir.FunctionId.fromIndex(0);
+        const worker_function = ir.FunctionId.fromIndex(1);
+        const getter_function = ir.FunctionId.fromIndex(2);
+        const cell = ir.PlaceId.fromIndex(0);
+        const captured_cell = ir.PlaceId.fromIndex(1);
+        const capture = ir.CaptureId.fromIndex(0);
+        const block = ir.BlockId.fromIndex;
+        const instruction = ir.InstructionId.fromIndex;
+        const value = ir.ValueId.fromIndex;
+        // Instructions: 0 the export, 1 next_value(), 2 and 3 observe() in the odd arm, 4 the allocating write, 5 the
+        // closure, 6 record(getter), 7 .. 6 + filler observe(), then the read, the constant one, the sum, the write back,
+        // keep_going() in the latch and the getter's read.
+        const read_id = instruction(7 + filler);
+        const keep_id = instruction(11 + filler);
+        const get_id = instruction(12 + filler);
+
+        const values = [_]ir.Value{
+            .{ .id = value(0), .function = chunk_function, .type = .function, .name_hint = "worker", .origin = .{ .instruction_result = .{ .instruction = instruction(0), .index = 0 } } },
+            .{ .id = value(1), .function = worker_function, .type = .function, .name_hint = "next_value", .origin = .{ .parameter = 0 } },
+            .{ .id = value(2), .function = worker_function, .type = .function, .name_hint = "record", .origin = .{ .parameter = 1 } },
+            .{ .id = value(3), .function = worker_function, .type = .function, .name_hint = "observe", .origin = .{ .parameter = 2 } },
+            .{ .id = value(4), .function = worker_function, .type = .function, .name_hint = "keep_going", .origin = .{ .parameter = 3 } },
+            .{ .id = value(5), .function = worker_function, .type = .boolean, .name_hint = "odd", .origin = .{ .instruction_result = .{ .instruction = instruction(1), .index = 0 } } },
+            .{ .id = value(6), .function = worker_function, .type = .boolean, .name_hint = "skip", .origin = .{ .instruction_result = .{ .instruction = instruction(1), .index = 1 } } },
+            .{ .id = value(7), .function = worker_function, .type = .integer, .name_hint = "iteration", .origin = .{ .instruction_result = .{ .instruction = instruction(1), .index = 2 } } },
+            .{ .id = value(8), .function = worker_function, .type = .function, .name_hint = "getter", .origin = .{ .instruction_result = .{ .instruction = instruction(5), .index = 0 } } },
+            .{ .id = value(9), .function = worker_function, .type = .integer, .name_hint = "current", .origin = .{ .instruction_result = .{ .instruction = read_id, .index = 0 } } },
+            .{ .id = value(10), .function = worker_function, .type = .integer, .name_hint = "one", .origin = .{ .instruction_result = .{ .instruction = instruction(8 + filler), .index = 0 } } },
+            .{ .id = value(11), .function = worker_function, .type = .integer, .name_hint = "bumped", .origin = .{ .instruction_result = .{ .instruction = instruction(9 + filler), .index = 0 } } },
+            .{ .id = value(12), .function = worker_function, .type = .boolean, .name_hint = "keep", .origin = .{ .instruction_result = .{ .instruction = keep_id, .index = 0 } } },
+            .{ .id = value(13), .function = getter_function, .type = .integer, .name_hint = "captured_value", .origin = .{ .instruction_result = .{ .instruction = get_id, .index = 0 } } },
+        };
+        fn observeCall(index: usize, at: ir.BlockId) ir.Instruction {
+            return .{ .id = instruction(index), .block = at, .operation = .{ .call = .{ .callee = value(3), .arguments = &.{}, .result_arity = .{ .fixed = 0 } } }, .results = &.{}, .effects = .dynamic_call, .evidence = &.{proof} };
+        }
+        const instructions = list: {
+            var all: [13 + filler]ir.Instruction = undefined;
+            all[0] = .{ .id = instruction(0), .block = block(0), .operation = .{ .function_ref = worker_function }, .results = &.{value(0)}, .effects = .pure, .evidence = &.{proof} };
+            all[1] = .{ .id = instruction(1), .block = block(2), .operation = .{ .call = .{ .callee = value(1), .arguments = &.{}, .result_arity = .{ .fixed = 3 } } }, .results = &.{ value(5), value(6), value(7) }, .effects = .dynamic_call, .evidence = &.{proof} };
+            all[2] = observeCall(2, block(5));
+            all[3] = observeCall(3, block(9));
+            all[4] = .{ .id = instruction(4), .block = block(10), .operation = .{ .place_write = .{ .place = cell, .value = value(7) } }, .results = &.{}, .effects = .place_write, .evidence = &.{proof} };
+            all[5] = .{ .id = instruction(5), .block = block(10), .operation = .{ .make_closure = .{ .function = getter_function, .bindings = &.{.{ .place = cell }} } }, .results = &.{value(8)}, .effects = .pure, .evidence = &.{proof} };
+            all[6] = .{ .id = instruction(6), .block = block(10), .operation = .{ .call = .{ .callee = value(2), .arguments = &.{value(8)}, .result_arity = .{ .fixed = 0 } } }, .results = &.{}, .effects = .dynamic_call, .evidence = &.{proof} };
+            for (0..filler) |k| all[7 + k] = observeCall(7 + k, block(10));
+            all[7 + filler] = .{ .id = read_id, .block = block(10), .operation = .{ .place_read = cell }, .results = &.{value(9)}, .effects = .place_read, .evidence = &.{proof} };
+            all[8 + filler] = .{ .id = instruction(8 + filler), .block = block(10), .operation = .{ .constant = .{ .integer = "1" } }, .results = &.{value(10)}, .effects = .pure, .evidence = &.{proof} };
+            all[9 + filler] = .{ .id = instruction(9 + filler), .block = block(10), .operation = .{ .binary = .{ .operator = .add, .left = value(9), .right = value(10) } }, .results = &.{value(11)}, .effects = .dynamic_call, .evidence = &.{proof} };
+            all[10 + filler] = .{ .id = instruction(10 + filler), .block = block(10), .operation = .{ .place_write = .{ .place = cell, .value = value(11) } }, .results = &.{}, .effects = .place_write, .evidence = &.{proof} };
+            all[11 + filler] = .{ .id = keep_id, .block = block(3), .operation = .{ .call = .{ .callee = value(4), .arguments = &.{}, .result_arity = .{ .fixed = 1 } } }, .results = &.{value(12)}, .effects = .dynamic_call, .evidence = &.{proof} };
+            all[12 + filler] = .{ .id = get_id, .block = block(11), .operation = .{ .place_read = captured_cell }, .results = &.{value(13)}, .effects = .place_read, .evidence = &.{proof} };
+            break :list all;
+        };
+        const tail_instructions = list: {
+            var ids: [7 + filler]ir.InstructionId = undefined;
+            for (&ids, 0..) |*id, k| id.* = instruction(4 + k);
+            break :list ids;
+        };
+        const blocks = [_]ir.Block{
+            .{ .id = block(0), .function = chunk_function, .instructions = &.{instruction(0)}, .terminator = .{ .return_values = &.{value(0)} }, .evidence = &.{proof} },
+            .{ .id = block(1), .function = worker_function, .terminator = .{ .jump = .{ .target = block(2) } }, .evidence = &.{proof} },
+            .{ .id = block(2), .function = worker_function, .instructions = &.{instruction(1)}, .terminator = .{ .branch = .{ .condition = value(5), .then_edge = .{ .target = block(5) }, .else_edge = .{ .target = block(6) } } }, .evidence = &.{proof} },
+            .{ .id = block(3), .function = worker_function, .instructions = &.{keep_id}, .terminator = .{ .branch = .{ .condition = value(12), .then_edge = .{ .target = block(4) }, .else_edge = .{ .target = block(2) } } }, .evidence = &.{proof} },
+            .{ .id = block(4), .function = worker_function, .terminator = .{ .return_values = &.{} }, .evidence = &.{proof} },
+            .{ .id = block(5), .function = worker_function, .instructions = &.{instruction(2)}, .terminator = .{ .branch = .{ .condition = value(6), .then_edge = .{ .target = block(7) }, .else_edge = .{ .target = block(8) } } }, .evidence = &.{proof} },
+            .{ .id = block(6), .function = worker_function, .terminator = .{ .jump = .{ .target = block(10) } }, .evidence = &.{proof} },
+            .{ .id = block(7), .function = worker_function, .terminator = .{ .jump = .{ .target = block(3) } }, .evidence = &.{proof} },
+            .{ .id = block(8), .function = worker_function, .terminator = .{ .jump = .{ .target = block(9) } }, .evidence = &.{proof} },
+            .{ .id = block(9), .function = worker_function, .instructions = &.{instruction(3)}, .terminator = .{ .jump = .{ .target = block(10) } }, .evidence = &.{proof} },
+            .{ .id = block(10), .function = worker_function, .instructions = &tail_instructions, .terminator = .{ .jump = .{ .target = block(3) } }, .evidence = &.{proof} },
+            .{ .id = block(11), .function = getter_function, .instructions = &.{get_id}, .terminator = .{ .return_values = &.{value(13)} }, .evidence = &.{proof} },
+        };
+        const functions = [_]ir.Function{
+            .{ .id = chunk_function, .name_hint = "chunk", .blocks = &.{block(0)}, .entry_block = block(0), .evidence = &.{proof} },
+            .{ .id = worker_function, .name_hint = "worker", .parameters = &.{ value(1), value(2), value(3), value(4) }, .local_places = &.{cell}, .blocks = &.{ block(1), block(2), block(3), block(4), block(5), block(6), block(7), block(8), block(9), block(10) }, .entry_block = block(1), .evidence = &.{proof} },
+            .{ .id = getter_function, .name_hint = "getter", .lexical_parent = worker_function, .captures = &.{capture}, .blocks = &.{block(11)}, .entry_block = block(11), .evidence = &.{proof} },
+        };
+        const places = [_]ir.Place{
+            .{ .id = cell, .function = worker_function, .type = .integer, .name_hint = "cell", .origin = .{ .instruction = instruction(4) }, .evidence = &.{proof} },
+            .{ .id = captured_cell, .function = getter_function, .type = .integer, .name_hint = "captured_cell", .origin = .{ .capture = capture }, .evidence = &.{proof} },
+        };
+        const captures = [_]ir.Capture{.{ .id = capture, .function = getter_function, .kind = .{ .shared_place = captured_cell }, .evidence = &.{proof} }};
+        const evidence = [_]ir.Evidence{.{ .id = proof, .kind = .dynamic_fixture, .locator = "fixture:repeated-tail-cell" }};
+        const program: ir.Program = .{
+            .program_id = "repeated-tail-cell",
+            .entry_function = chunk_function,
+            .functions = &functions,
+            .blocks = &blocks,
+            .instructions = &instructions,
+            .values = &values,
+            .places = &places,
+            .captures = &captures,
+            .evidence = &evidence,
+        };
+    };
+}
+
+/// Whether a statement declares `cell` itself: `local cell` followed by a space, `=` or the end of the statement, so a
+/// declaration of another name that starts with `cell` does not count.
+fn declaresCell(statement: []const u8) bool {
+    const declaration = "local cell";
+    if (!std.mem.startsWith(u8, statement, declaration)) return false;
+    return statement.len == declaration.len or statement[declaration.len] == ' ' or statement[declaration.len] == '=';
+}
+
+test "a closure-captured cell of a tail written in both arms of a branch is declared in each arm" {
+    const module = repeatedTailCellModule(34);
+    const source = try emitAlloc(std.testing.allocator, &module.program);
+    defer std.testing.allocator.free(source);
+    errdefer std.debug.print("{s}\n", .{source});
+    // Both arms write the whole tail, split into segments; each arm's copy must assign a `local` of its own, or the
+    // closures recorded by one arm share one global cell.
+    var declarations: usize = 0;
+    var assignments: usize = 0;
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    while (lines.next()) |line| {
+        const statement = std.mem.trimStart(u8, line, " ");
+        if (declaresCell(statement)) declarations += 1;
+        if (std.mem.eql(u8, statement, "cell = iteration")) assignments += 1;
+    }
+    try std.testing.expect(std.mem.indexOf(u8, source, "local __lifter_pc") == null);
+    try std.testing.expectEqual(@as(usize, 2), declarations);
+    try std.testing.expect(assignments <= declarations);
+}
+
+test "a closure-captured cell of a short tail written in both arms of a branch is declared at its write" {
+    const module = repeatedTailCellModule(8);
+    const source = try emitAlloc(std.testing.allocator, &module.program);
+    defer std.testing.allocator.free(source);
+    errdefer std.debug.print("{s}\n", .{source});
+    try std.testing.expect(std.mem.indexOf(u8, source, "local __lifter_pc") == null);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, source, "local cell = iteration\n"));
+}
+
+// The worker of a `repeat` loop with a `continue` one `if` deeper whose tail is two blocks joined by a plain jump: the
+// first declares `cell` and stores a closure that captures it, the second runs eight plain statements and bumps `cell`.
+// Neither block is long enough to be split into segments, yet `cell` is used in both, so it is declared at the region
+// container of the first arm's two blocks, which the second arm's copy of the tail cannot see: that copy declares the
+// container's locals again before its first block. The fixture is the lifted IR of an author-written source of that
+// shape with its tail block split after the closure's store.
+test "a closure-captured cell of a two-block tail written in both arms of a branch keeps one cell per pass" {
+    const allocator = std.testing.allocator;
+    var parsed = try lifter.codec.parse(allocator, @embedFile("testdata/repeated_tail_two_block.lifter-ir.json"));
+    defer parsed.deinit();
+    const source = try lifter.emit_luau.emitAllocForTargetWithOptions(allocator, &parsed.value, .standard_luau, .{});
+    defer allocator.free(source);
+    errdefer std.debug.print("{s}\n", .{source});
+    // Each arm's copy of the tail declares its own `cell` before its first block, so the closures of every pass capture
+    // a cell of their own and the plan stays structured.
+    var declarations: usize = 0;
+    var assignments: usize = 0;
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    while (lines.next()) |line| {
+        const statement = std.mem.trimStart(u8, line, " ");
+        if (declaresCell(statement)) declarations += 1;
+        if (std.mem.eql(u8, statement, "cell = total * 10 + index")) assignments += 1;
+    }
+    try std.testing.expect(std.mem.indexOf(u8, source, "local __lifter_pc") == null);
+    try std.testing.expectEqual(@as(usize, 2), declarations);
+    try std.testing.expect(assignments <= declarations);
+}
+
+// The worker of the same loop shape whose tail declares a local that no closure captures, runs 36 plain statements and
+// bumps the local, with its tail block split after the local's first write. Split in two, the second block is long
+// enough to be split into segments, and the local, used in both blocks, is declared at the region container of the
+// first arm's two blocks; split in seven, the first arm's region holds eight nodes in two container groups, and the
+// local is declared at the node that owns that region. Each arm's copy declares it, on both targets; on
+// `direct-locals-luau` the dispatcher layout of this function does not fit the register budget, so a refused plan
+// would leave the function with no text.
+test "an uncaptured local of a split tail written in both arms of a branch is declared in each arm" {
+    const allocator = std.testing.allocator;
+    const programs = [_][]const u8{
+        @embedFile("testdata/repeated_tail_split_uncaptured_cell.lifter-ir.json"),
+        @embedFile("testdata/repeated_tail_split_across_groups.lifter-ir.json"),
+    };
+    for (programs) |json| {
+        var parsed = try lifter.codec.parse(allocator, json);
+        defer parsed.deinit();
+        for ([_]lifter.emit_luau.Target{ .standard_luau, .direct_locals_luau }) |target| {
+            const source = try lifter.emit_luau.emitAllocForTargetWithOptions(allocator, &parsed.value, target, .{});
+            defer allocator.free(source);
+            errdefer std.debug.print("{s}\n", .{source});
+            var declarations: usize = 0;
+            var lines = std.mem.splitScalar(u8, source, '\n');
+            while (lines.next()) |line| {
+                if (declaresCell(std.mem.trimStart(u8, line, " "))) declarations += 1;
+            }
+            try std.testing.expect(std.mem.indexOf(u8, source, "local __lifter_pc") == null);
+            try std.testing.expectEqual(@as(usize, 2), declarations);
+        }
+    }
+}
+
+// The worker of the same loop shape whose registers are held by extra parameters, so that it has fewer than 120
+// candidate values and both targets keep every value in a local: its odd arm writes `acc[102] = budget2 > 30 or
+// budget`, its even arm declares seven locals, and its tail declares `cell` and eight locals that its one call reads
+// twice each, with the tail block split after the eighth local's definition. Each of the eight is defined in the first
+// block and read in the second, so its scope is the container group of the first arm's two block nodes, above the
+// first block's own scope, and its definition declares it where it stands (`local v1 = cell + 1`). The copy of the
+// tail in the even arm declares the eight again beside the arm's seven: with 179 extra parameters that copy holds more
+// than 200 locals, so the register certificate must count them at the copy and refuse the function on both targets;
+// with 172 the copy fits, and the function is admitted and written structured.
+test "a two-block tail written in both arms of a branch counts the locals its first block declares at the copy" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { json: []const u8, refused: bool }{
+        .{ .json = @embedFile("testdata/repeated_tail_split_chain_locals_179.lifter-ir.json"), .refused = true },
+        .{ .json = @embedFile("testdata/repeated_tail_split_chain_locals_172.lifter-ir.json"), .refused = false },
+    };
+    for (cases) |case| {
+        var parsed = try lifter.codec.parse(allocator, case.json);
+        defer parsed.deinit();
+        for ([_]lifter.emit_luau.Target{ .standard_luau, .direct_locals_luau }) |target| {
+            var report = try lifter.validate.validateForTargetWithStrategy(allocator, &parsed.value, .readable_luau, target, .automatic);
+            defer report.deinit();
+            try std.testing.expectEqual(case.refused, report.contains(.unsupported_readable_register_pressure));
+            if (case.refused) {
+                try std.testing.expectError(error.InvalidIr, lifter.emit_luau.emitAllocForTargetWithOptions(allocator, &parsed.value, target, .{}));
+            } else {
+                const source = try lifter.emit_luau.emitAllocForTargetWithOptions(allocator, &parsed.value, target, .{});
+                defer allocator.free(source);
+                try std.testing.expect(std.mem.indexOf(u8, source, "local __lifter_pc") == null);
+            }
+        }
+    }
+}

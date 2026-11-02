@@ -28,6 +28,12 @@ const MovedLiteralInitializer = struct {
     literal: ir.Literal,
 };
 
+/// A scope whose locals a region declares again at its start (`Plan.region_declarations`).
+pub const RegionDeclaration = struct {
+    region: *const structure.Region,
+    scope: ScopeId,
+};
+
 pub const Plan = struct {
     allocator: std.mem.Allocator,
     program: *const ir.Program,
@@ -63,6 +69,13 @@ pub const Plan = struct {
     suppressed_control_instructions: []bool,
     inline_root_group: ScopeId,
     arbitrary_cfg: bool,
+    /// Where each region's projected terminal is written (`indexRegion`): after the region's last block node, in the
+    /// last node's group when that node is a branch joining at the terminal, or at the scope that owns an empty region.
+    terminal_projection_sites: std.AutoHashMapUnmanaged(*const structure.Region, ScopeId) = .empty,
+    /// The scopes whose locals a region declares again at its start, in order (`indexRegionDeclarations`): a node of the
+    /// region writes again a block whose text reads locals that its first placement declares at those scopes, which do
+    /// not enclose the node.
+    region_declarations: std.ArrayListUnmanaged(RegionDeclaration) = .empty,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -176,6 +189,8 @@ pub const Plan = struct {
             .arbitrary_cfg = structured.root.arbitrary_cfg,
         };
         errdefer plan.node_scopes.deinit(allocator);
+        errdefer plan.terminal_projection_sites.deinit(allocator);
+        errdefer plan.region_declarations.deinit(allocator);
 
         try plan.indexRegion(&parents, &depths, &loop_hosts, &physical_hosts, structured.root, 0, invalid_scope, false);
         try plan.indexInstructionSegments(&parents, &depths, &loop_hosts, &physical_hosts);
@@ -214,6 +229,11 @@ pub const Plan = struct {
             }
         }
         try plan.markNativeIterationDeclarations(structured.root);
+        if (!plan.arbitrary_cfg) {
+            var declared: std.ArrayList(ScopeId) = .empty;
+            defer declared.deinit(allocator);
+            try plan.indexRegionDeclarations(structured.root, &declared);
+        }
         return plan;
     }
 
@@ -235,6 +255,8 @@ pub const Plan = struct {
         self.allocator.free(self.repeated_blocks);
         self.allocator.free(self.block_scopes);
         self.node_scopes.deinit(self.allocator);
+        self.terminal_projection_sites.deinit(self.allocator);
+        self.region_declarations.deinit(self.allocator);
         self.allocator.free(self.declaration_counts);
         self.allocator.free(self.physical_hosts);
         self.allocator.free(self.loop_hosts);
@@ -504,6 +526,163 @@ pub const Plan = struct {
         return false;
     }
 
+    /// Structured layout: a block that more than one site writes. Every node that writes a block, and every region that
+    /// projects a terminal block, writes all of the block's instructions, but the block keeps the scopes of the first
+    /// node that wrote it (`assignBlock`), the segments of a block that `indexInstructionSegments` splits included. A
+    /// local that the block's text defines or reads, declared by a scope rather than at its instruction, is declared
+    /// only where that scope's text is written: at a site that scope does not enclose, the text assigns or reads a name
+    /// that no `local` declares. At another structure node the writer declares every such local again: those of the
+    /// first node's own scope before the node (`emitRegion`), and those of the scopes above it before the node's region
+    /// (`region_declarations`). At a projected terminal (`terminal_projection_sites`) it declares those of the first
+    /// node's own scope (`emitProjectedTerminal`). Whether some projected terminal of this function reads or assigns a
+    /// local that a scope above its first node's own scope declares and that scope does not enclose the site; without
+    /// `except_kept`, a local of the first node's own scope counts as well.
+    pub fn repeatedBlockReadsUndeclaredLocal(self: *const Plan, except_kept: bool) bool {
+        if (self.arbitrary_cfg) return false;
+        var projections = self.terminal_projection_sites.iterator();
+        while (projections.next()) |entry| {
+            const projection = entry.key_ptr.*.terminal_projection orelse continue;
+            const kept = self.blockScope(projection.terminal) orelse continue;
+            const skip = if (except_kept) kept else invalid_scope;
+            if (self.blockSiteUndeclaredScope(projection.terminal, entry.value_ptr.*, skip, &.{}) != null) return true;
+        }
+        return false;
+    }
+
+    /// Where a region's projected terminal is written (`terminal_projection_sites`).
+    pub fn terminalProjectionSite(self: *const Plan, region: *const structure.Region) ?ScopeId {
+        return self.terminal_projection_sites.get(region);
+    }
+
+    /// The blocks a structure node writes at its own scope (`indexRegion`'s `assignBlock` calls).
+    pub fn nodeWrittenBlocks(node: *const structure.Node) [2]?ir.BlockId {
+        return switch (node.*) {
+            .block => |block_id| .{ block_id, null },
+            .branch => |branch| .{ branch.block, null },
+            .loop => |loop| .{ loop.header, null },
+            .latch_loop, .infinite_loop => .{ null, null },
+            .loop_control => |control| .{ control.block, null },
+            .loop_boundary => |control| .{ control.block, switch (control.boundary) {
+                .terminal => |terminal| terminal.block,
+                else => null,
+            } },
+            .loop_terminal => |control| .{ control.block, control.terminal_block },
+        };
+    }
+
+    /// Whether `outer` is `inner` or one of its ancestors.
+    pub fn scopeEncloses(self: *const Plan, outer: ScopeId, inner: ScopeId) bool {
+        var scope = inner;
+        while (scope != invalid_scope and scope < self.parents.len) : (scope = self.parents[scope]) {
+            if (scope == outer) return true;
+        }
+        return false;
+    }
+
+    // A structure node that writes a block again at a site its first node's own scope does not enclose (`emitRegion`
+    // declares that scope's locals again before the node) reads locals that the block's first placement declares at
+    // scopes above that one. Each such scope that does not enclose the node either is recorded for the node's region,
+    // whose writer declares its locals before the region's first node, unless a region or node around this region in
+    // this text declares it already (`declared`).
+    fn indexRegionDeclarations(self: *Plan, region: *const structure.Region, declared: *std.ArrayList(ScopeId)) !void {
+        const around = declared.items.len;
+        defer declared.shrinkRetainingCapacity(around);
+        for (region.nodes) |*node| {
+            const site = self.nodeScope(node) orelse continue;
+            for (nodeWrittenBlocks(node)) |written| {
+                const block_id = written orelse continue;
+                const kept = self.blockScope(block_id) orelse continue;
+                if (self.scopeEncloses(kept, site)) continue;
+                while (self.blockSiteUndeclaredScope(block_id, site, kept, declared.items)) |scope| {
+                    try declared.append(self.allocator, scope);
+                    try self.region_declarations.append(self.allocator, .{ .region = region, .scope = scope });
+                }
+            }
+        }
+        for (region.nodes) |*node| {
+            const site = self.nodeScope(node) orelse continue;
+            const before = declared.items.len;
+            for (nodeWrittenBlocks(node)) |written| {
+                const block_id = written orelse continue;
+                const kept = self.blockScope(block_id) orelse continue;
+                if (!self.scopeEncloses(kept, site)) try declared.append(self.allocator, kept);
+            }
+            switch (node.*) {
+                .block, .loop_control, .loop_terminal => {},
+                .branch => |branch| {
+                    try self.indexRegionDeclarations(branch.then_region, declared);
+                    try self.indexRegionDeclarations(branch.else_region, declared);
+                },
+                .loop => |loop| try self.indexRegionDeclarations(loop.body_region, declared),
+                .latch_loop => |loop| try self.indexRegionDeclarations(loop.body_region, declared),
+                .infinite_loop => |loop| {
+                    try self.indexRegionDeclarations(loop.body_region, declared);
+                    if (loop.shared_side_exit) |side_exit| {
+                        for (side_exit.entries) |entry| try self.indexRegionDeclarations(entry.region, declared);
+                    }
+                },
+                .loop_boundary => |control| {
+                    try self.indexRegionDeclarations(control.body_region, declared);
+                    switch (control.boundary) {
+                        .side_exit => |side_exit| try self.indexRegionDeclarations(side_exit.region, declared),
+                        .side_escape => |side_escape| try self.indexRegionDeclarations(side_escape.region, declared),
+                        .exit, .escape, .terminal, .shared_exit => {},
+                    }
+                },
+            }
+            declared.shrinkRetainingCapacity(before);
+        }
+    }
+
+    // The first scope found that declares a local `block_id`'s text defines or reads at `site` and that is neither
+    // `skip`, one of `declared`, one of the block's segments, nor a scope enclosing `site`; null when there is none.
+    fn blockSiteUndeclaredScope(self: *const Plan, block_id: ir.BlockId, site: ScopeId, skip: ScopeId, declared: []const ScopeId) ?ScopeId {
+        if (block_id.index() >= self.block_scopes.len or block_id.index() >= self.program.blocks.len) return null;
+        const kept = self.block_scopes[block_id.index()];
+        if (kept == invalid_scope or site == invalid_scope or kept == site) return null;
+        var found: ?ScopeId = null;
+        const visitor = SiteDeclarationVisitor{
+            .plan = self,
+            .site = site,
+            .kept = kept,
+            .skip = skip,
+            .declared = declared,
+            .found = &found,
+            .remaining = self.renderedUseDepth(),
+        };
+        const block = self.program.blocks[block_id.index()];
+        for (block.instructions) |instruction_id| {
+            if (instruction_id.index() >= self.program.instructions.len or self.dead.contains(instruction_id)) continue;
+            const instruction = self.program.instructions[instruction_id.index()];
+            runtime_uses.visitOperationUses(instruction.operation, visitor);
+            for (instruction.results) |result| visitor.value(result);
+            if (instruction.pack_result) |pack_id| visitor.pack(pack_id);
+            if (found != null) return found;
+        }
+        runtime_uses.visitTerminatorUses(block.terminator, visitor);
+        return found;
+    }
+
+    // The scope that declares a place, when not its instruction (`emitScopeDeclarations`).
+    fn placeDeclaredAtScope(self: *const Plan, place_id: ir.PlaceId) ?ScopeId {
+        if (place_id.index() >= self.program.places.len or place_id.index() >= self.place_scopes.len) return null;
+        const place = self.program.places[place_id.index()];
+        if (place.function != self.function.id or place.origin == .capture) return null;
+        const scope = self.place_scopes[place_id.index()];
+        if (scope == invalid_scope or self.placeDeclaredAtInstruction(place_id)) return null;
+        return scope;
+    }
+
+    // The scope that declares a value, when not its instruction or a synthetic site (`emitScopeDeclarations`).
+    fn valueDeclaredAtScope(self: *const Plan, value_id: ir.ValueId) ?ScopeId {
+        if (value_id.index() >= self.program.values.len or value_id.index() >= self.value_scopes.len) return null;
+        if (self.program.values[value_id.index()].function != self.function.id) return null;
+        const scope = self.value_scopes[value_id.index()];
+        if (scope == invalid_scope or self.valueDeclaredAtInstruction(value_id) or
+            self.valueDeclaredAtSyntheticSite(value_id) or self.valueSuppressedByControl(value_id)) return null;
+        return scope;
+    }
+
     pub fn placeMovedLiteralInitializer(self: *const Plan, place_id: ir.PlaceId) ?ir.Literal {
         if (place_id.index() >= self.moved_literal_initializers.len) return null;
         return if (self.moved_literal_initializers[place_id.index()]) |initializer| initializer.literal else null;
@@ -616,6 +795,13 @@ pub const Plan = struct {
                     self.assignBlock(control.terminal_block, scope, repeated);
                 },
             }
+        }
+        if (region.terminal_projection != null) {
+            const site = if (region.nodes.len == 0) parent else switch (region.nodes[region.nodes.len - 1]) {
+                .branch => container,
+                else => self.node_scopes.get(&region.nodes[region.nodes.len - 1]) orelse parent,
+            };
+            try self.terminal_projection_sites.put(self.allocator, region, site);
         }
     }
 
@@ -1601,6 +1787,66 @@ pub const Plan = struct {
             right = self.parents[right];
         }
         return left;
+    }
+};
+
+// Reads a block's text at one site: the first scope found that declares a local the text defines or reads and does not
+// enclose the site, apart from `skip` and the scopes in `declared`, which the writer declares again around the site. A
+// fused or inlined value is written at its consumer, so its own operands are read at the site as well.
+const SiteDeclarationVisitor = struct {
+    plan: *const Plan,
+    site: ScopeId,
+    kept: ScopeId,
+    skip: ScopeId,
+    declared: []const ScopeId,
+    found: *?ScopeId,
+    remaining: usize,
+
+    fn check(self: SiteDeclarationVisitor, declared_at: ?ScopeId) void {
+        const scope = declared_at orelse return;
+        if (self.found.* != null or scope == self.skip) return;
+        if (std.mem.indexOfScalar(ScopeId, self.declared, scope) != null) return;
+        // A scope below the block's first node is one of the block's segments, whose declarations every site writes.
+        if (scope != self.kept and self.plan.scopeEncloses(self.kept, scope)) return;
+        if (!self.plan.scopeEncloses(scope, self.site)) self.found.* = scope;
+    }
+
+    pub fn value(self: SiteDeclarationVisitor, value_id: ir.ValueId) void {
+        if (self.remaining == 0) return;
+        const resolved = self.plan.dead.resolveValue(value_id);
+        if (resolved.index() >= self.plan.program.values.len or resolved.index() >= self.plan.value_scopes.len) return;
+        const value_info = self.plan.program.values[resolved.index()];
+        if (value_info.function != self.plan.function.id) return;
+        if (self.plan.value_scopes[resolved.index()] != invalid_scope) {
+            self.check(self.plan.valueDeclaredAtScope(resolved));
+            return;
+        }
+        const instruction_id = switch (value_info.origin) {
+            .instruction_result => |origin| origin.instruction,
+            else => return,
+        };
+        if (instruction_id.index() >= self.plan.program.instructions.len) return;
+        if (!self.plan.fused_values.contains(instruction_id) and !self.plan.dead.isInlined(instruction_id) and
+            !self.plan.place_reads.contains(instruction_id)) return;
+        runtime_uses.visitOperationUses(self.plan.program.instructions[instruction_id.index()].operation, SiteDeclarationVisitor{
+            .plan = self.plan,
+            .site = self.site,
+            .kept = self.kept,
+            .skip = self.skip,
+            .declared = self.declared,
+            .found = self.found,
+            .remaining = self.remaining - 1,
+        });
+    }
+
+    pub fn pack(self: SiteDeclarationVisitor, pack_id: ir.ValuePackId) void {
+        if (pack_id.index() >= self.plan.pack_scopes.len) return;
+        const scope = self.plan.pack_scopes[pack_id.index()];
+        if (scope != invalid_scope) self.check(scope);
+    }
+
+    pub fn place(self: SiteDeclarationVisitor, place_id: ir.PlaceId) void {
+        self.check(self.plan.placeDeclaredAtScope(place_id));
     }
 };
 

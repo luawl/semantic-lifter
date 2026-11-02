@@ -498,6 +498,11 @@ fn emitFunctionBody(
     // write (`capturedCellSharedAcrossPasses`): the dispatcher layout below gives each pass its own cell.
     const structured: (EmitError || std.mem.Allocator.Error)!void = if (scopes.capturedCellSharedAcrossPasses())
         error.UnsupportedControlFlow
+        // A plan whose block another site writes again with a local that site cannot see and the writer does not declare
+        // there is refused the same way (`repeatedBlockReadsUndeclaredLocal`): the dispatcher layout declares every
+        // local in the function's root list.
+    else if (scopes.repeatedBlockReadsUndeclaredLocal(true))
+        error.UnsupportedControlFlow
     else
         emitRegion(output, allocator, program, emission_plan, &scopes, plan.root, indent, place_aliases);
     structured catch |err| {
@@ -1160,6 +1165,12 @@ fn emitRegionBodyWithPredeclaredBlock(
         }
     }
     const wraps_groups = group_count > 1;
+    // A block this region's nodes write again reads locals its first placement declares at scopes above its first node
+    // that do not reach this region (`region_declarations`): they are declared again here, before the region's first
+    // node, so every node of the region sees them.
+    for (scopes.region_declarations.items) |declaration| {
+        if (declaration.region == region) try emitScopeDeclarations(output, allocator, program, emission_plan, scopes, declaration.scope, region_indent, composition);
+    }
     var active_group: emission_scope.ScopeId = emission_scope.invalid_scope;
     var active_group_wrapper: ?ContainerGroupWrapper = null;
     var allocated_group_indent: ?[]u8 = null;
@@ -1198,6 +1209,13 @@ fn emitRegionBodyWithPredeclaredBlock(
         const node_scope = scopes.nodeScope(node) orelse return error.UnsupportedControlFlow;
         const indent = allocated_group_indent orelse region_indent;
         try emitScopeDeclarations(output, allocator, program, emission_plan, scopes, node_scope, indent, composition);
+        // A block another node wrote first keeps that node's scopes (`assignBlock`), so its text reads locals declared
+        // only at that node's own scope: they are declared again here, where that scope does not reach, so this node's
+        // copy of the block assigns and reads its own.
+        for (emission_scope.Plan.nodeWrittenBlocks(node)) |written| {
+            const written_id = written orelse continue;
+            try emitRepeatedBlockDeclarations(output, allocator, program, emission_plan, scopes, written_id, node_scope, indent, composition);
+        }
         trace_stage = "node_emit";
         switch (node.*) {
             .block => |block_id| {
@@ -1236,6 +1254,7 @@ fn emitRegionBodyWithPredeclaredBlock(
                                         scopes,
                                         projected_edge,
                                         projection.terminal,
+                                        scopes.terminalProjectionSite(region) orelse return error.UnsupportedControlFlow,
                                         indent,
                                         place_aliases,
                                         composedValuePlan(emission_plan, place_aliases, composition),
@@ -1649,6 +1668,7 @@ fn emitRegionBodyWithPredeclaredBlock(
                 emission_plan,
                 scopes,
                 projection.terminal,
+                scopes.terminalProjectionSite(region) orelse return error.UnsupportedControlFlow,
                 allocated_group_indent orelse region_indent,
                 place_aliases,
                 composedValuePlan(emission_plan, place_aliases, composition),
@@ -1804,6 +1824,7 @@ fn emitBranchArmImpl(
                     scopes,
                     edge,
                     projection.terminal,
+                    scopes.terminalProjectionSite(region) orelse return error.UnsupportedControlFlow,
                     indent,
                     place_aliases,
                     valuePlan(emission_plan, place_aliases),
@@ -2101,6 +2122,26 @@ fn nodeAlwaysFunctionTerminates(program: *const ir.Program, node: structure.Node
     };
 }
 
+/// A block written again at a site other than its first node keeps that node's scopes (`assignBlock`): the locals
+/// declared at that node's own scope are declared again at the site, unless that scope encloses the site, where they
+/// are in scope already and a declaration would shadow them. `composition` is the one the site writes the block with
+/// (a region's at a node, none at a projected terminal), so a value it writes inline declares no local here either.
+fn emitRepeatedBlockDeclarations(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    emission_plan: *const EmissionPlan,
+    scopes: *const emission_scope.Plan,
+    block_id: ir.BlockId,
+    site: emission_scope.ScopeId,
+    indent: []const u8,
+    composition: ?*const branch_expression.Composition,
+) !void {
+    const kept = scopes.blockScope(block_id) orelse return;
+    if (scopes.scopeEncloses(kept, site)) return;
+    try emitScopeDeclarations(output, allocator, program, emission_plan, scopes, kept, indent, composition);
+}
+
 fn emitProjectedTerminal(
     output: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
@@ -2109,6 +2150,7 @@ fn emitProjectedTerminal(
     scopes: *const emission_scope.Plan,
     edge: ir.Edge,
     terminal_id: ir.BlockId,
+    site: emission_scope.ScopeId,
     indent: []const u8,
     place_aliases: []const PlaceAlias,
     values: render.ValuePlan,
@@ -2120,6 +2162,9 @@ fn emitProjectedTerminal(
         .return_values, .return_pack, .return_expanded, .throw_error => {},
         else => return error.UnsupportedControlFlow,
     }
+    // The terminal's text reads locals declared only at its first node's own scope: they are declared here, at the
+    // projection's site, before the parameter copies that may assign them.
+    try emitRepeatedBlockDeclarations(output, allocator, program, emission_plan, scopes, terminal_id, site, indent, null);
     try emitEdgeParametersUnlessConsumed(
         output,
         allocator,
@@ -2139,6 +2184,7 @@ fn emitProjectedTerminal(
         emission_plan,
         scopes,
         terminal_id,
+        null,
         indent,
         place_aliases,
         values,
@@ -2152,6 +2198,7 @@ fn emitProjectedTerminalBody(
     emission_plan: *const EmissionPlan,
     scopes: *const emission_scope.Plan,
     terminal_id: ir.BlockId,
+    site: ?emission_scope.ScopeId,
     indent: []const u8,
     place_aliases: []const PlaceAlias,
     values: render.ValuePlan,
@@ -2162,6 +2209,9 @@ fn emitProjectedTerminalBody(
         .return_values, .return_pack, .return_expanded, .throw_error => {},
         else => return error.UnsupportedControlFlow,
     }
+    // A terminal written after a joining branch reads locals declared only at its first node's own scope: they are
+    // declared here, at the projection's site (`emitProjectedTerminal` declares them before its parameter copies).
+    if (site) |at| try emitRepeatedBlockDeclarations(output, allocator, program, emission_plan, scopes, terminal_id, at, indent, null);
     try emitBlockInstructionsWithDeclaration(
         output,
         allocator,

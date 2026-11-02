@@ -621,6 +621,7 @@ fn hostPressure(
 
     if (!root.arbitrary_cfg) try addNativeForFootprints(allocator, program, emission, scopes, root, locals, frames, temporaries);
     if (statement_roots) try addStatementRootFrames(allocator, program, readable, emission, scopes, function, root, &compositions, temporaries);
+    if (!root.arbitrary_cfg) try addRepeatedBlockSites(allocator, program, readable, emission, scopes, function, root, &compositions, statement_roots, locals, closure_locals, temporaries);
 
     var maximum_locals = base;
     var maximum_total = base;
@@ -682,6 +683,590 @@ fn hostPressure(
         });
     }
     return .{ .locals = maximum_locals, .total = maximum_total, .scratch = maximum_scratch };
+}
+
+/// A block written again at a site other than its first node keeps that node's scopes (`assignBlock`), so the loops of
+/// `hostPressure` count its locals and frames on that node's chain only. Each other site writes the block whole: the
+/// locals the writer declares again there, each of the block's segments as a `do` block inside the site's physical
+/// block, which holds its own locals and frames above that chain as a closure's snapshot block does, and the block's
+/// other statements in the site's physical block, whose frames `addBlockFramesAtSite` adds there as `hostPressure`
+/// adds them at the first node. The sites: every other structure node that writes the block, with the locals of the
+/// first node's own scope (`emitRegion` declares the bare ones again right before the node); the start of every region
+/// whose nodes write such blocks, with the locals of the scopes above their first nodes that the region declares again
+/// (`region_declarations`); and every projected terminal (`emitProjectedTerminal`), with the locals of its first node's
+/// own scope unless that scope encloses the site or the site's chain counts them already.
+///
+/// A local declared again is live from its declaration to the end of the Luau block that holds it, so it is priced
+/// where the text declares it: beside the copy that follows the declaration and what its block writes after that copy,
+/// never beside a statement or a `do` segment written before it in that block, which ends before the declaration
+/// begins. A projected terminal ends its region, and a group of block nodes written again that ends its container group
+/// is followed there by nothing but that terminal and a transfer wrapper's `until true` (`SitePositions`), so each such
+/// copy is priced as a block inside the site's physical block: the locals declared again at it and before it in its
+/// group beside each of its frames. A region's declarations are live in each of its container groups. Any other site
+/// keeps its locals in its physical block's locals, which every statement of that block counts.
+///
+/// Only the rooted call (`statement_roots`) adds the copy's statement frames at the site. That call models the written
+/// text: it builds the writer's `Compositions`, so a value a composition writes inline at its first node is no local
+/// there; it counts the locals a site declares again with the composition the writer passes at that site (the
+/// region's at a node and at a region's start, none at a projected terminal: `SitePositions.declared` and
+/// `localsDeclaredAtScope`), so a value is a local at the site exactly when the text declares one for it there; and
+/// it prices every statement root, so its count at the site is never below the registers the text holds there. The
+/// held call builds no composition and counts as a local every value a composition writes inline, so the copy's
+/// frames on top of it would refuse texts that fit. Left out of it, the held count is a part of the maximum that
+/// needs no frame of the copy: `maximumPressure` keeps the larger of the two counts, and the rooted one bounds the
+/// text at the site.
+fn addRepeatedBlockSites(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    readable: *const readable_scope.Scope,
+    emission: *const emission_planning.Plan,
+    scopes: *const emission_scope.Plan,
+    function: ir.Function,
+    root: *const structure.Region,
+    compositions: *const Compositions,
+    statement_roots: bool,
+    locals: []usize,
+    closure_locals: []usize,
+    temporaries: []usize,
+) std.mem.Allocator.Error!void {
+    // The conditions and edge copies the region walk prices at its nodes, which `addStatementRootFrames` passes over at
+    // a block's first node, found once by the same walk.
+    var walked: ?WalkedRoots = null;
+    defer if (walked) |priced| priced.deinit(allocator);
+    var positions = try SitePositions.init(allocator, program, readable, emission, scopes, function, statement_roots, root);
+    defer positions.deinit(allocator);
+    var nodes = scopes.node_scopes.iterator();
+    while (nodes.next()) |entry| {
+        const site = entry.value_ptr.*;
+        // A positioned node holds the locals declared again at it and before it in its group beside its copy only.
+        const positioned = positions.nodes.get(entry.key_ptr.*);
+        // Any other node holds the locals declared again for each block it writes, counted with the composition of the
+        // region it is written in (`SitePositions.declared`); a node the region walk does not reach counts them all.
+        const declared = positions.declared.get(entry.key_ptr.*);
+        for (emission_scope.Plan.nodeWrittenBlocks(entry.key_ptr.*), 0..) |written, slot| {
+            const block_id = written orelse continue;
+            const kept = scopes.blockScope(block_id) orelse continue;
+            if (kept == site) continue;
+            const live = positioned orelse (if (declared) |counts| counts[slot] else localsWrittenAtSite(program, readable, emission, scopes, function, null, block_id, kept, site));
+            addBlockAtSite(program, scopes, block_id, kept, site, live, positioned != null, locals, closure_locals, temporaries);
+            if (statement_roots) {
+                if (walked == null) walked = try WalkedRoots.init(allocator, program, emission, scopes, root, compositions);
+                try addBlockFramesAtSite(allocator, program, readable, emission, scopes, compositions, &walked.?, block_id, kept, site, if (positioned != null) live else 0, closure_locals, temporaries);
+            }
+        }
+    }
+    for (scopes.region_declarations.items) |declaration| {
+        const region = declaration.region;
+        if (region.nodes.len == 0) continue;
+        // `emitRegion` declares them with the composition it writes the region with.
+        var composition: ?branch_expression.Composition = if (statement_roots) try branch_expression.Composition.init(allocator, program, emission, scopes, region) else null;
+        defer if (composition) |*built| built.deinit();
+        const declared = localsDeclaredAtScope(program, readable, emission, scopes, function, if (composition) |*built| built else null, declaration.scope);
+        // Declared before the region's first node, in the Luau block that holds the region and nothing else: live in
+        // each of the region's container groups, and beside no statement around that block.
+        var counted: emission_scope.ScopeId = emission_scope.invalid_scope;
+        for (region.nodes) |*node| {
+            const group = scopes.nodeContainerScope(node) orelse continue;
+            if (group == counted) continue;
+            counted = group;
+            const host = scopes.physicalHost(group) orelse continue;
+            if (host >= locals.len) continue;
+            locals[host] = saturatingAdd(locals[host], declared);
+        }
+    }
+    var projections = scopes.terminal_projection_sites.iterator();
+    while (projections.next()) |entry| {
+        const projection = entry.key_ptr.*.terminal_projection orelse continue;
+        const site = entry.value_ptr.*;
+        const kept = scopes.blockScope(projection.terminal) orelse continue;
+        // A terminal block's first node is the last node of its region: `emitRegion` writes a block that returns or
+        // throws, a loop terminal and a loop boundary only there, and a region that ends in one projects no terminal.
+        // So a site whose chain holds the first node's physical block is written before that node and its
+        // declarations: the chain counts the first node's locals once, where the first copy's are not live yet, and
+        // the site's copy takes their place. Off that chain the first copy is not counted, and the site's is added.
+        // A site that the first node's own scope encloses declares none of them (`emitRepeatedBlockDeclarations`).
+        // The site declares them with no composition (`emitProjectedTerminal` and `emitProjectedTerminalBody` write the
+        // terminal with none), so every value of that scope is a local there.
+        const declared = if (scopes.scopeEncloses(kept, site) or physicalHostOnChain(scopes, kept, site))
+            0
+        else
+            localsWrittenAtSite(program, readable, emission, scopes, function, null, projection.terminal, kept, site);
+        // The projected terminal is the last text of its region, so its locals are live beside its copy only, with
+        // those that a positioned group of its physical block declared again before it.
+        const live = saturatingAdd(declared, positions.groupTotal(scopes, site));
+        addBlockAtSite(program, scopes, projection.terminal, kept, site, live, true, locals, closure_locals, temporaries);
+        if (statement_roots) {
+            if (walked == null) walked = try WalkedRoots.init(allocator, program, emission, scopes, root, compositions);
+            try addBlockFramesAtSite(allocator, program, readable, emission, scopes, compositions, &walked.?, projection.terminal, kept, site, live, closure_locals, temporaries);
+        }
+    }
+    // A wrapped region's `until true` follows its one positioned group: its literal sits above the locals declared again.
+    if (statement_roots) {
+        var literals = positions.literals.iterator();
+        while (literals.next()) |entry| {
+            if (entry.key_ptr.* < temporaries.len) temporaries[entry.key_ptr.*] = @max(temporaries[entry.key_ptr.*], entry.value_ptr.*);
+        }
+    }
+}
+
+/// Where the locals a site declares again are live, by the text `emitRegion` writes. It declares them right before the
+/// node that writes a block again, inside that node's container group, so they are live from there to the end of the
+/// group's Luau block. A group whose nodes from its first such node on are all block nodes written again (`.block`,
+/// which write no region of their own) holds nothing after their copies but, in its region's last group, the region's
+/// projected terminal, a transfer wrapper's `until true` and an escape flag's set and `break`, which take no frame
+/// (`emitRegionBodyWithPredeclaredBlock`). Such a group is priced by position: `nodes` holds, for each of its nodes,
+/// the locals declared again at it and before it in the group; `hosts`, by the group's physical block, all that the
+/// group declares again, which the region's projected terminal joins; and `literals`, by that block, the frame of a
+/// wrapper's `until true` above them. Any other group keeps the locals it declares again in its physical block's
+/// locals (`addRepeatedBlockSites`). `declared` holds, for every node that writes a block again, the locals declared
+/// again for each block it writes, counted with the composition `emitRegion` writes the node's region with (in the
+/// rooted call; the held call counts every value).
+const SitePositions = struct {
+    nodes: std.AutoHashMapUnmanaged(*const structure.Node, usize) = .empty,
+    declared: std.AutoHashMapUnmanaged(*const structure.Node, [2]usize) = .empty,
+    hosts: std.AutoHashMapUnmanaged(emission_scope.ScopeId, usize) = .empty,
+    literals: std.AutoHashMapUnmanaged(emission_scope.ScopeId, usize) = .empty,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        program: *const ir.Program,
+        readable: *const readable_scope.Scope,
+        emission: *const emission_planning.Plan,
+        scopes: *const emission_scope.Plan,
+        function: ir.Function,
+        composed: bool,
+        root: *const structure.Region,
+    ) std.mem.Allocator.Error!SitePositions {
+        var positions: SitePositions = .{};
+        errdefer positions.deinit(allocator);
+        try positions.addRegion(allocator, program, readable, emission, scopes, function, composed, root);
+        return positions;
+    }
+
+    fn deinit(self: *SitePositions, allocator: std.mem.Allocator) void {
+        self.literals.deinit(allocator);
+        self.hosts.deinit(allocator);
+        self.declared.deinit(allocator);
+        self.nodes.deinit(allocator);
+    }
+
+    /// All that the positioned group of a site's physical block declares again, written before the site.
+    fn groupTotal(self: *const SitePositions, scopes: *const emission_scope.Plan, site: emission_scope.ScopeId) usize {
+        const host = scopes.physicalHost(site) orelse return 0;
+        return self.hosts.get(host) orelse 0;
+    }
+
+    fn addRegion(
+        self: *SitePositions,
+        allocator: std.mem.Allocator,
+        program: *const ir.Program,
+        readable: *const readable_scope.Scope,
+        emission: *const emission_planning.Plan,
+        scopes: *const emission_scope.Plan,
+        function: ir.Function,
+        composed: bool,
+        region: *const structure.Region,
+    ) std.mem.Allocator.Error!void {
+        // The composition `emitRegion` writes this region with, which its declarations pass `emitScopeDeclarations`.
+        var composition: ?branch_expression.Composition = if (composed) try branch_expression.Composition.init(allocator, program, emission, scopes, region) else null;
+        defer if (composition) |*built| built.deinit();
+        const region_composition: ?*const branch_expression.Composition = if (composition) |*built| built else null;
+        for (region.nodes) |*node| {
+            const site = scopes.nodeScope(node) orelse continue;
+            var counts: [2]usize = .{ 0, 0 };
+            var writes = false;
+            for (emission_scope.Plan.nodeWrittenBlocks(node), 0..) |written, slot| {
+                const block_id = written orelse continue;
+                const kept = scopes.blockScope(block_id) orelse continue;
+                if (kept == site) continue;
+                counts[slot] = localsWrittenAtSite(program, readable, emission, scopes, function, region_composition, block_id, kept, site);
+                writes = true;
+            }
+            if (writes) try self.declared.put(allocator, node, counts);
+        }
+        var start: usize = 0;
+        var groups: usize = 0;
+        var last_total: usize = 0;
+        while (start < region.nodes.len) {
+            const group = scopes.nodeContainerScope(&region.nodes[start]) orelse emission_scope.invalid_scope;
+            var end = start + 1;
+            while (end < region.nodes.len and (scopes.nodeContainerScope(&region.nodes[end]) orelse emission_scope.invalid_scope) == group) end += 1;
+            last_total = try self.addGroup(allocator, program, readable, emission, scopes, function, region_composition, region.nodes[start..end]);
+            groups += 1;
+            start = end;
+        }
+        if (groups == 1 and last_total != 0 and try structured_escape.regionIsWrapped(allocator, region)) {
+            if (scopes.nodeContainerScope(&region.nodes[0])) |group| {
+                if (scopes.physicalHost(group)) |host| try self.literals.put(allocator, host, saturatingAdd(last_total, 1));
+            }
+        }
+        for (region.nodes) |*node| switch (node.*) {
+            .block, .loop_control, .loop_terminal => {},
+            .branch => |branch| {
+                try self.addRegion(allocator, program, readable, emission, scopes, function, composed, branch.then_region);
+                try self.addRegion(allocator, program, readable, emission, scopes, function, composed, branch.else_region);
+            },
+            .loop => |loop| try self.addRegion(allocator, program, readable, emission, scopes, function, composed, loop.body_region),
+            .latch_loop => |loop| try self.addRegion(allocator, program, readable, emission, scopes, function, composed, loop.body_region),
+            .infinite_loop => |loop| {
+                try self.addRegion(allocator, program, readable, emission, scopes, function, composed, loop.body_region);
+                if (loop.shared_side_exit) |side_exit| {
+                    for (side_exit.entries) |entry| try self.addRegion(allocator, program, readable, emission, scopes, function, composed, entry.region);
+                }
+            },
+            .loop_boundary => |control| {
+                try self.addRegion(allocator, program, readable, emission, scopes, function, composed, control.body_region);
+                switch (control.boundary) {
+                    .side_exit => |side_exit| try self.addRegion(allocator, program, readable, emission, scopes, function, composed, side_exit.region),
+                    .side_escape => |side_escape| try self.addRegion(allocator, program, readable, emission, scopes, function, composed, side_escape.region),
+                    else => {},
+                }
+            },
+        };
+    }
+
+    /// Positions one container group when its nodes from its first node that writes a block again on are all block
+    /// nodes written again, and returns all that it declares again; returns 0 for any other group.
+    fn addGroup(
+        self: *SitePositions,
+        allocator: std.mem.Allocator,
+        program: *const ir.Program,
+        readable: *const readable_scope.Scope,
+        emission: *const emission_planning.Plan,
+        scopes: *const emission_scope.Plan,
+        function: ir.Function,
+        composition: ?*const branch_expression.Composition,
+        group: []const structure.Node,
+    ) std.mem.Allocator.Error!usize {
+        const first = for (group, 0..) |*node, index| {
+            if (writesBlockAgain(scopes, node)) break index;
+        } else return 0;
+        for (group[first..]) |*node| {
+            if (node.* != .block or !writesBlockAgain(scopes, node)) return 0;
+        }
+        var live: usize = 0;
+        for (group[first..]) |*node| {
+            const kept = scopes.blockScope(node.block) orelse return 0;
+            live = saturatingAdd(live, localsWrittenAtSite(program, readable, emission, scopes, function, composition, node.block, kept, scopes.nodeScope(node) orelse emission_scope.invalid_scope));
+            try self.nodes.put(allocator, node, live);
+        }
+        const site = scopes.nodeScope(&group[group.len - 1]) orelse return live;
+        const host = scopes.physicalHost(site) orelse return live;
+        const total = try self.hosts.getOrPut(allocator, host);
+        total.value_ptr.* = if (total.found_existing) saturatingAdd(total.value_ptr.*, live) else live;
+        return live;
+    }
+};
+
+/// Whether a structure node writes a block that another node wrote first: `assignBlock` keeps that node's scope.
+fn writesBlockAgain(scopes: *const emission_scope.Plan, node: *const structure.Node) bool {
+    const site = scopes.nodeScope(node) orelse return false;
+    for (emission_scope.Plan.nodeWrittenBlocks(node)) |written| {
+        const block_id = written orelse continue;
+        const kept = scopes.blockScope(block_id) orelse continue;
+        if (kept != site) return true;
+    }
+    return false;
+}
+
+/// The blocks whose branch condition and whose edge copies the region walk (`addRegionLiteralFrames`) prices at its
+/// nodes, and which `addStatementRootFrames` therefore passes over at a block's first node.
+const WalkedRoots = struct {
+    condition_priced: []bool,
+    edges_composed: []bool,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        program: *const ir.Program,
+        emission: *const emission_planning.Plan,
+        scopes: *const emission_scope.Plan,
+        root: *const structure.Region,
+        compositions: *const Compositions,
+    ) std.mem.Allocator.Error!WalkedRoots {
+        const condition_priced = try allocator.alloc(bool, program.blocks.len);
+        errdefer allocator.free(condition_priced);
+        @memset(condition_priced, false);
+        const edges_composed = try allocator.alloc(bool, program.blocks.len);
+        errdefer allocator.free(edges_composed);
+        @memset(edges_composed, false);
+        const walk_frames = try allocator.alloc(usize, scopes.pressureSlotCount());
+        defer allocator.free(walk_frames);
+        @memset(walk_frames, 0);
+        var pricing: RootPricing = .{
+            .allocator = allocator,
+            .program = program,
+            .emission = emission,
+            .scopes = scopes,
+            .compositions = compositions,
+        };
+        try addRegionLiteralFrames(&pricing, root, false, walk_frames, condition_priced, edges_composed);
+        return .{ .condition_priced = condition_priced, .edges_composed = edges_composed };
+    }
+
+    fn deinit(self: WalkedRoots, allocator: std.mem.Allocator) void {
+        allocator.free(self.condition_priced);
+        allocator.free(self.edges_composed);
+    }
+};
+
+/// The frames `hostPressure` counts for a block at its first node's physical block, joined at another site that writes
+/// the block whole, as that site's statements are joined: the site writes the block whole, so its frames live at the
+/// site. They are the frames of `hostPressure`'s loop over the block (a return's values, `returnTemporaryFrameSize`;
+/// each edge's copy cycles, `addTerminatorEdgeFrames`; each instruction's, `emittedOperationTemporaryFrameSize`; each
+/// closure's snapshot locals) and of `addStatementRootFrames`' (the terminator's, `terminatorRootFrame`; a branch's
+/// condition and each edge's copy unless the region walk prices them; each instruction written as a statement), each
+/// kept where its scope lies in the first node's physical block: the terminator, its edges and the values written
+/// into it, and every instruction of a block with no segments. A segment's frames are its `do` block's
+/// (`addBlockAtSite`). A positioned copy holds `live` locals declared again beside each frame. Only the rooted call
+/// adds them (`addRepeatedBlockSites`).
+fn addBlockFramesAtSite(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    readable: *const readable_scope.Scope,
+    emission: *const emission_planning.Plan,
+    scopes: *const emission_scope.Plan,
+    compositions: *const Compositions,
+    walked: *const WalkedRoots,
+    block_id: ir.BlockId,
+    kept: emission_scope.ScopeId,
+    site: emission_scope.ScopeId,
+    live: usize,
+    closure_locals: []usize,
+    temporaries: []usize,
+) std.mem.Allocator.Error!void {
+    const kept_host = scopes.physicalHost(kept) orelse return;
+    const site_host = scopes.physicalHost(site) orelse return;
+    if (site_host >= closure_locals.len or block_id.index() >= program.blocks.len) return;
+    const block = program.blocks[block_id.index()];
+    var frame: usize = returnTemporaryFrameSize(program, emission, scopes, block) orelse 0;
+    switch (block.terminator) {
+        .jump => |edge| frame = @max(frame, edgeCycleFrame(program, emission, scopes, edge)),
+        .branch => |branch| frame = @max(frame, @max(edgeCycleFrame(program, emission, scopes, branch.then_edge), edgeCycleFrame(program, emission, scopes, branch.else_edge))),
+        else => {},
+    }
+    var snapshots: usize = 0;
+    for (block.instructions) |instruction_id| {
+        if (!readable.instruction(instruction_id) or instruction_id.index() >= program.instructions.len) continue;
+        if (emission.dead.contains(instruction_id) and !emission.dead.isInlined(instruction_id)) continue;
+        const instruction = program.instructions[instruction_id.index()];
+        if (emittedOperationTemporaryFrameSize(program, emission, scopes, instruction)) |frame_size| {
+            if (scopes.renderedPressureScope(instruction.id)) |scope| {
+                if (scopes.physicalHost(scope) == kept_host) frame = @max(frame, frame_size);
+            }
+        }
+        const closure = switch (instruction.operation) {
+            .make_closure => |value| value,
+            else => continue,
+        };
+        if (closure.function.index() >= program.functions.len) continue;
+        const rendered_scope = closureRenderedScope(emission, scopes, instruction.id) orelse continue;
+        if (scopes.physicalHost(rendered_scope) != kept_host) continue;
+        var closure_plan = lexical.ClosurePlan.initWithStableValues(
+            allocator,
+            program,
+            program.functions[closure.function.index()],
+            closure,
+            &.{},
+            StableCaptureValues{ .scopes = scopes, .emission = emission },
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidClosureBinding => unreachable,
+        };
+        defer closure_plan.deinit();
+        snapshots = @max(snapshots, closure_plan.value_bindings.len);
+    }
+    var pricing: RootPricing = .{
+        .allocator = allocator,
+        .program = program,
+        .emission = emission,
+        .scopes = scopes,
+        .compositions = compositions,
+    };
+    frame = @max(frame, try terminatorRootFrame(&pricing, block));
+    switch (block.terminator) {
+        .branch => |branch| if (!walked.condition_priced[block_id.index()] and !scopes.nativeIterationConsumesParameters(block_id)) {
+            frame = @max(frame, try pricing.frame(.{ .condition = branch.condition }));
+        },
+        else => {},
+    }
+    if (!walked.edges_composed[block_id.index()]) switch (block.terminator) {
+        .jump => |edge| frame = @max(frame, try edgeCopyFrame(&pricing, edge)),
+        .branch => |branch| frame = @max(frame, @max(try edgeCopyFrame(&pricing, branch.then_edge), try edgeCopyFrame(&pricing, branch.else_edge))),
+        else => {},
+    };
+    for (block.instructions) |instruction_id| {
+        if (!readable.instruction(instruction_id) or instruction_id.index() >= program.instructions.len) continue;
+        const instruction = program.instructions[instruction_id.index()];
+        if (!instructionIsStatement(emission, scopes, compositions, instruction)) continue;
+        const scope = scopes.renderedPressureScope(instruction_id) orelse continue;
+        if (scopes.physicalHost(scope) != kept_host) continue;
+        const declare_place = switch (instruction.operation) {
+            .place_write => |write| !emission.names.placeUsesStorage(write.place) and scopes.instructionDeclaresPlace(instruction_id, write.place),
+            else => false,
+        };
+        frame = @max(frame, try statementRootFrame(&pricing, instruction, scopes.instructionDeclaresResults(instruction_id), declare_place));
+    }
+    addTemporaryAtScope(temporaries, scopes, site, saturatingAdd(live, frame));
+    closure_locals[site_host] = @max(closure_locals[site_host], saturatingAdd(live, snapshots));
+}
+
+/// An edge's copy cycles, as `addEdgeTemporaryFrame` counts them.
+fn edgeCycleFrame(program: *const ir.Program, emission: *const emission_planning.Plan, scopes: *const emission_scope.Plan, edge: ir.Edge) usize {
+    if (edge.target.index() >= program.blocks.len or scopes.edgeParametersConsumed(edge.target)) return 0;
+    return edgeAssignmentCycleCount(program, emission, edge);
+}
+
+/// An edge's copy as a statement root, as `edgeCopyRootFrame` prices it.
+fn edgeCopyFrame(pricing: *RootPricing, edge: ir.Edge) std.mem.Allocator.Error!usize {
+    const program = pricing.program;
+    if (edge.target.index() >= program.blocks.len or pricing.scopes.edgeParametersConsumed(edge.target)) return 0;
+    const target = program.blocks[edge.target.index()];
+    if (target.parameters.len == 0) return 0;
+    return pricing.frame(.{ .edge = .{ .target = target, .arguments = edge.arguments } });
+}
+
+/// Whether the physical block of `outer` is that of `inner` or one around it: one of the blocks whose locals
+/// `hostPressure` sums for `inner`'s block, a chain that `parentPhysicalHost` ends at the function's root scope.
+fn physicalHostOnChain(scopes: *const emission_scope.Plan, outer: emission_scope.ScopeId, inner: emission_scope.ScopeId) bool {
+    const host = scopes.physicalHost(outer) orelse return false;
+    var current = scopes.physicalHost(inner);
+    while (current) |physical| : (current = scopes.parentPhysicalHost(physical)) {
+        if (physical == host) return true;
+    }
+    return false;
+}
+
+/// One site of a block written again (`addRepeatedBlockSites`): the locals declared again there and each segment of the
+/// block as a `do` block inside the site's physical block. A positioned copy holds its `live` locals beside its own
+/// text only, as a block nested in the site's physical block holds its own; any other copy declares them in the site's
+/// physical block, where every statement of the block counts them.
+fn addBlockAtSite(
+    program: *const ir.Program,
+    scopes: *const emission_scope.Plan,
+    block_id: ir.BlockId,
+    kept: emission_scope.ScopeId,
+    site: emission_scope.ScopeId,
+    live: usize,
+    positioned: bool,
+    locals: []usize,
+    closure_locals: []usize,
+    temporaries: []usize,
+) void {
+    const site_host = scopes.physicalHost(site) orelse return;
+    if (site_host >= locals.len or block_id.index() >= program.blocks.len) return;
+    const beside: usize = if (positioned) live else 0;
+    if (positioned) {
+        closure_locals[site_host] = @max(closure_locals[site_host], live);
+    } else {
+        locals[site_host] = saturatingAdd(locals[site_host], live);
+    }
+    for (program.blocks[block_id.index()].instructions) |instruction_id| {
+        const scope = scopes.instructionScope(instruction_id) orelse continue;
+        if (scope == kept) continue;
+        const segment = scopes.physicalHost(scope) orelse continue;
+        if (segment >= locals.len) continue;
+        const segment_locals = saturatingAdd(beside, locals[segment]);
+        closure_locals[site_host] = @max(closure_locals[site_host], saturatingAdd(segment_locals, closure_locals[segment]));
+        temporaries[site_host] = @max(temporaries[site_host], saturatingAdd(segment_locals, @max(closure_locals[segment], temporaries[segment])));
+    }
+}
+
+/// The locals a block's copy declares at a site that writes the block again: those of its first node's own scope `kept`
+/// (`localsDeclaredAtScope`), and the results its instructions declare where they stand whose scope lies above `kept`.
+/// A value two blocks of one container group share (a block cut into a chain of blocks written in one Luau block) has
+/// that group's scope, and its write still declares it (`instructionDeclaresResults`: the group and the write share a
+/// Luau block), so every copy of the block writes that `local` again where the write stands; `localsDeclaredAtScope`
+/// counts `kept`'s values only, and no region declares the group's scope again for such a value alone
+/// (`valueDeclaredAtScope` is null for a value declared at its instruction). A scope that a region around the site
+/// declares again is priced whole at that region's container groups (`addRepeatedBlockSites`), so its results are not
+/// counted here again. `composition` is the one the site writes the block with: a value it writes inline in place of
+/// its name declares no local there.
+fn localsWrittenAtSite(
+    program: *const ir.Program,
+    readable: *const readable_scope.Scope,
+    emission: *const emission_planning.Plan,
+    scopes: *const emission_scope.Plan,
+    function: ir.Function,
+    composition: ?*const branch_expression.Composition,
+    block_id: ir.BlockId,
+    kept: emission_scope.ScopeId,
+    site: emission_scope.ScopeId,
+) usize {
+    var count = localsDeclaredAtScope(program, readable, emission, scopes, function, composition, kept);
+    if (block_id.index() >= program.blocks.len) return count;
+    for (program.blocks[block_id.index()].instructions) |instruction_id| {
+        if (!readable.instruction(instruction_id) or instruction_id.index() >= program.instructions.len) continue;
+        if (!scopes.instructionDeclaresResults(instruction_id)) continue;
+        for (program.instructions[instruction_id.index()].results) |result| {
+            if (emission.names.valueUsesStorage(result)) continue;
+            if (composition) |written| {
+                if (written.isOverridden(result)) continue;
+            }
+            const declared = scopes.valueScope(result) orelse continue;
+            if (declared == kept or !scopes.scopeEncloses(declared, kept)) continue;
+            if (regionDeclaresAround(scopes, declared, site)) continue;
+            count = saturatingAdd(count, 1);
+        }
+    }
+    return count;
+}
+
+/// Whether a region whose text holds `site` declares `scope` again before its first node (`region_declarations`), so
+/// that `addRepeatedBlockSites` counts every local of `scope` at the container group that holds the site.
+fn regionDeclaresAround(scopes: *const emission_scope.Plan, scope: emission_scope.ScopeId, site: emission_scope.ScopeId) bool {
+    if (site == emission_scope.invalid_scope) return false;
+    for (scopes.region_declarations.items) |declaration| {
+        if (declaration.scope != scope) continue;
+        for (declaration.region.nodes) |*node| {
+            const group = scopes.nodeContainerScope(node) orelse continue;
+            if (scopes.scopeEncloses(group, site)) return true;
+        }
+    }
+    return false;
+}
+
+/// The locals a scope itself declares, as `hostPressure` counts them: values with no value storage that the text
+/// declares, stored packs, places with no storage, and the locals of discarded branch conditions. `composition` is
+/// the one the writer passes where it declares them again (`emitScopeDeclarations`): a value it writes inline in
+/// place of its name (`isOverridden`: a deferred composition or an absorbed condition) has no local there, and with
+/// none every value is a local.
+fn localsDeclaredAtScope(
+    program: *const ir.Program,
+    readable: *const readable_scope.Scope,
+    emission: *const emission_planning.Plan,
+    scopes: *const emission_scope.Plan,
+    function: ir.Function,
+    composition: ?*const branch_expression.Composition,
+    scope: emission_scope.ScopeId,
+) usize {
+    var count: usize = 0;
+    for (program.values) |value| {
+        if (value.function != function.id or emission.names.valueUsesStorage(value.id)) continue;
+        if (composition) |written| {
+            if (written.isOverridden(value.id)) continue;
+        }
+        if (scopes.valueScope(value.id)) |declared| {
+            if (declared == scope) count += 1;
+        }
+    }
+    for (program.value_packs) |pack| {
+        if (pack.function != function.id) continue;
+        if (scopes.packScope(pack.id)) |declared| {
+            if (declared == scope) count += 1;
+        }
+    }
+    for (function.local_places) |place_id| {
+        if (emission.names.placeUsesStorage(place_id)) continue;
+        if (scopes.placeScope(place_id)) |declared| {
+            if (declared == scope) count += 1;
+        }
+    }
+    for (function.blocks) |block_id| {
+        if (!readable.block(block_id) or block_id.index() >= program.blocks.len) continue;
+        const declared = scopes.blockScope(block_id) orelse continue;
+        if (declared == scope and emission.discardedBranchConditionNeedsLocal(program, program.blocks[block_id.index()])) count += 1;
+    }
+    return count;
 }
 
 /// Registers a native `for` holds that no value scope counts (`emit_luau.nativeForAt`): its frame registers beside its

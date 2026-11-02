@@ -2648,6 +2648,159 @@ pub fn build(b: *std.Build) void {
         addLuauSourceConformanceForTarget(b, exe, z3_enabled, z3_bin, fixture.path, fixture.name, "standard-luau").addTo(conformance_step);
         addLuauSourceConformanceForTarget(b, exe, z3_enabled, z3_bin, fixture.path, b.fmt("{s}-direct-locals", .{fixture.name}), "direct-locals-luau").addTo(conformance_step);
     }
+    // Author-written source programs whose `repeat` loop holds a `continue` one `if` deeper, so the structure writes the
+    // loop's tail in both arms of the outer `if`, and whose tail, past 32 statements, declares a local that its later
+    // statements read: a click counter that stored handlers capture, and a local of a recursive function that the
+    // recursive call re-enters before its read. Each copy of the tail must declare its own local. Each lifts, resolves,
+    // validates, emits and runs on both targets, returns what its source returns on the 45-point worker grid, and keeps
+    // the structured layout (no dispatcher loop).
+    const repeated_tail_sources = [_]struct { path: []const u8, name: []const u8 }{
+        .{ .path = "luau/fixtures/repeated_tail_handler_counter_source.luau", .name = "source-frontend-repeated-tail-handler-counter" },
+        .{ .path = "luau/fixtures/repeated_tail_recursive_local_source.luau", .name = "source-frontend-repeated-tail-recursive-local" },
+    };
+    for (repeated_tail_sources) |fixture| {
+        const direct_locals_name = b.fmt("{s}-direct-locals", .{fixture.name});
+        const arms = [_]struct { name: []const u8, conformance: FixtureConformance }{
+            .{ .name = fixture.name, .conformance = addLuauSourceConformanceForTarget(b, exe, z3_enabled, z3_bin, fixture.path, fixture.name, "standard-luau") },
+            .{ .name = direct_locals_name, .conformance = addLuauSourceConformanceForTarget(b, exe, z3_enabled, z3_bin, fixture.path, direct_locals_name, "direct-locals-luau") },
+        };
+        for (arms) |arm| {
+            arm.conformance.addTo(conformance_step);
+            const audit = addStructureAstAudit(b, arm.name, arm.conformance.generated_luau);
+            audit.expectExitCode(0);
+            audit.expectStdOutMatch(" class=structured-no-dispatcher ");
+            conformance_step.dependOn(&audit.step);
+        }
+    }
+    // Author-written source programs of the same loop shape whose even arm declares many locals that stay in scope
+    // through the tail written again there, and whose tail declares 40 locals its last statements read. On
+    // `direct-locals-luau` the register budget counts the tail at each node that writes it: with 150 locals in the arm
+    // the second copy needs more than 200 locals and the function is refused; with 145 it is admitted, and the text
+    // compiles. Two programs whose `if` holds a `repeat` loop left by a `break`, followed by a return block of 191 and
+    // 192 locals its last statements read, need 200 and 201 locals at each copy of that block, and the budget counts
+    // the block's locals once at the copy the loop's exit arm writes ahead of the first: 191 is admitted, with a text
+    // that compiles, and 192 is refused. A program of that shape whose `if` arm declares 60 locals that stay live at the
+    // loop's exit, where the copy is written, and whose return block of 100 locals returns a call of 100 arguments: at
+    // that copy the locals live there and the call's frame need more than 255 registers, which the budget counts at the
+    // copy as at the first, so the function is refused. A program of the repeat loop shape whose even arm declares 110
+    // locals live where the tail is written again, and whose tail, within 32 statements, declares 30 locals and ends in
+    // a call of 120 arguments: at that copy the same holds, so the function is refused.
+    const register_budget_sources = [_]struct { path: []const u8, name: []const u8, refusal: ?[]const u8 }{
+        .{ .path = "luau/fixtures/repeated_tail_register_budget_150_source.luau", .name = "source-frontend-repeated-tail-register-budget-150", .refusal = "unsupported_readable_register_pressure" },
+        .{ .path = "luau/fixtures/repeated_tail_register_budget_145_source.luau", .name = "source-frontend-repeated-tail-register-budget-145", .refusal = null },
+        .{ .path = "luau/fixtures/projected_return_register_budget_191_source.luau", .name = "source-frontend-projected-return-register-budget-191", .refusal = null },
+        .{ .path = "luau/fixtures/projected_return_register_budget_192_source.luau", .name = "source-frontend-projected-return-register-budget-192", .refusal = "unsupported_readable_register_pressure" },
+        .{ .path = "luau/fixtures/projected_return_register_budget_wide_call_source.luau", .name = "source-frontend-projected-return-register-budget-wide-call", .refusal = "unsupported_readable_temporary_register_pressure" },
+        .{ .path = "luau/fixtures/repeated_tail_register_budget_wide_call_source.luau", .name = "source-frontend-repeated-tail-register-budget-wide-call", .refusal = "unsupported_readable_temporary_register_pressure" },
+    };
+    for (register_budget_sources) |fixture| {
+        const lifted = addLuauSourceIr(b, fixture.path, null, fixture.name);
+        const resolve = b.addRunArtifact(exe);
+        if (z3_enabled) resolve.addPathDir(b.pathFromRoot(z3_bin));
+        resolve.addArg("resolve-ir");
+        resolve.addFileArg(lifted);
+        const resolved = resolve.addOutputFileArg(b.fmt("{s}.resolved.lifter-ir.json", .{fixture.name}));
+        resolve.addArg(if (z3_enabled) "z3" else "internal");
+        const emit = b.addRunArtifact(exe);
+        if (z3_enabled) emit.addPathDir(b.pathFromRoot(z3_bin));
+        emit.addArg("emit-readable-luau-strategy");
+        emit.addFileArg(resolved);
+        if (fixture.refusal) |refusal| {
+            const seed_files = b.addWriteFiles();
+            emit.addFileArg(seed_files.add(b.fmt("{s}.direct-locals.luau", .{fixture.name}), ""));
+            emit.addArgs(&.{ "direct-locals-luau", "automatic" });
+            emit.expectExitCode(1);
+            emit.expectStdErrMatch(b.fmt("diagnostic={s} entity=1\n", .{refusal}));
+            conformance_step.dependOn(&emit.step);
+        } else {
+            const emitted = emit.addOutputFileArg(b.fmt("{s}.direct-locals.luau", .{fixture.name}));
+            emit.addArgs(&.{ "direct-locals-luau", "automatic" });
+            emit.expectExitCode(0);
+            const compile = b.addSystemCommand(&.{ luauCompileExe(b), "--null" });
+            compile.addFileArg(emitted);
+            compile.expectExitCode(0);
+            conformance_step.dependOn(&compile.step);
+        }
+    }
+    // An author-written source program whose `if` holds a `repeat` loop left by a `break`, followed by a return block of
+    // 120 locals each read twice: the structure writes the return block again in the loop's exit arm, and that copy
+    // must declare the locals its text reads that are declared only at the first copy. It lifts, resolves, validates,
+    // emits and runs on both targets, returns what its source returns on the 45-point worker grid, and keeps the
+    // structured layout (no dispatcher loop).
+    const projected_return_path = "luau/fixtures/projected_return_segment_locals_source.luau";
+    const projected_return_name = "source-frontend-projected-return-segment-locals";
+    const projected_return_arms = [_]struct { name: []const u8, conformance: FixtureConformance }{
+        .{ .name = projected_return_name, .conformance = addLuauSourceConformanceForTarget(b, exe, z3_enabled, z3_bin, projected_return_path, projected_return_name, "standard-luau") },
+        .{ .name = projected_return_name ++ "-direct-locals", .conformance = addLuauSourceConformanceForTarget(b, exe, z3_enabled, z3_bin, projected_return_path, projected_return_name ++ "-direct-locals", "direct-locals-luau") },
+    };
+    for (projected_return_arms) |arm| {
+        arm.conformance.addTo(conformance_step);
+        const audit = addStructureAstAudit(b, arm.name, arm.conformance.generated_luau);
+        audit.expectExitCode(0);
+        audit.expectStdOutMatch(" class=structured-no-dispatcher ");
+        conformance_step.dependOn(&audit.step);
+    }
+    // A program of the same shape whose return block declares 94 locals that its last statements read across its
+    // segments, so the block declares them at its own scope: the copy in the loop's exit arm must declare them, and the
+    // register budget counts them once there, before the first copy declares its own. It lifts, resolves, validates,
+    // emits and runs on `direct-locals-luau`, returns what its source returns on the 45-point worker grid, and keeps
+    // the structured layout (no dispatcher loop).
+    const projected_return_shared_path = "luau/fixtures/projected_return_shared_locals_source.luau";
+    const projected_return_shared_name = "source-frontend-projected-return-shared-locals-direct-locals";
+    const projected_return_shared = addLuauSourceConformanceForTarget(b, exe, z3_enabled, z3_bin, projected_return_shared_path, projected_return_shared_name, "direct-locals-luau");
+    projected_return_shared.addTo(conformance_step);
+    const projected_return_shared_audit = addStructureAstAudit(b, projected_return_shared_name, projected_return_shared.generated_luau);
+    projected_return_shared_audit.expectExitCode(0);
+    projected_return_shared_audit.expectStdOutMatch(" class=structured-no-dispatcher ");
+    conformance_step.dependOn(&projected_return_shared_audit.step);
+    // An author-written source program whose `repeat` loop holds a `continue` one `if` deeper, so the structure writes
+    // the loop's tail in both arms of the outer `if`, and whose tail, past 32 statements, declares a local that a
+    // stored closure captures and that the tail's last statement bumps: the tail is cut into segments, and the local,
+    // written in the first segment and read in the last, is declared at the tail's own scope. Each copy of the tail
+    // must declare its own local. It lifts, resolves, validates, emits and runs on both targets, returns what its
+    // source returns on the 45-point worker grid, and keeps the structured layout (no dispatcher loop).
+    const repeat_continue_tail_cell_path = "luau/fixtures/repeat_continue_tail_cell_segments_source.luau";
+    const repeat_continue_tail_cell_name = "source-frontend-repeat-continue-tail-cell-segments";
+    const repeat_continue_tail_cell_arms = [_]struct { name: []const u8, conformance: FixtureConformance }{
+        .{ .name = repeat_continue_tail_cell_name, .conformance = addLuauSourceConformanceForTarget(b, exe, z3_enabled, z3_bin, repeat_continue_tail_cell_path, repeat_continue_tail_cell_name, "standard-luau") },
+        .{ .name = repeat_continue_tail_cell_name ++ "-direct-locals", .conformance = addLuauSourceConformanceForTarget(b, exe, z3_enabled, z3_bin, repeat_continue_tail_cell_path, repeat_continue_tail_cell_name ++ "-direct-locals", "direct-locals-luau") },
+    };
+    for (repeat_continue_tail_cell_arms) |arm| {
+        arm.conformance.addTo(conformance_step);
+        const audit = addStructureAstAudit(b, arm.name, arm.conformance.generated_luau);
+        audit.expectExitCode(0);
+        audit.expectStdOutMatch(" class=structured-no-dispatcher ");
+        conformance_step.dependOn(&audit.step);
+    }
+    // The same loop with two passes and 34 plain statements: one pass writes the tail's second copy, so every call
+    // returns what the source returns, and only a copy that assigns the local as a global tells the texts apart, which
+    // the generated lexical oracle refuses. It lifts, resolves, validates, emits and runs on both targets, returns what
+    // its source returns on the 45-point worker grid, and keeps the structured layout (no dispatcher loop).
+    const repeat_continue_tail_cell_two_passes_path = "luau/fixtures/repeat_continue_tail_cell_two_passes_source.luau";
+    const repeat_continue_tail_cell_two_passes_name = "source-frontend-repeat-continue-tail-cell-two-passes";
+    const repeat_continue_tail_cell_two_passes_arms = [_]struct { name: []const u8, conformance: FixtureConformance }{
+        .{ .name = repeat_continue_tail_cell_two_passes_name, .conformance = addLuauSourceConformanceForTarget(b, exe, z3_enabled, z3_bin, repeat_continue_tail_cell_two_passes_path, repeat_continue_tail_cell_two_passes_name, "standard-luau") },
+        .{ .name = repeat_continue_tail_cell_two_passes_name ++ "-direct-locals", .conformance = addLuauSourceConformanceForTarget(b, exe, z3_enabled, z3_bin, repeat_continue_tail_cell_two_passes_path, repeat_continue_tail_cell_two_passes_name ++ "-direct-locals", "direct-locals-luau") },
+    };
+    for (repeat_continue_tail_cell_two_passes_arms) |arm| {
+        arm.conformance.addTo(conformance_step);
+        const audit = addStructureAstAudit(b, arm.name, arm.conformance.generated_luau);
+        audit.expectExitCode(0);
+        audit.expectStdOutMatch(" class=structured-no-dispatcher ");
+        conformance_step.dependOn(&audit.step);
+    }
+    // A program of that loop whose tail stores a call's three results in three locals (a stored invocation pack, whose
+    // names the scope plan declares at the tail's first copy) beside 36 table stores: the copy in the other arm must
+    // declare the three names again. It lifts, resolves, validates, emits and runs on `direct-locals-luau`, returns
+    // what its source returns on the 45-point worker grid, and keeps the structured layout (no dispatcher loop).
+    const repeated_tail_stored_pack_path = "luau/fixtures/repeated_tail_stored_pack_source.luau";
+    const repeated_tail_stored_pack_name = "source-frontend-repeated-tail-stored-pack-direct-locals";
+    const repeated_tail_stored_pack = addLuauSourceConformanceForTarget(b, exe, z3_enabled, z3_bin, repeated_tail_stored_pack_path, repeated_tail_stored_pack_name, "direct-locals-luau");
+    repeated_tail_stored_pack.addTo(conformance_step);
+    const repeated_tail_stored_pack_audit = addStructureAstAudit(b, repeated_tail_stored_pack_name, repeated_tail_stored_pack.generated_luau);
+    repeated_tail_stored_pack_audit.expectExitCode(0);
+    repeated_tail_stored_pack_audit.expectStdOutMatch(" class=structured-no-dispatcher ");
+    conformance_step.dependOn(&repeated_tail_stored_pack_audit.step);
     // Author-written workers over 120 candidate values, whose values the standard target keeps in a storage table.
     // The first makes a closure in each pass of a numeric for loop over a local that the pass reads again; the second
     // makes a function with a storage table of its own that reads a value its maker computed right before making it.
